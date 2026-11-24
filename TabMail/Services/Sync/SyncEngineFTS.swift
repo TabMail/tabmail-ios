@@ -351,17 +351,20 @@ extension SyncEngine {
                     BackgroundSyncLogger.logDebug("[FTS] bodyComplete restore paused by suspension — resuming next launch")
                     return
                 }
-                // ⚠ STAGE E1 — `chunk` holds `messageHeader.id`s; the FTS probe below
-                // keys by CONTENT, while the HTML-cache pair and the heal's UPDATE key
-                // by HEADER. All three are the same string only until E1.
+                // ⚠ STAGE E1 — `chunk` holds `messageHeader.id`s; the FTS probe and the
+                // `messageBody` probe below both key by CONTENT, and the heal's UPDATE
+                // keys by HEADER. All three are the same string only until E1.
                 let withBody = try await SearchIndex.shared.contentKeysWithFTSBody(
                     chunk.map(ContentKey.init(rawValue:)))
                 guard !withBody.isEmpty else { continue }
                 let withBodyArr: [String] = withBody.map(\.rawValue)
-                // Which of them have cached HTML, read from the pair (#1433); the rest
-                // are the ones to heal.
                 let cachedIds: Set<String> = try await dbPool.read { db in
-                    try HTMLCachePair.cachedHeaderIds(db, among: withBodyArr)
+                    let placeholders = withBodyArr.map { _ in "?" }.joined(separator: ",")
+                    return try Set(String.fetchAll(
+                        db,
+                        sql: "SELECT id FROM messageBody WHERE id IN (\(placeholders))",
+                        arguments: StatementArguments(withBodyArr)
+                    ))
                 }
                 let toHeal = withBodyArr.filter { !cachedIds.contains($0) }
                 guard !toHeal.isEmpty else { continue }

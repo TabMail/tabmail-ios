@@ -8,14 +8,15 @@ import Testing
 
 /// #1433: "is this message's HTML cached?" is asked through `HTMLCachePair`, which
 /// reads one header row; a probe of `messageBody` itself reads the body row, HTML
-/// included, and is what the pair replaced at six sites. So every query site that
+/// included, and is what the pair replaced at five sites. So every query site that
 /// names `messageBody` outside `HTMLCachePair` and the registered migrations is
 /// listed here with the reason it needs the body row, by file and enclosing
 /// declaration with its count of sites (the census of `QueryCensusScanner`). A new
 /// site fails until it is listed with its reason, or asks `HTMLCachePair` instead.
 ///
-/// And `messageHeader.htmlCachedAt` is written only by v116's triggers and read only
-/// through `HTMLCachePair`: no other production code names it.
+/// And `messageHeader.htmlCachedAt` is written only by v116's triggers and the
+/// deferred fill (`HTMLCachePair.fillSQL`), and read only through `HTMLCachePair`: no
+/// other production code names it.
 @Suite("HTML-cache pair fence")
 struct HTMLCachePairFenceTests {
 
@@ -49,7 +50,7 @@ struct HTMLCachePairFenceTests {
         "TabMail/Services/AI/Tools/EmailForwardTool.swift\tEmailForwardTool.execute": Allowed(count: 1, reason: readsHTML),
         "TabMail/Services/AI/Tools/EmailReadTool.swift\tEmailReadTool.execute": Allowed(count: 1, reason: readsHTML),
         "TabMail/Services/AI/Tools/EmailReplyTool.swift\tEmailReplyTool.execute": Allowed(count: 1, reason: readsHTML),
-        "TabMail/Services/AppDataWiper.swift\tAppDataWiper.wipeAll": Allowed(count: 2, reason: "wipe: " + deletesHTML),
+        "TabMail/Services/AppDataWiper.swift\tAppDataWiper.wipeRowsTxn": Allowed(count: 2, reason: "wipe: " + deletesHTML),
         "TabMail/Services/BodyAssetMaintenance.swift\tBodyAssetMaintenance.dropMessage": Allowed(count: 2, reason: deletesHTML),
         "TabMail/Services/BodyAssetMaintenance.swift\tBodyAssetMaintenance.wipeAll": Allowed(count: 2, reason: deletesHTML),
         "TabMail/Services/Demo/DemoModeService.swift\tDemoModeService.indexSeededFTS": Allowed(count: 1, reason: "demo: " + readsHTML),
@@ -68,6 +69,8 @@ struct HTMLCachePairFenceTests {
         "TabMail/Services/Sync/SyncEngineMaintenance.swift\tSyncEngine.pruneFolderBodies": Allowed(count: 1, reason: deletesHTML),
         "TabMail/Services/Sync/SyncEngineMaintenance.swift\tSyncEngine.runEvictStaleBodies":
             Allowed(count: 1, reason: "the evict: deletes each candidate's body; candidates come from HTMLCachePair"),
+        "TabMail/Services/Sync/SyncEngineFTS.swift\tSyncEngine.oneTimeBodyCompleteRestore":
+            Allowed(count: 2, reason: "runs once at startup, possibly before the deferred fill records the bodies cached before v116, so it asks messageBody itself (HTMLCachePair, \"Before the first upgrade step\")"),
         "TabMail/Services/Sync/SyncEngineSettingsReset.swift\tSyncEngine": Allowed(count: 1, reason: "settings reset statement list: " + deletesHTML),
         "TabMail/Services/Sync/SyncEngineSettingsReset.swift\tSyncEngine.resetMessageDataTxn": Allowed(count: 2, reason: deletesHTML),
         "TabMail/ViewModels/InboxViewModel.swift\tInboxViewModel.deleteDraftMessage": Allowed(count: 1, reason: deletesHTML),
@@ -161,6 +164,6 @@ struct HTMLCachePairFenceTests {
         }
         let owners: Set<String> = ["AppDatabase.swift", "HTMLCachePair.swift"]
         #expect(files > 100, "setup: the walk read the production sources: \(files) files")
-        #expect(namers == owners, "htmlCachedAt is written by v116's triggers and read through HTMLCachePair only: \(namers.sorted())")
+        #expect(namers == owners, "htmlCachedAt is written by v116's triggers and the fill, and read through HTMLCachePair only: \(namers.sorted())")
     }
 }

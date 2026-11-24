@@ -11,10 +11,58 @@ import GRDB
 /// code probes `messageBody` for existence or writes the column
 /// (`HTMLCachePairFenceTests`). Reading the HTML itself still reads `messageBody`.
 ///
+/// ## Before the first upgrade step
+///
+/// v116 adds the column empty and its triggers; the bodies cached before it are
+/// recorded by the fill (`fillSQL`), which runs in the deferred index step
+/// (`SyncEngine.deferredIndexes`), in the same write that builds `indexName` and
+/// analyzes it. Until that write commits, a message whose HTML was cached before v116
+/// and not written since reads as not cached here. That is the only difference:
+///
+/// - `AccountManager.fetchBody` and the thread bubble's load fetch its body again
+///   (the user's first open runs the step first);
+/// - the notification merge re-merges a staged row whose body predates v116, because
+///   its body insert is ignored and leaves the pair empty;
+/// - the AI queue's diagnostic line says `hasMessageBody=false`.
+///
+/// None of them deletes a body or uses another message's content, and the evict
+/// waits for `indexName` (`SyncEngine.runEvictStaleBodiesIfIndexed`). The one-time
+/// `bodyComplete` restore, which runs at startup and can come first, keeps its own
+/// probe of `messageBody` for this reason. The index existing is the proof the fill
+/// ran: both commit in one write, and nothing else records it.
+///
 /// ⚠ STAGE E1: the triggers match a body to its header by id, which is exact while
 /// `ContentKey.forHeader` returns the header id. Every answer here is about a HEADER,
 /// so callers pass header ids and never content keys.
 enum HTMLCachePair {
+
+    /// The column, for code that has to name it (`InboxNotificationObserver`).
+    static let column = "htmlCachedAt"
+
+    /// The index the evict's page seeks, built by the deferred index step.
+    static let indexName = "messageHeader_htmlCachedAt"
+
+    /// `(isInInbox, htmlCachedAt)` holds every header, NULLs included (not a partial
+    /// index): the evict seeks `isInInbox = 0 AND htmlCachedAt < cutoff`, and "no cached
+    /// HTML" is `htmlCachedAt IS NULL` under one `isInInbox` value. Leading with
+    /// `isInInbox` keeps the evict from walking old inbox entries it would only skip.
+    /// Building it reads `messageHeader` once.
+    static let indexSQL = """
+        CREATE INDEX IF NOT EXISTS messageHeader_htmlCachedAt
+        ON messageHeader(isInInbox, htmlCachedAt)
+        """
+
+    /// Records the bodies cached before v116: each body's header gets its `fetchedAt`.
+    /// Runs once, in the deferred step's write and before `indexSQL`, so the index is
+    /// built once from the filled column. It reads every cached body once (`fetchedAt`
+    /// is stored after the HTML, so each read walks that body's pages) and seeks each
+    /// one's header by primary key; headers with no body keep NULL, which the triggers
+    /// have kept exact since v116.
+    static let fillSQL = """
+        UPDATE messageHeader
+        SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE messageBody.id = messageHeader.id)
+        WHERE id IN (SELECT id FROM messageBody)
+        """
 
     /// Whether `headerId`'s HTML is cached. Reads one header row by primary key, never
     /// the body row (which holds the HTML). A header that does not exist reads as not
@@ -25,19 +73,6 @@ enum HTMLCachePair {
             sql: "SELECT htmlCachedAt IS NOT NULL FROM messageHeader WHERE id = ?",
             arguments: [headerId]
         ) ?? false
-    }
-
-    /// The ids among `headerIds` whose HTML is cached; every other id has none, or no
-    /// header. One primary-key seek per id; the caller passes a bounded batch (each id
-    /// is one bound argument).
-    static func cachedHeaderIds(_ db: Database, among headerIds: [String]) throws -> Set<String> {
-        guard !headerIds.isEmpty else { return [] }
-        let placeholders = headerIds.map { _ in "?" }.joined(separator: ",")
-        return try Set(String.fetchAll(
-            db,
-            sql: "SELECT id FROM messageHeader WHERE id IN (\(placeholders)) AND htmlCachedAt IS NOT NULL",
-            arguments: StatementArguments(headerIds)
-        ))
     }
 
     // MARK: - The body-cache evict's candidates

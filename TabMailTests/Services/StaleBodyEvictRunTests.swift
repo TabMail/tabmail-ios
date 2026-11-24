@@ -121,7 +121,7 @@ struct StaleBodyEvictRunTests {
                 "evicted \(seeded.subtracting(after).count) of \(victims) victims; kept victims: \(after.subtracting(keepers).count), lost keepers: \(keepers.subtracting(after).count)")
     }
 
-    /// The index the evict's page seeks (migration v116).
+    /// The index the evict's page seeks, built by the deferred index step.
     static let candidateIndexName = "messageHeader_htmlCachedAt"
 
     /// The plan the writer uses on a database like a device's: populated, with
@@ -173,20 +173,24 @@ struct StaleBodyEvictRunTests {
 
     // MARK: - The maintenance pass
 
-    /// The real pass, not its helpers. Since #1433 the step has no deferred index of
-    /// its own to wait for: the first pass after an upgrade evicts by the unchanged
-    /// rules, before the pass has built the deferred indexes.
+    /// The real pass, not its helpers, on a database upgraded with bodies cached
+    /// before v116: their headers hold no cached-at time yet. The first pass finds
+    /// no candidate index: it keeps every body, then fills the pair and builds the
+    /// index and its statistics in one write (`DeferredIndex.fill`). The next pass
+    /// evicts by the unchanged rules, which it can only do through the filled
+    /// pair: a body whose header holds no time is never a candidate.
     /// `.processGlobalState`: the build and the statistics refresh give up while
     /// `DatabaseSuspension.isSuspended`, and the refresh holds a process-wide
     /// single-flight latch and a process-wide marker.
-    @Test("The maintenance pass evicts on its first pass, deferred indexes not built yet",
+    @Test("The maintenance pass keeps every body, fills the pair and builds its index, and the next pass evicts",
           .processGlobalState)
-    func theFirstMaintenancePassEvicts() async throws {
+    func theMaintenancePassFillsAndIndexesThenTheNextPassEvicts() async throws {
         let fixture = try Hold.makeFixture(buildsDeferredIndexes: false)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
-        // The pass's statistics step records the `schema_version` of its `ANALYZE`
-        // in `UserDefaults.standard`, so the marker is cleared for this test and put
-        // back after it.
+        // The statistics marker is the `schema_version` of the last `ANALYZE`, kept
+        // in `UserDefaults.standard`. A fresh database's version can equal one an
+        // earlier run recorded, which would skip the refresh, so the marker is
+        // cleared for this test and put back after it.
         let defaults = UserDefaults.standard
         let markerKey = SyncEngine.plannerStatisticsSchemaVersionKey
         let savedMarker = defaults.object(forKey: markerKey) as? Int
@@ -200,23 +204,55 @@ struct StaleBodyEvictRunTests {
         }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
         let recent = SyncConfig.bodyCacheRecentPerFolder
-        let inbox = 3
-        try Hold.seedKeptInboxBodies(fixture, uids: 1..<(inbox + 1))
+        try Hold.seedKeptInboxBodies(fixture, uids: 1..<4)
         let inboxIds = try Hold.bodyIds(fixture)
         let archived = try Hold.seedArchiveBodies(fixture, count: recent + 3)
-        let deferredNames = Set(SyncEngine.deferredIndexes.map(\.name))
-        let indexesBefore = try await fixture.pool.read { db in
-            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'index'"))
+        let seeded = inboxIds.union(archived)
+        // Bodies cached before v116: the triggers did not exist when they were saved.
+        try await fixture.pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET \(HTMLCachePair.column) = NULL")
         }
-        let deferredIndexesBefore = indexesBefore.intersection(deferredNames).count
+        let indexName = HTMLCachePair.indexName
+        let unpaired = """
+            SELECT COUNT(*) FROM messageHeader
+            WHERE htmlCachedAt IS NOT (SELECT fetchedAt FROM messageBody WHERE messageBody.id = messageHeader.id)
+            """
+        let unpairedBefore = try await fixture.pool.read { db in try Int.fetchOne(db, sql: unpaired) ?? 0 }
 
         await SyncEngine.runWALMaintenance(
             dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterFirstPass = try Hold.bodyIds(fixture)
+        let firstPass = try await fixture.pool.read { db in
+            (built: try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                arguments: [indexName]) ?? 0,
+             unpaired: try Int.fetchOne(db, sql: unpaired) ?? 0,
+             indexStatistics: try String.fetchAll(
+                db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName]),
+             bodyStatistics: try String.fetchAll(
+                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = 'messageBody' ORDER BY idx"))
+        }
+        #expect(unpairedBefore == seeded.count, "setup: \(unpairedBefore) of \(seeded.count) headers lost their pair")
+        #expect(afterFirstPass == seeded, "the first pass evicted with no index to seek")
+        #expect(firstPass.built == 1, "the first pass did not build \(indexName)")
+        #expect(firstPass.unpaired == 0, "the first pass left \(firstPass.unpaired) headers unpaired")
+        #expect(firstPass.indexStatistics.count == 1, "the first pass's statistics do not cover \(indexName)")
+        // A table's statistics start with the number of rows it held when analyzed.
+        let analyzedBodies = firstPass.bodyStatistics.first?.split(separator: " ").first.flatMap { Int($0) }
+        #expect(analyzedBodies == seeded.count, "setup: the first pass analyzed every body: \(firstPass.bodyStatistics)")
 
-        #expect(deferredIndexesBefore == 0, "setup: the fixture built deferred indexes: \(deferredIndexesBefore)")
-        #expect(afterFirstPass == inboxIds.union(archived.prefix(recent)),
-                "the first pass evicts the archive bodies past the newest \(recent), and only them")
+        await SyncEngine.runWALMaintenance(
+            dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
+        let afterSecondPass = try Hold.bodyIds(fixture)
+        let bodyStatisticsAfterSecondPass = try await fixture.pool.read { db in
+            try String.fetchAll(db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = 'messageBody' ORDER BY idx")
+        }
+        #expect(afterSecondPass == inboxIds.union(archived.prefix(recent)),
+                "the next pass evicts the archive bodies past the newest \(recent), and only them")
+        // The first pass's analysis settled: the next pass does not analyze the
+        // whole database again (that would count the bodies left after it).
+        #expect(bodyStatisticsAfterSecondPass == firstPass.bodyStatistics,
+                "the next pass analyzed again: \(firstPass.bodyStatistics) -> \(bodyStatisticsAfterSecondPass)")
     }
 
     // MARK: - The rules a page applies

@@ -29,7 +29,8 @@ The flip conflated two independent facts:
 
 "The display cache gets NO flag" still holds for app code: no code path writes a "cached" flag.
 `messageHeader.htmlCachedAt` (v116) is the `fetchedAt` of the `messageBody` row, kept exact by
-SQLite triggers on every write to either table, so it cannot drift from the row's existence the way
+SQLite triggers on every write to either table (the bodies cached before v116 are recorded by the
+deferred index step's fill, ADR-IOS-119 decision 7), so it cannot drift from the row's existence the way
 an app-written flag could (the failure this ADR names). The row's existence remains the cache state;
 the column is its mirror on the header, read only through `HTMLCachePair`. The three evictors still
 never touch `bodyComplete`, and deleting a `messageBody` row (any evictor) clears the column through

@@ -72,7 +72,8 @@ page is a keyset seek on `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)` 
 inbox cached before the cutoff (`HTMLCachePair.evictCandidatesPage`). Inbox bodies are not read at all;
 the page reads only candidates, the rules (undo set, a folder's newest) are unchanged, and the orphan
 leg is gone. The write stays the synchronous pass-through write through `passThroughWrite`, bounded per
-page as before, and the WAL checkpoint between pages is unchanged; the gate on `messageBody_staleEvict`
-is removed. **Census:** this row's predicate is unchanged by the change (no `dbPool.write` site added
+page as before, and the WAL checkpoint between pages is unchanged. The evict waits for
+`messageHeader_htmlCachedAt`, which the deferred index step builds after filling the column, as it
+waited for `messageBody_staleEvict`. **Census:** this row's predicate is unchanged by the change (no `dbPool.write` site added
 or removed). Old against new, with write costs: `StaleBodyEvictPairProofTests`.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->

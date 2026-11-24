@@ -4587,18 +4587,22 @@ final class AppDatabase: Sendable {
         //   `ContentKey.forHeader` returns the header id. The change that makes
         //   content keys differ from header ids must point these triggers at the
         //   content key the header holds (`HTMLCachePairTests` fails that day).
-        // - `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)` holds every header,
-        //   NULLs included (not a partial index): the evict seeks `isInInbox = 0 AND
-        //   htmlCachedAt < cutoff`, and "no cached HTML" is `htmlCachedAt IS NULL`
-        //   under one `isInInbox` value. Leading with `isInInbox` keeps the evict from
-        //   walking old inbox entries it would only skip.
-        // - The fill reads `messageBody` (bodies are far fewer than headers) and
-        //   seeks each one's header by primary key; it runs before the index exists
-        //   so the index is built once from the filled column. Building the index
-        //   reads `messageHeader` once.
-        // - Write cost: a body save or delete also rewrites its header row and moves
-        //   one index entry; a header insert probes `messageBody` by primary key.
-        //   Whole-table body deletes fire the delete trigger per row.
+        // - This migration adds the column, empty, and the triggers: an `ALTER TABLE`
+        //   that adds a nullable column rewrites no row, and creating a trigger reads
+        //   no data, so it costs the same at any size on every launch path. The bodies
+        //   cached before it are recorded by the fill, and the evict's index
+        //   `messageHeader_htmlCachedAt` is built, in the deferred index step
+        //   (`SyncEngine.deferredIndexes`, `HTMLCachePair.fillSQL` and `.indexSQL`),
+        //   in one write with the `ANALYZE` that gives the index its statistics
+        //   (#1401, ADR-IOS-029). Until that write commits, those bodies read as not
+        //   cached and the evict waits (`HTMLCachePair`, "Before the first upgrade
+        //   step").
+        // - Write cost: a body save or delete also rewrites its header row, and once
+        //   the index exists moves one index entry; a header insert or id change
+        //   probes `messageBody` by primary key and, when a body is there, reads its
+        //   `fetchedAt` through the body's pages (it is stored after the HTML). A
+        //   delete of many bodies fires the delete trigger once per body, one header
+        //   seek each.
         // - A later migration that rebuilds `messageHeader` or `messageBody` drops
         //   these triggers with the old table and must create them again
         //   (`HTMLCachePairTests` checks the pair after the whole chain).
@@ -4606,15 +4610,6 @@ final class AppDatabase: Sendable {
             "v116_addMessageHeaderHTMLCachedAt", foreignKeyChecks: .immediate
         ) { db in
             try db.execute(sql: "ALTER TABLE messageHeader ADD COLUMN htmlCachedAt DATETIME")
-            try db.execute(sql: """
-                UPDATE messageHeader
-                SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE messageBody.id = messageHeader.id)
-                WHERE id IN (SELECT id FROM messageBody)
-                """)
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS messageHeader_htmlCachedAt
-                ON messageHeader(isInInbox, htmlCachedAt)
-                """)
             try db.execute(sql: """
                 CREATE TRIGGER messageBody_htmlCachedAtInsert
                 AFTER INSERT ON messageBody

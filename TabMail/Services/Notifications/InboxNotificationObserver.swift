@@ -58,9 +58,27 @@ final class InboxNotificationObserver: TransactionObserver, @unchecked Sendable 
     /// Pre-filter — restrict observation to messageHeader insert/update/delete.
     /// All other table writes (folder, pendingOperation, chatTurn, …) skip
     /// the observer entirely.
+    ///
+    /// An update that writes only `htmlCachedAt` is skipped too. Only the
+    /// HTML-cache pair's triggers and its one-time fill write that column
+    /// (`HTMLCachePair`), and none of them changes `isInInbox`, so they never
+    /// move a row into or out of the inbox. Without this, every body save or
+    /// delete, and the fill over every cached header, would put those headers'
+    /// rowids into the post-commit read below. GRDB passes the column names an
+    /// update statement writes, a trigger's included, so this is decided per
+    /// statement: a statement that also writes another `messageHeader` column
+    /// is still observed.
     func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
-        eventKind.tableName == MessageHeader.databaseTableName
+        guard eventKind.tableName == MessageHeader.databaseTableName else { return false }
+        if case .update(_, let columnNames) = eventKind,
+           columnNames.isSubset(of: Self.ignoredUpdateColumns) {
+            return false
+        }
+        return true
     }
+
+    /// `messageHeader` columns whose updates alone cannot change inbox membership.
+    static let ignoredUpdateColumns: Set<String> = [HTMLCachePair.column]
 
     /// Called once per affected row, INSIDE the in-flight transaction.
     /// Cheap by design — just record the rowid. No SQL.

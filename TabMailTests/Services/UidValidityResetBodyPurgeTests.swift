@@ -21,11 +21,18 @@ import Testing
 /// Controls that must keep their bodies: a ':'-delimited child folder
 /// (`INBOX:sub`, inside the id range, excluded by the no-deeper-colon guard), a
 /// sibling whose path extends the name (`INBOX2`), and another account whose id
-/// extends this one's (same folder path, same UID).
+/// extends this one's (same folder path, same UID). Those three hold a ':' past the
+/// range's prefix, so the guard alone keeps them. The rest only the range keeps:
+/// folders whose names have the folder's length and sort just below and above it
+/// (`INBOW`, `INBOY`), and accounts whose ids have this account's length and sort
+/// below and above it, as equal-length account ids do in production.
 @Suite("A UIDVALIDITY reset removes every cached body in the folder", .serialized, .processGlobalState)
 struct UidValidityResetBodyPurgeTests {
 
     private static let folderPath = "INBOX"
+    /// The folder's length, sorting just below and just above it.
+    private static let folderBelow = "INBOW"
+    private static let folderAbove = "INBOY"
 
     /// Installs a temp `AppDatabase` as `AppDatabase.shared` (what
     /// `AccountManager.shared` reads) holding two IMAP accounts and the folders.
@@ -51,6 +58,8 @@ struct UidValidityResetBodyPurgeTests {
                     ("Inbox", Self.folderPath, FolderRole.inbox),
                     ("Sub", "\(Self.folderPath):sub", FolderRole.custom),
                     ("Inbox2", "\(Self.folderPath)2", FolderRole.custom),
+                    ("Below", Self.folderBelow, FolderRole.custom),
+                    ("Above", Self.folderAbove, FolderRole.custom),
                 ] {
                     var folder = Folder(name: name, path: path, role: role, accountId: accountId)
                     folder.lastKnownUidValidity = 12345
@@ -78,10 +87,16 @@ struct UidValidityResetBodyPurgeTests {
     @Test("After a reset, a reused UID never shows the HTML cached for the message it named before")
     @MainActor
     func aReusedUIDAdoptsNoCachedHTML() async throws {
-        let accountId = "reset-\(UUID().uuidString)"
+        let suffix = UUID().uuidString
+        let accountId = "reset-m-\(suffix)"
         // Extends `accountId`: its ids share the reset folder's prefix up to the ':'.
         let otherAccountId = "\(accountId)2"
-        let (pool, dir, previous) = try makeTestDB(accountIds: [accountId, otherAccountId])
+        // `accountId`'s length, sorting just below and just above it.
+        let accountBelow = "reset-l-\(suffix)"
+        let accountAbove = "reset-n-\(suffix)"
+        #expect(accountBelow < accountId && accountId < accountAbove && accountBelow.count == accountId.count
+                && accountAbove.count == accountId.count, "setup: the neighbouring account ids")
+        let (pool, dir, previous) = try makeTestDB(accountIds: [accountId, otherAccountId, accountBelow, accountAbove])
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
 
         let held = header(accountId: accountId, folderPath: Self.folderPath, uid: "5")
@@ -91,6 +106,10 @@ struct UidValidityResetBodyPurgeTests {
             MessageIdentity.headerId(accountId: accountId, folderPath: "\(Self.folderPath):sub", messageId: "7"),
             MessageIdentity.headerId(accountId: accountId, folderPath: "\(Self.folderPath)2", messageId: "7"),
             MessageIdentity.headerId(accountId: otherAccountId, folderPath: Self.folderPath, messageId: "7"),
+            MessageIdentity.headerId(accountId: accountId, folderPath: Self.folderBelow, messageId: "7"),
+            MessageIdentity.headerId(accountId: accountId, folderPath: Self.folderAbove, messageId: "7"),
+            MessageIdentity.headerId(accountId: accountBelow, folderPath: Self.folderPath, messageId: "7"),
+            MessageIdentity.headerId(accountId: accountAbove, folderPath: Self.folderPath, messageId: "7"),
         ]
         try await pool.write { db in
             try held.insert(db)
@@ -121,6 +140,6 @@ struct UidValidityResetBodyPurgeTests {
         #expect(!reusedCached, "the reused UID's header must not read as cached")
         #expect(!after.contains(held.id), "the body of a purged header goes")
         #expect(after == Set(controls),
-                "a child folder, a sibling folder and another account keep their bodies: \(after.sorted())")
+                "child and sibling folders and other accounts keep their bodies: \(after.sorted())")
     }
 }

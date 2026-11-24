@@ -260,7 +260,7 @@ struct BackfillProgressIndexProofTests {
         }
     }
 
-    private struct Probe: Sendable {
+    struct Probe: Sendable {
         let name: String
         let hot: Bool
         let sql: String
@@ -275,8 +275,9 @@ struct BackfillProgressIndexProofTests {
     /// The hot reads, from their production statements; then the other reads on the
     /// completeness flags (statements transcribed in `DeferredIndexStatisticsTests`'
     /// census, cited at their production sites), and the three backfill progress counts
-    /// as `SyncEngine.backfillProgressCounts` runs them.
-    private static func probes(_ db: Database) throws -> [Probe] {
+    /// as `SyncEngine.backfillProgressCounts` runs them. `StaleBodyEvictPairProofTests`
+    /// plans the same reads around the HTML-cache pair's index (#1433).
+    static func probes(_ db: Database) throws -> [Probe] {
         let account = DBProof.accountId(Config.accountIndex)
         let inbox = try String.fetchOne(db, sql: """
             SELECT folderId FROM messageHeader WHERE accountId = ? AND folderPath = ? LIMIT 1

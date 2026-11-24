@@ -330,6 +330,31 @@ extension SyncEngine {
         BackgroundSyncLogger.logDebug("[Prune] Done — now \(String(format: "%.1f", StorageEstimator.totalSizeMB()))MB")
     }
 
+    /// The evict step as the maintenance pass runs it: only once its index
+    /// (`HTMLCachePair.indexName`) exists. Returns whether it ran.
+    ///
+    /// Without the index every page would scan the whole header table inside its
+    /// write, the #1354 hold made worse, and the bodies cached before v116 would not
+    /// be candidates yet (the fill that records them commits with the index). The
+    /// index is deferred, built later in the same pass
+    /// (`runRefreshPlannerStatisticsIfStale`), so the first pass after an upgrade
+    /// skips the step and the next one evicts; stale bodies stay cached one pass
+    /// longer, which changes nothing but disk use. A schema that cannot be read counts
+    /// as missing (retried next pass).
+    @discardableResult
+    nonisolated static func runEvictStaleBodiesIfIndexed(
+        dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>
+    ) async -> Bool {
+        guard let missing = missingDeferredIndexes(dbPool), !missing.contains(HTMLCachePair.indexName) else {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[BodyCache] evict waits for \(HTMLCachePair.indexName)")
+            }
+            return false
+        }
+        await runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+        return true
+    }
+
     /// `PrioritizedDatabase.write`'s synchronous pass-through overload, for an
     /// async caller. Not `async` on purpose: from an async context Swift binds the
     /// awaited overload, which enters `DatabaseWriteQueue`; the evict's page write
@@ -343,7 +368,8 @@ extension SyncEngine {
     /// The body-cache evict: deletes the cached HTML of messages outside every inbox
     /// that was cached more than `SyncConfig.bodyCacheTTLHours` ago, except the undo
     /// set's and each folder's newest `SyncConfig.bodyCacheRecentPerFolder`. Runs on
-    /// every maintenance pass, entirely off the main thread.
+    /// every maintenance pass once its index exists (`runEvictStaleBodiesIfIndexed`),
+    /// entirely off the main thread.
     ///
     /// ## What it reads (#1433)
     ///
@@ -884,9 +910,15 @@ extension SyncEngine {
     /// that drifts the first time somebody adds an index to one and not the other
     /// (`MIS-006`), and the drift is silent: the pass would report "already
     /// present" for an index it never built.
+    ///
+    /// `fill`, when set, is the data the index needs before it may exist, run just
+    /// before `sql` and only while the index is missing, in the same write. The index
+    /// existing is then the proof the fill ran: no marker records it, and a write that
+    /// is rolled back leaves neither.
     struct DeferredIndex: Sendable {
         let name: String
         let sql: String
+        var fill: String? = nil
     }
 
     /// Indexes moved OFF the blocking migration path (ADR-IOS-029, 2026-08-05
@@ -977,11 +1009,22 @@ extension SyncEngine {
                 ON messageHeader(isInInbox, headerComplete, bodyComplete,
                                  bodyEmptyConfirmed, bodyMetadataOversized, date)
                 """),
-        // #1433: `messageBody_staleEvict` (messageBody(fetchedAt), #1354) left this
-        // list. The stale-body evict reads its candidates from
-        // `messageHeader_htmlCachedAt` (migration v116, `HTMLCachePair`), so nothing
-        // reads that index any more. A database that already built it keeps it; it
-        // changes no result.
+        // #1433: the stale-body evict's index, replacing `messageBody_staleEvict`
+        // (messageBody(fetchedAt), #1354), which nothing reads any more (a database
+        // that already built it keeps it; it changes no result). Its fill records the
+        // bodies cached before v116 in `messageHeader.htmlCachedAt` first (v116 adds
+        // the column and its triggers only), so the index is built once from the
+        // filled column and commits with it. Deferred like the others, and for one
+        // more reason: built in a migration, it would have no statistics row until
+        // this write's `ANALYZE` (#1401). Its absence changes no result: the evict
+        // waits for it (`runEvictStaleBodiesIfIndexed`), and until the fill commits
+        // the bodies cached before v116 read as not cached (`HTMLCachePair`, "Before
+        // the first upgrade step"). The fill reads every cached body once, as
+        // `messageBody_staleEvict`'s build did.
+        DeferredIndex(
+            name: HTMLCachePair.indexName,
+            sql: HTMLCachePair.indexSQL,
+            fill: HTMLCachePair.fillSQL),
         // #1401: the backfill progress counts (`backfillProgressCounts`) count
         // `MessageHeader.bodySettledRequest` and `.pendingBodyRequest` for one account
         // on every progress update. This index holds every column either predicate
@@ -1027,7 +1070,9 @@ extension SyncEngine {
     ]
 
     /// Creates every index in `indexes` (the deferred set unless a test names another)
-    /// that does not already exist, inside the caller's transaction.
+    /// that does not already exist, inside the caller's transaction, each after its
+    /// `fill` when it has one. Which indexes are missing is read inside that
+    /// transaction, so a fill runs exactly when its index is built.
     ///
     /// Separate from the `async` pass below so a test can reach the PRODUCTION DDL
     /// through a plain `Database` instead of re-typing the `CREATE INDEX` — a
@@ -1035,7 +1080,11 @@ extension SyncEngine {
     nonisolated static func createDeferredIndexes(
         _ db: Database, _ indexes: [DeferredIndex] = SyncEngine.deferredIndexes
     ) throws {
+        let missing = Set(try missingDeferredIndexNames(db, among: indexes))
         for index in indexes {
+            if let fill = index.fill, missing.contains(index.name) {
+                try db.execute(sql: fill)
+            }
             try db.execute(sql: index.sql)
         }
     }
@@ -1052,14 +1101,21 @@ extension SyncEngine {
     private static func missingDeferredIndexes(
         _ dbPool: PrioritizedDatabase, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
     ) -> [String]? {
-        try? dbPool.read { db in
-            try indexes.filter { index in
-                try Row.fetchOne(
-                    db,
-                    sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-                    arguments: [index.name]) == nil
-            }.map(\.name)
-        }
+        try? dbPool.read { db in try missingDeferredIndexNames(db, among: indexes) }
+    }
+
+    /// The names of the indexes of `indexes` that `sqlite_master` does not have: one
+    /// lookup per index on the schema table, no data read. Also the build's own check
+    /// (`createDeferredIndexes`), inside its write.
+    nonisolated static func missingDeferredIndexNames(
+        _ db: Database, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
+    ) throws -> [String] {
+        try indexes.filter { index in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                arguments: [index.name]) == nil
+        }.map(\.name)
     }
 
     // MARK: Building a deferred index (inside the statistics write below)
@@ -1097,9 +1153,9 @@ extension SyncEngine {
     //
     // FAILS SAFE. If the write is skipped, cancelled or aborted it rolls back whole
     // (index and statistics), `markAllAsRead` sorts through a temp B-tree — slow, and
-    // correct in the sense that matters (identical rows, identical order). Until #1433
-    // the stale-body evict step also waited for its index here; its index is now built
-    // by migration v116, so it no longer depends on this pass. Nothing is recorded on failure,
+    // correct in the sense that matters (identical rows, identical order), and the
+    // stale-body evict step waits for its index (`runEvictStaleBodiesIfIndexed`); a
+    // rolled-back write takes the HTML-cache pair's fill with it. Nothing is recorded on failure,
     // so the next pass retries. Recovery is automatic and needs no user gesture (THE
     // MANTRA: recoverable ⇒ fail closed).
     //
@@ -1128,7 +1184,9 @@ extension SyncEngine {
     // is the whole point of it being here rather than on the launch path.
     // `messageBody_staleEvict` (#1354, out of the list since #1433) read every cached
     // body once, since `fetchedAt` is stored after the HTML, so its build cost more
-    // than those figures on a large body cache.
+    // than those figures on a large body cache. `messageHeader_htmlCachedAt`'s fill
+    // (#1433) reads every cached body once the same way, then the build reads
+    // `messageHeader` once.
 
     // MARK: - Query-planner statistics (ADR-IOS-029 rule 5, deferred timing)
 

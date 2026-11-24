@@ -30,6 +30,8 @@ struct StaleBodyEvictDifferentialTests {
     static let heldFolder = "Held"
     /// No such folder: the old gate could not resolve it, and deleted.
     static let ghostFolder = "Ghost"
+    /// A second account with the same live folders, for the seeded databases.
+    static let secondAccountId = "evict-other"
 
     /// The old step's keyset position: the last body a page looked at, as stored.
     struct LegacyCursor {
@@ -134,7 +136,8 @@ struct StaleBodyEvictDifferentialTests {
         return deleted
     }
 
-    /// The fixture plus a second non-inbox folder and a quarantined one.
+    /// The fixture plus a second non-inbox folder and a quarantined one, and a second
+    /// account with the same live folders.
     static func makeFixture() throws -> Hold.Fixture {
         let fixture = try Hold.makeFixture()
         try fixture.pool.write { db in
@@ -142,6 +145,13 @@ struct StaleBodyEvictDifferentialTests {
             var held = Folder(name: Self.heldFolder, path: Self.heldFolder, role: .custom, accountId: fixture.accountId)
             held.uidValidityResetPendingAt = Date()
             try held.insert(db)
+            var other = Account(
+                emailAddress: "\(Self.secondAccountId)@example.com", displayName: "T2", provider: .imap)
+            other.id = Self.secondAccountId
+            try other.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: Self.secondAccountId).insert(db)
+            try Folder(name: "Archive", path: "Archive", role: .archive, accountId: Self.secondAccountId).insert(db)
+            try Folder(name: "Projects", path: "Projects", role: .custom, accountId: Self.secondAccountId).insert(db)
         }
         return fixture
     }
@@ -162,10 +172,15 @@ struct StaleBodyEvictDifferentialTests {
         return header.id
     }
 
-    static func insertBody(_ db: Database, id: String, fetchedAt: Date) throws {
+    /// `replacing` saves over an existing body, as a re-fetch does.
+    static func insertBody(_ db: Database, id: String, fetchedAt: Date, replacing: Bool = false) throws {
         var body = MessageBody(contentKey: ContentKey(rawValue: id), htmlContent: Self.html)
         body.fetchedAt = fetchedAt
-        try body.insert(db)
+        if replacing {
+            try body.save(db)
+        } else {
+            try body.insert(db)
+        }
     }
 
     struct Outcome {
@@ -300,59 +315,160 @@ struct StaleBodyEvictDifferentialTests {
             : Int.random(in: 0..<max(ttl - 1, 1), using: &rng)
     }
 
-    /// Replaces the fixture's messages and bodies with seed `seed`'s; returns its undo set.
-    static func seedRandom(_ fixture: Hold.Fixture, seed: Int) throws -> Set<String> {
+    /// What a seed made, beyond its rows: the undo set, and how many of each change
+    /// after caching it applied.
+    struct Seeded {
+        var undo: Set<String> = []
+        var inboxMoves = 0
+        var refetches = 0
+        var carried = 0
+    }
+
+    /// Replaces the fixture's messages and bodies with seed `seed`'s.
+    ///
+    /// Per account and live folder, messages newest first; one in four shares the
+    /// date of the message before it, so a folder's newest N can end inside a tie.
+    /// Most messages get a body. Half the bodies share one of two stale cache times
+    /// (bodies fetched in one batch), so a shared time spans more candidates than a
+    /// page. Then, after caching: some messages move into or out of the inbox with
+    /// their id kept (a label change), some bodies are fetched again, and some
+    /// messages are moved optimistically and then carried to their canonical id by
+    /// the full sync's canonicalize pass (`SyncEngine.canonicalizeLocalRows`, the
+    /// production function), which carries the body with its cache time.
+    static func seedRandom(_ fixture: Hold.Fixture, seed: Int) throws -> Seeded {
         let recent = SyncConfig.bodyCacheRecentPerFolder
-        let accountId = fixture.accountId
-        return try fixture.pool.write { db -> Set<String> in
+        let accounts = [fixture.accountId, Self.secondAccountId]
+        return try fixture.pool.write { db -> Seeded in
             var rng = DBProof.SeededGenerator(seed: UInt64(seed))
             try db.execute(sql: "DELETE FROM messageBody")
             try db.execute(sql: "DELETE FROM messageHeader")
-            var undo: Set<String> = []
+            var seeded = Seeded()
             var uid = 0
-            for folderPath in Self.liveFolders {
-                let count = Int.random(in: (recent / 2)...(recent * 3), using: &rng)
-                for _ in 0..<count {
+            var cached: [String] = []
+            let sharedTimes = (0..<2).map { _ in
+                Self.hoursAgo(SyncConfig.bodyCacheTTLHours + Int.random(in: 1...2_000, using: &rng))
+            }
+            func nextDate(after previous: Date?) -> Date {
+                if let previous, Int.random(in: 0..<4, using: &rng) == 0 { return previous }
+                return Date().addingTimeInterval(-Double(uid) * 600 - Double(Int.random(in: 0..<500, using: &rng)))
+            }
+            func cacheTime() -> Date {
+                Bool.random(using: &rng)
+                    ? sharedTimes[Int.random(in: 0..<sharedTimes.count, using: &rng)]
+                    : Self.hoursAgo(Self.randomAge(using: &rng))
+            }
+            for accountId in accounts {
+                for folderPath in Self.liveFolders {
+                    let count = Int.random(in: (recent / 2)...(recent * 3), using: &rng)
+                    var previous: Date?
+                    for _ in 0..<count {
+                        uid += 1
+                        let date = nextDate(after: previous)
+                        previous = date
+                        let id = try Self.insertHeader(db, accountId: accountId, folderPath: folderPath, uid: uid, date: date)
+                        guard Int.random(in: 0..<10, using: &rng) < 8 else { continue }
+                        try Self.insertBody(db, id: id, fetchedAt: cacheTime())
+                        cached.append(id)
+                        if Int.random(in: 0..<40, using: &rng) == 0 { seeded.undo.insert(id) }
+                    }
+                }
+                // Optimistic moves from the inbox to the archive: the row keeps its
+                // inbox id until the canonicalize pass carries it.
+                for _ in 0..<Int.random(in: 0...4, using: &rng) {
                     uid += 1
-                    // Distinct dates, so each folder's newest N is one set.
-                    let date = Date().addingTimeInterval(-Double(uid) * 600 - Double(Int.random(in: 0..<500, using: &rng)))
-                    let id = try Self.insertHeader(db, accountId: accountId, folderPath: folderPath, uid: uid, date: date)
-                    guard Int.random(in: 0..<10, using: &rng) < 8 else { continue }
+                    let id = try Self.insertHeader(
+                        db, accountId: accountId, folderPath: "INBOX", uid: uid, date: nextDate(after: nil))
+                    try Self.insertBody(db, id: id, fetchedAt: cacheTime())
+                    try db.execute(
+                        sql: "UPDATE messageHeader SET folderId = ?, folderPath = 'Archive', isInInbox = 0 WHERE id = ?",
+                        arguments: [MessageIdentity.folderId(accountId: accountId, folderPath: "Archive"), id])
+                    let carry = try SyncEngine.canonicalizeLocalRows(
+                        accountId: accountId, folderPath: "Archive",
+                        folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "Archive"),
+                        messageId: String(uid), isInInbox: false, windowMode: .date,
+                        sourceBoundEpoch: nil, incomingRfc822Identity: nil, db: db)
+                    if carry.ftsRekey != nil { seeded.carried += 1 }
+                }
+                let folders = Self.liveFolders + [Self.heldFolder, Self.ghostFolder]
+                for index in 0..<Int.random(in: 0...8, using: &rng) {
+                    let folderPath = folders[Int.random(in: 0..<folders.count, using: &rng)]
+                    let id = MessageIdentity.headerId(
+                        accountId: accountId, folderPath: folderPath, messageId: String(900_000 + index))
                     try Self.insertBody(db, id: id, fetchedAt: Self.hoursAgo(Self.randomAge(using: &rng)))
-                    if Int.random(in: 0..<40, using: &rng) == 0 { undo.insert(id) }
+                    if Int.random(in: 0..<8, using: &rng) == 0 { seeded.undo.insert(id) }
                 }
             }
-            let folders = Self.liveFolders + [Self.heldFolder, Self.ghostFolder]
-            let orphanCount = Int.random(in: 0...15, using: &rng)
-            for index in 0..<orphanCount {
-                let folderPath = folders[Int.random(in: 0..<folders.count, using: &rng)]
-                let id = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: String(900_000 + index))
-                try Self.insertBody(db, id: id, fetchedAt: Self.hoursAgo(Self.randomAge(using: &rng)))
-                if Int.random(in: 0..<8, using: &rng) == 0 { undo.insert(id) }
+            for id in cached {
+                switch Int.random(in: 0..<10, using: &rng) {
+                case 0:
+                    try db.execute(sql: "UPDATE messageHeader SET isInInbox = 1 - isInInbox WHERE id = ?", arguments: [id])
+                    seeded.inboxMoves += 1
+                case 1:
+                    try Self.insertBody(db, id: id, fetchedAt: Self.hoursAgo(Self.randomAge(using: &rng)), replacing: true)
+                    seeded.refetches += 1
+                default:
+                    break
+                }
             }
-            return undo
+            return seeded
         }
     }
 
-    /// 40 seeded databases: three live folders, a quarantined one and a missing one;
-    /// headers with and without bodies, bodies with and without headers, stale and
-    /// fresh, and an undo set. Each seed checks the property; across the seeds both
-    /// runs must have evicted something and the old run must have taken headerless
-    /// bodies, or the comparison pins nothing.
+    /// The most evict candidates sharing one cache time, and how many folders have a
+    /// date tie across their newest-N boundary.
+    static func ties(_ fixture: Hold.Fixture) throws -> (sharedCacheTime: Int, boundaryDateTies: Int) {
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        return try fixture.pool.read { db in
+            let shared = try Int.fetchOne(db, sql: """
+                SELECT MAX(n) FROM (
+                    SELECT COUNT(*) AS n FROM messageHeader
+                    WHERE isInInbox = 0 AND htmlCachedAt IS NOT NULL GROUP BY htmlCachedAt)
+                """) ?? 0
+            var boundaryTies = 0
+            for folderId in try String.fetchAll(db, sql: "SELECT DISTINCT folderId FROM messageHeader") {
+                let dates = try DatabaseValue.fetchAll(
+                    db, sql: "SELECT date FROM messageHeader WHERE folderId = ? ORDER BY date DESC LIMIT 2 OFFSET ?",
+                    arguments: [folderId, recent - 1])
+                if dates.count == 2, dates[0] == dates[1] { boundaryTies += 1 }
+            }
+            return (shared, boundaryTies)
+        }
+    }
+
+    /// 40 seeded databases (`seedRandom`): two accounts, three live folders each, a
+    /// quarantined folder and a missing one; headers with and without bodies, bodies
+    /// with and without headers, stale and fresh; inbox moves, re-fetches and carries
+    /// after caching; and an undo set. Each seed checks the property; across the seeds
+    /// both runs must have evicted something, the old run must have taken headerless
+    /// bodies, and every shape must have occurred, or the comparison pins nothing.
     @Test("40 seeded databases: the new run evicts what the old did, minus the headerless bodies")
     func seededDatabases() async throws {
         let fixture = try Self.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         var evicted = 0
         var orphansTakenByOld = 0
+        var shapes = Seeded()
+        var widestSharedTime = 0
+        var boundaryDateTies = 0
         for seed in 1...40 {
-            let undo = try Self.seedRandom(fixture, seed: seed)
-            let outcome = try await Self.compare(fixture, undoProtected: undo)
+            let seeded = try Self.seedRandom(fixture, seed: seed)
+            let ties = try Self.ties(fixture)
+            let outcome = try await Self.compare(fixture, undoProtected: seeded.undo)
             Self.expectTheProperty(outcome, "seed \(seed)")
             evicted += outcome.new.count
             orphansTakenByOld += outcome.old.intersection(outcome.headerless).count
+            shapes.inboxMoves += seeded.inboxMoves
+            shapes.refetches += seeded.refetches
+            shapes.carried += seeded.carried
+            widestSharedTime = max(widestSharedTime, ties.sharedCacheTime)
+            boundaryDateTies += ties.boundaryDateTies
         }
         #expect(evicted > 0, "setup: across the seeds the new run evicted something")
         #expect(orphansTakenByOld > 0, "setup: across the seeds the old run took headerless bodies")
+        #expect(shapes.inboxMoves > 0 && shapes.refetches > 0 && shapes.carried > 0,
+                "setup: inbox moves \(shapes.inboxMoves), re-fetches \(shapes.refetches), carries \(shapes.carried)")
+        #expect(widestSharedTime > SyncConfig.pruneChunkSize,
+                "setup: no cache time is shared by more candidates than a page holds: \(widestSharedTime)")
+        #expect(boundaryDateTies > 0, "setup: no folder has a date tie across its newest-N boundary")
     }
 }

@@ -749,20 +749,22 @@ extension AccountManager {
         // Clean up non-cascaded tables first
         try PendingOperation.filter(Column("accountId") == accountId).deleteAll(db)
         try db.execute(sql: "DELETE FROM messageAICache WHERE key LIKE ? || ':%'", arguments: [accountId])
+        // Cascade: account → folders → messageHeaders → outboxMessages.
+        // (messageBody is NO LONGER on this chain — see the explicit delete below.)
+        try Account.deleteOne(db, key: accountId)
         // `messageBody` is keyed by CONTENT key, not by `messageHeader.id`, and
         // Stage D (`v70_dropMessageBodyHeaderFK`) removed the FK that used to carry
         // it out on the cascade. Without this the removed account's cached email
-        // HTML would survive in the database for up to `bodyCacheTTLHours` after the
-        // user asked for the account to be gone. LIKE-escaped (account ids are
-        // colon-free UUIDs today, so this is hygiene rather than a fix) — content
-        // keys share the header id's `accountId:folderPath:` prefix, so one prefix
-        // covers every folder of the account.
+        // HTML would stay in the database with no header, and nothing reclaims a
+        // body that has no header (the evict reads headers, #1433). LIKE-escaped
+        // (account ids are colon-free UUIDs today, so this is hygiene rather than a
+        // fix) — content keys share the header id's `accountId:folderPath:` prefix,
+        // so one prefix covers every folder of the account. AFTER the cascade, so the
+        // HTML-cache pair's body-delete trigger (migration v116) finds no header to
+        // rewrite just before it is deleted.
         try db.execute(
             sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
             arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
-        // Cascade: account → folders → messageHeaders → outboxMessages.
-        // (messageBody is NO LONGER on this chain — see the explicit delete above.)
-        try Account.deleteOne(db, key: accountId)
 
         // Promote next oldest active account to primary if we just removed the primary
         if wasPrimary {

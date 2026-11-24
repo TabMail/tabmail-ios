@@ -167,20 +167,35 @@ Two reads cost more:
 - `FTSSelfHealCandidateProofTests` measures, on the proof databases: the read, the two other reads, the sync pass's header writes, and the index's size.
 - The query registry gives the read the verdict `STOPS: FTSSelfHealCandidateReadTests.candidateReadStopsAtTheWindow`, not `SEEK`: the plan check runs without statistics too, and there the planner does not choose a partial index.
 
-## Amendment 2026-11-24 (#1433): `messageHeader_htmlCachedAt` added, `messageBody_staleEvict` unused
+## Amendment 2026-11-24 (#1433): `messageHeader_htmlCachedAt` replaces `messageBody_staleEvict` in the deferred set
 
-**Added in a migration, not deferred.** `v116_addMessageHeaderHTMLCachedAt` creates
-`messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)` with the column it indexes (ADR-IOS-119). It
-is not a deferred index: the stale-body evict's page has no other exact plan (without it the page
-would scan `messageHeader` inside each write), and the column it indexes is new, so building it
-reads `messageHeader` once in the migration that fills the column. Rule 1: it serves exactly the
-evict's keyset page (`isInInbox = 0 AND htmlCachedAt < ?` in `(htmlCachedAt, rowid)` order) and
-"no cached HTML" (`htmlCachedAt IS NULL` under one `isInInbox` value); `SyncEngineMaintenanceTests.staleBodyPageSeeksItsIndex`
+**A deferred index, built with its column's fill.** `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)`
+(ADR-IOS-119) is in `SyncEngine.deferredIndexes`. `v116_addMessageHeaderHTMLCachedAt` adds only the
+column and its triggers; the deferred step's one write (`runRefreshPlannerStatisticsIfStale`) first
+fills the column from `messageBody` (`HTMLCachePair.fillSQL`, run by `createDeferredIndexes` only
+while the index is missing), then builds the index, then runs `ANALYZE`, so no connection ever loads
+it without a statistics row (#1401). The index existing is the proof the fill ran. The fill reads
+every cached body once (`fetchedAt` is stored after the HTML), as `messageBody_staleEvict`'s build
+did, so the step costs what it cost before; `StaleBodyEvictPairProofTests` reports v116's time and the
+step's (whole, its three statements apart, and per MB of body pages) at 105k and 525k headers, and
+the step again at 105k with bodies of 24 to 40 KB. Rule 1: it serves exactly the evict's keyset page
+(`isInInbox = 0 AND htmlCachedAt < ?` in `(htmlCachedAt, rowid)` order) and "no cached HTML"
+(`htmlCachedAt IS NULL` under one `isInInbox` value); `SyncEngineMaintenanceTests.staleBodyPageSeeksItsIndex`
 pins the page's plan without statistics. Its size and its write cost against the old schema are
 measured in `StaleBodyEvictPairProofTests`.
 
+**Rule 5 (other reads).** The same proof reads the plan of every hot read the #1401 census lists
+(`BackfillProgressIndexProofTests.probes`, the evict's own excepted) and the chat pill's reminder
+count on the old file analyzed, then after v116 and the step: none may change. Its control builds
+the index after v116 with no `ANALYZE`, the state a migration-built index would leave, and must move
+at least one `isInInbox = 1` read onto it, so the census is shown to see such a change.
+
+**The evict waits for it** (`runEvictStaleBodiesIfIndexed`, as it waited for `messageBody_staleEvict`).
+Until the step commits, the bodies cached before v116 read as not cached and nothing is deleted
+(ADR-IOS-119 decision 7).
+
 **`messageBody_staleEvict` (#1354) leaves `SyncEngine.deferredIndexes`.** Nothing reads it since the
-evict reads its candidates from the header; the gate that waited for it
-(`runEvictStaleBodiesIfIndexed`) is removed. A database that already built it keeps it: no query
-names it, it changes no result, and dropping it would be cleanup code for a leftover that costs only
-its pages and its upkeep on body writes (accepted as a harmless leftover, #1446).
+evict reads its candidates from the header. As of 2026-11-24 no released or TestFlight build ran the
+deferred step with it in the list (it was added after build 392, the newest TestFlight build then),
+so no user's database holds it, and nothing drops it; a development database that built it keeps
+it, unread and changing no result.

@@ -120,10 +120,11 @@ struct StaleBodyEvictWriterHoldTests {
     }
 
     /// A migrated pool with one account, an INBOX, an Archive and a "Fresh" folder
-    /// (`seedFreshBodies`). The fixture builds the deferred indexes through the
-    /// production DDL, as the first maintenance pass does, unless a test is about
-    /// their absence. With `readersFail`, no reader connection can open, so every
-    /// read fails while the writer works.
+    /// (`seedFreshBodies`). The evict step runs only once its deferred index exists
+    /// (`runEvictStaleBodiesIfIndexed`), so the fixture builds the deferred indexes
+    /// through the production DDL, as the first maintenance pass does, unless a
+    /// test is about their absence. With `readersFail`, no reader connection can
+    /// open, so every read fails while the writer works.
     static func makeFixture(buildsDeferredIndexes: Bool = true, readersFail: Bool = false) throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -274,14 +275,17 @@ struct StaleBodyEvictWriterHoldTests {
         return (fixture.connections.pagesSoFar - before, rows)
     }
 
-    /// One evict run as the maintenance pass runs it: the writer's per-write
-    /// reading, and the pages every connection of the pool fetched during the run.
+    /// One evict run as the maintenance pass runs it, through its index gate
+    /// (`runEvictStaleBodiesIfIndexed`): the writer's per-write reading, and the
+    /// pages every connection of the pool fetched from before the gate's check to
+    /// the run's end, so a read the gate adds counts as the run's.
     static func measuredRun(
         _ fixture: Fixture, meter: WriterWorkMeter, undoProtected: Set<String> = []
     ) async throws -> (writes: WriterWorkMeter.Reading, pagesRead: Int) {
         try await fixture.pool.writeWithoutTransaction { db in meter.start(db) }
-        let pagesRead = await productionRun(fixture, undoProtected: undoProtected)
-        return (meter.current, pagesRead)
+        let run = await gatedRun(fixture, undoProtected: undoProtected)
+        #expect(run.ran, "the gated step did not run, though the fixture built its index")
+        return (meter.current, run.pagesRead)
     }
 
     /// What a direct call of the step makes between its pages: nothing. The
@@ -292,16 +296,17 @@ struct StaleBodyEvictWriterHoldTests {
     /// runs is `SyncEngineMaintenanceTests.evictStepCheckpointsWithTheThrottledCheckpoint`.
     static let noCheckpoint: @Sendable () async -> Void = {}
 
-    /// The step as the maintenance pass calls it, and the pages every connection of
-    /// the pool fetched during it. It runs production's checkpoint between pages, on
-    /// the app's database, which is why this suite holds the process-global test
-    /// lock; the fixture's counters do not see it.
-    static func productionRun(_ fixture: Fixture, undoProtected: Set<String> = []) async -> Int {
+    /// The gate and whatever it runs, as the maintenance pass calls it: whether the
+    /// step ran, and the pages every connection of the pool fetched from before the
+    /// gate's check to the end. The gate runs production's checkpoint between
+    /// pages, on the app's database, which is why this suite holds the
+    /// process-global test lock; the fixture's counters do not see it.
+    static func gatedRun(_ fixture: Fixture, undoProtected: Set<String> = []) async -> (ran: Bool, pagesRead: Int) {
         let before = fixture.connections.pagesSoFar
-        await SyncEngine.runEvictStaleBodies(
+        let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background),
             undoProtectedBodyIds: undoProtected)
-        return fixture.connections.pagesSoFar - before
+        return (ran, fixture.connections.pagesSoFar - before)
     }
 
     static func observedFixture(
@@ -592,14 +597,13 @@ struct StaleBodyEvictWriterHoldTests {
                 "a run read \(many - few) more pages with 10x the fresh bodies (\(few) -> \(many)); the slack is \(Self.runGrowthSlackPages)")
     }
 
-    /// The same bound where the run has nothing to evict: no body is stale, the step
-    /// finds an empty first page, and it may not read the table, on any connection.
-    /// Since #1433 the step has no index of its own to wait for: it runs whether or
-    /// not the maintenance pass has built the deferred indexes.
-    @Test("A run with nothing stale reads no more with ten times the bodies, deferred indexes built or not",
+    /// The same bound where the run has nothing to evict: with the index built and
+    /// no body stale, the step runs and finds an empty first page; with no index,
+    /// the gate holds the step back. Neither may read the table, on any connection.
+    @Test("A run with nothing stale, or one its gate holds back, reads no more with ten times the bodies",
           arguments: [true, false])
-    func aRunWithNothingToEvictReadsNoMore(deferredIndexesBuilt: Bool) async throws {
-        let fixture = try Self.makeFixture(buildsDeferredIndexes: deferredIndexesBuilt)
+    func aRunWithNothingToEvictReadsNoMore(indexed: Bool) async throws {
+        let fixture = try Self.makeFixture(buildsDeferredIndexes: indexed)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
 
         let fewFresh = 1_000
@@ -609,15 +613,17 @@ struct StaleBodyEvictWriterHoldTests {
         // schema after the migrations is not counted in it.
         let seeded = try Self.bodyIds(fixture)
         #expect(seeded.count == fewFresh)
-        let few = await Self.productionRun(fixture)
+        let few = await Self.gatedRun(fixture)
         let afterFirstRun = try Self.bodyIds(fixture)
         let tableFew = try Self.wholeTableRead(fixture)
 
         try Self.seedFreshBodies(fixture, ids: fewFresh..<manyFresh)
-        let many = await Self.productionRun(fixture)
+        let many = await Self.gatedRun(fixture)
         let afterSecondRun = try Self.bodyIds(fixture)
         let tableMany = try Self.wholeTableRead(fixture)
 
+        #expect(few.ran == indexed && many.ran == indexed,
+                "the gate let the step run \(few.ran), \(many.ran); its index is built: \(indexed)")
         #expect(afterFirstRun.count == fewFresh && afterSecondRun.count == manyFresh, "every body stays")
         // Non-vacuous, and independent of the code under test: reading the table
         // costs over four times the pages at the second size.

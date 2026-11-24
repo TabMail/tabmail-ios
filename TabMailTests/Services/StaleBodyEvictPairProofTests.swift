@@ -9,8 +9,9 @@ import Synchronization
 import Testing
 @testable import TabMail
 
-/// #1433: the stale-body evict through the HTML-cache pair (`HTMLCachePair`, migration
-/// v116) against the evict it replaced, which walked every cached body older than the
+/// #1433: the stale-body evict through the HTML-cache pair (`HTMLCachePair`: migration
+/// v116 adds its column and triggers, the maintenance pass's deferred step fills it and
+/// builds its index) against the evict it replaced, which walked every cached body older than the
 /// TTL and read each one's header (#1427), on the proof database (`DBProof`) at about
 /// 105,000 and 525,000 headers with a body cache seeded the way a synced phone holds it.
 ///
@@ -19,8 +20,10 @@ import Testing
 ///   today. The old step runs (`StaleBodyEvictDifferentialTests.legacyEvictPage`), one
 ///   write per page as it ran.
 /// - pair (isInInbox, htmlCachedAt): the same file after the app's migration chain ran
-///   v116 on it, then without `messageBody_staleEvict` (nothing reads it any more). The
-///   production step runs.
+///   v116 on it and the maintenance pass's deferred step ran
+///   (`SyncEngine.runRefreshPlannerStatisticsIfStale`: the fill, the index and `ANALYZE`
+///   in one write), then without `messageBody_staleEvict` (nothing reads it any more).
+///   The production step runs.
 /// - pair (htmlCachedAt): the same with the index on the column alone, the other shape
 ///   the issue left to this measurement.
 ///
@@ -28,14 +31,21 @@ import Testing
 /// time, how long each write holds SQLite's writer); what the triggers and the index add
 /// to the writes that touch either table (a body save, re-save and delete, a header
 /// merge batch, inbox moves both ways, an IMAP move that carries its body, a message
-/// delete, both whole-table wipes, and a UIDVALIDITY reset in both orders); the
-/// migration's time and the pages the column and each index take; and the plans.
+/// delete, a whole-table wipe and an account removal in both orders, and a UIDVALIDITY
+/// reset in both orders); the
+/// migration's time, the deferred step's time (whole, and the fill, the index and
+/// `ANALYZE` apart, per MB of body pages), the pages the column and each index take;
+/// and the plans. Then, at about 105,000 headers only, v116 and the deferred step again
+/// with larger HTML (`Config.largerHTMLBytes`), so the report shows whether the step's
+/// time per MB of body pages holds as bodies grow.
 ///
 /// Enabled only when `TEST_RUNNER_TABMAIL_DB_PROOF_DIR` is set; writes
 /// `<dir>/ios-evict-kept-walk-repeat/report.txt` and removes its database files after
 /// each size. Test tooling only.
+// `.processGlobalState`: the deferred step holds a process-wide single-flight latch and
+// gives up while `DatabaseSuspension.isSuspended`.
 @Suite("Stale-body evict: the HTML-cache pair against the body walk, measured (#1433)",
-       .enabled(if: DBProof.outputDirectory != nil), .serialized)
+       .enabled(if: DBProof.outputDirectory != nil), .serialized, .processGlobalState)
 struct StaleBodyEvictPairProofTests {
 
     typealias Legacy = StaleBodyEvictDifferentialTests
@@ -52,9 +62,14 @@ struct StaleBodyEvictPairProofTests {
         static let arrivalFetchDelay: Double = 30
         /// One whole cycle of a 4,096-byte page's overflow layout (see #1427).
         static let htmlBytes = 4_200..<8_292
+        /// The extra data point's HTML: about 32 KB per body, nearer real HTML mail
+        /// (newsletters especially) than `htmlBytes`.
+        static let largerHTMLBytes = 24_000..<40_000
         static let seed: UInt64 = 0x1433
         /// The last migration before the pair: the old schema.
         static let oldSchemaMigration = "v115_addUserLabelLastUsed"
+        /// The deferred indexes a phone on the old schema has: every one but the pair's.
+        static let oldDeferredIndexes = SyncEngine.deferredIndexes.filter { $0.name != HTMLCachePair.indexName }
         /// The old step's index (#1354), built by the old maintenance pass.
         static let oldIndexName = "messageBody_staleEvict"
         static let oldIndexSQL = "CREATE INDEX IF NOT EXISTS messageBody_staleEvict ON messageBody(fetchedAt)"
@@ -122,7 +137,7 @@ struct StaleBodyEvictPairProofTests {
     /// for every complete message (`bodyComplete`) the rules keep (in an inbox, or among
     /// its folder's `SyncConfig.bodyCacheRecentPerFolder` newest), and for every other
     /// complete message that arrived within the TTL. Rows go in in fetch order.
-    static func seedBodies(at url: URL, anchor: Date) throws -> CacheCensus {
+    static func seedBodies(at url: URL, anchor: Date, htmlBytes: Range<Int> = Config.htmlBytes) throws -> CacheCensus {
         let queue = try DatabaseQueue(path: url.path)
         defer { try? queue.close() }
         return try queue.write { db in
@@ -166,7 +181,7 @@ struct StaleBodyEvictPairProofTests {
             var rng = DBProof.SeededGenerator(seed: Config.seed)
             let insert = try db.makeStatement(sql: "INSERT INTO messageBody (id, htmlContent, fetchedAt) VALUES (?, ?, ?)")
             for body in bodies {
-                let size = Int.random(in: Config.htmlBytes, using: &rng)
+                let size = Int.random(in: htmlBytes, using: &rng)
                 try insert.execute(arguments: [body.id, String(Self.filler.prefix(size)), body.fetchedAt])
             }
             return census
@@ -174,7 +189,7 @@ struct StaleBodyEvictPairProofTests {
     }
 
     static let filler = String(
-        repeating: "<p>Proof body text line.</p>\n", count: Config.htmlBytes.upperBound / 28 + 1)
+        repeating: "<p>Proof body text line.</p>\n", count: Config.largerHTMLBytes.upperBound / 28 + 1)
 
     // MARK: - The old step, one write per page
 
@@ -219,17 +234,30 @@ struct StaleBodyEvictPairProofTests {
         return evicted
     }
 
-    // MARK: - The migration
+    // MARK: - The migration and the deferred step
 
     struct MigrationCost {
         var wallMs: [Double] = []
+        /// The maintenance pass's deferred step, whole, through the production function.
+        var stepWallMs: [Double] = []
+        /// The step's three statements apart, each run on its own fresh copy.
+        var fillMs: [Double] = []
+        var indexMs: [Double] = []
+        var analyzeMs: [Double] = []
         var pageSize = 0
         var oldPages = 0
         var migratedPages = 0
+        var steppedPages = 0
+        var bodyPages = 0
         var pairFreePages = 0
         var pairIndexPages = 0
         var columnOnlyIndexPages = 0
         var oldIndexPages = 0
+        /// Right after v116, before the step: headers with a cached-at time, and
+        /// whether the pair's index exists.
+        var filledByMigration = -1
+        var indexedByMigration = -1
+        var stepResults: [SyncEngine.PlannerStatisticsRefresh] = []
         var headersFilled = 0
         var mismatches = 0
     }
@@ -248,20 +276,53 @@ struct StaleBodyEvictPairProofTests {
         return Double(elapsed) / 1_000_000
     }
 
+    /// Runs the maintenance pass's deferred step on `url` as the app runs it after the
+    /// upgrade (`SyncEngine.runRefreshPlannerStatisticsIfStale`, with a marker of its
+    /// own so the app's is untouched). Returns its wall time and result.
+    static func runDeferredStep(_ url: URL) async throws -> (wallMs: Double, result: SyncEngine.PlannerStatisticsRefresh) {
+        let suiteName = "StaleBodyEvictPairProof.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let pool = try DatabasePool(path: url.path, configuration: AppDatabase.makeConfiguration())
+        let start = DispatchTime.now().uptimeNanoseconds
+        let result = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: PrioritizedDatabase(pool: pool, priority: .background),
+            defaults: defaults, markerKey: "plannerStatisticsSchemaVersion")
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+        try await pool.writeWithoutTransaction { db in _ = try db.checkpoint(.truncate) }
+        try pool.close()
+        return (Double(elapsed) / 1_000_000, result)
+    }
+
+    /// The step's statements apart, in one transaction on a migrated copy: the fill,
+    /// the index, then `ANALYZE`. Wall times in ms.
+    static func timeStepParts(_ url: URL) throws -> (fill: Double, index: Double, analyze: Double) {
+        let pool = try DatabasePool(path: url.path, configuration: AppDatabase.makeConfiguration())
+        defer { try? pool.close() }
+        return try pool.write { db in
+            func timed(_ sql: String) throws -> Double {
+                let start = DispatchTime.now().uptimeNanoseconds
+                try db.execute(sql: sql)
+                return Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            }
+            return (try timed(HTMLCachePair.fillSQL), try timed(HTMLCachePair.indexSQL), try timed("ANALYZE"))
+        }
+    }
+
     static func pageCount(_ db: Database) throws -> Int {
         try Int.fetchOne(db, sql: "PRAGMA page_count") ?? 0
     }
 
-    /// The pages index `name` holds: the pages its drop frees, in a transaction that is
-    /// rolled back.
-    static func indexPages(_ url: URL, _ name: String) throws -> Int {
+    /// The pages `drop` frees, after `setup`, in a transaction that is rolled back.
+    static func freedPages(_ url: URL, setup: [String] = [], _ drop: String) throws -> Int {
         let queue = try DatabaseQueue(path: url.path)
         defer { try? queue.close() }
         return try queue.writeWithoutTransaction { db in
             var pages = 0
             try db.inTransaction {
+                for sql in setup { try db.execute(sql: sql) }
                 let before = try Int.fetchOne(db, sql: "PRAGMA freelist_count") ?? 0
-                try db.execute(sql: "DROP INDEX \(name)")
+                try db.execute(sql: drop)
                 let after = try Int.fetchOne(db, sql: "PRAGMA freelist_count") ?? 0
                 pages = after - before
                 return .rollback
@@ -270,26 +331,61 @@ struct StaleBodyEvictPairProofTests {
         }
     }
 
-    /// Times the migration `DBProof.repeats` times, each on a fresh copy of `oldBase`,
-    /// keeps the first copy as `pairBase`, drops the old index from it (its pages go to
-    /// the free list, as on a phone), and measures what the column and the indexes
-    /// take. The pair file is not compacted: it is the old file after the upgrade.
-    static func measureMigration(oldBase: URL, pairBase: URL, scratch: URL) throws -> MigrationCost {
+    /// The pages index `name` holds.
+    static func indexPages(_ url: URL, _ name: String) throws -> Int {
+        try freedPages(url, "DROP INDEX \(name)")
+    }
+
+    /// Times the migration and the deferred step `DBProof.repeats` times each, every
+    /// run on a fresh copy of `oldBase`, keeps the first copy as `pairBase`, drops the
+    /// old index from it (its pages go to the free list, as on a phone), and measures
+    /// what the column and the indexes take. Then times the step's three statements
+    /// apart, `DBProof.repeats` times, on further fresh copies. The pair file is not
+    /// compacted: it is the old file after the upgrade.
+    static func measureMigration(oldBase: URL, pairBase: URL, scratch: URL) async throws -> MigrationCost {
         var cost = MigrationCost()
-        cost.wallMs.append(try Self.migrate(base: oldBase, to: pairBase))
-        for _ in 1..<DBProof.repeats {
-            cost.wallMs.append(try Self.migrate(base: oldBase, to: scratch))
-            try DBProof.removeDatabaseFiles(at: scratch)
-        }
         cost.oldIndexPages = try Self.indexPages(oldBase, Config.oldIndexName)
-        cost.pairIndexPages = try Self.indexPages(pairBase, Config.pairIndexName)
+        // The body table and its primary key, without the old step's index on it.
+        cost.bodyPages = try Self.freedPages(
+            oldBase, setup: ["DROP INDEX \(Config.oldIndexName)"], "DROP TABLE messageBody")
         let oldQueue = try DatabaseQueue(path: oldBase.path)
         cost.oldPages = try oldQueue.read { try Self.pageCount($0) }
         cost.pageSize = try oldQueue.read { try Int.fetchOne($0, sql: "PRAGMA page_size") ?? 0 }
         try oldQueue.close()
+
+        for run in 0..<DBProof.repeats {
+            let file = run == 0 ? pairBase : scratch
+            cost.wallMs.append(try Self.migrate(base: oldBase, to: file))
+            if run == 0 {
+                let queue = try DatabaseQueue(path: file.path)
+                try queue.read { db in
+                    cost.migratedPages = try Self.pageCount(db)
+                    cost.filledByMigration = try Int.fetchOne(
+                        db, sql: "SELECT count(*) FROM messageHeader WHERE htmlCachedAt IS NOT NULL") ?? -1
+                    cost.indexedByMigration = try Int.fetchOne(
+                        db, sql: "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                        arguments: [HTMLCachePair.indexName]) ?? -1
+                }
+                try queue.close()
+            }
+            let step = try await Self.runDeferredStep(file)
+            cost.stepWallMs.append(step.wallMs)
+            cost.stepResults.append(step.result)
+            if run != 0 { try DBProof.removeDatabaseFiles(at: scratch) }
+        }
+        for _ in 0..<DBProof.repeats {
+            cost.wallMs.append(try Self.migrate(base: oldBase, to: scratch))
+            let parts = try Self.timeStepParts(scratch)
+            cost.fillMs.append(parts.fill)
+            cost.indexMs.append(parts.index)
+            cost.analyzeMs.append(parts.analyze)
+            try DBProof.removeDatabaseFiles(at: scratch)
+        }
+
+        cost.pairIndexPages = try Self.indexPages(pairBase, Config.pairIndexName)
         let queue = try DatabaseQueue(path: pairBase.path)
         try queue.writeWithoutTransaction { db in
-            cost.migratedPages = try Self.pageCount(db)
+            cost.steppedPages = try Self.pageCount(db)
             cost.headersFilled = try Int.fetchOne(
                 db, sql: "SELECT count(*) FROM messageHeader WHERE htmlCachedAt IS NOT NULL") ?? 0
             cost.mismatches = try HTMLCachePairTests.mismatches(db).count
@@ -299,6 +395,118 @@ struct StaleBodyEvictPairProofTests {
         }
         try queue.close()
         return cost
+    }
+
+    /// The extra data point: v116 and the deferred step at about 105,000 headers, the
+    /// same cache model with `Config.largerHTMLBytes` of HTML per body.
+    struct LargerHTMLSection {
+        let name: String
+        let htmlBytes: Range<Int>
+        let census: CacheCensus
+        let settled: Int
+        let migration: MigrationCost
+    }
+
+    static func measureLargerHTML(in unitDirectory: URL) async throws -> LargerHTMLSection {
+        let name = "105k-larger-html"
+        let anchor = Date()
+        let oldBase = unitDirectory.appendingPathComponent("\(name)-old-base.sqlite")
+        let pairBase = unitDirectory.appendingPathComponent("\(name)-pair-base.sqlite")
+        let scratch = unitDirectory.appendingPathComponent("\(name)-scratch.sqlite")
+        try DBProof.build(
+            at: oldBase, shape: .large, anchor: anchor, migratedUpTo: Config.oldSchemaMigration,
+            deferredIndexes: Config.oldDeferredIndexes)
+        let census = try Self.seedBodies(at: oldBase, anchor: anchor, htmlBytes: Config.largerHTMLBytes)
+        let settled = try await Self.settleOld(oldBase)
+        let migration = try await Self.measureMigration(oldBase: oldBase, pairBase: pairBase, scratch: scratch)
+        for file in [oldBase, pairBase, scratch] {
+            try DBProof.removeDatabaseFiles(at: file)
+        }
+        return LargerHTMLSection(
+            name: "105k", htmlBytes: Config.largerHTMLBytes, census: census, settled: settled, migration: migration)
+    }
+
+    // MARK: - The other reads' plans
+
+    /// The statistics and schema states the plan census compares.
+    enum PlanState: String, CaseIterable, Sendable {
+        /// Before #1433: the old file after a whole-database `ANALYZE`.
+        case before
+        /// The old file after the upgrade and the deferred step, as a phone has it.
+        case after
+        /// The control: the old file analyzed, then v116 and the pair's fill and index
+        /// with no `ANALYZE` after them, so the index has no statistics row (the index
+        /// built in a migration, as #1433 first had it).
+        case indexWithoutStatistics
+    }
+
+    struct PlanCensusLine {
+        let read: String
+        let isInboxRead: Bool
+        let plans: [PlanState: String]
+        var changedAfter: Bool { plans[.before] != plans[.after] }
+        var controlOnPairIndex: Bool { plans[.indexWithoutStatistics]?.contains(Config.pairIndexName) == true }
+    }
+
+    /// The reads the census plans: #1401's (`BackfillProgressIndexProofTests.probes`) but
+    /// the evict's own, which seek the pair's index by design (`plans`), and the chat
+    /// pill's reminder count.
+    static func censusReads(_ base: URL) throws -> [BackfillProgressIndexProofTests.Probe] {
+        let queue = try DatabaseQueue(path: base.path)
+        defer { try? queue.close() }
+        var reads = try queue.read { db in try BackfillProgressIndexProofTests.probes(db) }
+            .filter { !$0.name.hasPrefix("stale-body evict") }
+        reads.append(BackfillProgressIndexProofTests.Probe(
+            name: "chat pill reminder count", hot: true, sql: ChatPillState.Session.reminderCountSQL, arguments: []))
+        return reads
+    }
+
+    static func readPlans(_ file: URL, _ reads: [BackfillProgressIndexProofTests.Probe]) throws -> [String] {
+        let pool = try DatabasePool(path: file.path, configuration: AppDatabase.makeConfiguration())
+        defer { try? pool.close() }
+        return try pool.read { db in
+            try reads.map { read in
+                try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + read.sql, arguments: read.arguments)
+                    .compactMap { $0["detail"] as String? }
+                    .joined(separator: " | ")
+            }
+        }
+    }
+
+    /// Plans every census read in each state, each on its own copy of `oldBase`.
+    static func planCensus(oldBase: URL, scratch: URL) async throws -> [PlanCensusLine] {
+        let reads = try Self.censusReads(oldBase)
+        var plans: [PlanState: [String]] = [:]
+        for state in PlanState.allCases {
+            switch state {
+            case .after:
+                _ = try Self.migrate(base: oldBase, to: scratch)
+                let step = try await Self.runDeferredStep(scratch)
+                #expect(step.result == .refreshed, "setup: the deferred step did not complete: \(step.result)")
+            case .before, .indexWithoutStatistics:
+                try DBProof.removeDatabaseFiles(at: scratch)
+                try FileManager.default.copyItem(at: oldBase, to: scratch)
+                let queue = try DatabaseQueue(path: scratch.path)
+                try queue.writeWithoutTransaction { db in try DBProof.apply(.analyzed, to: db) }
+                try queue.close()
+                if state == .indexWithoutStatistics {
+                    let pool = try DatabasePool(path: scratch.path, configuration: AppDatabase.makeConfiguration())
+                    try AppDatabase.runMigrations(on: pool)
+                    try pool.write { db in
+                        try db.execute(sql: HTMLCachePair.fillSQL)
+                        try db.execute(sql: HTMLCachePair.indexSQL)
+                    }
+                    try pool.close()
+                }
+            }
+            plans[state] = try Self.readPlans(scratch, reads)
+            try DBProof.removeDatabaseFiles(at: scratch)
+        }
+        return reads.enumerated().map { offset, read in
+            PlanCensusLine(
+                read: read.name, isInboxRead: read.sql.contains("isInInbox = 1"),
+                plans: Dictionary(uniqueKeysWithValues: PlanState.allCases.map { ($0, plans[$0]?[offset] ?? "") }))
+        }
     }
 
     // MARK: - Measuring one evict pass
@@ -645,18 +853,32 @@ struct StaleBodyEvictPairProofTests {
                 }
                 return count
             },
-            WriteOperation(name: "whole-table wipe, bodies first (AppDataWiper's order)", repeats: Config.bulkRepeats) { db in
+            WriteOperation(name: "whole-table wipe, bodies first (AppDataWiper's order before #1433)", repeats: Config.bulkRepeats) { db in
                 try db.execute(sql: "DELETE FROM messageBody")
                 var count = db.changesCount
                 try db.execute(sql: "DELETE FROM messageHeader")
                 count += db.changesCount
                 return count
             },
-            WriteOperation(name: "whole-table wipe, headers first (the settings reset's order)", repeats: Config.bulkRepeats) { db in
+            WriteOperation(name: "whole-table wipe, headers first (AppDataWiper's and the settings reset's order)", repeats: Config.bulkRepeats) { db in
                 try db.execute(sql: "DELETE FROM messageHeader")
                 var count = db.changesCount
                 try db.execute(sql: "DELETE FROM messageBody")
                 count += db.changesCount
+                return count
+            },
+            WriteOperation(name: "account removal of the IMAP account (AccountManager.removeAccountRowsTxn: the cascade, then its bodies)", repeats: Config.bulkRepeats) { db in
+                // The function's last statement is its body delete: the rows counted.
+                try AccountManager.removeAccountRowsTxn(db, accountId: DBProof.accountId(Config.resetAccountIndex), wasPrimary: false)
+                return db.changesCount
+            },
+            WriteOperation(name: "account removal of the IMAP account, bodies first (the order before #1433)", repeats: Config.bulkRepeats) { db in
+                let accountId = DBProof.accountId(Config.resetAccountIndex)
+                try db.execute(
+                    sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
+                    arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
+                let count = db.changesCount
+                try AccountManager.removeAccountRowsTxn(db, accountId: accountId, wasPrimary: false)
                 return count
             },
             WriteOperation(name: "UIDVALIDITY reset of the IMAP inbox, headers then bodies (as built)", repeats: Config.bulkRepeats) { db in
@@ -690,11 +912,12 @@ struct StaleBodyEvictPairProofTests {
         let census: CacheCensus
         let settled: Int
         let migration: MigrationCost
+        let planCensus: [PlanCensusLine]
         let evicts: [EvictSection]
         let writes: [WriteCost]
     }
 
-    @Test("the evict, the pair's write costs and its migration, old against new, at about 105,000 and 525,000 headers")
+    @Test("the evict, the pair's write costs, its migration and its deferred step, old against new, at about 105,000 and 525,000 headers")
     func measurePair() async throws {
         let directory = try #require(DBProof.outputDirectory)
         let unitDirectory = directory.appendingPathComponent(Self.unit, isDirectory: true)
@@ -706,10 +929,13 @@ struct StaleBodyEvictPairProofTests {
             let oldBase = unitDirectory.appendingPathComponent("\(database.name)-old-base.sqlite")
             let pairBase = unitDirectory.appendingPathComponent("\(database.name)-pair-base.sqlite")
             let scratch = unitDirectory.appendingPathComponent("\(database.name)-scratch.sqlite")
-            try DBProof.build(at: oldBase, shape: database.shape, anchor: anchor, migratedUpTo: Config.oldSchemaMigration)
+            try DBProof.build(
+                at: oldBase, shape: database.shape, anchor: anchor, migratedUpTo: Config.oldSchemaMigration,
+                deferredIndexes: Config.oldDeferredIndexes)
             let census = try Self.seedBodies(at: oldBase, anchor: anchor)
             let settled = try await Self.settleOld(oldBase)
-            var migration = try Self.measureMigration(oldBase: oldBase, pairBase: pairBase, scratch: scratch)
+            var migration = try await Self.measureMigration(oldBase: oldBase, pairBase: pairBase, scratch: scratch)
+            let planCensus = try await Self.planCensus(oldBase: oldBase, scratch: scratch)
             let sample = try Self.sampleWrites(oldBase)
 
             var evicts: [EvictSection] = []
@@ -750,17 +976,37 @@ struct StaleBodyEvictPairProofTests {
             }
             sections.append(DatabaseSection(
                 name: database.name, headers: database.shape.totalHeaders, census: census, settled: settled,
-                migration: migration, evicts: evicts, writes: writes))
+                migration: migration, planCensus: planCensus, evicts: evicts, writes: writes))
             for file in variantFiles + [oldBase, pairBase, scratch] {
                 try DBProof.removeDatabaseFiles(at: file)
             }
         }
-        let report = Self.report(sections, repeats: repeats)
+        let larger = try await Self.measureLargerHTML(in: unitDirectory)
+        // The control: with the index and no statistics row for it, an inbox read moves
+        // onto it, so the census above can see such a change.
+        let flips = sections.flatMap { section in
+            section.planCensus.filter { $0.isInboxRead && $0.controlOnPairIndex }.map { "\(section.name) \($0.read)" }
+        }
+        let report = Self.report(sections, larger: larger, repeats: repeats)
         try report.write(to: unitDirectory.appendingPathComponent("report.txt"), atomically: true, encoding: .utf8)
         print(report)
+        #expect(!flips.isEmpty,
+                "the control moved no isInInbox = 1 read onto \(Config.pairIndexName); the census cannot see such a change")
+        #expect(larger.migration.filledByMigration == 0, "larger HTML: v116 filled \(larger.migration.filledByMigration) headers")
+        #expect(larger.migration.stepResults.allSatisfy { $0 == .refreshed },
+                "larger HTML: the deferred step did not complete: \(larger.migration.stepResults)")
+        #expect(larger.migration.mismatches == 0, "larger HTML: the deferred step's fill is exact")
+        #expect(larger.migration.headersFilled == larger.census.total - larger.settled,
+                "larger HTML: one filled header per cached body")
 
         for section in sections {
-            #expect(section.migration.mismatches == 0, "\(section.name): the migration's fill is exact")
+            // v116 adds the column and the triggers only: the fill and the index wait
+            // for the deferred step.
+            #expect(section.migration.filledByMigration == 0, "\(section.name): v116 filled \(section.migration.filledByMigration) headers")
+            #expect(section.migration.indexedByMigration == 0, "\(section.name): v116 built \(HTMLCachePair.indexName)")
+            #expect(section.migration.stepResults.allSatisfy { $0 == .refreshed },
+                    "\(section.name): the deferred step did not complete: \(section.migration.stepResults)")
+            #expect(section.migration.mismatches == 0, "\(section.name): the deferred step's fill is exact")
             #expect(section.migration.headersFilled == section.census.total - section.settled,
                     "\(section.name): one filled header per cached body")
             for statistics in [DBProof.Statistics.analyzed, DBProof.Statistics.none] {
@@ -782,6 +1028,11 @@ struct StaleBodyEvictPairProofTests {
                     #expect(pageReads == writes, "\(section.name) \(pair.schema.label): one page per write")
                 }
             }
+            // The other reads plan as they did before #1433 once the step has run.
+            for line in section.planCensus {
+                #expect(!line.changedAfter,
+                        "\(section.name) \(line.read): the plan changed after the step: \(line.plans[.before] ?? "") -> \(line.plans[.after] ?? "")")
+            }
             for operation in Set(section.writes.map(\.operation)) {
                 let rows = section.writes.filter { $0.operation == operation }.map { $0.runs.first?.resultRows ?? -1 }
                 let distinct = Set(rows)
@@ -792,16 +1043,16 @@ struct StaleBodyEvictPairProofTests {
 
     // MARK: - Report
 
-    static func report(_ sections: [DatabaseSection], repeats: Int) -> String {
+    static func report(_ sections: [DatabaseSection], larger: LargerHTMLSection, repeats: Int) -> String {
         var lines = [
             "Measurement: the stale-body evict through the HTML-cache pair against the body walk (#1433)",
             "Side: simulator (the app's SQLite, production connection configuration, background pool tier)",
             "Old: the schema before v116 with messageBody_staleEvict; the old step (dd9150d13), one write per page",
-            "Pair: the old file after the app's migration chain ran v116, without messageBody_staleEvict, compacted; the production step",
+            "Pair: the old file after the app's migration chain ran v116 and the maintenance pass's deferred step (fill, index, ANALYZE in one write), without messageBody_staleEvict, compacted; the production step",
             "Rules: page size \(SyncConfig.pruneChunkSize), TTL \(SyncConfig.bodyCacheTTLHours) h, \(SyncConfig.bodyCacheRecentPerFolder) newest kept per folder",
             "Cache model: a body for every complete message in an inbox or among its folder's newest, and for other complete mail that arrived within the TTL; first sync \(Int(Config.installDaysAgo)) days ago, newest first; HTML \(Config.htmlBytes.lowerBound)-\(Config.htmlBytes.upperBound) bytes",
             "Evict runs: 1 counting run (rows traced), then \(repeats) timed runs, each on a fresh clone and a fresh connection (empty page cache)",
-            "Write runs: \(repeats) per kind (\(Config.bulkRepeats) for wipes and resets), each on a fresh clone, in one transaction, commit included",
+            "Write runs: \(repeats) per kind (\(Config.bulkRepeats) for wipes, account removals and resets), each on a fresh clone, in one transaction, commit included",
             "",
         ]
         for section in sections {
@@ -811,13 +1062,34 @@ struct StaleBodyEvictPairProofTests {
                 "\(pages) pages (\(String(format: "%.1f", Double(pages) * pageMB)) MB)"
             }
             let migrationWall = DBProof.Distribution(migration.wallMs)
+            let stepWall = DBProof.Distribution(migration.stepWallMs)
+            let fill = DBProof.Distribution(migration.fillMs)
+            let index = DBProof.Distribution(migration.indexMs)
+            let analyze = DBProof.Distribution(migration.analyzeMs)
+            let bodyMB = Double(migration.bodyPages) * pageMB
+            func perMB(_ value: Double) -> String { bodyMB > 0 ? ms(value / bodyMB) : "n/a" }
             lines.append("== \(section.name): \(section.headers) headers")
             lines.append("cached bodies: \(section.census.total) (inbox \(section.census.inbox), folder newest \(section.census.folderNewest), fresh \(section.census.fresh)); the old step's settle pass evicted \(section.settled)")
-            lines.append("migration v116 on the old file, \(migration.wallMs.count) runs: median \(ms(migrationWall.median)) ms, p10 \(ms(migrationWall.p10)), p90 \(ms(migrationWall.p90)), max \(ms(migrationWall.sorted.last ?? 0))")
-            lines.append("  old file \(pagesText(migration.oldPages)); after v116 \(pagesText(migration.migratedPages)) (+\(migration.migratedPages - migration.oldPages)); free after dropping messageBody_staleEvict \(pagesText(migration.pairFreePages))")
+            lines.append("migration v116 (column and triggers) on the old file, \(migration.wallMs.count) runs: median \(ms(migrationWall.median)) ms, p10 \(ms(migrationWall.p10)), p90 \(ms(migrationWall.p90)), max \(ms(migrationWall.sorted.last ?? 0))")
+            lines.append("  old file \(pagesText(migration.oldPages)); after v116 \(pagesText(migration.migratedPages)) (+\(migration.migratedPages - migration.oldPages)); headers with a cached-at time after v116: \(migration.filledByMigration); \(HTMLCachePair.indexName) after v116: \(migration.indexedByMigration)")
+            lines.append("deferred step (fill, index and ANALYZE in one write, runRefreshPlannerStatisticsIfStale), \(migration.stepWallMs.count) runs: median \(ms(stepWall.median)) ms, p10 \(ms(stepWall.p10)), p90 \(ms(stepWall.p90)), max \(ms(stepWall.sorted.last ?? 0)); results \(Set(migration.stepResults.map { "\($0)" }).sorted())")
+            lines.append("  its statements apart, \(migration.fillMs.count) runs each: fill median \(ms(fill.median)) ms (p90 \(ms(fill.p90))); index median \(ms(index.median)) (p90 \(ms(index.p90))); ANALYZE median \(ms(analyze.median)) (p90 \(ms(analyze.p90)))")
+            lines.append("  body pages (messageBody and its primary key): \(pagesText(migration.bodyPages)); per MB of them: fill \(perMB(fill.median)) ms, step \(perMB(stepWall.median)) ms")
+            lines.append("  after the step \(pagesText(migration.steppedPages)) (+\(migration.steppedPages - migration.migratedPages) over v116); free after dropping messageBody_staleEvict \(pagesText(migration.pairFreePages))")
             lines.append("  index messageHeader_htmlCachedAt (isInInbox, htmlCachedAt): \(pagesText(migration.pairIndexPages)); (htmlCachedAt) alone: \(pagesText(migration.columnOnlyIndexPages)); messageBody_staleEvict (old): \(pagesText(migration.oldIndexPages))")
-            lines.append("  the column's fill: \(pagesText(migration.migratedPages - migration.oldPages - migration.pairIndexPages)) (the growth after v116 less its index)")
+            lines.append("  the column's fill: \(pagesText(migration.steppedPages - migration.migratedPages - migration.pairIndexPages)) (the step's growth less its index, the statistics table included)")
             lines.append("  headers filled: \(migration.headersFilled); pair mismatches after the fill: \(migration.mismatches)")
+            lines.append("")
+            lines.append("-- the other reads' plans: before #1433 (old file, analyzed), after the upgrade and the deferred step, and the control (v116 with the index built and no ANALYZE after it)")
+            for line in section.planCensus {
+                let before = line.plans[.before] ?? ""
+                let after = line.plans[.after] ?? ""
+                let control = line.plans[.indexWithoutStatistics] ?? ""
+                lines.append("  \(line.read)\(line.isInboxRead ? " (isInInbox = 1)" : "")")
+                lines.append("    before: \(before)")
+                lines.append("    after: \(after == before ? "the same" : after)")
+                lines.append("    control: \(control == before ? "the same" : control)\(line.controlOnPairIndex ? "  [ON \(Config.pairIndexName)]" : "")")
+            }
             lines.append("")
             for statistics in [DBProof.Statistics.analyzed, DBProof.Statistics.none] {
                 lines.append("-- evict pass, \(statistics.label)")
@@ -864,7 +1136,43 @@ struct StaleBodyEvictPairProofTests {
             lines.append("  (* varied between runs)")
             lines.append("")
         }
+        lines.append(contentsOf: Self.largerHTMLReport(larger, against: sections.first { $0.name == larger.name }))
         return lines.joined(separator: "\n")
+    }
+
+    /// The extra data point's lines, next to the same figures of the main run at the
+    /// same size.
+    static func largerHTMLReport(_ larger: LargerHTMLSection, against main: DatabaseSection?) -> [String] {
+        func figures(_ migration: MigrationCost) -> (bodyMB: Double, step: Double, fill: Double, index: Double, analyze: Double) {
+            let bodyMB = Double(migration.bodyPages) * Double(migration.pageSize) / 1_048_576
+            return (bodyMB,
+                    DBProof.Distribution(migration.stepWallMs).median,
+                    DBProof.Distribution(migration.fillMs).median,
+                    DBProof.Distribution(migration.indexMs).median,
+                    DBProof.Distribution(migration.analyzeMs).median)
+        }
+        func line(_ label: String, _ migration: MigrationCost) -> String {
+            let f = figures(migration)
+            func perMB(_ value: Double) -> String { f.bodyMB > 0 ? ms(value / f.bodyMB) : "n/a" }
+            return "  \(label): body pages \(String(format: "%.1f", f.bodyMB)) MB; step median \(ms(f.step)) ms (fill \(ms(f.fill)), index \(ms(f.index)), ANALYZE \(ms(f.analyze))); per MB of body pages: step \(perMB(f.step)) ms, fill \(perMB(f.fill)) ms"
+        }
+        let migration = larger.migration
+        let stepWall = DBProof.Distribution(migration.stepWallMs)
+        let migrationWall = DBProof.Distribution(migration.wallMs)
+        var lines = [
+            "== \(larger.name), larger HTML (\(larger.htmlBytes.lowerBound)-\(larger.htmlBytes.upperBound) bytes per body): v116 and the deferred step only",
+            "cached bodies: \(larger.census.total) (inbox \(larger.census.inbox), folder newest \(larger.census.folderNewest), fresh \(larger.census.fresh)); the old step's settle pass evicted \(larger.settled)",
+            "migration v116, \(migration.wallMs.count) runs: median \(ms(migrationWall.median)) ms, p90 \(ms(migrationWall.p90))",
+            "deferred step, \(migration.stepWallMs.count) runs: median \(ms(stepWall.median)) ms, p10 \(ms(stepWall.p10)), p90 \(ms(stepWall.p90)), max \(ms(stepWall.sorted.last ?? 0)); results \(Set(migration.stepResults.map { "\($0)" }).sorted())",
+            "  headers filled: \(migration.headersFilled); pair mismatches after the fill: \(migration.mismatches)",
+            "-- against the main run at the same size",
+            line("HTML \(larger.htmlBytes.lowerBound)-\(larger.htmlBytes.upperBound) bytes", migration),
+        ]
+        if let main {
+            lines.append(line("HTML \(Config.htmlBytes.lowerBound)-\(Config.htmlBytes.upperBound) bytes", main.migration))
+        }
+        lines.append("")
+        return lines
     }
 
     private static func ms(_ value: Double) -> String { String(format: "%.3f", value) }

@@ -276,8 +276,9 @@ struct BackfillProgressCountTests {
     /// the table: written over the test's rows, they give it a large mailbox's estimates.
     /// The test checks at setup that they name every index of the table and no other, and
     /// that under them the read without its index name plans that skip-scan.
-    /// `messageHeader_htmlCachedAt` (migration v116, #1433) comes from the same `ANALYZE`
-    /// of the same database with v116's column, fill and index added (Mac sqlite3 3.54):
+    /// `messageHeader_htmlCachedAt` (#1433, a deferred index) comes from the same `ANALYZE`
+    /// of the same database with v116's column and the deferred step's fill and index
+    /// added (Mac sqlite3 3.54):
     /// that database caches no HTML, so every header's value is NULL, and every other
     /// index's row came out unchanged.
     private static let largeMailboxStatistics: [String: String] = [

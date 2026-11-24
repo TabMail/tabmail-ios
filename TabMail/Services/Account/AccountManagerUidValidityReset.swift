@@ -659,8 +659,21 @@ extension AccountManager {
     /// `headerIdLikeNoDeeperColonSQLFragment`, so a folder whose path continues after
     /// a `:` and a folder whose path merely starts with this one's are left alone. It
     /// runs AFTER the header delete, so the HTML-cache pair's body-delete trigger
-    /// finds no header to update (`HTMLCachePair`, migration v116). Not routed
-    /// through `MessageContentStore`, whose quarantine guard would make it a no-op
+    /// (`HTMLCachePair`, migration v116) finds none of the folder's own headers to
+    /// update. Two shapes of an optimistic move still in flight (a row keeps its
+    /// source id until the drain re-keys it, ADR-IOS-061) differ:
+    /// - a message moving OUT of this folder keeps its header (its `folderId` is the
+    ///   destination, so the header delete leaves it), but its id is in the range, so
+    ///   its HTML is deleted and the trigger clears its pair. Its address is in the
+    ///   renumbered space, so the cached HTML is no longer trusted (as for every id
+    ///   in the range);
+    /// - a message moving INTO this folder from another one loses its header (its
+    ///   `folderId` is this folder), but its id names the source folder, outside the
+    ///   range, so its HTML stays with no header. Only the same message, at the same
+    ///   source id under the source's unchanged numbering, can take it back; otherwise
+    ///   it is a harmless leftover like #1446's.
+    ///
+    /// Not routed through `MessageContentStore`, whose quarantine guard would make it a no-op
     /// here. `ContentKey.forHeader` is byte-identical to `MessageHeader.id` at the
     /// current stage; a content key `<account>:<folder>:<tail>` keeps the prefix, so
     /// the later content-key mint stays inside the range.

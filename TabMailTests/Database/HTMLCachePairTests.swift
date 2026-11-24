@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -32,6 +33,13 @@ struct HTMLCachePairTests {
     ]
 
     // MARK: - Helpers
+
+    /// Counts a region observation's changes, which GRDB reports on its writer queue.
+    final class ChangeCounter: Sendable {
+        private let value = Mutex(0)
+        var count: Int { value.withLock { $0 } }
+        func increment() { value.withLock { $0 += 1 } }
+    }
 
     /// Every header whose `htmlCachedAt` is not exactly its body's `fetchedAt` (NULL
     /// when it has no body), compared as stored.
@@ -97,27 +105,34 @@ struct HTMLCachePairTests {
 
     // MARK: - The schema
 
-    /// The column, its index and the five triggers exist at the end of the whole
-    /// migration chain: a later migration that rebuilds either table drops the
-    /// triggers with it, and this fails.
-    @Test("The chain ends with the column, its index and the five triggers")
+    /// The column and the five triggers exist at the end of the whole migration
+    /// chain: a later migration that rebuilds either table drops the triggers with
+    /// it, and this fails. The index is not the chain's: the deferred step builds it.
+    @Test("The chain ends with the column and the five triggers; the index waits for the deferred step")
     func theChainEndsWithThePair() throws {
         let db = try TestDatabase.make()
-        let (triggers, indexColumns, column) = try db.read { conn in
-            (Set(try String.fetchAll(conn, sql: "SELECT name FROM sqlite_master WHERE type = 'trigger'")),
-             try String.fetchAll(conn, sql: "SELECT name FROM pragma_index_info('messageHeader_htmlCachedAt') ORDER BY seqno"),
-             try String.fetchAll(conn, sql: "SELECT name FROM pragma_table_info('messageHeader') WHERE name = 'htmlCachedAt'"))
+        let triggers = try db.read { conn in
+            Set(try String.fetchAll(conn, sql: "SELECT name FROM sqlite_master WHERE type = 'trigger'"))
         }
+        let column = try db.read { conn in
+            try String.fetchAll(conn, sql: "SELECT name FROM pragma_table_info('messageHeader') WHERE name = 'htmlCachedAt'")
+        }
+        let missing = try db.read { try SyncEngine.missingDeferredIndexNames($0) }
         #expect(Self.triggerNames.isSubset(of: triggers), "missing: \(Self.triggerNames.subtracting(triggers).sorted())")
-        #expect(indexColumns == ["isInInbox", "htmlCachedAt"])
         #expect(column == ["htmlCachedAt"])
+        #expect(missing.contains(HTMLCachePair.indexName), "the chain built the index; the deferred step must")
     }
 
-    /// v116 fills the column from the bodies already cached: a header with a body
-    /// takes its `fetchedAt`, inbox or not; a header without one stays NULL; a body
-    /// no header holds is left as it is.
-    @Test("v116 fills the pair from the bodies already cached")
-    func theMigrationFillsThePair() throws {
+    /// A database upgraded with HTML already cached. v116 adds the column empty and
+    /// its triggers. Until the deferred step commits, those bodies read as not
+    /// cached, no body is deleted, and a pair that is set names its own body's
+    /// `fetchedAt` (a body written after v116). The step's one write fills the pair
+    /// from every cached body and builds the index; after it the pair equals
+    /// `messageBody` exactly. The index existing is the proof the fill ran: a step
+    /// that rolls back leaves neither, and a step with the index already there does
+    /// not fill again.
+    @Test("Before the deferred step old bodies read as not cached; the step fills the pair exactly")
+    func theDeferredStepFillsThePair() throws {
         var config = Configuration()
         config.foreignKeysEnabled = true
         let db = try DatabaseQueue(configuration: config)
@@ -130,26 +145,106 @@ struct HTMLCachePairTests {
         let inboxCached = try Self.header(db, "1")
         let inboxBare = try Self.header(db, "2")
         let archiveCached = try Self.header(db, "3", folderPath: "Archive")
+        let resaved = try Self.header(db, "5", folderPath: "Archive")
         let orphan = "acc1:Archive:4"
         try db.write { conn in
             try Self.body(inboxCached.id, fetchedAt: Self.hoursAgo(1)).insert(conn)
             try Self.body(archiveCached.id, fetchedAt: Self.hoursAgo(900)).insert(conn)
+            try Self.body(resaved.id, fetchedAt: Self.hoursAgo(800)).insert(conn)
             try Self.body(orphan, fetchedAt: Self.hoursAgo(5)).insert(conn)
         }
+        let headerIds = [inboxCached.id, archiveCached.id, resaved.id, inboxBare.id]
+        func bodyIds() throws -> Set<String> {
+            try db.read { try Set(String.fetchAll($0, sql: "SELECT id FROM messageBody")) }
+        }
+        func cachedAnswers() throws -> [Bool] {
+            try db.read { conn in try headerIds.map { try HTMLCachePair.isCached(conn, headerId: $0) } }
+        }
+        func indexMissing() throws -> Bool {
+            try db.read { try SyncEngine.missingDeferredIndexNames($0).contains(HTMLCachePair.indexName) }
+        }
+        let bodiesBefore = try bodyIds()
 
         try AppDatabase.runMigrations(on: db)
+        // A body saved again between v116 and the step: the triggers record it.
+        try db.write { conn in try Self.body(resaved.id, fetchedAt: Self.hoursAgo(2)).save(conn) }
 
-        let (bad, inboxValue, inboxBody, archiveValue, archiveBody, bareValue, orphanBody) = try db.read { conn in
-            (try Self.mismatches(conn),
-             try Self.cachedAt(conn, inboxCached.id), try Self.fetchedAt(conn, inboxCached.id),
-             try Self.cachedAt(conn, archiveCached.id), try Self.fetchedAt(conn, archiveCached.id),
-             try Self.cachedAt(conn, inboxBare.id), try Self.fetchedAt(conn, orphan))
+        let interimBodies = try bodyIds()
+        let interimAnswers = try cachedAnswers()
+        let interimWrong = try db.read { conn in
+            try String.fetchAll(conn, sql: """
+                SELECT id FROM messageHeader
+                WHERE htmlCachedAt IS NOT NULL
+                  AND htmlCachedAt IS NOT (SELECT fetchedAt FROM messageBody WHERE messageBody.id = messageHeader.id)
+                """)
         }
-        #expect(bad.isEmpty, "headers out of step with their bodies: \(bad)")
-        #expect(!inboxValue.isNull && inboxValue == inboxBody, "an inbox header takes its body's fetchedAt")
-        #expect(!archiveValue.isNull && archiveValue == archiveBody, "a header outside the inbox takes its body's fetchedAt")
-        #expect(bareValue.isNull, "a header with no body stays NULL")
-        #expect(!orphanBody.isNull, "a body no header holds is left as it is")
+        let interimIndexMissing = try indexMissing()
+        #expect(interimBodies == bodiesBefore, "no body is deleted before the step")
+        #expect(interimAnswers == [false, false, true, false],
+                "inbox, archive, re-saved, bare: only the body saved after v116 reads as cached: \(interimAnswers)")
+        #expect(interimWrong.isEmpty, "a pair that is set names its own body's fetchedAt: \(interimWrong)")
+        #expect(interimIndexMissing, "the index waits for the step")
+
+        struct Abort: Error {}
+        var aborted = false
+        do {
+            try db.write { conn in
+                try SyncEngine.createDeferredIndexes(conn)
+                throw Abort()
+            }
+        } catch is Abort {
+            aborted = true
+        }
+        let rolledBackAnswers = try cachedAnswers()
+        let rolledBackIndexMissing = try indexMissing()
+        #expect(aborted, "setup: the step's write rolled back")
+        #expect(rolledBackAnswers == interimAnswers, "a rolled-back step leaves the pair unfilled: \(rolledBackAnswers)")
+        #expect(rolledBackIndexMissing, "and the index unbuilt")
+
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
+
+        let bad = try db.read { try Self.mismatches($0) }
+        let answers = try cachedAnswers()
+        let bodiesAfter = try bodyIds()
+        let indexColumns = try db.read { conn in
+            try String.fetchAll(conn, sql: "SELECT name FROM pragma_index_info('messageHeader_htmlCachedAt') ORDER BY seqno")
+        }
+        #expect(bad.isEmpty, "headers out of step with their bodies after the step: \(bad)")
+        #expect(answers == [true, true, true, false], "inbox, archive, re-saved, bare: \(answers)")
+        #expect(bodiesAfter == bodiesBefore, "the step deletes no body, the one no header holds included")
+        #expect(indexColumns == ["isInInbox", "htmlCachedAt"])
+
+        // With the index there, a later step does not fill again (a fill reads every
+        // cached body). The cleared value stays cleared.
+        try db.write { conn in
+            try conn.execute(sql: "UPDATE messageHeader SET htmlCachedAt = NULL WHERE id = ?", arguments: [archiveCached.id])
+        }
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
+        let refilled = try db.read { try HTMLCachePair.isCached($0, headerId: archiveCached.id) }
+        #expect(!refilled, "the fill ran again though its index was there")
+    }
+
+    /// The pair's writes touch only `htmlCachedAt`, which the chat pill's reminder
+    /// count does not read, so its observation does not re-run on a body save or
+    /// delete, or on the fill. Observed through GRDB's own region tracking of the
+    /// production statement; a write of a column the count reads is the control.
+    @Test("The pair's writes do not re-run the reminder count")
+    func thePairsWritesDoNotRerunTheReminderCount() throws {
+        let db = try Self.seeded()
+        let id = try Self.header(db, "1", folderPath: "Archive").id
+        let changes = ChangeCounter()
+        let observation = DatabaseRegionObservation(tracking: SQLRequest<Int>(sql: ChatPillState.Session.reminderCountSQL))
+        let cancellable = observation.start(in: db, onError: { _ in }, onChange: { _ in changes.increment() })
+        try db.write { try Self.body(id, fetchedAt: Self.hoursAgo(1)).insert($0) }
+        try db.write { try $0.execute(sql: "UPDATE messageBody SET fetchedAt = ? WHERE id = ?", arguments: [Self.hoursAgo(2), id]) }
+        try db.write { try $0.execute(sql: HTMLCachePair.fillSQL) }
+        try db.write { _ = try MessageBody.deleteOne($0, key: ContentKey(rawValue: id)) }
+        let afterPairWrites = changes.count
+        try db.write { try $0.execute(sql: "UPDATE messageHeader SET isInInbox = 1 WHERE id = ?", arguments: [id]) }
+        let afterControl = changes.count
+        cancellable.cancel()
+        #expect(afterPairWrites == 0, "a write of htmlCachedAt alone re-ran the count \(afterPairWrites) times")
+        #expect(afterControl == 1, "control: a write of isInInbox re-runs it: \(afterControl)")
     }
 
     // MARK: - Body writes
@@ -221,6 +316,101 @@ struct HTMLCachePairTests {
             try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM messageHeader WHERE htmlCachedAt IS NOT NULL") ?? -1
         }
         #expect(stillCached == 0, "after the whole table goes, no header is cached")
+    }
+
+    // MARK: - Deletes of both rows
+
+    /// Counts the `messageHeader` rows written through `htmlCachedAt`, the triggers'
+    /// writes included: GRDB is told of a trigger's writes when it compiles the
+    /// statement that fires it, and SQLite reports each row the trigger changes.
+    final class PairRewriteCounter: TransactionObserver, Sendable {
+        private let value = Mutex(0)
+        var count: Int { value.withLock { $0 } }
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            guard case let .update(tableName, columnNames) = eventKind else { return false }
+            return tableName == MessageHeader.databaseTableName && columnNames.contains(HTMLCachePair.column)
+        }
+
+        func databaseDidChange(with event: DatabaseEvent) {
+            guard event.kind == .update, event.tableName == MessageHeader.databaseTableName else { return }
+            value.withLock { $0 += 1 }
+        }
+
+        func databaseDidCommit(_ db: Database) {}
+        func databaseDidRollback(_ db: Database) {}
+    }
+
+    /// Account removal and the full wipe delete the headers before the bodies, so
+    /// the body-delete trigger finds no header left to rewrite: no header is written
+    /// just before it is deleted. The production transactions run as they are; the
+    /// control deletes the same bodies first, in a copy of each, and counts one
+    /// rewrite per cached header, which is what either order swapped would cost.
+    @Test("Account removal and the wipe rewrite no header: headers go before bodies")
+    func removalAndWipeRewriteNoHeader() throws {
+        func seed() throws -> (db: DatabaseQueue, removed: [String], kept: [String]) {
+            let db = try Self.seeded()
+            try TestDatabase.insertAccount(db, id: "acc2", email: "other@example.com")
+            try TestDatabase.insertFolder(db, accountId: "acc2")
+            let removed = try (1...3).map { try Self.header(db, "\($0)").id }
+                + [try Self.header(db, "4", folderPath: "Archive").id]
+            let kept = try (5...6).map { messageId in
+                try TestDatabase.insertMessageHeader(
+                    db, messageId: "\(messageId)", folderId: "acc2:INBOX", accountId: "acc2").id
+            }
+            try db.write { conn in
+                for (offset, id) in (removed + kept).enumerated() {
+                    try Self.body(id, fetchedAt: Self.hoursAgo(offset + 1)).insert(conn)
+                }
+            }
+            return (db, removed, kept)
+        }
+        func rowsLeft(_ db: DatabaseQueue, accountId: String) throws -> Int {
+            try db.read { conn in
+                try Int.fetchOne(conn, sql: """
+                    SELECT (SELECT COUNT(*) FROM messageHeader WHERE accountId = ?)
+                         + (SELECT COUNT(*) FROM messageBody WHERE substr(id, 1, length(?) + 1) = ? || ':')
+                    """, arguments: [accountId, accountId, accountId]) ?? -1
+            }
+        }
+
+        let (db, removed, kept) = try seed()
+        let counter = PairRewriteCounter()
+        db.add(transactionObserver: counter)
+        try db.write { try AccountManager.removeAccountRowsTxn($0, accountId: "acc1", wasPrimary: false) }
+        let afterRemoval = counter.count
+        let removedLeft = try rowsLeft(db, accountId: "acc1")
+        let keptCached = try db.read { conn in try kept.map { try HTMLCachePair.isCached(conn, headerId: $0) } }
+        #expect(removedLeft == 0, "setup: the removed account's headers and bodies are gone")
+        #expect(keptCached == [true, true], "setup: the other account stays cached: \(keptCached)")
+        #expect(afterRemoval == 0, "account removal rewrote \(afterRemoval) headers just before deleting them")
+
+        try db.write { try AppDataWiper.wipeRowsTxn($0) }
+        let afterWipe = counter.count - afterRemoval
+        let wipedLeft = try rowsLeft(db, accountId: "acc2")
+        #expect(wipedLeft == 0, "setup: the wipe left rows")
+        #expect(afterWipe == 0, "the wipe rewrote \(afterWipe) headers just before deleting them")
+
+        // Control: the bodies deleted while their headers are still there.
+        let control = try seed()
+        let controlCounter = PairRewriteCounter()
+        control.db.add(transactionObserver: controlCounter)
+        try control.db.write { conn in
+            try conn.execute(
+                sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
+                arguments: [MessageIdentity.escapeForLike("acc1") + ":%"])
+            try Account.deleteOne(conn, key: "acc1")
+        }
+        let controlRemoval = controlCounter.count
+        try control.db.write { conn in
+            try conn.execute(sql: "DELETE FROM messageBody")
+            try conn.execute(sql: "DELETE FROM messageHeader")
+        }
+        let controlWipe = controlCounter.count - controlRemoval
+        #expect(controlRemoval == removed.count,
+                "control: bodies first rewrites each removed header: \(controlRemoval) of \(removed.count)")
+        #expect(controlWipe == control.kept.count,
+                "control: bodies first rewrites each header the wipe deletes: \(controlWipe) of \(control.kept.count)")
     }
 
     // MARK: - Header writes
@@ -327,7 +517,7 @@ struct HTMLCachePairTests {
 
     // MARK: - The reads
 
-    @Test("isCached and cachedHeaderIds answer from the pair")
+    @Test("isCached answers from the pair")
     func theReadsAnswerFromThePair() throws {
         let db = try Self.seeded()
         let cached = try Self.header(db, "1").id
@@ -343,13 +533,7 @@ struct HTMLCachePairTests {
         let answers = try db.read { conn in
             try [cached, archived, bare, missing].map { try HTMLCachePair.isCached(conn, headerId: $0) }
         }
-        let (among, amongNone) = try db.read { conn in
-            (try HTMLCachePair.cachedHeaderIds(conn, among: [cached, bare, archived, missing]),
-             try HTMLCachePair.cachedHeaderIds(conn, among: []))
-        }
         #expect(answers == [true, true, false, false], "cached, archived, bare, missing: \(answers)")
-        #expect(among == Set([cached, archived]))
-        #expect(amongNone.isEmpty)
     }
 
     // MARK: - Stage E1 tripwire
