@@ -416,7 +416,7 @@ struct UndoSendReturnsToDraftsTests {
             instanceEpoch: UUID().uuidString)
         for returned in [true, false] {
             let compose = UndoReopenCompose.composeView(for: PendingSendService.ReopenSnapshot(
-                id: "outbox-\(UUID().uuidString)", authority: authority, returnedToDrafts: returned))
+                id: "outbox-\(UUID().uuidString)", authority: authority, returnedToDrafts: returned, openedOn: nil))
             #expect(compose.prefillTreatAsUnsavedChanges == !returned)
             #expect(compose.retainedDraftAuthority == authority)
         }

@@ -6,9 +6,10 @@
 /// (`ComposeView.openedOn`) and never read later from what is on screen. With the chat view
 /// setting read at the Send tap, it decides whether a reply's Undo is on the chat's "Sending"
 /// bubble (`PendingSendService.sendHasBubbleUndo`): only a compose the chat opened for one of its
-/// own emails closes back onto the chat that shows that bubble. A compose opened anywhere else (the
-/// Drafts list, the inbox, an email screen, the compose an Undo reopens) records none, and its send
-/// keeps the toast.
+/// own emails closes back onto the chat that shows that bubble. The compose an Undo reopens records
+/// the screen the undone send had (`PendingSendService.ReopenSnapshot.openedOn`): the chat after its
+/// bubble's Undo, none after the toast's. A compose opened anywhere else (the Drafts list, the
+/// inbox, an email screen) records none, and its send keeps the toast.
 ///
 /// Only a screen whose compose behaves differently is named; nil stands for every other.
 enum ComposeScreen: Hashable, Sendable {
