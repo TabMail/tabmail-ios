@@ -946,7 +946,24 @@ extension SyncEngine {
             sql: """
                 CREATE INDEX IF NOT EXISTS messageBody_staleEvict
                 ON messageBody(fetchedAt)
-                """)
+                """),
+        // Serves `SyncEngine.ftsBodyMembershipCandidateSQL`, the start-up search
+        // self-check's newest 2,000 complete headers (#1397). With it that read walks
+        // this index newest first, takes `id` from it (covering: no table page is read)
+        // and stops at the 2,000th entry; without it the read seeks
+        // `idx_messageHeader_bodyStatus` and sorts every complete header of every
+        // account before returning the first. Deferred because its absence degrades
+        // performance and nothing else: the statement names no index and picks the same
+        // headers either way, so until the first maintenance pass builds it the read
+        // costs what it cost before. It holds every header, complete or not, so every
+        // header insert and every change of `headerComplete`, `bodyComplete` or `date`
+        // also writes it.
+        DeferredIndex(
+            name: "messageHeader_ftsSelfHealWindow",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_ftsSelfHealWindow
+                ON messageHeader(headerComplete, bodyComplete, date, id)
+                """),
     ]
 
     /// The index the stale-body evict step seeks (`deferredIndexes`).

@@ -479,9 +479,7 @@ enum DBProof {
         var entries: [ManifestEntry] = []
         for mode in modes {
             for state in statistics {
-                let stem = unitDirectory.appendingPathComponent("\(fileSafe(mode.name))-\(state.rawValue)")
-                let oldFile = stem.appendingPathExtension("old.sqlite")
-                let newFile = stem.appendingPathExtension("new.sqlite")
+                let (oldFile, newFile) = variantFiles(unit: unit, mode: mode.name, statistics: state, in: directory)
                 try prepareVariantFile(base: base, setupSQL: mode.old.setupSQL, statistics: state, at: oldFile)
                 try prepareVariantFile(base: base, setupSQL: mode.new.setupSQL, statistics: state, at: newFile)
                 // One warm-up each, then old and new interleaved so drift hits both.
@@ -511,6 +509,15 @@ enum DBProof {
         try (header + report(results)).write(
             to: unitDirectory.appendingPathComponent("report.txt"), atomically: true, encoding: .utf8)
         return results
+    }
+
+    /// The old and new variant files `compare` leaves for `mode` under `statistics`, for a
+    /// proof that reads them afterwards (a query plan, say).
+    static func variantFiles(unit: String, mode: String, statistics: Statistics, in directory: URL)
+        -> (old: URL, new: URL) {
+        let stem = directory.appendingPathComponent(unit, isDirectory: true)
+            .appendingPathComponent("\(fileSafe(mode))-\(statistics.rawValue)")
+        return (stem.appendingPathExtension("old.sqlite"), stem.appendingPathExtension("new.sqlite"))
     }
 
     /// Two empty results compare as equal whatever the statements cost to find nothing, so a

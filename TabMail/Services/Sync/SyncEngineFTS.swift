@@ -90,6 +90,15 @@ extension SyncEngine {
     ///
     /// The SQL is a shared constant so `FTSSelfHealTests` locks the exact
     /// candidate contract (a reintroduced `isInInbox` filter must fail a test).
+    ///
+    /// It runs at every launch and foreground, so it must cost the window and not the
+    /// mailbox (#1397): the deferred index `messageHeader_ftsSelfHealWindow`
+    /// (`SyncEngine.deferredIndexes`) holds `(headerComplete, bodyComplete, date, id)`,
+    /// which the planner walks newest first with no sort, reading `id` from the index
+    /// and stopping at the 2,000th entry. The statement names no index on purpose:
+    /// before the maintenance pass has built it, the same statement seeks
+    /// `idx_messageHeader_bodyStatus` and sorts, as it always did, and returns the same
+    /// headers. `FTSSelfHealCandidateReadTests` pins both the answer and the plan.
     static let ftsBodyMembershipCandidateSQL = """
         SELECT id FROM messageHeader
         WHERE bodyComplete = 1 AND headerComplete = 1
@@ -103,9 +112,16 @@ extension SyncEngine {
             // materializing 2000 full MessageHeader rows (~30 columns each) just
             // to extract `.id` is wasted allocation on every launch. Full rows
             // are loaded lazily below only for the missing subset.
-            let candidateIds: [String] = try await dbPool.read { db in
-                try String.fetchAll(db, sql: Self.ftsBodyMembershipCandidateSQL)
+            // With debug logging on, the read's cost (#1397): the rows it visited and
+            // the pages it fetched, so a device log shows whether it read the window
+            // or the mailbox. Logged after the read returns.
+            let (candidateIds, costLine): ([String], String?) = try await dbPool.read { db in
+                let meter = ReadCostMeter.start(db)
+                let statement = try ReadCostMeter.statement(db, sql: Self.ftsBodyMembershipCandidateSQL, meter: meter)
+                let ids = try String.fetchAll(statement)
+                return (ids, meter?.line("FTSSelfHealCandidates", ["rows": ids.count]))
             }
+            if let costLine { ReadCostMeter.log([costLine]) }
             guard !candidateIds.isEmpty else { return }
 
             // ⚠ STAGE E1: `candidateIds` are `messageHeader.id`s and are being asked
