@@ -1114,13 +1114,18 @@ struct PlannerStatisticsRefreshTests {
     /// The row count `ANALYZE` last recorded for `table`, read out of `sqlite_stat1`.
     /// `nil` when statistics have never been computed (the table does not exist yet)
     /// or when they do not cover this table.
+    ///
+    /// Each row's leading integer is the number of entries in that row's index. A
+    /// full index holds every row of the table, a partial index (`WHERE ...`) only
+    /// the rows it matches, so the table's count is the largest leading integer.
+    /// Any single row is not enough: `ANALYZE` writes the newest index first, and a
+    /// partial index built last reads below the table's count.
     private func recordedRowCount(_ pool: DatabasePool, table: String) throws -> Int? {
         try pool.read { db in
             guard try db.tableExists("sqlite_stat1") else { return nil }
-            let stat = try String.fetchOne(
-                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ? LIMIT 1", arguments: [table])
-            guard let leading = stat?.split(separator: " ").first else { return nil }
-            return Int(leading)
+            let stats = try String.fetchAll(
+                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ?", arguments: [table])
+            return stats.compactMap { stat in stat.split(separator: " ").first.flatMap { Int($0) } }.max()
         }
     }
 

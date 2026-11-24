@@ -37,8 +37,8 @@ actor ActiveBodyQueue {
         let isInInbox: Bool
     }
 
-    /// The SOLE admission query for this queue: every row that still needs a body
-    /// fetch, in the order the queue wants them. Hoisted into ONE symbol because it
+    /// The SOLE admission query for this queue: the rows that still need a body
+    /// fetch, in the order the queue wants them (a window of them; see below). Hoisted into ONE symbol because it
     /// has three consumers that must never diverge — `repopulateFromDatabase`
     /// (launch / foreground / sync recovery), `repopulateOnDrain` (the drain-time
     /// safety net), and the tests that assert what the queue will and will not admit.
@@ -49,12 +49,20 @@ actor ActiveBodyQueue {
     ///
     /// `bodyMetadataOversized = 0` is the quarantine gate — see
     /// `MessageHeader.bodyMetadataOversized` for the full CLEARED enumeration.
+    ///
+    /// A refill admits a WINDOW: the newest `SyncConfig.bodyFetchRepopulateLimit`
+    /// pending inbox rows, read through `messageHeader_bodyRepopulateV2` in `date` order
+    /// with no sort, stopping at the limit. A row leaves the predicate once its body is
+    /// stored, confirmed empty or quarantined, so the drain-time refill after a window
+    /// completes admits the next newest window. The window's cost is accepted as
+    /// `IOS-BODY-007`, stated on `BackfillBodyQueue.admissionSQL`.
     nonisolated static let admissionSQL = """
         SELECT id, accountId, folderPath, messageId, isInInbox
         FROM messageHeader
         WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
           AND bodyMetadataOversized = 0
         ORDER BY date DESC
+        LIMIT \(SyncConfig.bodyFetchRepopulateLimit)
         """
 
     /// Runs `admissionSQL` and maps it to queue items. Synchronous — the caller owns
@@ -227,6 +235,34 @@ actor ActiveBodyQueue {
         cancelAllInFlight()
         storage = QueueStorage<Item>()
     }
+
+    #if DEBUG
+    /// Test-only seam (pattern: `BackfillBodyQueue.setDispatchSuppressedForTesting`).
+    /// While set, `dispatchBatch` returns before it collects candidates, so items stay
+    /// pending and the queue sends nothing to the server.
+    private var dispatchSuppressedForTesting = false
+    func setDispatchSuppressedForTesting(_ suppressed: Bool) {
+        dispatchSuppressedForTesting = suppressed
+    }
+
+    /// Test-only seam: awaited at the start of the drain-time refill's read, so a test
+    /// can see the queue's state at that moment.
+    private var drainRefillWillReadForTesting: (@Sendable () async -> Void)?
+    func setDrainRefillWillReadForTesting(_ hook: (@Sendable () async -> Void)?) {
+        drainRefillWillReadForTesting = hook
+    }
+
+    /// Test-only seam: one batch dispatched for `folderPath` (the counts a real dispatch
+    /// raises) whose items the test completes, then the end of that batch, as the
+    /// batch task runs it.
+    func noteBatchDispatchedForTesting(accountId: String, folderPath: String) {
+        activeBatchCount += 1
+        folderActiveBatches[FolderCapKey(accountId: accountId, folderPath: folderPath), default: 0] += 1
+    }
+    func finishBatchForTesting(accountId: String, folderPath: String) async {
+        await finishBatch(capKey: FolderCapKey(accountId: accountId, folderPath: folderPath))
+    }
+    #endif
 
     /// Test-only seam: pre-set the per-folder batch cap so the disposition tests can
     /// pin that the defer decision keys on THIS batch's `items.count` and NOT on the
@@ -591,6 +627,9 @@ actor ActiveBodyQueue {
     /// No deferred FTS buffer — the IMAP batch IS the write batch.
     /// Concurrency is per-batch (not per-item) — always collects full batches.
     private func dispatchBatch() async {
+        #if DEBUG
+        guard !dispatchSuppressedForTesting else { return }
+        #endif
         guard NetworkMonitor.checkConnected() else {
             if !storage.isEmpty { scheduleDispatchOnReconnect() }
             return
@@ -784,28 +823,40 @@ actor ActiveBodyQueue {
                 // If cancelled by cancelAllInFlight(), counters are already reset to 0.
                 // Skip decrement to avoid negative counts.
                 guard !Task.isCancelled else { return }
-
-                activeBatchCount -= 1
-                let remaining = (self.folderActiveBatches[capKey] ?? 1) - 1
-                if remaining <= 0 {
-                    self.folderActiveBatches.removeValue(forKey: capKey)
-                } else {
-                    self.folderActiveBatches[capKey] = remaining
-                }
-                notifyActiveStateIfNeeded()
-
-                if storage.pendingCount > 0 {
-                    scheduleDispatch()
-                } else if storage.isEmpty && activeBatchCount == 0 {
-                    // Drain-time safety net: re-query GRDB for anything missed
-                    // by the push path (headerComplete=1 set but enqueue lost,
-                    // body queue cancelled mid-fetch, etc.). Only when this
-                    // returns zero rows is the queue truly idle.
-                    await self.repopulateOnDrain()
-                }
+                await self.finishBatch(capKey: capKey)
             }
             batchTasks.removeAll { $0.isCancelled }
             batchTasks.append(batchTask)
+        }
+    }
+
+    /// The end of one batch, after its items are done. The last batch to end with the
+    /// queue empty first reads the next window of waiting rows (`repopulateOnDrain`) and
+    /// only then gives up its batch count. A refill reads one window
+    /// (`SyncConfig.bodyFetchRepopulateLimit`), so with more rows waiting the queue
+    /// empties once per window; reading before the count drops keeps `isIdle` and
+    /// `awaitDrain` false until no row waits (#1400).
+    private func finishBatch(capKey: FolderCapKey) async {
+        if storage.isEmpty && activeBatchCount == 1 {
+            // Drain-time safety net: re-query GRDB for anything missed
+            // by the push path (headerComplete=1 set but enqueue lost,
+            // body queue cancelled mid-fetch, etc.), and the next window.
+            // Only when this returns zero rows is the queue truly idle.
+            await repopulateOnDrain()
+            // cancelAllInFlight() during the read has already reset the counters.
+            guard !Task.isCancelled else { return }
+        }
+        activeBatchCount -= 1
+        let remaining = (folderActiveBatches[capKey] ?? 1) - 1
+        if remaining <= 0 {
+            folderActiveBatches.removeValue(forKey: capKey)
+        } else {
+            folderActiveBatches[capKey] = remaining
+        }
+        notifyActiveStateIfNeeded()
+
+        if storage.pendingCount > 0 {
+            scheduleDispatch()
         }
     }
 
@@ -999,10 +1050,14 @@ actor ActiveBodyQueue {
     }
 
     /// Drain-time self-repopulate: re-run the work-remaining query and enqueue any
-    /// hits. Called only when `storage.isEmpty && activeBatchCount == 0`, so no
-    /// in-flight overlap. `QueueStorage.enqueue` dedups against `enqueued`, which
-    /// already contains any in-flight items, as an extra safety net.
+    /// hits. Called only by the last batch to end, with the queue empty and before it
+    /// gives up its count (`finishBatch`), so no in-flight overlap; the caller
+    /// dispatches what it admits. `QueueStorage.enqueue` dedups against `enqueued`,
+    /// which already contains any in-flight items, as an extra safety net.
     private func repopulateOnDrain() async {
+        #if DEBUG
+        if let hook = drainRefillWillReadForTesting { await hook() }
+        #endif
         do {
             let items: [Item] = try await dbPool.read { db in
                 try Self.admissionItems(db)
@@ -1011,7 +1066,6 @@ actor ActiveBodyQueue {
             let added = admitDrainCandidates(items)
             if added > 0 {
                 BackgroundSyncLogger.logDebug("[ActiveBody] Drain-time self-repopulate enqueued \(added) items")
-                scheduleDispatch()
             }
         } catch {
             BackgroundSyncLogger.logDebug("[ActiveBody] Drain-time repopulate failed: \(error)")
