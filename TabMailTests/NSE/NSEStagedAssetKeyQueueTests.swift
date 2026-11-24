@@ -216,7 +216,7 @@ struct NSEStagedAssetKeyQueueTests {
             to: "user@example.com", date: Date(), snippet: "held",
             folderId: world.inbox.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true)
         held.rfc822MessageId = "rfc-msg-2@example.com"
-        try world.pool.write { try held.insert($0) }
+        try await world.pool.write { [held] db in try held.insert(db) }
         #expect(held.id == stagedKey("msg-2"), "precondition: a header holds the second staged key")
 
         await NSEDataBridge.applyOldEpochStagingCleanup([
@@ -236,7 +236,7 @@ struct NSEStagedAssetKeyQueueTests {
         try insertDurable(world, folder: world.archive, isInInbox: false)
         try stage(world, messageId: "msg-1", aiCompleted: false)
         try stage(world, messageId: "msg-3", aiCompleted: true)
-        try world.pool.write { try $0.execute(sql: "DROP TABLE bodyAssetPendingDelete") }
+        try await world.pool.write { try $0.execute(sql: "DROP TABLE bodyAssetPendingDelete") }
 
         await NSEDataBridge.applyOldEpochStagingCleanup(
             [.init(id: "acc1:msg-3", headerId: stagedKey("msg-3"))], nseDB: world.staging)
