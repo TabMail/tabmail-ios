@@ -510,8 +510,10 @@ extension DatabaseIndexTests {
         #expect(check.unexplained.count == 4, "\(check.unexplained)")
         #expect(check.unexplained.filter { $0.contains("TabMail/Fixture.swift") && $0.contains("message_ids") }.count == 1)
         #expect(check.unexplained.filter { $0.contains("otherDeclaration") }.count == 1)
-        #expect(check.unexplained.filter { $0.contains(malformed) && $0.contains("incomplete input") }.count == 1)
-        #expect(check.unexplained.filter { $0.contains(misspelled) }.count == 1)
+        // A row is picked by its whole text after the site's colon: the run-time fragment's
+        // text starts with `malformed`, so a plain `contains(malformed)` also matches it.
+        #expect(check.unexplained.filter { $0.contains(": \(malformed)\n") && $0.contains("incomplete input") }.count == 1)
+        #expect(check.unexplained.filter { $0.contains(": \(misspelled)\n") }.count == 1)
     }
 
     /// Pins the named waivers apart from the loop: which preparation errors leave a
