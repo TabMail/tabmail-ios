@@ -702,7 +702,9 @@ struct BodyAssetPreparationLeaseTests {
     /// The UPGRADE half of `migrateAttachmentIdentitySchema`'s convergence claim
     /// (ADR-IOS-066 / T5.1). A manifest that predates `identityStamp` must gain the
     /// column and then behave identically to a freshly created one — otherwise every
-    /// existing install's attachment cache is a hard error rather than a miss.
+    /// existing install's attachment cache is a hard error rather than a miss. The
+    /// upgrade runs through `migrateManifestSchema`, the entry point every manifest
+    /// open calls, so the test fails if that entry point stops running the upgrade.
     @Test("A manifest that predates identityStamp upgrades and then serves stamped attachments")
     func attachmentIdentitySchemaUpgradesAnExistingManifest() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -746,8 +748,8 @@ struct BodyAssetPreparationLeaseTests {
                 "precondition: the column really is absent before the upgrade")
 
         // Run twice — the upgrade path is also re-entered on every manifest open.
-        try queue.write { db in try BodyAssetStore.migrateAttachmentIdentitySchema(db) }
-        try queue.write { db in try BodyAssetStore.migrateAttachmentIdentitySchema(db) }
+        try queue.write { db in try BodyAssetStore.migrateManifestSchema(db) }
+        try queue.write { db in try BodyAssetStore.migrateManifestSchema(db) }
         let hasColumnAfter = try hasIdentityStampColumn()
         #expect(hasColumnAfter)
 
