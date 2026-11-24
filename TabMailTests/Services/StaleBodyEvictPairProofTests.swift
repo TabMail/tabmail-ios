@@ -240,10 +240,12 @@ struct StaleBodyEvictPairProofTests {
         var wallMs: [Double] = []
         /// The maintenance pass's deferred step, whole, through the production function.
         var stepWallMs: [Double] = []
-        /// The WAL file's size right after that step, before this proof truncates it:
-        /// what the step's one transaction wrote to the WAL (the step's own checkpoint
-        /// is PASSIVE, which leaves the file at that size).
+        /// The WAL file's size when the step's write has committed, read just before the
+        /// step's own checkpoint (a TRUNCATE, which empties it): what the step's one
+        /// transaction wrote to the WAL.
         var stepWalBytes: [Int] = []
+        /// That checkpoint's own time: a second writer hold, after the step's write.
+        var stepCheckpointMs: [Double] = []
         /// The step's three statements apart, each run on its own fresh copy.
         var fillMs: [Double] = []
         var indexMs: [Double] = []
@@ -282,24 +284,49 @@ struct StaleBodyEvictPairProofTests {
 
     /// Runs the maintenance pass's deferred step on `url` as the app runs it after the
     /// upgrade (`SyncEngine.runRefreshPlannerStatisticsIfStale`, with a marker of its
-    /// own so the app's is untouched). Returns its wall time, its result and the WAL
-    /// file's size after it, read before the truncate below.
+    /// own so the app's is untouched). Its checkpoint is the app's
+    /// (`checkpointWALThrottled(truncate: true, pool:)`, the step's default, pinned by
+    /// `SyncEngineMaintenanceTests.deferredBuildCheckpointsWithTheThrottledTruncate`),
+    /// with the WAL file's size read just before it. Returns the step's wall time (its
+    /// checkpoint included), its result, that size (-1 when the step built nothing, so
+    /// no checkpoint ran) and the checkpoint's own time.
     static func runDeferredStep(_ url: URL) async throws -> (
-        wallMs: Double, result: SyncEngine.PlannerStatisticsRefresh, walBytes: Int
+        wallMs: Double, result: SyncEngine.PlannerStatisticsRefresh, walBytes: Int, checkpointMs: Double
     ) {
         let suiteName = "StaleBodyEvictPairProof.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let pool = try DatabasePool(path: url.path, configuration: AppDatabase.makeConfiguration())
+        let seen = DeferredCheckpointRecord()
         let start = DispatchTime.now().uptimeNanoseconds
         let result = await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: PrioritizedDatabase(pool: pool, priority: .background),
-            defaults: defaults, markerKey: "plannerStatisticsSchemaVersion")
+            defaults: defaults, markerKey: "plannerStatisticsSchemaVersion",
+            checkpointWAL: { written in
+                let bytes = (try? Self.walFileBytes(url)) ?? -1
+                let checkpointStart = DispatchTime.now().uptimeNanoseconds
+                await SyncEngine.checkpointWALThrottled(truncate: true, pool: written)
+                let checkpointEnd = DispatchTime.now().uptimeNanoseconds
+                await seen.record(walBytes: bytes, checkpointMs: Double(checkpointEnd - checkpointStart) / 1_000_000)
+            })
         let elapsed = DispatchTime.now().uptimeNanoseconds - start
-        let walBytes = try Self.walFileBytes(url)
         try await pool.writeWithoutTransaction { db in _ = try db.checkpoint(.truncate) }
         try pool.close()
-        return (Double(elapsed) / 1_000_000, result, walBytes)
+        let walBytes = await seen.walBytes
+        let checkpointMs = await seen.checkpointMs
+        return (Double(elapsed) / 1_000_000, result, walBytes, checkpointMs)
+    }
+
+    /// What the deferred step's checkpoint saw: the WAL file's size just before it, and
+    /// its own time.
+    actor DeferredCheckpointRecord {
+        var walBytes = -1
+        var checkpointMs = 0.0
+
+        func record(walBytes: Int, checkpointMs: Double) {
+            self.walBytes = walBytes
+            self.checkpointMs = checkpointMs
+        }
     }
 
     /// The size of `url`'s WAL file, 0 when there is none.
@@ -427,6 +454,7 @@ struct StaleBodyEvictPairProofTests {
             let step = try await Self.runDeferredStep(file)
             cost.stepWallMs.append(step.wallMs)
             cost.stepWalBytes.append(step.walBytes)
+            cost.stepCheckpointMs.append(step.checkpointMs)
             cost.stepResults.append(step.result)
             if run != 0 { try DBProof.removeDatabaseFiles(at: scratch) }
         }
@@ -1135,7 +1163,8 @@ struct StaleBodyEvictPairProofTests {
             lines.append("migration v116 (column and triggers) on the old file, \(migration.wallMs.count) runs: median \(ms(migrationWall.median)) ms, p10 \(ms(migrationWall.p10)), p90 \(ms(migrationWall.p90)), max \(ms(migrationWall.sorted.last ?? 0))")
             lines.append("  old file \(pagesText(migration.oldPages)); after v116 \(pagesText(migration.migratedPages)) (+\(migration.migratedPages - migration.oldPages)); headers with a cached-at time after v116: \(migration.filledByMigration); \(HTMLCachePair.indexName) after v116: \(migration.indexedByMigration)")
             lines.append("deferred step (fill, index and ANALYZE in one write, runRefreshPlannerStatisticsIfStale), \(migration.stepWallMs.count) runs: median \(ms(stepWall.median)) ms, p10 \(ms(stepWall.p10)), p90 \(ms(stepWall.p90)), max \(ms(stepWall.sorted.last ?? 0)); results \(Set(migration.stepResults.map { "\($0)" }).sorted())")
-            lines.append("  WAL file after the step (before the truncate): \(Self.walText(migration.stepWalBytes))")
+            lines.append("  WAL file when the step's write commits (before its TRUNCATE checkpoint): \(Self.walText(migration.stepWalBytes))")
+            lines.append("  that checkpoint, a second writer hold after the write: \(Self.checkpointText(migration.stepCheckpointMs))")
             lines.append("  its statements apart, \(migration.fillMs.count) runs each: fill median \(ms(fill.median)) ms (p90 \(ms(fill.p90))); index median \(ms(index.median)) (p90 \(ms(index.p90))); ANALYZE median \(ms(analyze.median)) (p90 \(ms(analyze.p90)))")
             lines.append("  body pages (messageBody and its primary key): \(pagesText(migration.bodyPages)); per MB of them: fill \(perMB(fill.median)) ms, step \(perMB(stepWall.median)) ms")
             lines.append("  after the step \(pagesText(migration.steppedPages)) (+\(migration.steppedPages - migration.migratedPages) over v116); free after dropping messageBody_staleEvict \(pagesText(migration.pairFreePages))")
@@ -1227,7 +1256,8 @@ struct StaleBodyEvictPairProofTests {
             "cached bodies: \(larger.census.total) (inbox \(larger.census.inbox), folder newest \(larger.census.folderNewest), fresh \(larger.census.fresh)); the old step's settle pass evicted \(larger.settled)",
             "migration v116, \(migration.wallMs.count) runs: median \(ms(migrationWall.median)) ms, p90 \(ms(migrationWall.p90))",
             "deferred step, \(migration.stepWallMs.count) runs: median \(ms(stepWall.median)) ms, p10 \(ms(stepWall.p10)), p90 \(ms(stepWall.p90)), max \(ms(stepWall.sorted.last ?? 0)); results \(Set(migration.stepResults.map { "\($0)" }).sorted())",
-            "  WAL file after the step (before the truncate): \(Self.walText(migration.stepWalBytes))",
+            "  WAL file when the step's write commits (before its TRUNCATE checkpoint): \(Self.walText(migration.stepWalBytes))",
+            "  that checkpoint, a second writer hold after the write: \(Self.checkpointText(migration.stepCheckpointMs))",
             "  headers filled: \(migration.headersFilled); pair mismatches after the fill: \(migration.mismatches)",
             "-- against the main run at the same size",
             line("HTML \(larger.htmlBytes.lowerBound)-\(larger.htmlBytes.upperBound) bytes", migration),
@@ -1240,6 +1270,13 @@ struct StaleBodyEvictPairProofTests {
     }
 
     private static func ms(_ value: Double) -> String { String(format: "%.3f", value) }
+
+    /// The step's checkpoint times: median, p90 and max over the runs.
+    private static func checkpointText(_ times: [Double]) -> String {
+        guard !times.isEmpty else { return "n/a" }
+        let distribution = DBProof.Distribution(times)
+        return "median \(ms(distribution.median)) ms, p90 \(ms(distribution.p90)), max \(ms(distribution.sorted.last ?? 0)) over \(times.count) runs"
+    }
 
     /// The step's WAL sizes in MB: median and max over the runs.
     private static func walText(_ bytes: [Int]) -> String {

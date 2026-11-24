@@ -74,7 +74,8 @@ reads `messageBody_staleEvict` any more and it is out of `SyncEngine.deferredInd
 `ANALYZE`. The fill reads every cached body once, as `messageBody_staleEvict`'s build did, and also
 rewrites one header row per cached body, and the index covers every header, all in the one write, so
 the step costs more than that build did (`StaleBodyEvictPairProofTests` reports it at 105k and 525k
-headers, with the WAL size after it). This row's points apply to it as they did to that build: it runs
+headers, with the WAL size its write leaves and the time of the TRUNCATE checkpoint the step runs
+after it commits, a second writer hold). This row's points apply to it as they did to that build: it runs
 in the first background maintenance pass after the upgrade, never on the launch path, and a
 `.priority` write issued during it (a Send) waits for it once. The evict waits for it
 (`runEvictStaleBodiesIfIndexed`, now pointed at `messageHeader_htmlCachedAt`). **A named exception to

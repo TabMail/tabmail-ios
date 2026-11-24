@@ -428,6 +428,31 @@ struct SyncEngineMaintenanceTests {
                 "the step's parameter with its default and its one call, and no caller passing another: \(uses)")
     }
 
+    /// Production's checkpoint after a deferred index build is the throttled TRUNCATE on
+    /// the pool the step wrote to, `checkpointWALThrottled(truncate: true, pool:)`, the
+    /// refresh's default, and no production caller passes another. One that did nothing
+    /// would leave the build's whole WAL for later; one on `backgroundPool` would
+    /// checkpoint another database than the one a pass on its own pool wrote; a PASSIVE
+    /// one would make the pass's closing TRUNCATE skip inside the throttle's interval
+    /// and leave the WAL file at its largest ("THE WAL AFTER A BUILD"). The AI-cache
+    /// purge's `checkpointWAL` (a PASSIVE between batches, never after its last) is
+    /// listed too, as every production line naming the parameter is. The tests that run
+    /// the refresh pass their own, so only the source shows which one production runs.
+    @Test("Production's deferred index step checkpoints after a build with the throttled TRUNCATE on its own pool, its default, and no caller passes another")
+    func deferredBuildCheckpointsWithTheThrottledTruncate() {
+        let uses = Self.productionCodeLines()
+            .filter { $0.code.contains("checkpointWAL:") || $0.code.contains("checkpointWAL(") }
+            .map { "\($0.file): \($0.code)" }
+        let expected = [
+            "SyncEngineMaintenance.swift: checkpointWAL: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }",
+            "SyncEngineMaintenance.swift: await checkpointWAL()",
+            "SyncEngineMaintenance.swift: checkpointWAL: @Sendable (PrioritizedDatabase) async -> Void = { await SyncEngine.checkpointWALThrottled(truncate: true, pool: $0) }",
+            "SyncEngineMaintenance.swift: if !missing.isEmpty { await checkpointWAL(dbPool) }",
+        ]
+        #expect(uses == expected,
+                "each step's parameter with its default and its one call, and no caller passing another: \(uses)")
+    }
+
     /// Every line of production code under `TabMail/`, trimmed, with its file's
     /// name. Comment lines are left out.
     static func productionCodeLines() -> [(file: String, code: String)] {

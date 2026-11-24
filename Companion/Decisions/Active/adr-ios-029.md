@@ -180,9 +180,11 @@ did, and it also rewrites one header row per cached body, and the index covers e
 the one write, so the step costs more than that build did. It runs where that build ran: in the
 first background maintenance pass after the upgrade (`runWALMaintenance`, `.background`), never on
 the launch path; a `.priority` write issued while it holds the writer (a Send) waits for it once.
-After it commits, the step calls `checkpointWALThrottled` with the pool it wrote to, as every batch
-writer does. `StaleBodyEvictPairProofTests` reports v116's time and the step's (whole, its three
-statements apart, and per MB of body pages) and the WAL size after it, at 105k and 525k headers, and
+After it commits, the step calls `checkpointWALThrottled(truncate: true)` with the pool it wrote to:
+a TRUNCATE, because a PASSIVE checkpoint there would make the pass's closing TRUNCATE skip inside the
+throttle's interval and leave the WAL file at its largest. `StaleBodyEvictPairProofTests` reports
+v116's time and the step's (whole, its three statements apart, and per MB of body pages), the WAL
+size its write leaves and its checkpoint's time, at 105k and 525k headers, and
 the step again at 105k with bodies of 24 to 40 KB. Rule 1: it serves exactly the evict's keyset page
 (`isInInbox = 0 AND htmlCachedAt < ?` in `(htmlCachedAt, rowid)` order) and "no cached HTML"
 (`htmlCachedAt IS NULL` under one `isInInbox` value); `SyncEngineMaintenanceTests.staleBodyPageSeeksItsIndex`

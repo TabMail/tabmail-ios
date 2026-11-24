@@ -4596,7 +4596,7 @@ final class AppDatabase: Sendable {
         //   (`SyncEngine.deferredIndexes`, `HTMLCachePair.fillSQL` and `.indexSQL`),
         //   in one write with the `ANALYZE` that gives the index its statistics
         //   (#1401, ADR-IOS-029). Until that write commits, those bodies read as not
-        //   cached and the evict waits (`HTMLCachePair`, "Before the first upgrade
+        //   cached and the evict waits (`HTMLCachePair`, "Before the deferred index
         //   step").
         // - Write cost: a body save or delete also rewrites its header row, and once
         //   the index exists moves one index entry; a header insert or id change

@@ -542,10 +542,9 @@ actor SyncEngine {
     /// off the constantly-running backfill — not just the sparse per-poll maintenance, which
     /// ran 0x in a 44-min capture — is what bounds the WAL reliably.
     ///
-    /// `pool` is `backgroundPool` for every caller but one: the deferred index step passes
-    /// the pool it wrote to (`runRefreshPlannerStatisticsIfStale`), because it can run
-    /// before the database is published and `backgroundPool` is reached through
-    /// `AppDatabase.shared`. That pool is `.background` from the maintenance pass too.
+    /// `pool` is `backgroundPool` for every caller in the app. The deferred index step
+    /// passes the pool it wrote to (`runRefreshPlannerStatisticsIfStale`), so a pass run
+    /// on another database (a test, the size proof) checkpoints that database.
     nonisolated static func checkpointWALThrottled(
         truncate: Bool = false, pool: PrioritizedDatabase = AppDatabase.backgroundPool
     ) async {

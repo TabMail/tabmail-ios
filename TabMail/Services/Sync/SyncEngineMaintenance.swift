@@ -1305,12 +1305,18 @@ extension SyncEngine {
     /// above).
     ///
     /// THE WAL AFTER A BUILD. A write that built an index (and ran a fill for one)
-    /// wrote many pages in one transaction, and autocheckpoint is off, so after it
-    /// commits this calls `checkpointWAL` with the pool it wrote to
-    /// (`checkpointWALThrottled(pool:)` in the app), outside the write, as every batch
-    /// writer checkpoints after its batch. It is the one checkpoint helper, throttle
-    /// included: a checkpoint run less than `walCheckpointMinIntervalSeconds` earlier
-    /// skips this one, and the next batch writer's checkpoint takes those frames. A
+    /// wrote many pages in one transaction, the largest WAL of the pass, and
+    /// autocheckpoint is off, so after it commits this calls `checkpointWAL` with the
+    /// pool it wrote to (`checkpointWALThrottled(truncate: true, pool:)` in the app),
+    /// outside the write. It is the one checkpoint helper, throttle included. It asks
+    /// for a TRUNCATE, which leaves the WAL file empty, because the throttle lets only
+    /// one checkpoint through per `walCheckpointMinIntervalSeconds`: a PASSIVE one here
+    /// would make the pass's closing TRUNCATE (`scheduleMaintenanceInBackground`), which
+    /// follows this last step within that window, skip, and the file would stay at its
+    /// largest until a later pass. The background-processing pass, which has no closing
+    /// checkpoint, gets its TRUNCATE here too. A checkpoint run less than the interval
+    /// earlier skips this one, and the next batch writer's checkpoint takes those
+    /// frames. It runs once per build, so its wait on readers is a one-time cost. A
     /// refresh that built nothing writes only `sqlite_stat1` and adds no checkpoint.
     ///
     /// ⚠️ THIS FUNCTION IS `async` FOR ONE REASON, AND THE PREVIOUS VERSION OF THIS
@@ -1338,7 +1344,7 @@ extension SyncEngine {
         defaults: UserDefaults = .standard,
         markerKey: String = plannerStatisticsSchemaVersionKey,
         indexes: [DeferredIndex] = SyncEngine.deferredIndexes,
-        checkpointWAL: @Sendable (PrioritizedDatabase) async -> Void = { await SyncEngine.checkpointWALThrottled(pool: $0) }
+        checkpointWAL: @Sendable (PrioritizedDatabase) async -> Void = { await SyncEngine.checkpointWALThrottled(truncate: true, pool: $0) }
     ) async -> PlannerStatisticsRefresh {
         // SINGLE-FLIGHT. Taken BEFORE the marker read, because the race is two
         // callers both reading the marker stale — taking it after the read would

@@ -73,9 +73,13 @@ inbox instead reads about 85k rows at 105k.
    that build. It runs in the first background maintenance pass after the upgrade
    (`runWALMaintenance`, `.background`), never on the launch path; a `.priority` write issued
    while it holds the writer (a Send) waits for it once. After it commits, the step calls
-   `SyncEngine.checkpointWALThrottled` with the pool it wrote to, the one checkpoint helper, so a
-   checkpoint run moments earlier in the same pass can skip this one and leave its frames to the
-   next batch writer's checkpoint (the proof reports the WAL size after the step).
+   `SyncEngine.checkpointWALThrottled(truncate: true)` with the pool it wrote to, the one
+   checkpoint helper. A TRUNCATE, because the throttle lets one checkpoint through per interval
+   and this is the pass's last step: a PASSIVE one would make the pass's closing TRUNCATE skip and
+   leave the WAL file at its largest until a later pass; the background-processing pass, which has
+   no closing checkpoint, gets its TRUNCATE here too. A checkpoint run moments earlier can still
+   skip this one and leave its frames to the next batch writer's checkpoint. The proof reports the
+   WAL size the step's write leaves and the checkpoint's time.
    **Before the step,** a message whose HTML was cached before v116 and not written since reads
    as not cached: `fetchBody` and the thread view fetch its body again; the notification merge
    re-merges a staged row whose body predates v116 (its body insert is ignored, so the pair stays
@@ -85,6 +89,15 @@ inbox instead reads about 85k rows at 105k.
    is a named exception to ADR-IOS-029 NEGATIVE CASE 3 (recorded there and in IOS-PERF-005), and
    it rests on this paragraph: what its absence changes is a repeat fetch or merge, never a
    deletion or another message's content.
+
+**v116 changed before it merged (Data Integrity rule 5).** As first written on this branch, v116
+also ran the fill and built the index; the change that moved both to the deferred step removed those
+two statements from the same named migration. Rule 5 forbids appending to or renaming an applied
+migration; this only shrank one that no released database ran (main stops at v115). A development
+database that ran the first version converges: its column is filled and its index built with the
+same SQL, so the deferred step finds the index and skips the fill and the build, and building the
+index changed `schema_version`, so the pass still runs `ANALYZE` for it. The trigger SQL is the same
+in both versions.
 
 **Proof of need (why a column, triggers and an index):** no existing field says whether a header's
 HTML is cached or when. `bodyComplete` is the search-text pair (ADR-IOS-050) and is set for messages
