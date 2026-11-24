@@ -1415,15 +1415,17 @@ extension SyncEngine {
     /// `DatabaseWriteQueue` at the caller's tier (`.background` from both
     /// maintenance callers), so a user action's `.priority` write jumps ahead of
     /// this instead of waiting behind it. The third caller, the upgrade step, passes
-    /// `.priority`: it runs before the database is published, when no user action
-    /// can be queued behind it.
+    /// `.priority`: it runs before the database is published, or at the first
+    /// foreground of a process launched in the background, before the inbox shows;
+    /// either way the user is waiting for it and no user action can be queued behind it.
     ///
     /// The schema-version READ stays synchronous deliberately — see
     /// `plannerStatisticsSchemaVersion`, which exists only to keep that binding.
     ///
     /// It runs at most once per schema change: on an upgrade launch, behind the
     /// "Updating…" screen and before the database is published
-    /// (`AppDatabase.runUpgradeStep`, ADR-IOS-029 amendment of 2026-11-24, #1392),
+    /// (`AppDatabase.runUpgradeStep`, ADR-IOS-029 amendment of 2026-11-24, #1392), or
+    /// behind it at the first foreground of a process launched in the background,
     /// and otherwise from the background maintenance pass, which also finishes
     /// whatever an interrupted upgrade launch left. On a launch that is not an
     /// upgrade it never runs on the launch path.

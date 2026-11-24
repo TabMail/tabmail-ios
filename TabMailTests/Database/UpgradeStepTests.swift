@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// The upgrade step (`AppDatabase.runUpgradeStep`, ADR-IOS-029 amendment of
@@ -224,6 +225,118 @@ struct UpgradeStepTests {
         let liveVersion = try Self.schemaVersion(fixture.pool)
         #expect(marker != nil && marker == liveVersion,
                 "the marker must hold the schema version after the foreground launch: marker \(String(describing: marker)), live \(String(describing: liveVersion))")
+    }
+
+    /// What the database held when the inbox would have shown: the deferred indexes
+    /// still missing, the statistics marker and the live `schema_version`.
+    private struct AtFirstPaint: Sendable {
+        let missing: Set<String>
+        let marker: Int?
+        let liveVersion: Int?
+    }
+
+    /// A launch through `AppStartup` on the fixture's database, in the background or
+    /// the foreground, whose first paint records `AtFirstPaint`. A launch in the
+    /// background is never an upgrade launch, and the foreground one here is not one
+    /// either, so the probe answers false; the build is the real launch build.
+    @MainActor
+    private static func startup(
+        _ fixture: Fixture, isForeground: Bool, atFirstPaint: @escaping @Sendable (AtFirstPaint) -> Void
+    ) -> AppStartup {
+        let pool = fixture.pool
+        let suiteName = fixture.suiteName
+        let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
+        return AppStartup(
+            probe: { (pool, false) },
+            buildAndPublish: { built in
+                _ = try await AppDatabase.openForLaunch(pool: built, isUpgradeLaunch: false, runStartupResets: false)
+            },
+            preparation: {},
+            upkeep: {},
+            launch: (dbExisted: true, isForeground: isForeground),
+            markerSuiteName: suiteName,
+            firstPaint: {
+                let existing = (try? Self.existingIndexes(pool)) ?? []
+                let marker = UserDefaults(suiteName: suiteName)?
+                    .object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) as? Int
+                atFirstPaint(AtFirstPaint(
+                    missing: deferred.subtracting(existing), marker: marker,
+                    liveVersion: (try? Self.schemaVersion(pool)) ?? nil))
+            })
+    }
+
+    /// The upgrade step on the fixture's database with its defaults suite, for a
+    /// main-actor test (the suite is opened here, so no `UserDefaults` crosses actors).
+    private static func runStep(_ pool: DatabasePool, suiteName: String) async -> SyncEngine.PlannerStatisticsRefresh? {
+        guard let defaults = UserDefaults(suiteName: suiteName) else { return nil }
+        return await AppDatabase.runUpgradeStep(pool: pool, isUpgradeLaunch: true, defaults: defaults)
+    }
+
+    @Test("A process launched in the background runs the step at its first foreground, behind the Updating screen, before the inbox shows")
+    @MainActor
+    func backgroundLaunchedProcessRunsTheStepAtItsFirstForeground() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: try Self.existingIndexes(fixture.pool)),
+                "the fixture must start without the deferred indexes, or the launch proves nothing")
+        let seen = Mutex<AtFirstPaint?>(nil)
+        let startup = Self.startup(fixture, isForeground: false) { state in seen.withLock { $0 = state } }
+
+        // The launch in the background after the update (a silent push): the app
+        // delegate's trigger builds the database, migrations only.
+        #expect(await startup.ensureDatabaseReady())
+        #expect(!startup.isMigrating && !startup.isReady)
+        let builtInBackground = deferred.intersection(try Self.existingIndexes(fixture.pool))
+        #expect(builtInBackground.isEmpty, "the background launch built deferred indexes: \(builtInBackground.sorted())")
+        #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
+
+        // The user opens the app: the scene's task, in the same process.
+        await startup.runIfNeeded(navigationStore: NavigationStore())
+        #expect(startup.isMigrating, "the step ran without the Updating screen")
+        #expect(startup.isReady)
+        let recorded = seen.withLock { $0 }
+        let atPaint = try #require(recorded, "the inbox never showed")
+        #expect(atPaint.missing.isEmpty, "deferred indexes missing when the inbox showed: \(atPaint.missing.sorted())")
+        #expect(atPaint.marker != nil && atPaint.marker == atPaint.liveVersion,
+                "the statistics were not current when the inbox showed: marker \(String(describing: atPaint.marker)), live \(String(describing: atPaint.liveVersion))")
+    }
+
+    @Test("A process launched in the background whose database has no upgrade work shows no Updating screen at its first foreground")
+    @MainActor
+    func backgroundLaunchedProcessWithNothingToDoShowsNoUpdatingScreen() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let settled = await Self.runStep(fixture.pool, suiteName: fixture.suiteName)
+        #expect(settled == .refreshed, "the fixture must start with nothing left to do")
+        let seen = Mutex<AtFirstPaint?>(nil)
+        let startup = Self.startup(fixture, isForeground: false) { state in seen.withLock { $0 = state } }
+
+        #expect(await startup.ensureDatabaseReady())
+        await startup.runIfNeeded(navigationStore: NavigationStore())
+        #expect(!startup.isMigrating, "the Updating screen showed with nothing to update")
+        #expect(startup.isReady)
+        let recorded = seen.withLock { $0 }
+        let atPaint = try #require(recorded, "the inbox never showed")
+        #expect(atPaint.missing.isEmpty)
+    }
+
+    @Test("A process launched in the foreground runs nothing more at its first foreground than its launch decided")
+    @MainActor
+    func foregroundLaunchedProcessRunsNoSecondStep() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
+        let seen = Mutex<AtFirstPaint?>(nil)
+        let startup = Self.startup(fixture, isForeground: true) { state in seen.withLock { $0 = state } }
+
+        await startup.runIfNeeded(navigationStore: NavigationStore())
+        #expect(!startup.isMigrating)
+        #expect(startup.isReady)
+        let recorded = seen.withLock { $0 }
+        let atPaint = try #require(recorded, "the inbox never showed")
+        #expect(atPaint.missing == deferred, "the foreground entry ran a step the launch did not decide on")
+        #expect(atPaint.marker == nil)
     }
 
     @Test("On any other launch the launch build runs no step: indexes, statistics and marker untouched")

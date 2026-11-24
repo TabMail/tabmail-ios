@@ -534,7 +534,8 @@ struct TabMailApp: App {
 ///      launch (`AppDatabase.isUpgradeLaunch`): a foreground launch on a database
 ///      that existed before this launch, with pending migration work, a missing
 ///      deferred index or planner statistics older than the schema. A background
-///      launch is never one.
+///      launch is never one: its process runs the upgrade step at its first
+///      foreground instead (`runIfNeeded`), behind the same "Updating…" screen.
 ///      While this runs the UI shows a blank launch screen (matching the empty
 ///      `UILaunchScreen`).
 ///   2. **Migrate + load** — build the database (`AppDatabase.openForLaunch`) and
@@ -563,9 +564,12 @@ final class AppStartup {
     /// True on an upgrade launch (`AppDatabase.isUpgradeLaunch`): real,
     /// potentially-slow upgrade work (migrations, resets, a missing deferred
     /// index or stale planner statistics) on an EXISTING database, at a foreground
-    /// launch — drives the one-time "Updating…" splash. Stays false on the common
+    /// launch — drives the one-time "Updating…" splash. Also set at the first
+    /// foreground of a process launched in the background when its database has that
+    /// work (`runUpgradeStepAtFirstForeground`). Stays false on the common
     /// path (a migrated DB with every deferred index and current statistics), on a
-    /// fresh install's first launch and on a background launch, so the launch
+    /// fresh install's first launch and while a background launch has not been
+    /// brought to the foreground, so the launch
     /// screen shows blank until the inbox is ready instead of flashing the
     /// migration splash on every launch.
     private(set) var isMigrating = false
@@ -590,6 +594,16 @@ final class AppStartup {
     /// Continuations parked by `ensureDatabaseReady()` while the DB is building.
     private var dbWaiters: [CheckedContinuation<Void, Never>] = []
 
+    /// Set by the database build of a launch in the background, which runs no
+    /// upgrade step (`AppDatabase.isUpgradeLaunch` is false there): the database and
+    /// whether its file existed before the launch. The process's first foreground
+    /// (`runIfNeeded`) takes it and runs the step (`runUpgradeStepAtFirstForeground`).
+    private var upgradeStepWaitsForForeground: (pool: DatabasePool, dbExisted: Bool)?
+
+    /// The first foreground's upgrade step once started, so a second foreground entry
+    /// waits for it rather than showing the inbox while it runs.
+    private var firstForegroundUpgradeStep: Task<Void, Never>?
+
     private init() {}
 
     #if DEBUG
@@ -599,6 +613,12 @@ final class AppStartup {
     private var testBuildAndPublish: (@Sendable (DatabasePool) async throws -> Void)?
     private var testPreparation: (@MainActor () async -> Void)?
     private var testUpkeep: (@MainActor () -> Void)?
+    // The launch's facts (the file existed, the launch is in the foreground), the
+    // statistics marker's defaults suite and the first paint, for a test of the
+    // first-foreground upgrade step; nil in every other test.
+    private var testLaunch: (dbExisted: Bool, isForeground: Bool)?
+    private var testMarkerSuiteName: String?
+    private var testFirstPaint: (@MainActor () async -> Void)?
     var databaseWaiterCountForTesting: Int { dbWaiters.count }
     private(set) var paintPollCountForTesting = 0
 
@@ -606,12 +626,18 @@ final class AppStartup {
         probe: @escaping @Sendable () async throws -> (pool: DatabasePool, isUpgradeLaunch: Bool),
         buildAndPublish: @escaping @Sendable (DatabasePool) async throws -> Void,
         preparation: @escaping @MainActor () async -> Void,
-        upkeep: @escaping @MainActor () -> Void
+        upkeep: @escaping @MainActor () -> Void,
+        launch: (dbExisted: Bool, isForeground: Bool)? = nil,
+        markerSuiteName: String? = nil,
+        firstPaint: (@MainActor () async -> Void)? = nil
     ) {
         testProbe = probe
         testBuildAndPublish = buildAndPublish
         testPreparation = preparation
         testUpkeep = upkeep
+        testLaunch = launch
+        testMarkerSuiteName = markerSuiteName
+        testFirstPaint = firstPaint
     }
 
     func signalFirstPaintForTesting() { isReady = true }
@@ -644,13 +670,14 @@ final class AppStartup {
         // `makePool()` creates it. A fresh/empty DB migrates instantly, so we
         // never show the migration splash on first install (it would falsely
         // read "Updating…" with nothing to update).
-        let dbExisted = FileManager.default.fileExists(atPath: AppDatabase.databaseURL.path)
         // Whether the user is opening the app, read once here at the start of the
         // build (the same rule as `DatabaseSuspension.start()`): a background launch
         // (silent push, background refresh, notification action) is `.background`, a
         // launch the user opens is `.inactive` on its way to `.active`. Only a
-        // foreground launch can be an upgrade launch (`AppDatabase.isUpgradeLaunch`).
-        let isForegroundLaunch = UIApplication.shared.applicationState != .background
+        // foreground launch can be an upgrade launch (`AppDatabase.isUpgradeLaunch`);
+        // a background launch leaves the upgrade step to the process's first
+        // foreground (`runUpgradeStepAtFirstForeground`).
+        let (dbExisted, isForegroundLaunch) = launchFacts()
         BootProfiler.mark("ensureDatabaseReady enter (dbExisted=\(dbExisted), foreground=\(isForegroundLaunch))")
 
         // Phase 1 (off main): open the pool + cheaply decide whether this is an
@@ -731,6 +758,12 @@ final class AppStartup {
         }
         BackgroundSyncLogger.log("AppStartup: database ready in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
         BootProfiler.mark("db.built+migrated (AppDatabase.shared published)")
+        // A background launch ran no upgrade step: the first foreground runs it. Set
+        // before the waiters are released, so a foreground entry parked on this build
+        // finds it.
+        if !isForegroundLaunch {
+            upgradeStepWaitsForForeground = (pool, dbExisted)
+        }
 
         // DB-dependent NON-UI launch steps, in the same spirit/order as before
         // (all touch AppDatabase / shared UserDefaults). These previously lived
@@ -766,6 +799,16 @@ final class AppStartup {
         startDatabaseUpkeep()
         #endif
         return true
+    }
+
+    /// Whether the database file exists (read before `makePool()` creates it) and
+    /// whether this launch is in the foreground.
+    private func launchFacts() -> (dbExisted: Bool, isForeground: Bool) {
+        #if DEBUG
+        if let testLaunch { return testLaunch }
+        #endif
+        return (FileManager.default.fileExists(atPath: AppDatabase.databaseURL.path),
+                UIApplication.shared.applicationState != .background)
     }
 
     private func prepareDatabaseForLaunch() async {
@@ -837,11 +880,22 @@ final class AppStartup {
         for waiter in waiters { waiter.resume() }
     }
 
-    /// Foreground entry: build the DB (if not already) then run the UI-only step
-    /// — the initial sidebar load — and flip `isReady` to route splash → inbox.
-    /// Called from `TabMailApp.body.task`. Idempotent.
+    /// Foreground entry: build the DB (if not already), run the upgrade step a
+    /// background launch left (`runUpgradeStepAtFirstForeground`), then run the
+    /// UI-only step — the initial sidebar load — and flip `isReady` to route
+    /// splash → inbox. Called from `TabMailApp.body.task`. Idempotent.
     func runIfNeeded(navigationStore: NavigationStore) async {
         guard await ensureDatabaseReady(), !isReady else { return }
+        // A process launched in the background built its database without the
+        // upgrade step; its first foreground runs it here, before the inbox shows.
+        await runUpgradeStepAtFirstForeground()
+        #if DEBUG
+        if let testFirstPaint {
+            await testFirstPaint()
+            isReady = true
+            return
+        }
+        #endif
         // Debug-gated (no-op unless debug logging is unlocked): stamps
         // "⚠ MAIN THREAD STALL ~Xms" into the BootProfile timeline so a reported
         // main-actor stall can be correlated against the surrounding merge/sync/
@@ -880,6 +934,59 @@ final class AppStartup {
         // Visually a no-op on a fast resume (blank → inbox are both .identity).
         withAnimation(.easeOut(duration: 0.3)) { isReady = true }
         BootProfiler.mark("★ isReady=true → FIRST PAINT (inbox on screen)")
+    }
+
+    /// The upgrade step at the first foreground of a process launched in the
+    /// background (ADR-IOS-029, #1392). That launch built the database without the
+    /// step (`AppDatabase.isUpgradeLaunch` is false in the background), and a silent
+    /// push often starts the process after an update before the user opens the app,
+    /// so the first launch the user sees is this one. When the database has upgrade
+    /// work (`AppDatabase.isUpgradeLaunch`, asked as a foreground launch with the
+    /// build's `dbExisted`), the "Updating…" screen shows and the step runs with no
+    /// time limit, as on a launch in the foreground, before the caller shows the
+    /// inbox. Its write takes the `.priority` tier, ahead of queued background
+    /// writes. Runs at most once per process; a second caller waits for the first.
+    /// A failed probe runs nothing: the maintenance pass does the work, as before
+    /// #1392.
+    private func runUpgradeStepAtFirstForeground() async {
+        if let running = firstForegroundUpgradeStep {
+            await running.value
+            return
+        }
+        guard let waiting = upgradeStepWaitsForForeground else { return }
+        upgradeStepWaitsForForeground = nil
+        #if DEBUG
+        let suiteName = testMarkerSuiteName
+        #else
+        let suiteName: String? = nil
+        #endif
+        let step = Task.detached(priority: .userInitiated) { [self] in
+            let defaults = suiteName.flatMap { UserDefaults(suiteName: $0) } ?? .standard
+            let pending: Bool
+            do {
+                pending = try AppDatabase.isUpgradeLaunch(
+                    waiting.pool, dbExisted: waiting.dbExisted, isForegroundLaunch: true, defaults: defaults)
+            } catch {
+                if DebugModeManager.isLoggingEnabled() {
+                    BackgroundSyncLogger.logDebug("[AppStartup] first-foreground upgrade probe failed, left to the maintenance pass: \(error)")
+                }
+                return
+            }
+            BootProfiler.mark("first foreground: upgrade probe (upgradeLaunch=\(pending))")
+            guard pending else { return }
+            await self.showUpgradeScreen()
+            let outcome = await AppDatabase.runUpgradeStep(
+                pool: waiting.pool, isUpgradeLaunch: true, defaults: defaults)
+            BootProfiler.mark("first foreground: db.upgradeStep \(outcome.map { "\($0)" } ?? "none")")
+        }
+        firstForegroundUpgradeStep = step
+        await step.value
+    }
+
+    /// Switches the launch screen to "Updating…" for the upgrade step.
+    private func showUpgradeScreen() {
+        isMigrating = true
+        BackgroundSyncLogger.log("AppStartup: upgrade work at the first foreground — showing migration splash")
     }
 
     /// Suspends until the launch milestone appropriate for the caller, kicking off

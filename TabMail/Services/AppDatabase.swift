@@ -136,10 +136,11 @@ final class AppDatabase: Sendable {
     /// (`hasPendingUpgradeWork`). A fresh install's first launch is never one: its
     /// brand-new file migrates instantly and holds no mail. A launch in the
     /// background (a silent push, a background refresh, a notification action) is
-    /// never one either: it migrates as before and leaves the index builds and the
-    /// statistics to the maintenance pass, so a wake the user does not see spends
-    /// no time on them. Any later foreground launch whose database still lacks a
-    /// deferred index, or whose statistics are older than its schema, is one.
+    /// never one either: it migrates as before, so a wake the user does not see
+    /// spends no time on the step, and the process's first foreground asks again as
+    /// a foreground launch (`AppStartup.runIfNeeded`) and runs the step then. Any
+    /// later foreground launch whose database still lacks a deferred index, or whose
+    /// statistics are older than its schema, is one.
     static func isUpgradeLaunch(
         _ reader: some DatabaseReader, dbExisted: Bool, isForegroundLaunch: Bool,
         defaults: UserDefaults = .standard
@@ -157,10 +158,13 @@ final class AppDatabase: Sendable {
     /// for an `ANALYZE` while the user works. On any other launch it does nothing and
     /// returns nil.
     ///
-    /// Nothing else can reach the database here (it is not published yet), so the
-    /// write's tier only names that the user is waiting for it. If the write fails or
-    /// is abandoned it rolls back whole and leaves the marker stale, and the
-    /// maintenance pass does the work as before.
+    /// On a launch in the foreground nothing else can reach the database here (it is
+    /// not published yet), so the write's tier only names that the user is waiting for
+    /// it. At the first foreground of a process launched in the background
+    /// (`AppStartup.runIfNeeded`) the database is published, and the tier puts the
+    /// step ahead of queued background writes while the inbox waits for it. If the
+    /// write fails or is abandoned it rolls back whole and leaves the marker stale,
+    /// and the maintenance pass does the work as before.
     @discardableResult
     static func runUpgradeStep(
         pool: DatabasePool, isUpgradeLaunch: Bool, defaults: UserDefaults = .standard
