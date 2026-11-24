@@ -185,6 +185,47 @@ struct UpgradeStepTests {
                 "the marker must hold the schema version after the build: marker \(String(describing: marker)), live \(String(describing: liveVersion))")
     }
 
+    @Test("A background launch after an update builds no deferred index and runs no statistics; the next foreground launch runs both before it returns the database")
+    func backgroundLaunchLeavesTheStepToTheNextForegroundLaunch() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: try Self.existingIndexes(fixture.pool)),
+                "the fixture must start without the deferred indexes, or the launches prove nothing")
+        #expect(try Self.statisticsRows(fixture.pool).isEmpty)
+
+        // The first launch after the update is a background one (a silent push):
+        // the file existed and the update left upgrade work.
+        let backgroundUpgrade = try AppDatabase.isUpgradeLaunch(
+            fixture.pool, dbExisted: true, isForegroundLaunch: false, defaults: fixture.defaults)
+        #expect(backgroundUpgrade == false)
+        _ = try await AppDatabase.openForLaunch(
+            pool: fixture.pool, isUpgradeLaunch: backgroundUpgrade, runStartupResets: false,
+            defaults: fixture.defaults)
+        let builtInBackground = deferred.intersection(try Self.existingIndexes(fixture.pool))
+        #expect(builtInBackground.isEmpty, "a background launch built deferred indexes: \(builtInBackground.sorted())")
+        #expect(try Self.statisticsRows(fixture.pool).isEmpty, "a background launch ran ANALYZE")
+        #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
+
+        // The next launch is the user opening the app: an upgrade launch, so the
+        // "Updating…" screen shows and the build runs the step before it returns.
+        let foregroundUpgrade = try AppDatabase.isUpgradeLaunch(
+            fixture.pool, dbExisted: true, isForegroundLaunch: true, defaults: fixture.defaults)
+        #expect(foregroundUpgrade == true)
+        _ = try await AppDatabase.openForLaunch(
+            pool: fixture.pool, isUpgradeLaunch: foregroundUpgrade, runStartupResets: false,
+            defaults: fixture.defaults)
+        let missing = deferred.subtracting(try Self.existingIndexes(fixture.pool))
+        #expect(missing.isEmpty, "deferred indexes missing after the foreground launch: \(missing.sorted())")
+        let withoutStatistics = deferred.subtracting(try Self.statisticsRows(fixture.pool))
+        #expect(withoutStatistics.isEmpty,
+                "deferred indexes with no sqlite_stat1 row after the foreground launch: \(withoutStatistics.sorted())")
+        let marker = fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) as? Int
+        let liveVersion = try Self.schemaVersion(fixture.pool)
+        #expect(marker != nil && marker == liveVersion,
+                "the marker must hold the schema version after the foreground launch: marker \(String(describing: marker)), live \(String(describing: liveVersion))")
+    }
+
     @Test("On any other launch the launch build runs no step: indexes, statistics and marker untouched")
     func launchBuildOnOtherLaunchRunsNoStep() async throws {
         let fixture = try Self.makeFixture()

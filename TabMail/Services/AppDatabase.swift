@@ -109,26 +109,43 @@ final class AppDatabase: Sendable {
     }
 
     /// True if this launch has upgrade work for the "Updating…" screen: pending
-    /// migration work (`hasPendingMigrationWork`), or a deferred index
+    /// migration work (`hasPendingMigrationWork`), a deferred index
     /// (`SyncEngine.deferredIndexes`) the database does not have yet, as after a
-    /// release that adds only a deferred index. The second check reads the schema
-    /// table alone. The same caveat applies: a brand-new file reports pending, so
-    /// `isUpgradeLaunch` also requires that the file existed before this launch.
-    static func hasPendingUpgradeWork(_ reader: some DatabaseReader) throws -> Bool {
+    /// release that adds only a deferred index, or planner statistics older than the
+    /// schema (`SyncEngine.plannerStatisticsAreStale`), as after a release whose only
+    /// schema change is a migration. The last two checks read the schema table and
+    /// `schema_version` alone. The same caveat applies: a brand-new file reports
+    /// pending, so `isUpgradeLaunch` also requires that the file existed before this
+    /// launch.
+    static func hasPendingUpgradeWork(
+        _ reader: some DatabaseReader, defaults: UserDefaults = .standard
+    ) throws -> Bool {
         if try hasPendingMigrationWork(reader) { return true }
-        return try reader.read { db in try !SyncEngine.missingDeferredIndexNames(db).isEmpty }
+        return try reader.read { db in
+            if try !SyncEngine.missingDeferredIndexNames(db).isEmpty { return true }
+            let schemaVersion = try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0
+            return SyncEngine.plannerStatisticsAreStale(currentVersion: schemaVersion, defaults: defaults)
+        }
     }
 
     /// The upgrade launch (ADR-IOS-029, amendment of 2026-11-24, #1392), decided in
     /// this one place: the "Updating…" screen and the upgrade step both run on its
-    /// answer. True when the database file existed before this launch
-    /// (`dbExisted`, checked before the pool is opened) and has upgrade work
+    /// answer. True when the app is launching into the foreground
+    /// (`isForegroundLaunch`), the database file existed before this launch
+    /// (`dbExisted`, checked before the pool is opened), and it has upgrade work
     /// (`hasPendingUpgradeWork`). A fresh install's first launch is never one: its
-    /// brand-new file migrates instantly and holds no mail. Any later launch whose
-    /// database still lacks a deferred index is one.
-    static func isUpgradeLaunch(_ reader: some DatabaseReader, dbExisted: Bool) throws -> Bool {
-        guard dbExisted else { return false }
-        return try hasPendingUpgradeWork(reader)
+    /// brand-new file migrates instantly and holds no mail. A launch in the
+    /// background (a silent push, a background refresh, a notification action) is
+    /// never one either: it migrates as before and leaves the index builds and the
+    /// statistics to the maintenance pass, so a wake the user does not see spends
+    /// no time on them. Any later foreground launch whose database still lacks a
+    /// deferred index, or whose statistics are older than its schema, is one.
+    static func isUpgradeLaunch(
+        _ reader: some DatabaseReader, dbExisted: Bool, isForegroundLaunch: Bool,
+        defaults: UserDefaults = .standard
+    ) throws -> Bool {
+        guard dbExisted, isForegroundLaunch else { return false }
+        return try hasPendingUpgradeWork(reader, defaults: defaults)
     }
 
     /// The upgrade step (ADR-IOS-029, amendment of 2026-11-24, #1392). On a launch that

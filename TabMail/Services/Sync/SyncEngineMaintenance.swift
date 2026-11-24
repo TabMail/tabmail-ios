@@ -1330,6 +1330,24 @@ extension SyncEngine {
     /// using `UserDefaults` as a durable one-shot latch here.
     nonisolated static let plannerStatisticsSchemaVersionKey = "didAnalyzeAtSchemaVersion_v1"
 
+    /// True when the last completed whole-database `ANALYZE` was not at
+    /// `currentVersion`, the SQLite `schema_version` now: no marker at all, or one
+    /// recorded at another version. The one comparison both callers make, this
+    /// pass (`runRefreshPlannerStatisticsIfStale`) and the launch probe
+    /// (`AppDatabase.hasPendingUpgradeWork`), so the two cannot disagree on what
+    /// stale means.
+    ///
+    /// `object(forKey:)` rather than `integer(forKey:)`: a never-analyzed database
+    /// has NO stored value, and `integer(forKey:)` cannot tell that apart from a
+    /// stored 0, which is a legal `schema_version`.
+    nonisolated static func plannerStatisticsAreStale(
+        currentVersion: Int, defaults: UserDefaults,
+        markerKey: String = plannerStatisticsSchemaVersionKey
+    ) -> Bool {
+        guard let analyzed = defaults.object(forKey: markerKey) as? Int else { return true }
+        return analyzed != currentVersion
+    }
+
     /// Whole-database `ANALYZE`, moved OFF the blocking migration path and run here
     /// at most once per schema change (ADR-IOS-029, 2026-08-05 amendment; owner
     /// directive *"startup migrations should really have only things that are
@@ -1437,12 +1455,8 @@ extension SyncEngine {
             // marker alone and retry next pass.
             return .abandoned
         }
-        // `object(forKey:)` rather than `integer(forKey:)`: a never-analyzed database
-        // has NO stored value, and `integer(forKey:)` cannot tell that apart from a
-        // stored 0 — which is a legal `schema_version`.
         if missing.isEmpty,
-           let analyzed = defaults.object(forKey: markerKey) as? Int,
-           analyzed == currentVersion {
+           !plannerStatisticsAreStale(currentVersion: currentVersion, defaults: defaults, markerKey: markerKey) {
             return .alreadyFresh
         }
         let t0 = CFAbsoluteTimeGetCurrent()

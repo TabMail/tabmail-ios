@@ -531,8 +531,10 @@ struct TabMailApp: App {
 ///
 /// It runs in two phases on a background task:
 ///   1. **Probe** — open the pool and cheaply decide whether this is an upgrade
-///      launch (`AppDatabase.isUpgradeLaunch`): a database that existed before
-///      this launch, with pending migration work or a missing deferred index.
+///      launch (`AppDatabase.isUpgradeLaunch`): a foreground launch on a database
+///      that existed before this launch, with pending migration work, a missing
+///      deferred index or planner statistics older than the schema. A background
+///      launch is never one.
 ///      While this runs the UI shows a blank launch screen (matching the empty
 ///      `UILaunchScreen`).
 ///   2. **Migrate + load** — build the database (`AppDatabase.openForLaunch`) and
@@ -559,12 +561,13 @@ final class AppStartup {
     private(set) var isReady = false
 
     /// True on an upgrade launch (`AppDatabase.isUpgradeLaunch`): real,
-    /// potentially-slow upgrade work (migrations, resets or a missing deferred
-    /// index) on an EXISTING database — drives the one-time "Updating…" splash.
-    /// Stays false on the common path (a migrated DB with every deferred index)
-    /// and on a fresh install's first launch, so the launch screen shows blank
-    /// until the inbox is ready instead of flashing the migration splash on
-    /// every launch.
+    /// potentially-slow upgrade work (migrations, resets, a missing deferred
+    /// index or stale planner statistics) on an EXISTING database, at a foreground
+    /// launch — drives the one-time "Updating…" splash. Stays false on the common
+    /// path (a migrated DB with every deferred index and current statistics), on a
+    /// fresh install's first launch and on a background launch, so the launch
+    /// screen shows blank until the inbox is ready instead of flashing the
+    /// migration splash on every launch.
     private(set) var isMigrating = false
 
     /// Set on a catastrophic DB open/migration failure; drives the failure view.
@@ -642,12 +645,19 @@ final class AppStartup {
         // never show the migration splash on first install (it would falsely
         // read "Updating…" with nothing to update).
         let dbExisted = FileManager.default.fileExists(atPath: AppDatabase.databaseURL.path)
-        BootProfiler.mark("ensureDatabaseReady enter (dbExisted=\(dbExisted))")
+        // Whether the user is opening the app, read once here at the start of the
+        // build (the same rule as `DatabaseSuspension.start()`): a background launch
+        // (silent push, background refresh, notification action) is `.background`, a
+        // launch the user opens is `.inactive` on its way to `.active`. Only a
+        // foreground launch can be an upgrade launch (`AppDatabase.isUpgradeLaunch`).
+        let isForegroundLaunch = UIApplication.shared.applicationState != .background
+        BootProfiler.mark("ensureDatabaseReady enter (dbExisted=\(dbExisted), foreground=\(isForegroundLaunch))")
 
         // Phase 1 (off main): open the pool + cheaply decide whether this is an
         // upgrade launch. Fast — opens the connection and reads the migrator's
-        // applied set, the one-time-reset flags and the schema table's index
-        // names. The heavy migration passes are Phase 2.
+        // applied set, the one-time-reset flags, the schema table's index names
+        // and `schema_version` against the statistics marker. The heavy migration
+        // passes are Phase 2.
         #if DEBUG
         let probeHook = testProbe
         #endif
@@ -658,7 +668,8 @@ final class AppStartup {
                     if let probeHook { return try await probeHook() }
                     #endif
                     let pool = try AppDatabase.makePool()
-                    let isUpgradeLaunch = try AppDatabase.isUpgradeLaunch(pool, dbExisted: dbExisted)
+                    let isUpgradeLaunch = try AppDatabase.isUpgradeLaunch(
+                        pool, dbExisted: dbExisted, isForegroundLaunch: isForegroundLaunch)
                     return (pool, isUpgradeLaunch)
                 } catch {
                     BackgroundSyncLogger.log("AppStartup: pool open/probe FAILED: \(error)")
