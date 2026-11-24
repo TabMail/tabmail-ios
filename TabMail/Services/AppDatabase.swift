@@ -108,6 +108,39 @@ final class AppDatabase: Sendable {
         return !StartupMigrations.allResetsComplete
     }
 
+    /// True if this launch has upgrade work for the "Updating…" screen: pending
+    /// migration work (`hasPendingMigrationWork`), or a deferred index
+    /// (`SyncEngine.deferredIndexes`) the database does not have yet, as after a
+    /// release that adds only a deferred index. The second check reads the schema
+    /// table alone. The same caveat applies: a brand-new file reports pending, so the
+    /// caller also requires that the file existed before this launch (`AppStartup`).
+    static func hasPendingUpgradeWork(_ reader: some DatabaseReader) throws -> Bool {
+        if try hasPendingMigrationWork(reader) { return true }
+        return try reader.read { db in try !SyncEngine.missingDeferredIndexNames(db).isEmpty }
+    }
+
+    /// The upgrade step (ADR-IOS-029, amendment of 2026-11-24, #1392). On a launch that
+    /// shows the "Updating…" screen, after the migration chain and the startup resets
+    /// and before the database is published, it builds every missing deferred index
+    /// and runs the whole-database `ANALYZE` in one write, through the same function
+    /// the background maintenance pass calls, which also records the statistics
+    /// marker. The pass then finds the statistics fresh and does not hold the writer
+    /// for an `ANALYZE` while the user works. On any other launch it does nothing and
+    /// returns nil.
+    ///
+    /// Nothing else can reach the database here (it is not published yet), so the
+    /// write's tier only names that the user is waiting for it. If the write fails or
+    /// is abandoned it rolls back whole and leaves the marker stale, and the
+    /// maintenance pass does the work as before.
+    @discardableResult
+    static func runUpgradeStep(
+        pool: DatabasePool, isUpgradeLaunch: Bool, defaults: UserDefaults = .standard
+    ) async -> SyncEngine.PlannerStatisticsRefresh? {
+        guard isUpgradeLaunch else { return nil }
+        return await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: PrioritizedDatabase(pool: pool, priority: .priority), defaults: defaults)
+    }
+
     /// Designated initializer. Wraps an already-open `pool`, runs schema
     /// migrations, retires the previous RELEASE's action queue, then —
     /// production only — the one-time destructive cached-mail

@@ -530,14 +530,18 @@ struct TabMailApp: App {
 /// handlers hung on `awaitLaunchReady()`.
 ///
 /// It runs in two phases on a background task:
-///   1. **Probe** — open the pool and cheaply check for pending migration work
-///      (`AppDatabase.hasPendingMigrationWork`). While this runs the UI shows a
+///   1. **Probe** — open the pool and cheaply check for upgrade work: pending
+///      migration work or a missing deferred index
+///      (`AppDatabase.hasPendingUpgradeWork`). While this runs the UI shows a
 ///      blank launch screen (matching the empty `UILaunchScreen`).
 ///   2. **Migrate + load** — run the migrations/resets and the DB-dependent
 ///      launch steps. ONLY if Phase 1 found real work on an existing DB do we
 ///      flip `isMigrating` to show `SplashView(mode: .migrating)`; otherwise the
 ///      blank launch screen holds until `isReady` flips straight to the inbox.
 ///      This keeps the migration splash from flashing on every normal launch.
+///      On that same upgrade launch, after the migrations and before publication,
+///      the upgrade step (`AppDatabase.runUpgradeStep`) builds the missing deferred
+///      indexes and refreshes the planner statistics in one write.
 ///
 /// CRITICAL invariant: callers must receive true from `ensureDatabaseReady()`
 /// before touching `AppDatabase.dbPool`; failure leaves the pool unpublished.
@@ -650,7 +654,7 @@ final class AppStartup {
                     if let probeHook { return try await probeHook() }
                     #endif
                     let pool = try AppDatabase.makePool()
-                    let pending = try AppDatabase.hasPendingMigrationWork(pool)
+                    let pending = try AppDatabase.hasPendingUpgradeWork(pool)
                     return (pool, pending)
                 } catch {
                     BackgroundSyncLogger.log("AppStartup: pool open/probe FAILED: \(error)")
@@ -669,7 +673,10 @@ final class AppStartup {
         // "Updating…" splash. The common case (already-migrated DB) skips this
         // and stays blank until `isReady` flips straight to the inbox.
         BootProfiler.mark("db.probe done (pendingMigration=\(probe.pending))")
-        if probe.pending && dbExisted {
+        // The upgrade launch: the splash below and the upgrade step in Phase 2 run on
+        // exactly this condition.
+        let isUpgradeLaunch = probe.pending && dbExisted
+        if isUpgradeLaunch {
             isMigrating = true
             BackgroundSyncLogger.log("AppStartup: pending migration work on existing DB — showing migration splash")
         }
@@ -690,6 +697,10 @@ final class AppStartup {
                 }
                 #endif
                 let db = try AppDatabase(pool: pool, runStartupResets: true)
+                // Behind the same splash, before publication: build the missing
+                // deferred indexes and refresh the planner statistics in one write.
+                let upgrade = await AppDatabase.runUpgradeStep(pool: pool, isUpgradeLaunch: isUpgradeLaunch)
+                BootProfiler.mark("db.upgradeStep \(upgrade.map { "\($0)" } ?? "not an upgrade launch")")
                 AppDatabase.shared.withLock { $0 = db }
                 return true
             } catch {

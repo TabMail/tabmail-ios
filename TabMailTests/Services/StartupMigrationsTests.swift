@@ -396,6 +396,46 @@ struct StartupMigrationsTests {
         #expect(try AppDatabase.hasPendingMigrationWork(migrated) == true)
     }
 
+    @Test("hasPendingUpgradeWork: fully migrated, resets done, a deferred index missing IS pending")
+    func upgradePendingWhenADeferredIndexIsMissing() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        // The migration chain builds no deferred index, so only that check can say yes.
+        let migrated = try TestDatabase.make()
+        #expect(try AppDatabase.hasPendingMigrationWork(migrated) == false)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated) == true)
+    }
+
+    @Test("hasPendingUpgradeWork: fully migrated, resets done, every deferred index present is NOT pending (common launch)")
+    func upgradeNotPendingWhenEverythingIsDone() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated) == false)
+
+        // Any one deferred index missing makes it pending again.
+        let dropped = try #require(SyncEngine.deferredIndexes.last?.name)
+        try migrated.write { db in try db.execute(sql: "DROP INDEX \(dropped)") }
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated) == true)
+    }
+
+    @Test("hasPendingUpgradeWork: pending migration work is pending even with every deferred index present")
+    func upgradePendingWhenMigrationWorkIsPending() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        UserDefaults.standard.set(false, forKey: "didCleanResetMessageData_v1")
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated) == true)
+    }
+
     // MARK: - Legacy per-subsystem log files (GitHub #83)
 
     /// The names `AppLogStore`'s header records as the files it replaced,

@@ -166,3 +166,21 @@ Two reads cost more:
 - `FTSSelfHealCandidateReadTests` compares the read with the index against the replaced read, without the index, on these mailboxes: empty, one row, only incomplete headers, a window that cuts a run of equal dates, several accounts, and 100,000 rows both dense and sparse. It runs each comparison in the three statistics states, pins the plans in each state, and checks that the recovery read and the sweep page do not move to the index.
 - `FTSSelfHealCandidateProofTests` measures, on the proof databases: the read, the two other reads, the sync pass's header writes, and the index's size.
 - The query registry gives the read the verdict `STOPS: FTSSelfHealCandidateReadTests.candidateReadStopsAtTheWindow`, not `SEEK`: the plan check runs without statistics too, and there the planner does not choose a partial index.
+
+---
+
+## Amendment 2026-11-24 (#1392): at an upgrade launch, the statistics run behind the "Updating…" screen
+
+**Owner, verbatim (2026-11-24):** *"can this be run as a part of migration so that users "wait" for the upgrade? normal app behavior i think?"*, and then: *"We have a waiting screen already."*
+
+**Rule 5's timing, reversed for the upgrade launch.** The 2026-08-05 amendment moved the whole-database `ANALYZE` off the blocking launch path into the background maintenance pass. On an upgrade launch it now runs at launch again, behind the existing "Updating…" screen: `AppStartup` shows `SplashView(mode: .migrating)` only when a database that existed before the launch has upgrade work, and on exactly that launch, after the migration chain and the startup resets and before the database is published, `AppDatabase.runUpgradeStep` calls `SyncEngine.runRefreshPlannerStatisticsIfStale`, the same function the pass calls (no copy). It builds every missing deferred index, runs the whole-database `ANALYZE` and records the `schema_version` marker in one write, so the pass that follows finds the statistics fresh and does not run `ANALYZE` again.
+
+**Why the reversal.** In the background pass the `ANALYZE` (with any deferred build) is one write that holds SQLite's single writer while the user is working, so a Send or any other `.priority` write waits for it. At upgrade nothing else is running: the database is not yet published, so no sync, merge or user action can wait behind the write, and the user is already looking at the waiting screen.
+
+**What is unchanged.** The statistics are the same: a bare whole-database `ANALYZE`, no `PRAGMA analysis_limit` (NEGATIVE CASE 2 above still holds). It is not a numbered migration, so nothing is frozen. A normal launch and a fresh install are unchanged (no "Updating…" screen, no step). The background pass stays as it is and does whatever an interrupted or failed upgrade step left: the step's write rolls back whole and leaves the marker stale.
+
+**Which launches.** The probe, `AppDatabase.hasPendingUpgradeWork`, is pending migration work (`hasPendingMigrationWork`) or a deferred index the database does not have, so a release that adds only a deferred index also builds it behind the screen rather than in a background writer hold. The second check reads `sqlite_master` alone. The splash and the step run on the same condition, the probe's answer on a file that existed before the launch, on every launch type that builds the database (a cold background launch shows no screen but does the same work before it publishes the database).
+
+**Cost.** The one-time wait is the one write the background pass ran before, measured by `DeferredIndexStatisticsProofTests` on the shared large proof database (about 100,000 headers, and five times that); the numbers are in the change's description.
+
+**Pinned.** `UpgradeStepTests.upgradeLaunchBuildsAndAnalyzes`: after the step on an upgrade launch every deferred index exists with a `sqlite_stat1` row, the marker equals `schema_version`, and the next maintenance pass returns `.alreadyFresh`. `UpgradeStepTests.otherLaunchRunsNothing`: on any other launch the step changes no index, no statistics, no schema version and no marker. `StartupMigrationsTests.upgradePendingWhenADeferredIndexIsMissing`, `upgradeNotPendingWhenEverythingIsDone` and `upgradePendingWhenMigrationWorkIsPending` pin the probe.

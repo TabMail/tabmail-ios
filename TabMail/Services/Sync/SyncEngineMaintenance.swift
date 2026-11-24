@@ -1177,14 +1177,21 @@ extension SyncEngine {
     private static func missingDeferredIndexes(
         _ dbPool: PrioritizedDatabase, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
     ) -> [String]? {
-        try? dbPool.read { db in
-            try indexes.filter { index in
-                try Row.fetchOne(
-                    db,
-                    sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-                    arguments: [index.name]) == nil
-            }.map(\.name)
-        }
+        try? dbPool.read { db in try missingDeferredIndexNames(db, among: indexes) }
+    }
+
+    /// The names of the indexes of `indexes` that `sqlite_master` does not have: one
+    /// lookup per index on the schema table, no data read. Also the launch probe's
+    /// check (`AppDatabase.hasPendingUpgradeWork`).
+    nonisolated static func missingDeferredIndexNames(
+        _ db: Database, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
+    ) throws -> [String] {
+        try indexes.filter { index in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                arguments: [index.name]) == nil
+        }.map(\.name)
     }
 
     // MARK: Building a deferred index (inside the statistics write below)
@@ -1384,7 +1391,12 @@ extension SyncEngine {
     /// The schema-version READ stays synchronous deliberately — see
     /// `plannerStatisticsSchemaVersion`, which exists only to keep that binding.
     ///
-    /// It runs at most once per schema change and never on the launch path.
+    /// It runs at most once per schema change: on an upgrade launch, behind the
+    /// "Updating…" screen and before the database is published
+    /// (`AppDatabase.runUpgradeStep`, ADR-IOS-029 amendment of 2026-11-24, #1392),
+    /// and otherwise from the background maintenance pass, which also finishes
+    /// whatever an interrupted upgrade launch left. On a launch that is not an
+    /// upgrade it never runs on the launch path.
     @discardableResult
     nonisolated static func runRefreshPlannerStatisticsIfStale(
         dbPool: PrioritizedDatabase,
