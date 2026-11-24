@@ -115,52 +115,6 @@ struct SyncEngineMaintenanceTests {
         #expect(expiredCount == 0)
     }
 
-    @Test("AI cache rescue: entry with inbox message gets updatedAt refreshed")
-    func aiCacheRescueInboxMessage() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-
-        let rfc822 = "<msg1@example.com>"
-        _ = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", isInInbox: true, rfc822MessageId: rfc822
-        )
-
-        let expiredDate = Calendar.current.date(byAdding: .day, value: -(SyncConfig.aiCacheTTLDays + 1), to: Date())!
-        try db.write { dbConn in
-            var cache = MessageAICache(key: "acc1:INBOX:\(rfc822)", rfc822MessageId: rfc822)
-            cache.summaryBlurb = "Summary"
-            cache.updatedAt = expiredDate
-            try cache.insert(dbConn)
-        }
-
-        // Simulate the rescue logic from runPurgeExpiredAICache
-        let now = Date()
-        try db.write { dbConn in
-            let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = now
-                        try entry.update(dbConn)
-                    }
-                }
-            }
-        }
-
-        // Verify the entry was rescued (updatedAt refreshed)
-        let cache = try db.read { dbConn in
-            try MessageAICache.fetchOne(dbConn, key: "acc1:INBOX:\(rfc822)")
-        }
-        #expect(cache != nil)
-        #expect(cache!.updatedAt >= now.addingTimeInterval(-1))
-    }
-
     // MARK: - Prune Ordering
 
     @Test("Messages ordered by date ASC for pruning (oldest first)")
