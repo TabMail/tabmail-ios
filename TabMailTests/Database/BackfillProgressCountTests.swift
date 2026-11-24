@@ -266,25 +266,27 @@ struct BackfillProgressCountTests {
     private static let embeddingPlanRows = 20_000
 
     /// `sqlite_stat1` for `messageHeader` from a full `ANALYZE` of the 105,000-header proof
-    /// database with this index present (four accounts, 84,951 headers owing an embedding),
-    /// taken with the Mac's sqlite3. That is the database on which the proof saw the read
-    /// without its index name skip-scan this index. A plain `ANALYZE` with no analysis
-    /// limit, which is what the app runs, counts the rows of every key prefix exactly, so
-    /// these are the rows the app's own `ANALYZE` writes on that data. The app's SQLite
-    /// keeps no `sqlite_stat4`, so they are all the planner knows about the table: written
-    /// over the test's rows, they give it a large mailbox's estimates. The test checks at
-    /// setup that they name every index of the table and no other.
+    /// database with this index present (four accounts, 82,382 headers owing an embedding,
+    /// some bodies confirmed empty or oversized), taken with the Mac's sqlite3 and
+    /// identical to the simulator's `ANALYZE` of it. That is the database on which the
+    /// proof saw the read without its index name skip-scan this index. A plain `ANALYZE`
+    /// with no analysis limit, which is what the app runs, counts the rows of every key
+    /// prefix exactly, so these are the rows the app's own `ANALYZE` writes on that data.
+    /// The app's SQLite keeps no `sqlite_stat4`, so they are all the planner knows about
+    /// the table: written over the test's rows, they give it a large mailbox's estimates.
+    /// The test checks at setup that they name every index of the table and no other, and
+    /// that under them the read without its index name plans that skip-scan.
     private static let largeMailboxStatistics: [String: String] = [
-        "idx_messageHeader_bodyStatus": "105000 52500 35000 35000 17500",
+        "idx_messageHeader_bodyStatus": "105000 52500 35000 26250 13125",
         "messageHeader_accountId_bodyComplete": "105000 26250 13125",
         "messageHeader_accountId_messageId": "105000 26250 2",
         "messageHeader_aiIncomplete": "19833 1",
-        "messageHeader_backfillProgress": "105000 26250 13125 13125 13125 8750",
-        "messageHeader_bodyRepopulate": "105000 52500 26250 17500 17500 1",
-        "messageHeader_bodyRepopulateV2": "105000 52500 26250 17500 17500 17500 1",
+        "messageHeader_backfillProgress": "105000 26250 13125 8750 6563 5250",
+        "messageHeader_bodyRepopulate": "105000 52500 26250 17500 13125 1",
+        "messageHeader_bodyRepopulateV2": "105000 52500 26250 17500 13125 10500 1",
         "messageHeader_computedThreadId": "105000 105000",
         "messageHeader_date": "105000 1",
-        "messageHeader_embeddingIncomplete": "84951 42476 1",
+        "messageHeader_embeddingIncomplete": "82382 41191 1",
         "messageHeader_folderId": "105000 6563",
         "messageHeader_folderId_date": "105000 6563 1",
         "messageHeader_folderId_isRead": "105000 6563 3388",
@@ -369,6 +371,17 @@ struct BackfillProgressCountTests {
         #expect(Set(indexes) == measured,
                 "setup: the large mailbox's statistics name every index of the table and no other, so the planner estimates none by default: \(indexes.sorted())")
         try Self.applyLargeMailboxStatistics(to: queue)
+        // The control: under these statistics the same read without its index name is
+        // the skip-scan the name exists to prevent, so this state is the one that matters
+        // and statistics that do not plan it fail here.
+        let unnamed = sql.replacingOccurrences(of: " INDEXED BY messageHeader_embeddingIncomplete", with: "")
+        let unnamedPlan = try queue.read { conn in
+            try Row.fetchAll(conn, sql: "EXPLAIN QUERY PLAN " + unnamed)
+                .compactMap { $0["detail"] as String? }
+                .joined(separator: " | ")
+        }
+        #expect(unnamedPlan == "SEARCH messageHeader USING INDEX messageHeader_backfillProgress (ANY(accountId) AND bodyComplete=? AND bodyEmptyConfirmed=?) | USE TEMP B-TREE FOR ORDER BY",
+                "setup: under the large mailbox's statistics the read without its index name must plan the skip-scan, or this state pins nothing: \(unnamedPlan)")
         try expectOrderedScan("large mailbox")
     }
 
