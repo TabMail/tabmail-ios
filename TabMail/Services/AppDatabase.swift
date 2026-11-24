@@ -4448,6 +4448,19 @@ final class AppDatabase: Sendable {
                 t.add(column: "sentAt", .datetime)
             }
         }
+
+        // #1374 (ADR-IOS-029): the AI cache purge reads the expired entries,
+        // `messageAICache WHERE updatedAt < ?`, after every AI queue drain and in
+        // maintenance. No index led with `updatedAt`, so its count and every batch
+        // SCANNED the whole cache. This index serves both: the count is a covering
+        // range read and a batch reads only expired entries. Statistics come from
+        // the background ANALYZE after the schema change; nothing else to do here.
+        // IF NOT EXISTS, like every index migration here, keeps the DDL idempotent.
+        migrator.registerTimedMigration(
+            "v113_messageAICacheExpiryIndex", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageAICache_expiry ON messageAICache(updatedAt)")
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

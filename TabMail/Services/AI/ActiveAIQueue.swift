@@ -831,10 +831,10 @@ actor ActiveAIQueue {
                 }
                 await ProactiveNotifyService.shared.onInboxUpdated()
 
-                // Lazy TTL touch + eviction: refresh AI cache TTL for inbox messages
-                // and purge expired entries. Runs once after all AI work completes.
+                // Expire the AI cache once all AI work is done. The purge keeps an
+                // expired entry whose message is in an inbox (ADR-IOS-078).
                 Task.detached {
-                    SyncEngine.refreshAICacheTTLAndPurge(dbPool: AppDatabase.backgroundPool)
+                    await SyncEngine.runPurgeExpiredAICache(dbPool: AppDatabase.backgroundPool)
                 }
             }
         }
