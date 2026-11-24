@@ -324,7 +324,8 @@ struct ContentOwnershipSweepTests {
 
         let sweep = Task.detached(priority: .utility) {
             await SyncEngine.runEvictStaleBodies(
-                dbPool: AppDatabase.dbPool, undoProtectedBodyIds: [])
+                dbPool: AppDatabase.dbPool, undoProtectedBodyIds: [],
+                afterEachPage: StaleBodyEvictWriterHoldTests.noCheckpoint)
         }
         do {
             try await withTimeout(seconds: 30) { await sweep.value }

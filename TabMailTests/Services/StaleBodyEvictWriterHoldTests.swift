@@ -27,7 +27,7 @@ import Testing
 ///   wherever the run reads them (writer or reader), by a ratio or by more than a
 ///   few pages.
 // A run that never ends (a cursor that stops moving) fails here instead of hanging.
-@Suite("Stale-body evict: what one write holds and what a run reads", .timeLimit(.minutes(1)))
+@Suite("Stale-body evict: what one write holds and what a run reads", .timeLimit(.minutes(1)), .processGlobalState)
 struct StaleBodyEvictWriterHoldTests {
 
     /// Pages a connection has fetched so far (cumulative, never reset, so the
@@ -265,15 +265,25 @@ struct StaleBodyEvictWriterHoldTests {
     static func measuredRun(
         _ fixture: Fixture, meter: WriterWorkMeter
     ) async throws -> (writes: WriterWorkMeter.Reading, pagesRead: Int) {
-        fixture.pool.writeWithoutTransaction { db in meter.start(db) }
+        try await fixture.pool.writeWithoutTransaction { db in meter.start(db) }
         let run = await gatedRun(fixture)
         #expect(run.ran, "the gated step did not run, though the fixture built its index")
         return (meter.current, run.pagesRead)
     }
 
+    /// What a direct call of the step makes between its pages: nothing. The
+    /// production default, `checkpointWALThrottled`, writes the app's database
+    /// through the process-wide write queue, which a test that does not hold the
+    /// process-global test lock must not reach. Where the step calls it is
+    /// `StaleBodyEvictRunTests.aRunCheckpointsAfterEachPage`; which one production
+    /// runs is `SyncEngineMaintenanceTests.evictStepCheckpointsWithTheThrottledCheckpoint`.
+    static let noCheckpoint: @Sendable () async -> Void = {}
+
     /// The gate and whatever it runs, as the maintenance pass calls it: whether the
     /// step ran, and the pages every connection of the pool fetched from before the
-    /// gate's check to the end.
+    /// gate's check to the end. The gate runs production's checkpoint between
+    /// pages, on the app's database, which is why this suite holds the
+    /// process-global test lock; the fixture's counters do not see it.
     static func gatedRun(_ fixture: Fixture) async -> (ran: Bool, pagesRead: Int) {
         let before = fixture.connections.pagesSoFar
         let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(
@@ -459,7 +469,7 @@ struct StaleBodyEvictWriterHoldTests {
         // the step's or the control's, would go uncounted. With it off the HTML
         // stays in the WAL, where every read goes through the page cache. The
         // control below is read after the run, so it shows that held throughout.
-        try fixture.pool.writeWithoutTransaction { db in
+        try await fixture.pool.writeWithoutTransaction { db in
             try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
         }
         try Self.seedKeptInboxBodies(fixture, uids: 1..<(kept + 1), html: narrowHTML)
@@ -470,7 +480,7 @@ struct StaleBodyEvictWriterHoldTests {
         let narrowRead = try Self.wholeHTMLRead(fixture)
 
         // Same rows, same `fetchedAt`, 64 times the HTML.
-        try fixture.pool.write { db in
+        try await fixture.pool.write { db in
             try db.execute(sql: "UPDATE messageBody SET htmlContent = ?", arguments: [wideHTML])
         }
         let wide = try await Self.measuredRun(fixture, meter: meter).writes

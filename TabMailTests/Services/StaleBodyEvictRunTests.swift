@@ -25,7 +25,7 @@ struct StaleBodyEvictRunTests {
     static func run(_ fixture: Hold.Fixture, undoProtected: Set<String> = []) async {
         await SyncEngine.runEvictStaleBodies(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background),
-            undoProtectedBodyIds: undoProtected)
+            undoProtectedBodyIds: undoProtected, afterEachPage: Hold.noCheckpoint)
     }
 
     /// A stale body with no header, under the fixture's live Archive folder.
@@ -89,10 +89,10 @@ struct StaleBodyEvictRunTests {
         try Hold.seedKeptInboxBodies(fixture, uids: 1..<(inboxKept + 1), fetchedAt: tie)
         let archived = try Hold.seedArchiveBodies(fixture, count: recent + victims, fetchedAt: tie)
         let seeded = try Hold.bodyIds(fixture)
-        let storedAs = try fixture.pool.read { db in
+        let storedAs = try await fixture.pool.read { db in
             try Set(String.fetchAll(db, sql: "SELECT DISTINCT typeof(fetchedAt) FROM messageBody"))
         }
-        let distinctTimes = try fixture.pool.read { db in
+        let distinctTimes = try await fixture.pool.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(DISTINCT fetchedAt) FROM messageBody") ?? 0
         }
 
@@ -240,7 +240,7 @@ struct StaleBodyEvictRunTests {
         guard archived.count == recent + 2 else { return }
         let protectedVictim = archived[recent]
         let evictedVictim = archived[recent + 1]
-        try fixture.pool.write { db in
+        try await fixture.pool.write { db in
             try db.execute(
                 sql: "UPDATE messageHeader SET bodyComplete = 1 WHERE id IN (?, ?)",
                 arguments: [protectedVictim, evictedVictim])
@@ -248,7 +248,7 @@ struct StaleBodyEvictRunTests {
 
         await Self.run(fixture, undoProtected: [protectedVictim])
         let after = try Hold.bodyIds(fixture)
-        let complete = try fixture.pool.read { db in
+        let complete = try await fixture.pool.read { db in
             try Set(String.fetchAll(db, sql: "SELECT id FROM messageHeader WHERE bodyComplete = 1"))
         }
 
@@ -266,8 +266,9 @@ struct StaleBodyEvictRunTests {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let recent = SyncConfig.bodyCacheRecentPerFolder
-        try fixture.pool.write { db in
-            try Folder(name: "Projects", path: "Projects", role: .custom, accountId: fixture.accountId).insert(db)
+        let accountId = fixture.accountId
+        try await fixture.pool.write { db in
+            try Folder(name: "Projects", path: "Projects", role: .custom, accountId: accountId).insert(db)
         }
         // Archive first in page order, then Projects: the run reaches the second
         // folder after it has looked up the first folder's newest.
@@ -299,10 +300,10 @@ struct StaleBodyEvictRunTests {
         guard archived.count == recent + 1 else { return }
         let kept = Set(archived.dropFirst())
 
-        try fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account RENAME TO account_unreadable") }
+        try await fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account RENAME TO account_unreadable") }
         await Self.run(fixture)
         let whileUnreadable = try Hold.bodyIds(fixture)
-        try fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account_unreadable RENAME TO account") }
+        try await fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account_unreadable RENAME TO account") }
         await Self.run(fixture)
         let afterRestore = try Hold.bodyIds(fixture)
 
@@ -337,7 +338,7 @@ struct StaleBodyEvictRunTests {
         let keepers = Set(archived[victimCount...])
         // A page-two row with page-two victims deleted before it.
         let failing = archived[chunk + chunk / 5]
-        try fixture.pool.writeWithoutTransaction { db in
+        try await fixture.pool.writeWithoutTransaction { db in
             try db.execute(sql: """
                 CREATE TEMP TRIGGER evictFailsOnPageTwo BEFORE DELETE ON messageBody
                 WHEN old.id = '\(failing)'
@@ -347,7 +348,7 @@ struct StaleBodyEvictRunTests {
 
         await Self.run(fixture)
         let afterFailure = try Hold.bodyIds(fixture)
-        try fixture.pool.writeWithoutTransaction { db in
+        try await fixture.pool.writeWithoutTransaction { db in
             try db.execute(sql: "DROP TRIGGER temp.evictFailsOnPageTwo")
         }
         await Self.run(fixture)
@@ -394,7 +395,7 @@ struct StaleBodyEvictRunTests {
         let (start, startNow) = AsyncStream<Void>.makeStream()
         let evictRun = Task.detached {
             for await _ in start { break }
-            await SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [])
+            await SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [], afterEachPage: Hold.noCheckpoint)
         }
         runner.set(evictRun)
         startNow.yield(())

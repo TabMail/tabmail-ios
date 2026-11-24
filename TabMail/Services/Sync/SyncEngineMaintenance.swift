@@ -305,7 +305,15 @@ extension SyncEngine {
     /// moves a page's frames out of the WAL while the run goes on. After each
     /// page's write, outside it, the run calls `afterEachPage`: the throttled
     /// checkpoint (`checkpointWALThrottled`), so a long run never grows the WAL by
-    /// all of its pages. Tests pass their own to see where it runs.
+    /// all of its pages. The checkpoint shares its throttle with every other
+    /// caller, the foreground maintenance pass's closing checkpoint included (a
+    /// `TRUNCATE` on a prune pass): one that comes within the throttle's interval
+    /// after a page's checkpoint is skipped, so the WAL file is shrunk only by a
+    /// later `TRUNCATE`. The gate (`runEvictStaleBodiesIfIndexed`) passes nothing,
+    /// so production always runs this default. Tests that call the step directly
+    /// pass their own, to see where it runs or to keep a fixture's run off the
+    /// app's database; tests through the gate run the default and hold the
+    /// process-global test lock (`.processGlobalState`).
     nonisolated static func runEvictStaleBodies(
         dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>,
         afterEachPage: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }

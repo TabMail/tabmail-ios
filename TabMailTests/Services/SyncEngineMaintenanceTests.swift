@@ -324,7 +324,9 @@ struct SyncEngineMaintenanceTests {
 
     /// The gate waits for the evict step's own index and no other: with that index
     /// built and every other deferred index still missing, the step runs.
-    @Test("The evict step runs once its own index exists, whatever the other deferred indexes")
+    /// `.processGlobalState`: the gate runs production's checkpoint between pages,
+    /// which writes the app's database.
+    @Test("The evict step runs once its own index exists, whatever the other deferred indexes", .processGlobalState)
     func evictStepNeedsOnlyItsOwnIndex() async throws {
         let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
@@ -336,10 +338,11 @@ struct SyncEngineMaintenanceTests {
         #expect(ownIndex.count == 1, "the evict step's index is a deferred index")
         #expect(!otherNames.isEmpty, "setup: another deferred index exists to leave missing")
         // The production DDL of the step's index alone.
-        try fixture.pool.write { db in
-            for index in ownIndex { try db.execute(sql: index.sql) }
+        let ownSQL = ownIndex.map(\.sql)
+        try await fixture.pool.write { db in
+            for sql in ownSQL { try db.execute(sql: sql) }
         }
-        let present = try fixture.pool.read { db in
+        let present = try await fixture.pool.read { db in
             try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'index'"))
         }
         let othersPresent = otherNames.filter { present.contains($0) }
@@ -357,7 +360,9 @@ struct SyncEngineMaintenanceTests {
     /// the step, which without its index would scan the table inside its writes.
     /// No reader can open, so reading the catalog fails, while the writer works:
     /// a step the gate let through would evict.
-    @Test("The evict step does not run when its index cannot be checked")
+    /// `.processGlobalState`: a gate that let the step through would run
+    /// production's checkpoint between pages, which writes the app's database.
+    @Test("The evict step does not run when its index cannot be checked", .processGlobalState)
     func evictStepWaitsWhenItsIndexCannotBeChecked() async throws {
         let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(readersFail: true)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
@@ -381,7 +386,7 @@ struct SyncEngineMaintenanceTests {
         #expect(afterGate == Set(archived), "a body was evicted though the index could not be checked")
 
         // Positive control: the writer works, so the step itself evicts here.
-        await SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [])
+        await SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [], afterEachPage: StaleBodyEvictWriterHoldTests.noCheckpoint)
         let afterStep = try bodyIds()
         #expect(afterStep == Set(archived.prefix(recent)),
                 "setup: the step evicts on this database, so the gate is what held it back")
@@ -393,32 +398,64 @@ struct SyncEngineMaintenanceTests {
     /// Call sites are discovered by walking the production tree, never listed.
     @Test("Production runs the evict step only through its index gate")
     func evictStepIsReachedOnlyThroughItsGate() throws {
-        // …/tabmail-ios/TabMailTests/Services/<this file>
-        let projectRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let productionRoot = projectRoot.appendingPathComponent("TabMail")
         var gatedCalls: [String] = []
         var directCalls: [String] = []
-        let walker = FileManager.default.enumerator(at: productionRoot, includingPropertiesForKeys: nil)
-        while let entry = walker?.nextObject() as? URL {
-            guard entry.pathExtension == "swift",
-                  let source = try? String(contentsOf: entry, encoding: .utf8) else { continue }
-            for line in source.components(separatedBy: "\n") {
-                let code = line.trimmingCharacters(in: .whitespaces)
-                guard !code.hasPrefix("//"), !code.contains("func runEvictStaleBodies") else { continue }
-                if code.contains("runEvictStaleBodiesIfIndexed(") {
-                    gatedCalls.append(entry.lastPathComponent)
-                } else if code.contains("runEvictStaleBodies(") {
-                    directCalls.append(entry.lastPathComponent)
-                }
+        for line in Self.productionCodeLines() where !line.code.contains("func runEvictStaleBodies") {
+            if line.code.contains("runEvictStaleBodiesIfIndexed(") {
+                gatedCalls.append(line.file)
+            } else if line.code.contains("runEvictStaleBodies(") {
+                directCalls.append(line.file)
             }
         }
         #expect(gatedCalls == ["SyncEngine.swift"],
                 "the maintenance pass must call the gated step, once: \(gatedCalls)")
         #expect(directCalls == ["SyncEngineMaintenance.swift"],
                 "the only direct call is the gate's own: \(directCalls)")
+    }
+
+    /// Production's checkpoint between the evict's pages (#1354) is the throttled
+    /// `PASSIVE` one, `checkpointWALThrottled()` with no `truncate`, the step's
+    /// default, and no production caller passes another. One that
+    /// did nothing would let a long run grow the WAL by all of its pages again; a
+    /// `TRUNCATE`, or a checkpoint past the throttle, can wait on readers while it
+    /// holds the writer. The tests that call the step pass their own, and the
+    /// default writes the app's database, so only the source shows which one
+    /// production runs. Every production line that names `afterEachPage` is
+    /// discovered by walking the production tree.
+    @Test("Production's evict step checkpoints between pages with the throttled PASSIVE checkpoint, its default, and no caller passes another")
+    func evictStepCheckpointsWithTheThrottledCheckpoint() {
+        let uses = Self.productionCodeLines()
+            .filter { $0.code.contains("afterEachPage") }
+            .map { "\($0.file): \($0.code)" }
+        let expected = [
+            "SyncEngineMaintenance.swift: afterEachPage: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }",
+            "SyncEngineMaintenance.swift: await afterEachPage()",
+        ]
+        #expect(uses == expected,
+                "the step's parameter with its default and its one call, and no caller passing another: \(uses)")
+    }
+
+    /// Every line of production code under `TabMail/`, trimmed, with its file's
+    /// name. Comment lines are left out.
+    static func productionCodeLines() -> [(file: String, code: String)] {
+        // …/tabmail-ios/TabMailTests/Services/<this file>
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let productionRoot = projectRoot.appendingPathComponent("TabMail")
+        var lines: [(file: String, code: String)] = []
+        let walker = FileManager.default.enumerator(at: productionRoot, includingPropertiesForKeys: nil)
+        while let entry = walker?.nextObject() as? URL {
+            guard entry.pathExtension == "swift",
+                  let source = try? String(contentsOf: entry, encoding: .utf8) else { continue }
+            for line in source.components(separatedBy: "\n") {
+                let code = line.trimmingCharacters(in: .whitespaces)
+                guard !code.hasPrefix("//") else { continue }
+                lines.append((entry.lastPathComponent, code))
+            }
+        }
+        return lines
     }
 
     // MARK: - Chunk-based processing
