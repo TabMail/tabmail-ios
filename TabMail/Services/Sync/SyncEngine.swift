@@ -459,7 +459,9 @@ actor SyncEngine {
     /// ahead of every queued `.priority` write. (This sentence read *"ONLY because
     /// its last step is"* while `ANALYZE` was the only deferred step;
     /// `runBuildDeferredIndexesIfMissing` joined it on 2026-08-06.) Every other step
-    /// here is unchanged and still synchronous. Both callers already run inside
+    /// here is unchanged and still synchronous, except that the stale-body evict
+    /// awaits the throttled WAL checkpoint between its pages (#1354); its page
+    /// writes stay the pass-through write. Both callers already run inside
     /// detached tasks, so this adds no new concurrency.
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
@@ -474,7 +476,7 @@ actor SyncEngine {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+            await runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {

@@ -231,15 +231,25 @@ extension SyncEngine {
     @discardableResult
     nonisolated static func runEvictStaleBodiesIfIndexed(
         dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>
-    ) -> Bool {
+    ) async -> Bool {
         guard let missing = missingDeferredIndexes(dbPool), !missing.contains(staleBodyIndexName) else {
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[BodyCache] evict waits for \(staleBodyIndexName)")
             }
             return false
         }
-        runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+        await runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
         return true
+    }
+
+    /// `PrioritizedDatabase.write`'s synchronous pass-through overload, for an
+    /// async caller. Not `async` on purpose: from an async context Swift binds the
+    /// awaited overload, which enters `DatabaseWriteQueue`; the evict's page write
+    /// stays the pass-through write `IOS-PERF-002` accepts for it.
+    private nonisolated static func passThroughWrite<T>(
+        _ dbPool: PrioritizedDatabase, _ updates: (Database) throws -> T
+    ) throws -> T {
+        try dbPool.write(updates)
     }
 
     /// Nonisolated evict — runs entirely off the main thread.
@@ -288,7 +298,18 @@ extension SyncEngine {
     /// of the table's size, and a run reads only the stale bodies. A `VACUUM` during a run can renumber `rowid`s. Only rows that share
     /// the cursor's `fetchedAt` can then be read again (the rules keep a kept row
     /// again) or skipped (a later run evicts it).
-    nonisolated static func runEvictStaleBodies(dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>) {
+    ///
+    /// ## The WAL between pages
+    ///
+    /// SQLite's autocheckpoint is off (`AppDatabase.makePool`), so nothing else
+    /// moves a page's frames out of the WAL while the run goes on. After each
+    /// page's write, outside it, the run calls `afterEachPage`: the throttled
+    /// checkpoint (`checkpointWALThrottled`), so a long run never grows the WAL by
+    /// all of its pages. Tests pass their own to see where it runs.
+    nonisolated static func runEvictStaleBodies(
+        dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>,
+        afterEachPage: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }
+    ) async {
         let ttlCutoff = Calendar.current.date(byAdding: .hour, value: -SyncConfig.bodyCacheTTLHours, to: Date()) ?? Date.distantPast
         let recentPerFolder = SyncConfig.bodyCacheRecentPerFolder
         let chunkSize = SyncConfig.pruneChunkSize
@@ -307,7 +328,7 @@ extension SyncEngine {
                 pageArguments = [ttlCutoff, chunkSize]
             }
             do {
-                let pageResult = try dbPool.write { db -> (evicted: Int, last: (fetchedAt: DatabaseValue, rowId: Int64)?) in
+                let pageResult = try passThroughWrite(dbPool) { db -> (evicted: Int, last: (fetchedAt: DatabaseValue, rowId: Int64)?) in
                     let page = try Row.fetchAll(db, sql: pageSQL, arguments: pageArguments)
                     guard let lastRow = page.last else { return (0, nil) }
                     let lastFetchedAt: DatabaseValue = lastRow["fetchedAt"]
@@ -402,6 +423,7 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[BodyCache] Eviction failed: \(error)")
                 break
             }
+            await afterEachPage()
         }
         if evicted > 0 {
             BackgroundSyncLogger.logDebug("[BodyCache] Evicted \(evicted) stale bodies (TTL=\(SyncConfig.bodyCacheTTLHours)h)")

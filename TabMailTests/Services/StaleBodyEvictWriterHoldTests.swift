@@ -264,9 +264,9 @@ struct StaleBodyEvictWriterHoldTests {
     /// the run's end, so a read the gate adds counts as the run's.
     static func measuredRun(
         _ fixture: Fixture, meter: WriterWorkMeter
-    ) throws -> (writes: WriterWorkMeter.Reading, pagesRead: Int) {
+    ) async throws -> (writes: WriterWorkMeter.Reading, pagesRead: Int) {
         fixture.pool.writeWithoutTransaction { db in meter.start(db) }
-        let run = gatedRun(fixture)
+        let run = await gatedRun(fixture)
         #expect(run.ran, "the gated step did not run, though the fixture built its index")
         return (meter.current, run.pagesRead)
     }
@@ -274,9 +274,9 @@ struct StaleBodyEvictWriterHoldTests {
     /// The gate and whatever it runs, as the maintenance pass calls it: whether the
     /// step ran, and the pages every connection of the pool fetched from before the
     /// gate's check to the end.
-    static func gatedRun(_ fixture: Fixture) -> (ran: Bool, pagesRead: Int) {
+    static func gatedRun(_ fixture: Fixture) async -> (ran: Bool, pagesRead: Int) {
         let before = fixture.connections.pagesSoFar
-        let ran = SyncEngine.runEvictStaleBodiesIfIndexed(
+        let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background), undoProtectedBodyIds: [])
         return (ran, fixture.connections.pagesSoFar - before)
     }
@@ -292,7 +292,7 @@ struct StaleBodyEvictWriterHoldTests {
     }
 
     @Test("One write of the evict step holds the writer no longer with five times the kept stale bodies")
-    func oneWriteDoesNotGrowWithTheKeptStaleBodies() throws {
+    func oneWriteDoesNotGrowWithTheKeptStaleBodies() async throws {
         let meter = WriterWorkMeter()
         let fixture = try Self.observedFixture(meter)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
@@ -304,7 +304,7 @@ struct StaleBodyEvictWriterHoldTests {
         try Self.seedKeptInboxBodies(fixture, uids: 1..<(fewKept + 1))
         let archived = try Self.seedArchiveBodies(fixture, count: recent + olderArchived)
 
-        let few = try Self.measuredRun(fixture, meter: meter).writes
+        let few = try await Self.measuredRun(fixture, meter: meter).writes
 
         let afterFirstRun = try Self.bodyIds(fixture)
         let evictedArchive = archived.filter { !afterFirstRun.contains($0) }
@@ -318,7 +318,7 @@ struct StaleBodyEvictWriterHoldTests {
         // order, behind more pages of kept bodies than the first run had in all: a
         // run that stopped after a fixed number of pages would never reach them.
         let lateVictims = try Self.seedArchiveBodies(fixture, count: olderArchived, from: recent + olderArchived)
-        let many = try Self.measuredRun(fixture, meter: meter).writes
+        let many = try await Self.measuredRun(fixture, meter: meter).writes
         let afterSecondRun = try Self.bodyIds(fixture)
         #expect(afterSecondRun.count == manyKept + recent, "every kept body stays")
         #expect(afterSecondRun.isDisjoint(with: lateVictims),
@@ -383,7 +383,7 @@ struct StaleBodyEvictWriterHoldTests {
     static let writeGrowthSlackPages = 20
 
     @Test("One write of the evict step holds the writer no longer when forty times the bodies are stale")
-    func oneWriteDoesNotGrowWithTheStaleBodies() throws {
+    func oneWriteDoesNotGrowWithTheStaleBodies() async throws {
         let meter = WriterWorkMeter()
         let fixture = try Self.observedFixture(meter)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
@@ -401,13 +401,13 @@ struct StaleBodyEvictWriterHoldTests {
         let freshForHours = SyncConfig.bodyCacheTTLHours + 2
         try Self.shiftFetchedAt(fixture, of: restOfThem, byHours: freshForHours)
 
-        let few = try Self.measuredRun(fixture, meter: meter).writes
+        let few = try await Self.measuredRun(fixture, meter: meter).writes
         let staleFew = try Self.staleRangeRead(fixture)
         let afterFirstRun = try Self.bodyIds(fixture)
         #expect(afterFirstRun.count == allBodies, "every kept body stays")
 
         try Self.shiftFetchedAt(fixture, of: restOfThem, byHours: -freshForHours)
-        let many = try Self.measuredRun(fixture, meter: meter).writes
+        let many = try await Self.measuredRun(fixture, meter: meter).writes
         let staleMany = try Self.staleRangeRead(fixture)
         let afterSecondRun = try Self.bodyIds(fixture)
         #expect(afterSecondRun.count == allBodies, "every kept body stays")
@@ -443,7 +443,7 @@ struct StaleBodyEvictWriterHoldTests {
     }
 
     @Test("One write of the evict step holds the writer no longer when the kept bodies are 64 times wider")
-    func oneWriteDoesNotGrowWithTheKeptBodiesWidth() throws {
+    func oneWriteDoesNotGrowWithTheKeptBodiesWidth() async throws {
         let meter = WriterWorkMeter()
         let fixture = try Self.observedFixture(meter)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
@@ -464,7 +464,7 @@ struct StaleBodyEvictWriterHoldTests {
         }
         try Self.seedKeptInboxBodies(fixture, uids: 1..<(kept + 1), html: narrowHTML)
 
-        let narrow = try Self.measuredRun(fixture, meter: meter).writes
+        let narrow = try await Self.measuredRun(fixture, meter: meter).writes
         let afterNarrowRun = try Self.bodyIds(fixture)
         #expect(afterNarrowRun.count == kept, "every kept body stays")
         let narrowRead = try Self.wholeHTMLRead(fixture)
@@ -473,7 +473,7 @@ struct StaleBodyEvictWriterHoldTests {
         try fixture.pool.write { db in
             try db.execute(sql: "UPDATE messageBody SET htmlContent = ?", arguments: [wideHTML])
         }
-        let wide = try Self.measuredRun(fixture, meter: meter).writes
+        let wide = try await Self.measuredRun(fixture, meter: meter).writes
         let afterWideRun = try Self.bodyIds(fixture)
         #expect(afterWideRun.count == kept, "every kept body stays")
         let wideRead = try Self.wholeHTMLRead(fixture)
@@ -506,7 +506,7 @@ struct StaleBodyEvictWriterHoldTests {
     static let runGrowthSlackPages = 20
 
     @Test("A run reads no more with ten times the bodies that are not stale")
-    func aRunReadsOnlyTheStaleBodies() throws {
+    func aRunReadsOnlyTheStaleBodies() async throws {
         let meter = WriterWorkMeter()
         let fixture = try Self.observedFixture(meter)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
@@ -523,7 +523,7 @@ struct StaleBodyEvictWriterHoldTests {
         try Self.seedFreshBodies(fixture, ids: 0..<fewFresh)
         let keptIds = try Self.bodyIds(fixture).subtracting(archived.suffix(victimsPerRun))
 
-        let few = try Self.measuredRun(fixture, meter: meter).pagesRead
+        let few = try await Self.measuredRun(fixture, meter: meter).pagesRead
         let afterFirstRun = try Self.bodyIds(fixture)
         #expect(afterFirstRun == keptIds,
                 "the run evicts the \(victimsPerRun) older archive bodies and keeps the rest; fresh ones are not stale")
@@ -532,7 +532,7 @@ struct StaleBodyEvictWriterHoldTests {
         let secondVictims = try Self.seedArchiveBodies(fixture, count: victimsPerRun, from: recent + victimsPerRun)
         try Self.seedFreshBodies(fixture, ids: fewFresh..<manyFresh)
         let keptAfterGrowth = try Self.bodyIds(fixture).subtracting(secondVictims)
-        let many = try Self.measuredRun(fixture, meter: meter).pagesRead
+        let many = try await Self.measuredRun(fixture, meter: meter).pagesRead
         let afterSecondRun = try Self.bodyIds(fixture)
         #expect(afterSecondRun == keptAfterGrowth,
                 "the run evicts the \(victimsPerRun) new older archive bodies and keeps the rest; fresh ones are not stale")
@@ -565,7 +565,7 @@ struct StaleBodyEvictWriterHoldTests {
     /// the gate holds the step back. Neither may read the table, on any connection.
     @Test("A run with nothing stale, or one its gate holds back, reads no more with ten times the bodies",
           arguments: [true, false])
-    func aRunWithNothingToEvictReadsNoMore(indexed: Bool) throws {
+    func aRunWithNothingToEvictReadsNoMore(indexed: Bool) async throws {
         let fixture = try Self.makeFixture(buildsDeferredIndexes: indexed)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
 
@@ -576,12 +576,12 @@ struct StaleBodyEvictWriterHoldTests {
         // schema after the migrations is not counted in it.
         let seeded = try Self.bodyIds(fixture)
         #expect(seeded.count == fewFresh)
-        let few = Self.gatedRun(fixture)
+        let few = await Self.gatedRun(fixture)
         let afterFirstRun = try Self.bodyIds(fixture)
         let tableFew = try Self.wholeTableRead(fixture)
 
         try Self.seedFreshBodies(fixture, ids: fewFresh..<manyFresh)
-        let many = Self.gatedRun(fixture)
+        let many = await Self.gatedRun(fixture)
         let afterSecondRun = try Self.bodyIds(fixture)
         let tableMany = try Self.wholeTableRead(fixture)
 

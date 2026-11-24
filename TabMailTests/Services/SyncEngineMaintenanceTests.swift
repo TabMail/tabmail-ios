@@ -308,14 +308,14 @@ struct SyncEngineMaintenanceTests {
         let recent = SyncConfig.bodyCacheRecentPerFolder
         let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
 
-        let ranWithoutIndex = SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let ranWithoutIndex = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
         let beforeIndex = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
         #expect(!ranWithoutIndex, "the step ran with no index to seek")
         #expect(beforeIndex == Set(archived), "a body was evicted before the index existed")
 
         let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
         #expect(build == .built)
-        let ranWithIndex = SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let ranWithIndex = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
         let afterIndex = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
         #expect(ranWithIndex, "the step did not run once its index existed")
         #expect(afterIndex == Set(archived.prefix(recent)),
@@ -325,7 +325,7 @@ struct SyncEngineMaintenanceTests {
     /// The gate waits for the evict step's own index and no other: with that index
     /// built and every other deferred index still missing, the step runs.
     @Test("The evict step runs once its own index exists, whatever the other deferred indexes")
-    func evictStepNeedsOnlyItsOwnIndex() throws {
+    func evictStepNeedsOnlyItsOwnIndex() async throws {
         let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
@@ -346,7 +346,7 @@ struct SyncEngineMaintenanceTests {
         #expect(present.contains(SyncEngine.staleBodyIndexName), "setup: the step's index exists")
         #expect(othersPresent.isEmpty, "setup: every other deferred index is missing: \(othersPresent)")
 
-        let ran = SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
         let after = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
         #expect(ran, "the step waited for an index other than its own")
         #expect(after == Set(archived.prefix(recent)),
@@ -358,7 +358,7 @@ struct SyncEngineMaintenanceTests {
     /// No reader can open, so reading the catalog fails, while the writer works:
     /// a step the gate let through would evict.
     @Test("The evict step does not run when its index cannot be checked")
-    func evictStepWaitsWhenItsIndexCannotBeChecked() throws {
+    func evictStepWaitsWhenItsIndexCannotBeChecked() async throws {
         let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(readersFail: true)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
@@ -375,13 +375,13 @@ struct SyncEngineMaintenanceTests {
         if case .failure = catalogRead { catalogReadFailed = true }
         #expect(catalogReadFailed, "setup: the catalog cannot be read")
 
-        let ran = SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
         let afterGate = try bodyIds()
         #expect(!ran, "the step ran though its index could not be checked")
         #expect(afterGate == Set(archived), "a body was evicted though the index could not be checked")
 
         // Positive control: the writer works, so the step itself evicts here.
-        SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [])
+        await SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [])
         let afterStep = try bodyIds()
         #expect(afterStep == Set(archived.prefix(recent)),
                 "setup: the step evicts on this database, so the gate is what held it back")

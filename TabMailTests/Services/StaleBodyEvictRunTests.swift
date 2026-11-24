@@ -22,8 +22,8 @@ struct StaleBodyEvictRunTests {
 
     typealias Hold = StaleBodyEvictWriterHoldTests
 
-    static func run(_ fixture: Hold.Fixture, undoProtected: Set<String> = []) {
-        SyncEngine.runEvictStaleBodies(
+    static func run(_ fixture: Hold.Fixture, undoProtected: Set<String> = []) async {
+        await SyncEngine.runEvictStaleBodies(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background),
             undoProtectedBodyIds: undoProtected)
     }
@@ -78,7 +78,7 @@ struct StaleBodyEvictRunTests {
     /// `fetchedAt` alone ends after the first page and leaves every victim.
     @Test("Bodies sharing one fetchedAt across three pages: every victim is evicted and every keeper kept",
           arguments: TieStorage.allCases)
-    func aTieAcrossThreePages(_ storage: TieStorage) throws {
+    func aTieAcrossThreePages(_ storage: TieStorage) async throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let chunk = SyncConfig.pruneChunkSize
@@ -96,7 +96,7 @@ struct StaleBodyEvictRunTests {
             try Int.fetchOne(db, sql: "SELECT COUNT(DISTINCT fetchedAt) FROM messageBody") ?? 0
         }
 
-        Self.run(fixture)
+        await Self.run(fixture)
         let after = try Hold.bodyIds(fixture)
 
         // Non-vacuous: one shared value, stored in the class under test, over
@@ -231,7 +231,7 @@ struct StaleBodyEvictRunTests {
     /// it. Evicting a body leaves its header as it was: `bodyComplete` stays set,
     /// and the body is fetched again when it is opened.
     @Test("An undo-protected body is kept, and an evicted body's header keeps bodyComplete")
-    func anUndoProtectedBodyIsKeptAndHeadersKeepBodyComplete() throws {
+    func anUndoProtectedBodyIsKeptAndHeadersKeepBodyComplete() async throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let recent = SyncConfig.bodyCacheRecentPerFolder
@@ -246,7 +246,7 @@ struct StaleBodyEvictRunTests {
                 arguments: [protectedVictim, evictedVictim])
         }
 
-        Self.run(fixture, undoProtected: [protectedVictim])
+        await Self.run(fixture, undoProtected: [protectedVictim])
         let after = try Hold.bodyIds(fixture)
         let complete = try fixture.pool.read { db in
             try Set(String.fetchAll(db, sql: "SELECT id FROM messageHeader WHERE bodyComplete = 1"))
@@ -262,7 +262,7 @@ struct StaleBodyEvictRunTests {
     /// `bodyCacheRecentPerFolder` messages: in one run, the second folder's newest
     /// are judged against that folder's newest, never the first folder's.
     @Test("Each folder keeps its own newest bodies within one run")
-    func eachFolderKeepsItsOwnNewestBodies() throws {
+    func eachFolderKeepsItsOwnNewestBodies() async throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let recent = SyncConfig.bodyCacheRecentPerFolder
@@ -274,7 +274,7 @@ struct StaleBodyEvictRunTests {
         let archived = try Hold.seedArchiveBodies(fixture, count: recent + 2)
         let projects = try Hold.seedArchiveBodies(fixture, count: recent + 2, from: 1_000, folderPath: "Projects")
 
-        Self.run(fixture, undoProtected: [])
+        await Self.run(fixture, undoProtected: [])
         let after = try Hold.bodyIds(fixture)
 
         #expect(after == Set(archived.prefix(recent)).union(projects.prefix(recent)),
@@ -286,7 +286,7 @@ struct StaleBodyEvictRunTests {
     /// such body, and still applies the ordinary rules to the bodies that have a
     /// header. Once the roster reads again the next run evicts the orphan.
     @Test("An unreadable roster keeps the page's orphan but still evicts its header-backed victim")
-    func anUnreadableRosterKeepsTheOrphanOnly() throws {
+    func anUnreadableRosterKeepsTheOrphanOnly() async throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let recent = SyncConfig.bodyCacheRecentPerFolder
@@ -300,10 +300,10 @@ struct StaleBodyEvictRunTests {
         let kept = Set(archived.dropFirst())
 
         try fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account RENAME TO account_unreadable") }
-        Self.run(fixture)
+        await Self.run(fixture)
         let whileUnreadable = try Hold.bodyIds(fixture)
         try fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account_unreadable RENAME TO account") }
-        Self.run(fixture)
+        await Self.run(fixture)
         let afterRestore = try Hold.bodyIds(fixture)
 
         #expect(whileUnreadable == kept.union([orphan]),
@@ -318,7 +318,7 @@ struct StaleBodyEvictRunTests {
     /// committed; the run stops there, so the victims on the page after it stay
     /// too, and the next run evicts both pages.
     @Test("A page that fails rolls back alone, the run stops there, and the next run evicts it")
-    func aFailedPageRollsBackAloneAndTheNextRunRetriesIt() throws {
+    func aFailedPageRollsBackAloneAndTheNextRunRetriesIt() async throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let chunk = SyncConfig.pruneChunkSize
@@ -345,12 +345,12 @@ struct StaleBodyEvictRunTests {
                 """)
         }
 
-        Self.run(fixture)
+        await Self.run(fixture)
         let afterFailure = try Hold.bodyIds(fixture)
         try fixture.pool.writeWithoutTransaction { db in
             try db.execute(sql: "DROP TRIGGER temp.evictFailsOnPageTwo")
         }
-        Self.run(fixture)
+        await Self.run(fixture)
         let afterRetry = try Hold.bodyIds(fixture)
 
         #expect(afterFailure == pageTwo.union(laterVictims).union(keepers),
@@ -394,7 +394,7 @@ struct StaleBodyEvictRunTests {
         let (start, startNow) = AsyncStream<Void>.makeStream()
         let evictRun = Task.detached {
             for await _ in start { break }
-            SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [])
+            await SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [])
         }
         runner.set(evictRun)
         startNow.yield(())
@@ -403,12 +403,54 @@ struct StaleBodyEvictRunTests {
         let wasCancelled = evictRun.isCancelled
         let afterCancel = try Hold.bodyIds(fixture)
 
-        Self.run(fixture)
+        await Self.run(fixture)
         let afterNextRun = try Hold.bodyIds(fixture)
 
         #expect(wasCancelled, "the trigger did not cancel the run")
         #expect(afterCancel == pageTwo.union(keepers),
                 "the cancelled run must finish page one and leave page two untouched")
         #expect(afterNextRun == keepers, "a run that is not cancelled must evict page two")
+    }
+
+    /// The bodies left in the table each time a run called its `afterEachPage`.
+    final class PageCalls: Sendable {
+        private let left = Mutex<[Int]>([])
+
+        func record(_ count: Int) { left.withLock { $0.append(count) } }
+        var all: [Int] { left.withLock { $0 } }
+    }
+
+    /// SQLite's autocheckpoint is off in the app (`AppDatabase.makePool`), so a
+    /// run moves its pages' frames out of the WAL itself: after each page's write
+    /// has committed, and before the next page starts, it calls `afterEachPage`
+    /// (in production the throttled checkpoint). Seen from that call: page one's
+    /// victims are gone and page two's are all still there, and so on, one call
+    /// per page that read rows and none for the empty page that ends the run.
+    /// RED while the run left the checkpoint to the end of the whole maintenance
+    /// pass.
+    @Test("A run calls its checkpoint after each page's write has committed, before the next page")
+    func aRunCheckpointsAfterEachPage() async throws {
+        let fixture = try Hold.makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let chunk = SyncConfig.pruneChunkSize
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        // Oldest first: pages one and two are all victims, page three all keepers.
+        let archived = try Hold.seedArchiveBodies(fixture, count: 2 * chunk + recent, oldestFirst: true)
+        #expect(archived.count == 2 * chunk + recent)
+        guard archived.count == 2 * chunk + recent else { return }
+
+        let calls = PageCalls()
+        let pool = fixture.pool
+        await SyncEngine.runEvictStaleBodies(
+            dbPool: PrioritizedDatabase(pool: pool, priority: .background), undoProtectedBodyIds: [],
+            afterEachPage: {
+                let left = try? await pool.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageBody") ?? -1 }
+                calls.record(left ?? -1)
+            })
+        let after = try Hold.bodyIds(fixture)
+
+        #expect(after == Set(archived[(2 * chunk)...]), "setup: the run evicts pages one and two and keeps page three")
+        #expect(calls.all == [chunk + recent, recent, recent],
+                "bodies left at each call: one call after each page's committed write, none after the empty page: \(calls.all)")
     }
 }

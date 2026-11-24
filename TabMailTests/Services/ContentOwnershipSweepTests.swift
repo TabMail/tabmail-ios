@@ -323,7 +323,7 @@ struct ContentOwnershipSweepTests {
         try await seedBody(key: liveKey, html: "<p>live</p>", ageHours: staleHours)
 
         let sweep = Task.detached(priority: .utility) {
-            SyncEngine.runEvictStaleBodies(
+            await SyncEngine.runEvictStaleBodies(
                 dbPool: AppDatabase.dbPool, undoProtectedBodyIds: [])
         }
         do {
