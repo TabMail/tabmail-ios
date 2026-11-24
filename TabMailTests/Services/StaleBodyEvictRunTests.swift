@@ -8,11 +8,11 @@ import Synchronization
 import Testing
 @testable import TabMail
 
-/// #1354: what the stale-body evict step keeps, evicts and retries. The step
-/// pages through the stale bodies with a keyset cursor on its own index
-/// (`staleBodyPageSQL`), one write per page, and the maintenance pass runs it only
-/// once that index exists (`runEvictStaleBodiesIfIndexed`). The cost bounds are
-/// in `StaleBodyEvictWriterHoldTests`, whose fixture and seed helpers this suite
+/// #1354, #1433: what the stale-body evict step keeps, evicts and retries. The step
+/// pages through its candidates, messages outside every inbox whose HTML was cached
+/// before the cutoff, with a keyset cursor on `messageHeader_htmlCachedAt`
+/// (`HTMLCachePair.evictCandidatesPageSQL`), one write per page. The cost bounds
+/// are in `StaleBodyEvictWriterHoldTests`, whose fixture and seed helpers this suite
 /// reuses; here every test checks which bodies are left, so a cursor that skips
 /// rows, a rule that stops protecting one, or a run that does not stop where it
 /// should shows up as a wrong set of bodies.
@@ -72,13 +72,14 @@ struct StaleBodyEvictRunTests {
         }
     }
 
-    /// Every body shares one `fetchedAt`, so only the `rowid` half of the cursor
-    /// moves it. The pages are 30 inbox bodies and the 20 newest archive bodies
-    /// (all kept); 30 kept archive bodies and 20 victims; 30 victims. A cursor on
-    /// `fetchedAt` alone ends after the first page and leaves every victim.
-    @Test("Bodies sharing one fetchedAt across three pages: every victim is evicted and every keeper kept",
+    /// Every body shares one `fetchedAt`, so every candidate shares one
+    /// `htmlCachedAt` and only the header `rowid` half of the cursor moves it. The
+    /// candidates are the archive bodies (the inbox ones are never visited): the 50
+    /// newest (kept) on page one, the 50 victims on page two. A cursor on
+    /// `htmlCachedAt` alone ends after the first page and leaves every victim.
+    @Test("Bodies sharing one fetchedAt across pages: every victim is evicted and every keeper kept",
           arguments: TieStorage.allCases)
-    func aTieAcrossThreePages(_ storage: TieStorage) async throws {
+    func aTieAcrossPages(_ storage: TieStorage) async throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let chunk = SyncConfig.pruneChunkSize
@@ -90,39 +91,51 @@ struct StaleBodyEvictRunTests {
         let archived = try Hold.seedArchiveBodies(fixture, count: recent + victims, fetchedAt: tie)
         let seeded = try Hold.bodyIds(fixture)
         let storedAs = try await fixture.pool.read { db in
-            try Set(String.fetchAll(db, sql: "SELECT DISTINCT typeof(fetchedAt) FROM messageBody"))
+            try Set(String.fetchAll(db, sql: """
+                SELECT typeof(fetchedAt) FROM messageBody
+                UNION SELECT typeof(htmlCachedAt) FROM messageHeader WHERE htmlCachedAt IS NOT NULL
+                """))
         }
         let distinctTimes = try await fixture.pool.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(DISTINCT fetchedAt) FROM messageBody") ?? 0
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM (
+                    SELECT fetchedAt FROM messageBody
+                    UNION SELECT htmlCachedAt FROM messageHeader WHERE htmlCachedAt IS NOT NULL)
+                """) ?? 0
         }
 
         await Self.run(fixture)
         let after = try Hold.bodyIds(fixture)
 
-        // Non-vacuous: one shared value, stored in the class under test, over
-        // three pages.
-        #expect(distinctTimes == 1, "the bodies do not share one fetchedAt: \(distinctTimes)")
+        // Non-vacuous: one shared value, stored in the class under test in both
+        // tables, over more than one page of candidates.
+        #expect(distinctTimes == 1, "the bodies and their headers do not share one time: \(distinctTimes)")
         switch storage {
         case .text: #expect(storedAs == ["text"], "stored as \(storedAs)")
         case .number: #expect(storedAs == ["real"] || storedAs == ["integer"], "stored as \(storedAs)")
         }
-        #expect(seeded.count > 2 * chunk, "the tie spans \(seeded.count) bodies, under three pages of \(chunk)")
+        #expect(archived.count > chunk, "the tie spans \(archived.count) candidates, one page of \(chunk) or less")
 
         let keepers = seeded.subtracting(archived.suffix(victims))
         #expect(after == keepers,
                 "evicted \(seeded.subtracting(after).count) of \(victims) victims; kept victims: \(after.subtracting(keepers).count), lost keepers: \(keepers.subtracting(after).count)")
     }
 
+    /// The index the evict's page seeks (migration v116).
+    static let candidateIndexName = "messageHeader_htmlCachedAt"
+
     /// The plan the writer uses on a database like a device's: populated, with
-    /// statistics. The page after the cursor must seek the full `(fetchedAt, rowid)`
-    /// lower bound in the index; a seek on `fetchedAt` alone would visit every row
-    /// sharing the cursor's time again on each page.
-    @Test("On a populated, analyzed database the page after the cursor seeks (fetchedAt, rowid) in its index")
+    /// statistics. The page must seek `isInInbox = 0` and the cutoff in the
+    /// candidate index, and the page after the cursor the full
+    /// `(htmlCachedAt, rowid)` lower bound; a seek on `htmlCachedAt` alone would
+    /// visit every row sharing the cursor's time again on each page.
+    @Test("On a populated, analyzed database the page after the cursor seeks (htmlCachedAt, rowid) in its index")
     func thePageAfterTheCursorSeeksItsFullKeyOnAnAnalyzedDatabase() throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let chunk = SyncConfig.pruneChunkSize
         try Hold.seedKeptInboxBodies(fixture, uids: 1..<(3 * chunk + 1))
+        _ = try Hold.seedArchiveBodies(fixture, count: 3 * chunk)
         try Hold.seedFreshBodies(fixture, ids: 0..<2_000)
         let cutoff = Date().addingTimeInterval(-Double(SyncConfig.bodyCacheTTLHours) * 3600)
 
@@ -132,51 +145,48 @@ struct StaleBodyEvictRunTests {
             try db.execute(sql: "ANALYZE")
             let statistics = try Int.fetchOne(
                 db, sql: "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = ?",
-                arguments: [SyncEngine.staleBodyIndexName]) ?? 0
-            let firstArguments: StatementArguments = [cutoff, chunk]
-            let firstPage = try Row.fetchAll(
-                db, sql: SyncEngine.staleBodyPageSQL(afterCursor: false), arguments: firstArguments)
+                arguments: [Self.candidateIndexName]) ?? 0
+            let firstPage = try HTMLCachePair.evictCandidatesPage(db, cachedBefore: cutoff, after: nil, limit: chunk)
             let first = try Self.queryPlan(
-                db, sql: SyncEngine.staleBodyPageSQL(afterCursor: false), arguments: firstArguments)
+                db, sql: HTMLCachePair.evictCandidatesPageSQL(afterCursor: false), arguments: [cutoff, chunk])
             guard let last = firstPage.last else {
                 return (statistics, 0, first, "")
             }
-            let cursorFetchedAt: DatabaseValue = last["fetchedAt"]
-            let cursorRowId: Int64 = last["bodyRowId"]
             let afterCursor = try Self.queryPlan(
-                db, sql: SyncEngine.staleBodyPageSQL(afterCursor: true),
-                arguments: [cutoff, cursorFetchedAt, cursorRowId, chunk])
-            return (statistics, firstPage.count, first, afterCursor)
+                db, sql: HTMLCachePair.evictCandidatesPageSQL(afterCursor: true),
+                arguments: [cutoff, last.cachedAt, last.rowId, chunk])
+            return (statistics, firstPage.candidates.count, first, afterCursor)
         }
 
-        #expect(reading.statistics == 1, "ANALYZE recorded no statistics for \(SyncEngine.staleBodyIndexName)")
+        #expect(reading.statistics == 1, "ANALYZE recorded no statistics for \(Self.candidateIndexName)")
         #expect(reading.firstPageRows == chunk, "the cursor comes from a full first page: \(reading.firstPageRows)")
         for (name, plan) in [("first page", reading.first), ("after the cursor", reading.afterCursor)] {
-            #expect(plan.contains("USING INDEX \(SyncEngine.staleBodyIndexName)"), "\(name): no seek on the index: \(plan)")
+            #expect(plan.contains("USING INDEX \(Self.candidateIndexName) (isInInbox=?"),
+                    "\(name): no seek on the index's isInInbox: \(plan)")
+            #expect(plan.contains("htmlCachedAt<?"), "\(name): the seek does not stop at the cutoff: \(plan)")
             #expect(!plan.contains("SCAN"), "\(name): the page reads the whole table: \(plan)")
             #expect(!plan.contains("TEMP B-TREE"), "\(name): the page sorts: \(plan)")
         }
-        #expect(reading.afterCursor.contains("(fetchedAt,rowid)>(?,?)"),
-                "after the cursor: the seek does not use the full (fetchedAt, rowid) bound: \(reading.afterCursor)")
+        #expect(reading.afterCursor.contains("(htmlCachedAt,rowid)>(?,?)"),
+                "after the cursor: the seek does not use the full (htmlCachedAt, rowid) bound: \(reading.afterCursor)")
     }
 
     // MARK: - The maintenance pass
 
-    /// The real pass, not its helpers. The first pass after an upgrade finds no
-    /// index: it keeps every body, then builds the index and refreshes the planner
-    /// statistics over it. The next pass evicts by the unchanged rules.
+    /// The real pass, not its helpers. Since #1433 the step has no deferred index of
+    /// its own to wait for: the first pass after an upgrade evicts by the unchanged
+    /// rules, before the pass has built the deferred indexes.
     /// `.processGlobalState`: the build and the statistics refresh give up while
     /// `DatabaseSuspension.isSuspended`, and the refresh holds a process-wide
     /// single-flight latch and a process-wide marker.
-    @Test("The maintenance pass keeps every body, builds the index and its statistics, and the next pass evicts",
+    @Test("The maintenance pass evicts on its first pass, deferred indexes not built yet",
           .processGlobalState)
-    func theMaintenancePassBuildsTheIndexThenTheNextPassEvicts() async throws {
+    func theFirstMaintenancePassEvicts() async throws {
         let fixture = try Hold.makeFixture(buildsDeferredIndexes: false)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
-        // The statistics marker is the `schema_version` of the last `ANALYZE`, kept
-        // in `UserDefaults.standard`. A fresh database's version can equal one an
-        // earlier run recorded, which would skip the refresh, so the marker is
-        // cleared for this test and put back after it.
+        // The pass's statistics step records the `schema_version` of its `ANALYZE`
+        // in `UserDefaults.standard`, so the marker is cleared for this test and put
+        // back after it.
         let defaults = UserDefaults.standard
         let markerKey = SyncEngine.plannerStatisticsSchemaVersionKey
         let savedMarker = defaults.object(forKey: markerKey) as? Int
@@ -190,39 +200,23 @@ struct StaleBodyEvictRunTests {
         }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
         let recent = SyncConfig.bodyCacheRecentPerFolder
+        let inbox = 3
+        try Hold.seedKeptInboxBodies(fixture, uids: 1..<(inbox + 1))
+        let inboxIds = try Hold.bodyIds(fixture)
         let archived = try Hold.seedArchiveBodies(fixture, count: recent + 3)
-        let indexName = SyncEngine.staleBodyIndexName
+        let deferredNames = Set(SyncEngine.deferredIndexes.map(\.name))
+        let indexesBefore = try await fixture.pool.read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'index'"))
+        }
+        let deferredIndexesBefore = indexesBefore.intersection(deferredNames).count
 
         await SyncEngine.runWALMaintenance(
             dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterFirstPass = try Hold.bodyIds(fixture)
-        let built = try await fixture.pool.read { db in
-            try Int.fetchOne(
-                db, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
-                arguments: [indexName]) ?? 0
-        }
-        let statistics = try await fixture.pool.read { db in
-            try String.fetchAll(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName])
-        }
-        #expect(afterFirstPass == Set(archived), "the first pass evicted with no index to seek")
-        #expect(built == 1, "the first pass did not build \(indexName)")
-        #expect(statistics.count == 1, "the first pass's statistics do not cover \(indexName)")
-        // An index's statistics start with the number of rows it held when analyzed.
-        let analyzedRows = statistics.first?.split(separator: " ").first.flatMap { Int($0) }
-        #expect(analyzedRows == archived.count, "setup: the first pass analyzed every body: \(statistics)")
 
-        await SyncEngine.runWALMaintenance(
-            dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
-        let afterSecondPass = try Hold.bodyIds(fixture)
-        let statisticsAfterSecondPass = try await fixture.pool.read { db in
-            try String.fetchAll(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName])
-        }
-        #expect(afterSecondPass == Set(archived.prefix(recent)),
-                "the next pass evicts the archive bodies past the newest \(recent), and only them")
-        // The first pass's analysis settled: the next pass does not analyze the
-        // whole database again (that would count the bodies left after it).
-        #expect(statisticsAfterSecondPass == statistics,
-                "the next pass analyzed again: \(statistics) -> \(statisticsAfterSecondPass)")
+        #expect(deferredIndexesBefore == 0, "setup: the fixture built deferred indexes: \(deferredIndexesBefore)")
+        #expect(afterFirstPass == inboxIds.union(archived.prefix(recent)),
+                "the first pass evicts the archive bodies past the newest \(recent), and only them")
     }
 
     // MARK: - The rules a page applies
@@ -282,17 +276,15 @@ struct StaleBodyEvictRunTests {
                 "each folder keeps the bodies of its newest \(recent) messages, and only those")
     }
 
-    /// A body with no header is evicted only when the account and folder roster
-    /// says nothing owns it. When the roster cannot be read the page keeps every
-    /// such body, and still applies the ordinary rules to the bodies that have a
-    /// header. Once the roster reads again the next run evicts the orphan.
-    @Test("An unreadable roster keeps the page's orphan but still evicts its header-backed victim")
-    func anUnreadableRosterKeepsTheOrphanOnly() async throws {
+    /// #1433: a body with no header is not a candidate. The step reads its
+    /// candidates from the headers, so it leaves such a body where it is (a harmless
+    /// leftover, #1446), stale or not, and still evicts the victims around it.
+    @Test("A stale body with no header is left alone, and the victims around it are evicted")
+    func aStaleBodyWithNoHeaderIsLeftAlone() async throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let recent = SyncConfig.bodyCacheRecentPerFolder
-        // First in page order: the orphan, then the oldest archive body, the
-        // page's one header-backed victim.
+        // Cached before every archive body, so under the old body walk it came first.
         let orphan = "\(fixture.accountId):Archive:777777"
         try Self.seedOrphanBody(fixture, id: orphan)
         let archived = try Hold.seedArchiveBodies(fixture, count: recent + 1, oldestFirst: true)
@@ -300,16 +292,11 @@ struct StaleBodyEvictRunTests {
         guard archived.count == recent + 1 else { return }
         let kept = Set(archived.dropFirst())
 
-        try await fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account RENAME TO account_unreadable") }
         await Self.run(fixture)
-        let whileUnreadable = try Hold.bodyIds(fixture)
-        try await fixture.pool.write { db in try db.execute(sql: "ALTER TABLE account_unreadable RENAME TO account") }
-        await Self.run(fixture)
-        let afterRestore = try Hold.bodyIds(fixture)
+        let after = try Hold.bodyIds(fixture)
 
-        #expect(whileUnreadable == kept.union([orphan]),
-                "with the roster unreadable the orphan must stay and the header-backed victim must go")
-        #expect(afterRestore == kept, "once the roster reads, the orphan nothing owns must go")
+        #expect(after == kept.union([orphan]),
+                "the body with no header must stay and the header-backed victim must go")
     }
 
     // MARK: - Failure and cancellation

@@ -276,6 +276,10 @@ struct BackfillProgressCountTests {
     /// the table: written over the test's rows, they give it a large mailbox's estimates.
     /// The test checks at setup that they name every index of the table and no other, and
     /// that under them the read without its index name plans that skip-scan.
+    /// `messageHeader_htmlCachedAt` (migration v116, #1433) comes from the same `ANALYZE`
+    /// of the same database with v116's column, fill and index added (Mac sqlite3 3.54):
+    /// that database caches no HTML, so every header's value is NULL, and every other
+    /// index's row came out unchanged.
     private static let largeMailboxStatistics: [String: String] = [
         "idx_messageHeader_bodyStatus": "105000 52500 35000 26250 13125",
         "messageHeader_accountId_bodyComplete": "105000 26250 13125",
@@ -296,6 +300,7 @@ struct BackfillProgressCountTests {
         "messageHeader_folderId_providerDate": "105000 6563 1",
         "messageHeader_folderId_uidInt": "105000 6563 1",
         "messageHeader_headerIncomplete": "5213 1",
+        "messageHeader_htmlCachedAt": "105000 52500 52500",
         "messageHeader_inReplyTo": "105000 105000",
         "messageHeader_inbox_display": "105000 6563 3282 1",
         "messageHeader_isInInbox_date": "105000 52500 1",

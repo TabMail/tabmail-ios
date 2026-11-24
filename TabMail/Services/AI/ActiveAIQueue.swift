@@ -1084,7 +1084,7 @@ actor ActiveAIQueue {
             // Diagnostic: distinguish failure modes to find root cause of FTS body loss
             let ftsDbReady = await SearchIndex.shared.isReady
             let hasMessageBody = (try? await dbPool.read { db in
-                try MessageBody.fetchOne(db, key: job.headerId) != nil
+                try HTMLCachePair.isCached(db, headerId: job.headerId)
             }) ?? false
             let ftsReason = await SearchIndex.shared.bodyTextDiagnostic(
                 contentKey: ContentKey(rawValue: job.headerId))

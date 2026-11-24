@@ -166,3 +166,21 @@ Two reads cost more:
 - `FTSSelfHealCandidateReadTests` compares the read with the index against the replaced read, without the index, on these mailboxes: empty, one row, only incomplete headers, a window that cuts a run of equal dates, several accounts, and 100,000 rows both dense and sparse. It runs each comparison in the three statistics states, pins the plans in each state, and checks that the recovery read and the sweep page do not move to the index.
 - `FTSSelfHealCandidateProofTests` measures, on the proof databases: the read, the two other reads, the sync pass's header writes, and the index's size.
 - The query registry gives the read the verdict `STOPS: FTSSelfHealCandidateReadTests.candidateReadStopsAtTheWindow`, not `SEEK`: the plan check runs without statistics too, and there the planner does not choose a partial index.
+
+## Amendment 2026-11-24 (#1433): `messageHeader_htmlCachedAt` added, `messageBody_staleEvict` unused
+
+**Added in a migration, not deferred.** `v116_addMessageHeaderHTMLCachedAt` creates
+`messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)` with the column it indexes (ADR-IOS-119). It
+is not a deferred index: the stale-body evict's page has no other exact plan (without it the page
+would scan `messageHeader` inside each write), and the column it indexes is new, so building it
+reads `messageHeader` once in the migration that fills the column. Rule 1: it serves exactly the
+evict's keyset page (`isInInbox = 0 AND htmlCachedAt < ?` in `(htmlCachedAt, rowid)` order) and
+"no cached HTML" (`htmlCachedAt IS NULL` under one `isInInbox` value); `SyncEngineMaintenanceTests.staleBodyPageSeeksItsIndex`
+pins the page's plan without statistics. Its size and its write cost against the old schema are
+measured in `StaleBodyEvictPairProofTests`.
+
+**`messageBody_staleEvict` (#1354) leaves `SyncEngine.deferredIndexes`.** Nothing reads it since the
+evict reads its candidates from the header; the gate that waited for it
+(`runEvictStaleBodiesIfIndexed`) is removed. A database that already built it keeps it: no query
+names it, it changes no result, and dropping it would be cleanup code for a leftover that costs only
+its pages and its upkeep on body writes (accepted as a harmless leftover, #1446).

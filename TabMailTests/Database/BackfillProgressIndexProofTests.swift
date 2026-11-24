@@ -305,7 +305,7 @@ struct BackfillProgressIndexProofTests {
             inboxPage("label-filter page", inboxQuery(inbox, mode: .normal, unread: false, labels: [label])),
             Probe(name: "body download queue, active", hot: true, sql: ActiveBodyQueue.admissionSQL, arguments: []),
             Probe(name: "body download queue, backfill", hot: true, sql: BackfillBodyQueue.admissionSQL, arguments: []),
-            Probe(name: "stale-body evict page", hot: true, sql: SyncEngine.staleBodyPageSQL(afterCursor: false),
+            Probe(name: "stale-body evict page", hot: true, sql: HTMLCachePair.evictCandidatesPageSQL(afterCursor: false),
                   arguments: [cutoff, SyncConfig.pruneChunkSize]),
             Probe(name: "stale-body evict, recent bodies of a folder", hot: true, sql: recent.sql, arguments: recent.arguments),
             Probe(name: "FTS self-heal, recent window", hot: true, sql: SyncEngine.ftsBodyMembershipCandidateSQL, arguments: []),

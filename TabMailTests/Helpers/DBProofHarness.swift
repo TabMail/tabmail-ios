@@ -175,15 +175,25 @@ enum DBProof {
     // MARK: - Building the database
 
     /// Builds the proof database at `url`, replacing any file there. Deterministic for
-    /// a given shape, seed and anchor.
-    static func build(at url: URL, shape: Shape, seed: UInt64 = Config.seed, anchor: Date) throws {
+    /// a given shape, seed and anchor. `migratedUpTo` stops the schema at that
+    /// migration (a proof that measures a later migration runs it itself); nil runs
+    /// the whole chain.
+    static func build(
+        at url: URL, shape: Shape, seed: UInt64 = Config.seed, anchor: Date, migratedUpTo: String? = nil
+    ) throws {
         try removeDatabaseFiles(at: url)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var config = Configuration()
         config.foreignKeysEnabled = true
         let queue = try DatabaseQueue(path: url.path, configuration: config)
-        try AppDatabase.runMigrations(on: queue)
+        if let migratedUpTo {
+            var migrator = DatabaseMigrator()
+            AppDatabase.registerAllMigrations(on: &migrator)
+            try migrator.migrate(queue, upTo: migratedUpTo)
+        } else {
+            try AppDatabase.runMigrations(on: queue)
+        }
         try queue.write { db in
             try SyncEngine.createDeferredIndexes(db)
             var rng = SeededGenerator(seed: seed)

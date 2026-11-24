@@ -4564,6 +4564,102 @@ final class AppDatabase: Sendable {
                 t.column("lastUsedAt", .datetime).notNull()
             }
         }
+
+        // #1433: the header records when its message's HTML was cached, so the
+        // body-cache evict reads only the bodies it may delete. Before this, the evict
+        // walked every cached body older than the TTL and read each one's header,
+        // keeping the inbox ones, on every maintenance pass (about 19,000 kept bodies
+        // and 7 s per pass at 105k headers).
+        //
+        // - `messageHeader.htmlCachedAt` is the `fetchedAt` of the message's
+        //   `messageBody` row, NULL when it has none: the pair of the HTML cache, as
+        //   `bodyComplete` is the pair of the search text (ADR-IOS-050). No existing
+        //   column says whether a header's HTML is cached.
+        // - SQLite keeps it exact, whatever code writes either table: a body insert,
+        //   a body update that changes `fetchedAt` or `id`, a body delete, a header
+        //   insert (a body written before its header, or a header deleted and inserted
+        //   again under a new id) and an update of a header's `id`. Each trigger writes
+        //   the state at the end of its own statement, so any order of header and body
+        //   writes ends exact. The column is not part of the `MessageHeader` record,
+        //   so a record `insert`/`update`/`save` never writes it; `HTMLCachePair` is
+        //   the only reader.
+        // - The triggers match a body to its header by id, which holds while
+        //   `ContentKey.forHeader` returns the header id. The change that makes
+        //   content keys differ from header ids must point these triggers at the
+        //   content key the header holds (`HTMLCachePairTests` fails that day).
+        // - `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)` holds every header,
+        //   NULLs included (not a partial index): the evict seeks `isInInbox = 0 AND
+        //   htmlCachedAt < cutoff`, and "no cached HTML" is `htmlCachedAt IS NULL`
+        //   under one `isInInbox` value. Leading with `isInInbox` keeps the evict from
+        //   walking old inbox entries it would only skip.
+        // - The fill reads `messageBody` (bodies are far fewer than headers) and
+        //   seeks each one's header by primary key; it runs before the index exists
+        //   so the index is built once from the filled column. Building the index
+        //   reads `messageHeader` once.
+        // - Write cost: a body save or delete also rewrites its header row and moves
+        //   one index entry; a header insert probes `messageBody` by primary key.
+        //   Whole-table body deletes fire the delete trigger per row.
+        // - A later migration that rebuilds `messageHeader` or `messageBody` drops
+        //   these triggers with the old table and must create them again
+        //   (`HTMLCachePairTests` checks the pair after the whole chain).
+        migrator.registerTimedMigration(
+            "v116_addMessageHeaderHTMLCachedAt", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: "ALTER TABLE messageHeader ADD COLUMN htmlCachedAt DATETIME")
+            try db.execute(sql: """
+                UPDATE messageHeader
+                SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE messageBody.id = messageHeader.id)
+                WHERE id IN (SELECT id FROM messageBody)
+                """)
+            try db.execute(sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_htmlCachedAt
+                ON messageHeader(isInInbox, htmlCachedAt)
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtInsert
+                AFTER INSERT ON messageBody
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NEW.fetchedAt WHERE id = NEW.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtUpdate
+                AFTER UPDATE OF id, fetchedAt ON messageBody
+                WHEN OLD.id IS NOT NEW.id OR OLD.fetchedAt IS NOT NEW.fetchedAt
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NULL
+                    WHERE id = OLD.id AND OLD.id IS NOT NEW.id;
+                    UPDATE messageHeader SET htmlCachedAt = NEW.fetchedAt WHERE id = NEW.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtDelete
+                AFTER DELETE ON messageBody
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NULL WHERE id = OLD.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_htmlCachedAtInsert
+                AFTER INSERT ON messageHeader
+                WHEN NEW.htmlCachedAt IS NOT (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                BEGIN
+                    UPDATE messageHeader
+                    SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                    WHERE rowid = NEW.rowid;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_htmlCachedAtRekey
+                AFTER UPDATE OF id ON messageHeader
+                WHEN OLD.id IS NOT NEW.id
+                BEGIN
+                    UPDATE messageHeader
+                    SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                    WHERE rowid = NEW.rowid;
+                END
+                """)
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static

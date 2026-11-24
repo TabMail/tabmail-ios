@@ -24,3 +24,13 @@ The flip conflated two independent facts:
 **Relates:** ADR-IOS-046 (abandon-on-suspend — both the evictor and the heal abandon cleanly); the backfill-stall fixes of 2026-07-02 (UID-remap re-key — the other "never reaches 100%" mechanism); PROJECT_MEMORY "Backfill / Fast Sync Completion" (`pendingBodyCount` gate).
 
 ---
+
+## Amendment 2026-11-24 (#1433, ADR-IOS-119): the display cache's state is mirrored on the header by SQLite
+
+"The display cache gets NO flag" still holds for app code: no code path writes a "cached" flag.
+`messageHeader.htmlCachedAt` (v116) is the `fetchedAt` of the `messageBody` row, kept exact by
+SQLite triggers on every write to either table, so it cannot drift from the row's existence the way
+an app-written flag could (the failure this ADR names). The row's existence remains the cache state;
+the column is its mirror on the header, read only through `HTMLCachePair`. The three evictors still
+never touch `bodyComplete`, and deleting a `messageBody` row (any evictor) clears the column through
+the delete trigger with no code of its own.

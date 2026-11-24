@@ -1104,10 +1104,7 @@ enum NSEDataBridge {
                     rfc822MessageId: msg.rfc822MessageId
                 ) else { continue }
                 if msg.htmlContent != nil || msg.textContent != nil {
-                    let hasBody = try Bool.fetchOne(db, sql: """
-                        SELECT EXISTS(SELECT 1 FROM messageBody WHERE id = ?)
-                        """, arguments: [ref.id]) ?? false
-                    guard hasBody else { continue }
+                    guard try HTMLCachePair.isCached(db, headerId: ref.id) else { continue }
                 }
                 durable.insert(msg.id)
             }
@@ -2912,8 +2909,9 @@ enum NSEDataBridge {
         //
         // This is the highest-FREQUENCY site that used to lean on the FK cascade —
         // every archive/delete/move performed on another device arrives here. Without
-        // the release, Stage D would turn it into a recurring push-driven body leak,
-        // reclaimed only by `runEvictStaleBodies` up to `bodyCacheTTLHours` later.
+        // the release, Stage D would turn it into a recurring push-driven body leak
+        // that nothing reclaims: since #1433 the stale-body evict reads only bodies
+        // whose header exists (`HTMLCachePair`).
         var releasedContentKeys: [ContentKey] = []
 
         do {

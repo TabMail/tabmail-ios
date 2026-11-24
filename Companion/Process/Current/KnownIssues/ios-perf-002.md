@@ -59,3 +59,20 @@ Maintenance; `PriorityGate.write`; pass-through write; `DatabaseWriteQueue`; tie
 
 **Tests.** `StoragePrunePagingTests.theBodyPassTakesTheFormerPages` (the former walk, run on the same rows as the oracle: the same bodies deleted, the same deleted count and the same number of storage checks, with the check over the budget for 0 to all pages plus one; both orders, an empty folder, a folder at the floor, one row over it, ties in the key across page boundaries, and every row sharing one date; another folder's bodies untouched); `theCheckCountsTheRowsAfterTheCursor` (for floors 0, 1 and `floorPerFolder`, the check's answer equals counting the rows after every cursor of the folder, and the whole folder without one); `everyReadSeeksItsIndex` (the page and the check, first and after a cursor, seek the order's index with no scan of `messageHeader` and no sort, the check from the index alone, with the statistics the migrations leave, none, and a fresh `ANALYZE`); `aPageCostsTheSameWhereverItLies` (in a folder of 12,000 rows the pages fetched by the pass's last ten pages average no more than a small slack above its first ten, and each check fetches no more than a small slack above the same check in a folder of 200 rows); `theCheckCostsTheSameWhateverTheFolderSize` (the check before a header chunk fetches no more than a small slack more pages in 12,000 rows than in 200). Each of the last two first reads the former statement through the same meter in the same fixture, and requires it to cost clearly more in the large case (the `OFFSET` page at the folder's end against its start; the full count in 12,000 rows against 200), so the meter is shown to see the growth it rules out. `StoragePrunePassReadTests.noPassReadGrowsWithTheFolder` runs the whole `runPruneIfOverBudget` with the store over its limit on a 12,000-row and a 200-row folder of one account, both orders: both folders end at the floor, and every statement the pass reads headers with costs, in the large folder, no more than a small slack above the same statement in the small one. The prune tests in `IMAPMissingByUIDTests+CostAndBounds` run the whole `runPruneIfOverBudget` unchanged.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Amendment 2026-11-24 (#1433): the evict reads only its candidates
+
+After #1354 each evict write was bounded, but every pass still walked every cached body older than
+the TTL and read each one's header, a page of `SyncConfig.pruneChunkSize` per write. Inbox bodies are
+always kept, so once past the TTL they were all visited again on every pass (#1427, simulator: at 105k
+headers 18,764 bodies, 65.8k pages read, 7.5 s and 377 writes per pass; at 525k about 93,000 bodies,
+33 to 37 s and 1,861 writes, single writes up to 715 ms). **Fix (ADR-IOS-119):** the header records
+when its HTML was cached (`messageHeader.htmlCachedAt`, kept exact by SQLite triggers), and each write's
+page is a keyset seek on `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)` for headers outside an
+inbox cached before the cutoff (`HTMLCachePair.evictCandidatesPage`). Inbox bodies are not read at all;
+the page reads only candidates, the rules (undo set, a folder's newest) are unchanged, and the orphan
+leg is gone. The write stays the synchronous pass-through write through `passThroughWrite`, bounded per
+page as before, and the WAL checkpoint between pages is unchanged; the gate on `messageBody_staleEvict`
+is removed. **Census:** this row's predicate is unchanged by the change (no `dbPool.write` site added
+or removed). Old against new, with write costs: `StaleBodyEvictPairProofTests`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->

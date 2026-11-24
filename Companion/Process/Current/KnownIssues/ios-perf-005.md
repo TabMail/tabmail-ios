@@ -63,3 +63,13 @@ Performance; migrations; `v83_markAllAsReadUnreadSweepIndex`; `messageHeader_unr
 
 `SyncEngine.deferredIndexes` gains `messageHeader_backfillProgress` on `messageHeader(accountId, bodyComplete, bodyEmptyConfirmed, bodyMetadataOversized, headerComplete)`, the index the backfill progress counts read (`SyncEngine.backfillProgressCounts`; ADR-IOS-029 amendment of the same date). It qualifies under this row's rule: its absence changes no result, no write depends on it, and nothing names it in an `INDEXED BY`. Its build reads every header once. During this row's transient window the counts read header rows as they did before, with the same results, so nothing is gated on it. Point (ii) above applies unchanged to the one-time build. It is built in the statistics refresh's one write, like every deferred index since the amendment above.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Amendment 2026-11-24 (#1433): `messageBody_staleEvict` leaves the deferred set
+
+The stale-body evict reads its candidates from `messageHeader_htmlCachedAt` (migration v116,
+ADR-IOS-119), so nothing reads `messageBody_staleEvict` any more. It is out of
+`SyncEngine.deferredIndexes`, and the evict step is no longer gated on it (`runEvictStaleBodiesIfIndexed`
+is removed; `runWALMaintenance` calls `runEvictStaleBodies` directly). A database that already built it
+keeps it (harmless leftover, #1446). The 2026-11-23 amendment above describes the state from #1354 to
+#1433 and stays as history.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
