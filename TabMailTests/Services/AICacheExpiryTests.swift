@@ -42,12 +42,14 @@ struct AICacheExpiryTests {
     private static let otherAccountId = "acc2"
 
     /// Every statement the pool ran, with its bound values inlined so it can be planned
-    /// afterwards. `expandedDescription`, not `description`: see
+    /// afterwards, and whether the writer ran it (a pool's readers are read-only
+    /// connections). `expandedDescription`, not `description`: see
     /// `SearchScopedPageTests.SQLTape` for why. The fixtures hold only example.com data.
     private final class SQLTape: Sendable {
-        private let statements = Mutex<[String]>([])
-        func record(_ sql: String) { statements.withLock { $0.append(sql) } }
-        func drain() -> [String] {
+        private let statements = Mutex<[(sql: String, onWriter: Bool)]>([])
+        func record(_ sql: String, onWriter: Bool) { statements.withLock { $0.append((sql: sql, onWriter: onWriter)) } }
+        func drain() -> [String] { drainWithConnection().map { $0.sql } }
+        func drainWithConnection() -> [(sql: String, onWriter: Bool)] {
             statements.withLock { buffer in
                 let all = buffer
                 buffer = []
@@ -150,7 +152,8 @@ struct AICacheExpiryTests {
         var configuration = Configuration()
         configuration.foreignKeysEnabled = true
         configuration.prepareDatabase { db in
-            db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
+            let onWriter = !db.configuration.readonly
+            db.trace(options: .statement) { event in tape.record(event.expandedDescription, onWriter: onWriter) }
         }
         let pool = try DatabasePool(
             path: directory.appendingPathComponent("test.sqlite").path, configuration: configuration)
@@ -427,6 +430,61 @@ struct AICacheExpiryTests {
         let left = Set(after.map { $0.key })
         let otherArchived = archived.map { $0.key }.filter { $0 != rewritten }
         #expect(otherArchived.allSatisfy { !left.contains($0) }, "the run stopped after the write between batches")
+    }
+
+    /// The write between batches above lands before the next batch is read, so it cannot
+    /// tell where that read runs. Each batch must be read in the write transaction that
+    /// deletes or keeps its entries: a read before that transaction leaves a moment in
+    /// which an AI result can be written and then deleted by a decision made without it.
+    @Test("Each batch is read in the write transaction that deletes or keeps its entries")
+    func eachBatchIsReadInTheWriteThatHandlesIt() throws {
+        let env = try makeEnv()
+        defer { finish(env) }
+        let total = SyncConfig.pruneChunkSize + 10
+        var copies: [Copy] = []
+        for i in 0..<total {
+            copies.append(Copy(uid: "\(i + 1)", folderPath: i % 2 == 0 ? "INBOX" : "Archive", rfc: "t\(i)@example.com"))
+        }
+        try insert(env, copies: copies)
+        for (i, copy) in copies.enumerated() {
+            try insertEntry(env, rfc: copy.rfc, updatedAt: expired.addingTimeInterval(-Double(i)))
+        }
+        _ = env.tape.drain()
+
+        purge(env)
+
+        let statements = env.tape.drainWithConnection()
+        let batchReads = statements.filter { $0.sql.contains("SELECT key, rfc822MessageId FROM messageAICache") }
+        let allOnWriter = batchReads.allSatisfy { $0.onWriter }
+        #expect(!batchReads.isEmpty, "the run read no batch")
+        #expect(allOnWriter, "a batch was read on a reader, outside the write that handles it")
+
+        // The writer's statements, split into its transactions.
+        var transactions: [[String]] = []
+        var current: [String]?
+        for statement in statements where statement.onWriter {
+            let upper = statement.sql.uppercased()
+            if upper.hasPrefix("BEGIN") {
+                current = []
+            } else if upper.hasPrefix("COMMIT") || upper.hasPrefix("ROLLBACK") {
+                if let done = current { transactions.append(done) }
+                current = nil
+            } else {
+                current?.append(statement.sql)
+            }
+        }
+        func isDisposition(_ sql: String) -> Bool {
+            sql.hasPrefix("UPDATE messageAICache") || sql.hasPrefix("DELETE FROM messageAICache")
+        }
+        let handling = transactions.filter { $0.contains(where: isDisposition) }
+        // One full batch, then the last ten entries.
+        #expect(handling.count == 2, "write transactions that keep or delete entries: \(handling.count)")
+        for transaction in handling {
+            let read = transaction.firstIndex { $0.contains("SELECT key, rfc822MessageId FROM messageAICache") }
+            let write = transaction.firstIndex(where: isDisposition)
+            let readFirst = read.flatMap { r in write.map { r < $0 } } ?? false
+            #expect(readFirst, "a transaction kept or deleted entries it did not read: \(transaction.prefix(3))")
+        }
     }
 
     @Test("A batch that fails is undone whole, and the next run finishes the expiry")
