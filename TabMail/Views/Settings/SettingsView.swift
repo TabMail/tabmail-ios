@@ -673,8 +673,71 @@ struct SettingsView: View {
         oldMessageCount = 0
     }
 
+    /// The sweep's read: every message dated before `cutoff` in `folderIds`,
+    /// one folder after another, each oldest first. Each statement reads one
+    /// page of one folder (`oldInboxPage`), so no statement reads more than
+    /// `pageSize` rows and none sorts across folders. All pages are read in the
+    /// caller's one read transaction, so they come from one snapshot.
+    nonisolated static func oldInboxMessages(
+        _ db: Database, folderIds: Set<String>, cutoff: Date, pageSize: Int
+    ) throws -> [MessageHeader] {
+        var messages: [MessageHeader] = []
+        for folderId in folderIds.sorted() {
+            var after: OldInboxCursor?
+            while true {
+                let page = try oldInboxPage(db, folderId: folderId, cutoff: cutoff, after: after, limit: pageSize)
+                messages += page.headers
+                guard page.headers.count == pageSize, let next = page.next else { break }
+                after = next
+            }
+        }
+        return messages
+    }
+
+    /// Where the next page of `oldInboxPage` starts: the `date` value stored in
+    /// the previous page's last row, exactly as read, and that row's rowid.
+    struct OldInboxCursor {
+        let date: DatabaseValue
+        let rowid: Int64
+    }
+
+    /// One page of the sweep's read: `folderId`'s messages dated before
+    /// `cutoff`, oldest first, starting after `after`, at most `limit` of them.
+    ///
+    /// It walks `messageHeader_folderId_date` within the one folder, so it reads
+    /// only the rows it returns and needs no sort: the index holds them in
+    /// `(date, rowid)` order. `INDEXED BY` pins that index because the planner
+    /// can choose the plain `date` index instead, and then walks every folder's
+    /// mail older than the cutoff to find the inbox's. The cursor carries the
+    /// stored `date` value as read, so a page boundary inside a run of equal
+    /// dates neither skips nor repeats a row. `nonisolated`: it runs inside the
+    /// database's read, off the main actor.
+    nonisolated static func oldInboxPage(
+        _ db: Database, folderId: String, cutoff: Date, after: OldInboxCursor?, limit: Int
+    ) throws -> (headers: [MessageHeader], next: OldInboxCursor?) {
+        var sql = """
+            SELECT *, rowid AS sweepRowid FROM messageHeader INDEXED BY messageHeader_folderId_date
+            WHERE folderId = ? AND date < ?
+            """
+        var arguments: StatementArguments = [folderId, cutoff]
+        if let after {
+            sql += " AND (date, rowid) > (?, ?)"
+            arguments += [after.date, after.rowid]
+        }
+        sql += " ORDER BY date, rowid LIMIT ?"
+        arguments += [limit]
+        let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
+        guard let last = rows.last else { return ([], nil) }
+        let headers = try rows.map { try MessageHeader(row: $0) }
+        return (headers, OldInboxCursor(date: last["date"], rowid: last["sweepRowid"]))
+    }
+
     /// The "Archive old messages" sweep. Returns how many rows it asked to move,
     /// or nil when the read failed or found no old row (nothing was attempted).
+    ///
+    /// It reads each inbox folder's old messages in pages (`oldInboxMessages`),
+    /// then moves them as one operation per account, as before: one Undo
+    /// restores an account's whole sweep.
     ///
     /// The sweep is a gesture on the rows it reads (ADR-IOS-115): the folder
     /// reset stamp is taken BEFORE the read and bound around the mark-read and
@@ -694,11 +757,8 @@ struct SettingsView: View {
         let stamp = FolderResetGeneration.current()
         await beforeRead()
         guard let oldMessages = try? await AppDatabase.dbPool.read({ db in
-            try MessageHeader
-                .filter(inboxFolderIds.contains(Column("folderId")))
-                .filter(Column("date") < archiveCutoff)
-                .order(Column("date").asc)
-                .fetchAll(db)
+            try Self.oldInboxMessages(db, folderIds: inboxFolderIds, cutoff: archiveCutoff,
+                                      pageSize: SyncConfig.archiveOldReadPageSize)
         }), !oldMessages.isEmpty else { return nil }
         await afterRead()
 
