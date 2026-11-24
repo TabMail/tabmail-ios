@@ -81,6 +81,13 @@ within that directive's intent and are explicitly surfaced for owner veto.
   `flushBatch(enableAI: false)`). ⚠️ `flushBatch` is DUAL-ORIGIN — the user-open priority fetch
   also flushes through it (below); the origin travels as its `aiWindowExempt` parameter, so
   "flushBatch is gated" is true of its sync feeders, not of the function.
+  - *Correction 2026-11-24 (iOS #1400).* "Inbox-wide and UNBOUNDED" above describes the refill
+    before #1400. `ActiveBodyQueue.repopulateFromDatabase` and its drain-time refill now read the
+    newest `SyncConfig.bodyFetchRepopulateLimit` waiting inbox rows per refill (`admissionSQL`'s
+    `LIMIT`), and successive refills still reach every waiting row. So on first install every
+    historical Inbox row still flows through `flushBatch`, a window at a time, and the admission
+    window is still the only thing between that flood and the LLM: it stays load-bearing. The cost
+    of reading a window at a time is `IOS-BODY-007`.
 - **Window EXEMPT (arrival/user-intent bucket), carried by `AIJob.windowExempt`:**
   - *Push/NSE merge* (`NSEDataBridge`'s post-merge downstream loop): a pushed message is new mail
     the user was just notified about.
