@@ -42,6 +42,9 @@ import Testing
 /// A `sql` row carries the statement's plan obligation (the plan half checks it); the `call`
 /// row of the code that runs it carries how often and where (a loop makes it `N+1`, a
 /// forwarder runs it on another path), so a literal run once has the same verdict on both.
+/// A `request` row (a function or computed property returning a request) carries what the
+/// request reads, as a `sql` row does, and is not plan-checked; one returning only a filter
+/// expression is `NOT-A-QUERY`, and the requests it joins carry the read.
 extension DatabaseIndexTests {
 
     // MARK: - Registry rows
@@ -108,7 +111,8 @@ extension DatabaseIndexTests {
     // MARK: - Comparing the scan with the registry
 
     struct RegistryDiff: Equatable {
-        /// Sites with no row.
+        /// Sites with no row: the site's place in the source, then on the next line the row to
+        /// paste into the registry, with its verdict and note still to write.
         var unregistered: [String] = []
         /// Rows with no site (the site is gone or changed).
         var stale: [String] = []
@@ -118,12 +122,19 @@ extension DatabaseIndexTests {
         var malformed: [String] = []
     }
 
+    /// The placeholders of a printed row; neither passes `everyVerdictIsWellFormed`, so a row
+    /// pasted without its verdict still fails.
+    static let unwrittenVerdict = "<verdict>"
+    static let unwrittenNote = "<note>"
+
     static func compare(sites: [QueryCensusScanner.Site], entries: [RegistryEntry]) -> RegistryDiff {
         let scanned = Set(sites.map(\.key))
         let registered = Set(entries.map(\.key))
         var diff = RegistryDiff()
-        diff.unregistered = sites.filter { !registered.contains($0.key) }
-            .map { "\($0.file):\($0.line) [\($0.kind)] \($0.context): \($0.text.prefix(160))" }
+        diff.unregistered = sites.filter { !registered.contains($0.key) }.map { site in
+            let row = [site.file, site.context, site.kind, String(site.ordinal), unwrittenVerdict, unwrittenNote, site.text]
+            return "\(site.file):\(site.line)\n" + row.joined(separator: "\t")
+        }
         diff.stale = entries.filter { !scanned.contains($0.key) }.map(\.label)
         var seen: Set<String> = []
         var reported: Set<String> = []
@@ -140,8 +151,9 @@ extension DatabaseIndexTests {
     func everySiteIsRegistered() throws {
         let diff = Self.compare(sites: try QueryCensusScanner.scan(root: Self.repositoryRoot), entries: try Self.registry())
         #expect(diff.unregistered.isEmpty, """
-            Query sites with no row in TabMailTests/Database/QueryFence/query-registry.tsv. Add one row per \
-            site with its verdict (vocabulary: DatabaseIndexTests+QueryRegistry.swift):
+            Query sites with no row in TabMailTests/Database/QueryFence/query-registry.tsv. Each site is \
+            printed as its place in the source, then its row: paste the row and replace <verdict> and \
+            <note> (vocabulary: DatabaseIndexTests+QueryRegistry.swift):
             \(diff.unregistered.joined(separator: "\n"))
             """)
         #expect(diff.stale.isEmpty, """
@@ -283,6 +295,23 @@ extension DatabaseIndexTests {
         let missing = Self.compare(sites: sites, entries: try Self.parseRegistry(Self.fixtureRegistry([Self.fixtureRow(first)])))
         #expect(missing.unregistered.count == 1 && missing.unregistered[0].contains("messageBody"), "\(missing)")
         #expect(missing.stale.isEmpty && missing.duplicated.isEmpty && missing.malformed.isEmpty)
+
+        // The printed row is the site's exact row, full text and ordinal included: with its
+        // verdict and note written, it registers the site.
+        let long = Self.fixtureSite("SELECT * FROM messageBody WHERE id = ? AND " + String(repeating: "x", count: 200),
+                                    ordinal: 3, line: 9)
+        let printed = Self.compare(sites: [long], entries: []).unregistered
+        #expect(printed.count == 1, "\(printed)")
+        guard printed.count == 1 else { return }
+        let lines = printed[0].split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.count == 2 && lines[0] == "TabMail/Fixture.swift:9", "\(lines)")
+        guard lines.count == 2 else { return }
+        let pasted = lines[1].replacingOccurrences(of: Self.unwrittenVerdict, with: "SEEK")
+            .replacingOccurrences(of: Self.unwrittenNote, with: "one row by key")
+        let pastedEntries = try Self.parseRegistry(Self.fixtureRegistry([pasted]))
+        #expect(Self.compare(sites: [long], entries: pastedEntries) == RegistryDiff(), "\(pasted)")
+        let unwritten = try Self.parseRegistry(Self.fixtureRegistry([lines[1]]))
+        #expect(Self.compare(sites: [long], entries: unwritten).malformed.count == 1, "a row pasted as printed is refused")
 
         let edited = Self.fixtureSite("SELECT * FROM messageBody WHERE id = ? AND 1", line: 2)
         let stale = Self.compare(sites: sites, entries: try Self.parseRegistry(Self.fixtureRegistry(

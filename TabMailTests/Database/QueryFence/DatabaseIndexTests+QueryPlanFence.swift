@@ -44,12 +44,12 @@ extension DatabaseIndexTests {
 
     // MARK: - Schemas and statistics
 
-    /// The statistics the planner works from. `noStatistics` is a fresh database (the
-    /// migrations' `ANALYZE` ran on empty tables, which leaves no rows in `sqlite_stat1`, so
-    /// SQLite assumes its defaults), with the deferred indexes built as the first
-    /// maintenance pass builds them; `largeMailbox` installs statistics for ADR-IOS-029's
-    /// large profile, as the maintenance `ANALYZE` would leave them on a device with that
-    /// much mail.
+    /// The statistics the planner works from. `noStatistics` is a fresh database, with the
+    /// deferred indexes built as the first maintenance pass builds them: the migrations'
+    /// `ANALYZE` ran on empty tables, which leaves no `sqlite_stat1` row for a table or a
+    /// full index of it, only a "0 0" row for each partial index, so SQLite assumes its
+    /// defaults. `largeMailbox` installs statistics for ADR-IOS-029's large profile, as
+    /// the maintenance `ANALYZE` would leave them on a device with that much mail.
     enum StatisticsRegime: String, CaseIterable, Sendable {
         case noStatistics
         case largeMailbox
@@ -151,33 +151,47 @@ extension DatabaseIndexTests {
     }
 
     /// What a schema's `sqlite_stat1` says, for the regime check: the tables it has a row
-    /// for, and the largest row count it gives `messageHeader` (nil when none; a partial
+    /// for; the tables it tells the planner something about (a row for the table itself or
+    /// for a full index of it, or a partial index's row counting more than 0 rows: an
+    /// `ANALYZE` of an empty table leaves "0 0" rows for its partial indexes and nothing
+    /// else); and the largest row count it gives `messageHeader` (nil when none; a partial
     /// index's row holds fewer rows than the table's).
-    static func statistics(_ db: Database) throws -> (tables: Set<String>, headerRows: Int?) {
-        guard try db.tableExists("sqlite_stat1") else { return ([], nil) }
+    static func statistics(_ db: Database) throws -> (tables: Set<String>, informed: Set<String>, headerRows: Int?) {
+        guard try db.tableExists("sqlite_stat1") else { return ([], [], nil) }
+        let partialIndexes = try Set(String.fetchAll(db, sql: """
+            SELECT il.name FROM sqlite_master AS m, pragma_index_list(m.name) AS il
+            WHERE m.type = 'table' AND il.partial = 1
+            """))
         var tables: Set<String> = []
+        var informed: Set<String> = []
         var headerRows: Int?
-        for row in try Row.fetchAll(db, sql: "SELECT tbl, stat FROM sqlite_stat1") {
+        for row in try Row.fetchAll(db, sql: "SELECT tbl, idx, stat FROM sqlite_stat1") {
             let table: String = row["tbl"]
-            tables.insert(table)
+            let index: String? = row["idx"]
             let stat: String? = row["stat"]
-            if table == "messageHeader", let count = stat?.split(separator: " ").first.flatMap({ Int($0) }) {
+            let count = stat?.split(separator: " ").first.flatMap { Int($0) }
+            tables.insert(table)
+            let isTableOrFullIndex = index.map { !partialIndexes.contains($0) } ?? true
+            if isTableOrFullIndex || (count ?? 0) > 0 {
+                informed.insert(table)
+            }
+            if table == "messageHeader", let count {
                 headerRows = max(headerRows ?? 0, count)
             }
         }
-        return (tables, headerRows)
+        return (tables, informed, headerRows)
     }
 
     /// Nil when `schemas` carry `regime`'s statistics, else what is wrong. A fresh database
-    /// has no statistics for a mail-sized table (they are empty when the migrations'
-    /// `ANALYZE` runs); the large-mailbox one has a row for every table, and `messageHeader`'s
-    /// count is the profile's.
+    /// tells the planner nothing about a mail-sized table (`statistics(_:)`'s `informed`:
+    /// the migrations' `ANALYZE` ran on empty tables); the large-mailbox one has a row for
+    /// every table, and `messageHeader`'s count is the profile's.
     static func regimeProblem(_ regime: StatisticsRegime, _ schemas: [FenceSchema]) throws -> String? {
         for schema in schemas {
             let found = try schema.queue.read { try Self.statistics($0) }
             switch regime {
             case .noStatistics:
-                let mail = found.tables.intersection(QueryPlanRules.mailSized)
+                let mail = found.informed.intersection(QueryPlanRules.mailSized)
                 if !mail.isEmpty { return "\(schema.name) has statistics for \(mail.sorted())" }
             case .largeMailbox:
                 let tables = try schema.queue.read {
@@ -204,6 +218,70 @@ extension DatabaseIndexTests {
         let other: StatisticsRegime = regime == .noStatistics ? .largeMailbox : .noStatistics
         let otherProblem = try Self.regimeProblem(other, schemas)
         #expect(otherProblem != nil, "the \(other.rawValue) check passed \(regime.rawValue) schemas")
+
+        // The planner works from the regime's statistics, not only `sqlite_stat1`: the
+        // witness plans differently once the large-mailbox statistics are loaded
+        // (`installLargeMailboxStatistics` reloads them on the connection the fence
+        // explains with), and as on a fresh database without them.
+        guard let main = schemas.first(where: { $0.name == "main" }) else {
+            Issue.record("no main schema")
+            return
+        }
+        let fresh = try TestDatabase.make()
+        try fresh.write { try SyncEngine.createDeferredIndexes($0) }
+        let witness = try main.queue.read { try Self.planText(Self.plannerWitness, in: $0) }
+        let freshWitness = try fresh.read { try Self.planText(Self.plannerWitness, in: $0) }
+        switch regime {
+        case .noStatistics:
+            #expect(witness == freshWitness, "\(witness) | fresh: \(freshWitness)")
+        case .largeMailbox:
+            #expect(witness != freshWitness, "the large-mailbox statistics did not reach the planner: \(witness)")
+        }
+    }
+
+    /// A statement whose plan depends on the statistics: with none, SQLite takes the inbox
+    /// flag's index; with the large-mailbox ones, a folder's (a few hundred folders against
+    /// two flag values).
+    static let plannerWitness = "SELECT id FROM messageHeader WHERE folderId = ? AND isInInbox = 1"
+
+    static func planText(_ sql: String, in db: Database) throws -> String {
+        try Self.queryPlans(db, sql).flatMap(\.rows).map(\.detail).joined(separator: " | ")
+    }
+
+    /// The fresh-install check on fixed statistics: partial-index "0 0" rows, as the
+    /// migrations' `ANALYZE` of an empty table leaves them, tell the planner nothing; a
+    /// full index's row, a table's row or a partial index's row that counts rows does.
+    @Test("The fresh-install check refuses only statistics that inform the planner")
+    func noStatisticsCheckReadsWhatInformsThePlanner() throws {
+        let queue = try DatabaseQueue()
+        try queue.write { db in
+            try db.execute(sql: """
+                CREATE TABLE messageHeader (id TEXT PRIMARY KEY, folderId TEXT, isInInbox INTEGER);
+                CREATE INDEX messageHeader_folder ON messageHeader(folderId);
+                CREATE INDEX messageHeader_inbox ON messageHeader(folderId) WHERE isInInbox = 1;
+                ANALYZE;
+                DELETE FROM sqlite_stat1;
+                INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('messageHeader', 'messageHeader_inbox', '0 0');
+                """)
+        }
+        let schema = FenceSchema(name: "fixture", queue: queue, facts: try queue.read { try QueryPlanRules.SchemaFacts.load($0) })
+        let partialOnly = try Self.regimeProblem(.noStatistics, [schema])
+        #expect(partialOnly == nil, "\(partialOnly ?? "")")
+
+        let informing: [(String, String)] = [
+            ("INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('messageHeader', 'messageHeader_folder', '100 10')", "a full index's row"),
+            ("INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('messageHeader', NULL, '100')", "the table's row"),
+            ("UPDATE sqlite_stat1 SET stat = '50 5' WHERE idx = 'messageHeader_inbox'", "a partial index's row that counts rows"),
+        ]
+        for (sql, label) in informing {
+            try queue.write { db in
+                try db.execute(sql: "DELETE FROM sqlite_stat1")
+                try db.execute(sql: "INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES ('messageHeader', 'messageHeader_inbox', '0 0')")
+                try db.execute(sql: sql)
+            }
+            let problem = try Self.regimeProblem(.noStatistics, [schema])
+            #expect(problem != nil, "the fresh-install check passed \(label)")
+        }
     }
 
     static func makeFenceDirectory() throws -> URL {

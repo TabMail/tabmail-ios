@@ -53,6 +53,26 @@ extension DatabaseIndexTests {
         func evict(_ db: Database, afterEachPage: @Sendable () async -> Void = { await Pruner.pause() }) throws {
             try db.execute(sql: "DELETE FROM messageBody WHERE fetchedAt < 0")
         }
+
+        func inboxPage(_ db: Database, folderId: String, unreadOnly: Bool) throws -> [MessageHeader] {
+            let inbox = MessageHeader.filter(Column("isInInbox") == true)
+            let inFolder = inbox.filter(Column("folderId") == folderId)
+            let size = Pager.pageSize(for: folderId)
+            var page = inFolder.order(Column("date").desc)
+            if unreadOnly { page = page.filter(Column("isRead") == false) }
+            return try Pager.rows(db, page.limit(size), cap: size)
+        }
+
+        static func pendingRequest(accountId: String) -> QueryInterfaceRequest<MessageHeader> {
+            if accountId.isEmpty {
+                return MessageHeader.none()
+            }
+            return MessageHeader.filter(Column("accountId") == accountId && Column("bodyComplete") == false)
+        }
+
+        func pendingCount(_ db: Database, request: QueryInterfaceRequest<MessageHeader>) throws -> Int {
+            try request.fetchCount(db)
+        }
     }
     """###
 
@@ -125,6 +145,19 @@ extension DatabaseIndexTests {
             ScannedSite(37, "UnreadStore.evict", "call", 0, #"db.execute(sql: "DELETE FROM messageBody WHERE fetchedAt < 0")"#),
             ScannedSite(37, "UnreadStore.evict", "sql", 0, "DELETE FROM messageBody WHERE fetchedAt < 0",
                         sql: "DELETE FROM messageBody WHERE fetchedAt < 0"),
+            // A request passed as an argument carries its binding, the reassignment made under a
+            // condition, and the request bindings it was built from (two hops); the page size is a
+            // value, not a request, so it is not carried.
+            ScannedSite(46, "UnreadStore.inboxPage", "call", 0,
+                        #"Pager.rows(db, page.limit(size), cap: size) ⟨page = inFolder.order(Column("date").desc)⟩"#
+                            + #" ⟨page = page.filter(Column("isRead") == false)⟩ ⟨inFolder = inbox.filter(Column("folderId") == folderId)⟩"#
+                            + #" ⟨inbox = MessageHeader.filter(Column("isInInbox") == true)⟩"#),
+            // A function returning a request is a site of its own, its whole text the key.
+            ScannedSite(49, "UnreadStore.pendingRequest", "request", 0,
+                        #"func pendingRequest(accountId: String) -> QueryInterfaceRequest<MessageHeader> { if accountId.isEmpty { return MessageHeader.none() }"#
+                            + #" return MessageHeader.filter(Column("accountId") == accountId && Column("bodyComplete") == false) }"#),
+            // A receiver that is a parameter does not borrow another function's binding.
+            ScannedSite(57, "UnreadStore.pendingCount", "call", 0, "request.fetchCount(db)"),
         ]
         #expect(found == expected)
     }
@@ -132,7 +165,7 @@ extension DatabaseIndexTests {
     @Test("A CRLF or CR source scans exactly as the LF one")
     func scannerReadsEveryLineEnding() {
         let lf = Self.scanned(Self.scannerFixture).map { ScannedSite($0) }
-        #expect(lf.count == 17)
+        #expect(lf.count == 20)
         for ending in ["\r\n", "\r"] {
             let other = Self.scanned(Self.scannerFixture.replacingOccurrences(of: "\n", with: ending)).map { ScannedSite($0) }
             #expect(other == lf, "line ending \(ending.debugDescription)")
@@ -155,9 +188,16 @@ extension DatabaseIndexTests {
         let edits: [(name: String, from: String, to: String, changed: Int)] = [
             ("the predicate of a literal", "isRead = 0\"", "isRead = 1\"", 2),
             ("the source of an interpolation", #"IN (\(marks))"#, #"IN (\(placeholders))"#, 2),
+            // Only `flagged`'s call: `pendingCount`'s parameter `request` is not that binding.
             ("the request a call runs", #"Column("isFlagged") == true"#, #"Column("isFlagged") == false"#, 1),
             ("the second fragment of a concatenation",
              "\"WHERE folderId = ?\", arguments: [folderId])\n        print(", "\"WHERE accountId = ?\", arguments: [folderId])\n        print(", 1),
+            ("a request passed as an argument", #"inFolder.order(Column("date").desc)"#, #"inFolder.order(Column("date").asc)"#, 1),
+            ("a request two bindings back", #"Column("isInInbox") == true"#, #"Column("isInInbox") == false"#, 1),
+            ("a reassignment under a condition", #"page.filter(Column("isRead") == false)"#, #"page.filter(Column("isRead") == true)"#, 1),
+            ("the body of a request helper", #"Column("bodyComplete") == false"#, #"Column("bodyComplete") == true"#, 1),
+            ("a branch of a request helper", "return MessageHeader.none()", "return MessageHeader.all()", 1),
+            ("a value a call reads", "Pager.pageSize(for: folderId)", "Pager.defaultPageSize", 0),
         ]
         for edit in edits {
             let edited = Self.scannerFixture.replacingOccurrences(of: edit.from, with: edit.to)

@@ -2,10 +2,9 @@ import Foundation
 
 /// Static census of every database query site in the production sources (`TabMail`,
 /// `TabMailNotificationService`, `Shared`), the input of the query-plan fence
-/// (`DatabaseIndexTests`, files in `QueryFence/`). Pure Foundation, so the same file also
-/// runs on the host (`swiftc` with a small driver) to regenerate the registry skeleton.
+/// (`DatabaseIndexTests`, files in `QueryFence/`). Pure Foundation.
 ///
-/// Two kinds of site:
+/// Three kinds of site:
 /// - `sql`: a string literal whose text reads as SQL (the statement keywords below). Its
 ///   text keeps each interpolation with its source (`\(folderId)`), whitespace runs
 ///   collapsed to one space. `sql` is the statement as SQLite receives it: the escapes of
@@ -20,8 +19,17 @@ import Foundation
 ///   call is a site of its own, two calls on one line included. Its text runs from the
 ///   start of its receiver chain to its closing bracket: comments removed, string
 ///   literals with their contents, a closure body that spans lines shown as `{ … }` (each
-///   call inside it is a site of its own). A call on a local binding
-///   (`request.fetchAll(db)`) also carries the binding's initializer: ` ⟨request = …⟩`.
+///   call inside it is a site of its own). A call that reads a local binding, as its
+///   receiver (`request.fetchAll(db)`) or as the leading name of an argument
+///   (`helper(db, inbox)`, `fetchAll(db, inScope.limit(9))`), also carries the binding's
+///   initializer and each plain reassignment of it before the call (` ⟨request = …⟩`), and
+///   so on for the bindings those read (`inScope` = `inbox.filter(…)` brings `inbox`). A
+///   binding is the last of its name before the use, in the use's declaration or one
+///   enclosing it.
+/// - `request`: a function or computed property that returns a `QueryInterfaceRequest`,
+///   `SQLRequest` or `SQLExpression`, keyed by its whole text from `func`/`var` to its
+///   closing brace, so an edit of the request it builds changes the key; its context is
+///   its own name.
 ///
 /// A site is identified by file, enclosing declaration (`Type.function`), kind, text
 /// and an ordinal among identical sites in the same declaration, never by line, so
@@ -92,18 +100,35 @@ enum QueryCensusScanner {
             if !errors.all.isEmpty { throw ScanError.walk(errors.all) }
         }
         files.sort()
-        var sites: [Site] = []
+        let sources = try files.map { try String(contentsOf: root.appendingPathComponent($0), encoding: .utf8) }
         let patterns = Patterns()
-        for file in files {
-            let text = try String(contentsOf: root.appendingPathComponent(file), encoding: .utf8)
-            sites.append(contentsOf: scan(file: file, source: text, patterns: patterns))
+        let builds = requestBuilders(sources, patterns)
+        var sites: [Site] = []
+        for (file, text) in zip(files, sources) {
+            sites.append(contentsOf: scan(file: file, source: text, patterns: patterns, builds: builds))
         }
         return sites
     }
 
-    /// The sites of one file.
+    /// The sites of one file, alone (its request helpers are the only ones it knows).
     static func scan(file: String, source: String) -> [Site] {
-        scan(file: file, source: source, patterns: Patterns())
+        let patterns = Patterns()
+        return scan(file: file, source: source, patterns: patterns, builds: requestBuilders([source], patterns))
+    }
+
+    static let requestFunctionName = Patterns.regex(#"\bfunc\s+([A-Za-z_]\w*)(?:(?!\bfunc\b)[^{};])*?->\s*(?:some\s+|any\s+)?(?:GRDB\.)?(?:QueryInterfaceRequest|SQLRequest|SQLExpression)\b"#)
+    static let requestPropertyName = Patterns.regex(#"\bvar\s+([A-Za-z_]\w*)\s*:\s*(?:some\s+|any\s+)?(?:GRDB\.)?(?:QueryInterfaceRequest|SQLRequest|SQLExpression)\b"#)
+
+    /// `requestTokens`, plus a use of any request helper the sources declare.
+    private static func requestBuilders(_ sources: [String], _ patterns: Patterns) -> NSRegularExpression {
+        var names = Set<String>()
+        for source in sources {
+            for regex in [requestFunctionName, requestPropertyName] {
+                for m in patterns.matches(regex, source) { names.insert((source as NSString).substring(with: m.range(at: 1))) }
+            }
+        }
+        let uses = names.sorted().map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
+        return Patterns.regex(requestTokens + (uses.isEmpty ? "" : #"|\b(?:"# + uses + #")\b"#))
     }
 
     // MARK: - Patterns
@@ -554,7 +579,7 @@ enum QueryCensusScanner {
             .joined(separator: " ")
     }
 
-    private static func scan(file: String, source: String, patterns: Patterns) -> [Site] {
+    private static func scan(file: String, source: String, patterns: Patterns, builds: NSRegularExpression) -> [Site] {
         let normalized = source.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         let lexed = Lexer(normalized, patterns: patterns).run()
         let code = Code(lexed)
@@ -621,10 +646,18 @@ enum QueryCensusScanner {
             return lineStart + m.range.location + m.range.length - 1 == b
         }
 
+        let bindings = Bindings(code, patterns)
         for call in calls {
-            let text = render(call.start, call.end, code, lexed) + bindingSuffix(call.start, code, lexed, handles, patterns)
+            let text = render(call.start, call.end, code, lexed) + bindingSuffix(call.start, call.end, code, lexed, handles, bindings, builds)
             raw.append((code.line(of: call.start) + 1, code.line(of: call.end) + 1, call.start,
                         context(at: call.start, lexed), "call", text, ""))
+        }
+
+        for helper in requestHelpers(code, patterns) {
+            let owner = context(at: helper.start, lexed)
+            raw.append((code.line(of: helper.start) + 1, code.line(of: helper.close) + 1, helper.start,
+                        owner.isEmpty ? helper.name : owner + "." + helper.name, "request",
+                        render(helper.start, helper.close, code, lexed, collapsing: false), ""))
         }
 
         raw.sort { ($0.line, $0.kind, $0.start) < ($1.line, $1.kind, $1.start) }
@@ -660,8 +693,8 @@ enum QueryCensusScanner {
     }
 
     /// The code from `start` through `end` on one line: literals with their contents, a
-    /// closure body that spans lines as `{ … }`.
-    private static func render(_ start: Int, _ end: Int, _ code: Code, _ lexed: Lexed) -> String {
+    /// closure body that spans lines as `{ … }` (whole when `collapsing` is false).
+    private static func render(_ start: Int, _ end: Int, _ code: Code, _ lexed: Lexed, collapsing: Bool = true) -> String {
         var out = ""
         var p = start
         var segment = start
@@ -672,7 +705,7 @@ enum QueryCensusScanner {
                 segment = p
                 continue
             }
-            if code.u[p] == Code.openBrace, code.partner[p] > p, code.partner[p] <= end,
+            if collapsing, code.u[p] == Code.openBrace, code.partner[p] > p, code.partner[p] <= end,
                code.line(of: code.partner[p]) > code.line(of: p) {
                 out += code.substring(segment, p) + "{ … }"
                 p = code.partner[p] + 1
@@ -685,35 +718,161 @@ enum QueryCensusScanner {
         return normalize(out)
     }
 
-    /// ` ⟨name = initializer⟩` when the call's receiver is a local binding, so an edit of
-    /// the request it was built from changes the key.
-    private static func bindingSuffix(_ start: Int, _ code: Code, _ lexed: Lexed, _ handles: Set<String>, _ patterns: Patterns) -> String {
-        var k = start
-        while k < code.u.count, code.isIdent(code.u[k]) { k += 1 }
-        let name = code.substring(start, k)
-        guard let first = name.unicodeScalars.first, CharacterSet.lowercaseLetters.contains(first) || first == "_",
-              !handles.contains(name), !["self", "try", "await", "return"].contains(name) else { return "" }
-        var j = k
-        while j < code.u.count, code.isSpace(code.u[j]) { j += 1 }
-        guard j < code.u.count, code.u[j] == Code.dot else { return "" }
-        let binding = Patterns.regex(#"(?<![.\w])(if\s+|guard\s+|while\s+)?(?:let|var)\s+"# + NSRegularExpression.escapedPattern(for: name) + #"\s*(?::[^=\n]*)?=(?!=)\s*"#)
-        guard let m = patterns.matches(binding, code.text).last(where: { $0.range.location < start }) else { return "" }
-        let conditional = m.range(at: 1).location != NSNotFound
-        let from = m.range.location + m.range.length
+    // MARK: - Local bindings
+
+    /// The `let`/`var` bindings of a file by name (where the keyword is, where the
+    /// initializer starts, whether it is a condition: `if let x = y {` opens no closure),
+    /// and the plain reassignments of each name (`x = …`).
+    private struct Bindings {
+        struct Binding {
+            let location: Int
+            let from: Int
+            let conditional: Bool
+        }
+
+        var byName: [String: [Binding]] = [:]
+        var reassignments: [String: [(location: Int, from: Int)]] = [:]
+
+        static let binding = Patterns.regex(#"(?<![.\w])(if\s+|guard\s+|while\s+)?(?:let|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]*)?=(?!=)\s*"#)
+        static let assignment = Patterns.regex(#"(?<![.\w$])([a-z_]\w*)[ \t]*=(?!=)\s*"#)
+
+        init(_ code: Code, _ patterns: Patterns) {
+            for m in patterns.matches(Self.binding, code.text) {
+                var b = m.range.location - 1
+                while b >= 0, code.isSpace(code.u[b]) { b -= 1 }
+                // A second clause of a condition list (`if let a = x, let b = y {`) is a condition too.
+                let conditional = m.range(at: 1).location != NSNotFound || (b >= 0 && code.u[b] == Code.comma)
+                byName[code.ns.substring(with: m.range(at: 2)), default: []].append(
+                    Binding(location: m.range.location, from: m.range.location + m.range.length, conditional: conditional))
+            }
+            for m in patterns.matches(Self.assignment, code.text) {
+                var b = m.range.location
+                while b > 0, code.isSpace(code.u[b - 1]) { b -= 1 }
+                var w = b
+                while w > 0, code.isIdent(code.u[w - 1]) { w -= 1 }
+                // `let x =` / `var x =` / `case x =` declare; only a plain `x = …` reassigns.
+                if ["let", "var", "case"].contains(code.substring(w, b)) { continue }
+                reassignments[code.ns.substring(with: m.range(at: 1)), default: []].append(
+                    (m.range.location, m.range.location + m.range.length))
+            }
+        }
+    }
+
+    /// Words that are never a local binding a site reads.
+    private static let notBindings = Code.keywords.union(["self", "super", "true", "false", "nil", "inout", "throws", "rethrows", "async"])
+
+    /// Whether a binding at `binding` is in scope at `use`: it is in the use's declaration
+    /// or one enclosing it (a binding of another function of the file is not).
+    private static func encloses(_ binding: Int, _ use: Int, _ lexed: Lexed) -> Bool {
+        let outer = context(at: binding, lexed)
+        let inner = context(at: use, lexed)
+        return outer.isEmpty || outer == inner || inner.hasPrefix(outer + ".")
+    }
+
+    /// The local names the code from `from` up to `to` reads: each name at its own level that
+    /// is not a member (`.name`), and the leading name of each argument of a parenthesis at
+    /// its own level (after its label, `try`, `await`, a prefix `!` or `&`). Deeper names
+    /// (`Column("x") == y`'s `y`) are values, not the request.
+    private static func readNames(_ from: Int, _ to: Int, _ code: Code, _ handles: Set<String>) -> [String] {
+        let colon = UInt16(UInt8(ascii: ":")), ampersand = UInt16(UInt8(ascii: "&"))
+        var names: [String] = []
+        func wordEnd(_ p: Int) -> Int {
+            var e = p
+            while e < code.u.count, code.isIdent(code.u[e]) { e += 1 }
+            return e
+        }
+        func admit(_ name: String) {
+            guard let first = name.unicodeScalars.first, CharacterSet.lowercaseLetters.contains(first) || first == "_",
+                  name != "_", !handles.contains(name), !notBindings.contains(name) else { return }
+            names.append(name)
+        }
+        func leadingName(_ start: Int, _ end: Int) {
+            var p = start
+            func skipSpace() { while p < end, code.isSpace(code.u[p]) { p += 1 } }
+            skipSpace()
+            if p < end, code.isIdent(code.u[p]) {
+                var c = wordEnd(p)
+                while c < end, code.isSpace(code.u[c]) { c += 1 }
+                if c < end, code.u[c] == colon, !(c + 1 < end && code.u[c + 1] == colon) { p = c + 1 }
+            }
+            while true {
+                skipSpace()
+                guard p < end else { return }
+                if code.u[p] == Code.bang || code.u[p] == ampersand { p += 1; continue }
+                guard code.isIdent(code.u[p]) else { return }
+                let e = wordEnd(p)
+                let word = code.substring(p, e)
+                guard word == "try" || word == "await" else { admit(word); return }
+                p = e
+                if p < end, code.u[p] == Code.question || code.u[p] == Code.bang { p += 1 }
+            }
+        }
+        var p = from
+        while p < to {
+            let c = code.u[p]
+            if c == Code.openParen, code.partner[p] > p, code.partner[p] < to {
+                var argument = p + 1
+                var q = p + 1
+                while q < code.partner[p] {
+                    let d = code.u[q]
+                    if d == Code.openParen || d == Code.openBracket || d == Code.openBrace, code.partner[q] > q {
+                        q = code.partner[q] + 1
+                        continue
+                    }
+                    if d == Code.comma { leadingName(argument, q); argument = q + 1 }
+                    q += 1
+                }
+                leadingName(argument, code.partner[p])
+                p = code.partner[p] + 1
+                continue
+            }
+            if (c == Code.openBracket || c == Code.openBrace), code.partner[p] > p {
+                p = code.partner[p] + 1
+                continue
+            }
+            if code.isIdent(c), p == 0 || !code.isIdent(code.u[p - 1]) {
+                let e = wordEnd(p)
+                var b = p - 1
+                while b >= from, code.isSpace(code.u[b]) { b -= 1 }
+                if !(b >= from && code.u[b] == Code.dot) { admit(code.substring(p, e)) }
+                p = e
+                continue
+            }
+            p += 1
+        }
+        return names
+    }
+
+    /// Whether the line that ends at `newline` runs on into the next, whose first character
+    /// is at `next`: the next line starts with a member `.` or a binary operator, or this
+    /// line ends with one.
+    private static func continues(_ newline: Int, _ next: Int, _ code: Code) -> Bool {
+        let leading = Set(".?:&|=+*/".utf16)
+        if leading.contains(code.u[next]) { return true }
+        if code.u[next] == Code.bang, next + 1 < code.u.count, code.u[next + 1] == Code.equals { return true }
+        var b = newline - 1
+        while b >= 0, code.u[b] == Code.space || code.u[b] == Code.tab { b -= 1 }
+        return b >= 0 && Set("&|=+*".utf16).contains(code.u[b])
+    }
+
+    /// The end (exclusive) of the expression that starts at `from`, before `limit`: up to a
+    /// `,`, `;` or closing bracket of its own level, `else`, or a line end the next line does
+    /// not continue; each bracketed group whole (a brace only when not `conditional`).
+    private static func expressionEnd(_ from: Int, limit: Int, conditional: Bool, _ code: Code) -> Int {
         var q = from
-        scan: while q < code.u.count, q < start {
+        scan: while q < code.u.count, q < limit {
             let c = code.u[q]
             switch c {
             case Code.openParen, Code.openBracket:
-                guard code.partner[q] > q, code.partner[q] < start else { break scan }
+                guard code.partner[q] > q, code.partner[q] < limit else { break scan }
                 q = code.partner[q] + 1
             case Code.openBrace:
-                guard !conditional, code.partner[q] > q, code.partner[q] < start else { break scan }
+                guard !conditional, code.partner[q] > q, code.partner[q] < limit else { break scan }
                 q = code.partner[q] + 1
             case Code.newline:
                 var n = q + 1
                 while n < code.u.count, code.isSpace(code.u[n]) { n += 1 }
-                guard n < code.u.count, code.u[n] == Code.dot else { break scan }
+                guard n < code.u.count, continues(q, n, code) else { break scan }
                 q = n
             case Code.semicolon, Code.comma, Code.closeParen, Code.closeBracket, Code.closeBrace:
                 break scan
@@ -728,7 +887,137 @@ enum QueryCensusScanner {
                 }
             }
         }
-        let initializer = render(from, max(from, q - 1), code, lexed)
-        return initializer.isEmpty ? "" : " ⟨\(name) = \(initializer)⟩"
+        return q
+    }
+
+    /// What builds a request or a filter expression: a GRDB request method, `SQLRequest`,
+    /// `SQL(`, `Column(`, the request types. A call of a request helper is added per scan.
+    static let requestTokens = #"\.(?:filter|order|select|limit|all|none|including|joining|group|having|annotated|matching|distinct|aliased|orderByPrimaryKey)\s*\(|\b(?:SQLRequest|QueryInterfaceRequest|SQLExpression|SQL|Column)\b"#
+
+    /// The code from `from` up to `to` with every brace group left out.
+    private static func outsideClosures(_ from: Int, _ to: Int, _ code: Code) -> String {
+        var out = ""
+        var segment = from
+        var p = from
+        while p < to {
+            if code.u[p] == Code.openBrace, code.partner[p] > p {
+                out += code.substring(segment, p) + " "
+                p = code.partner[p] + 1
+                segment = p
+                continue
+            }
+            p += 1
+        }
+        return out + code.substring(segment, max(segment, min(to, code.u.count)))
+    }
+
+    /// The words of a code text.
+    private static func names(in text: String) -> [String] {
+        text.split { !($0.isLetter || $0.isNumber || $0 == "_" || $0 == "$") }.map(String.init)
+    }
+
+    /// One definition of a binding: its initializer or a plain reassignment, with where it is.
+    private struct Definition {
+        let location: Int
+        let from: Int
+        let end: Int
+    }
+
+    /// The binding of `name` in scope at `use`, and its definitions before `use`: the
+    /// initializer, then each plain reassignment.
+    private static func definitions(_ name: String, _ use: Int, _ code: Code, _ lexed: Lexed, _ bindings: Bindings) -> (binding: Int, definitions: [Definition])? {
+        guard let binding = bindings.byName[name]?.last(where: { $0.location < use && encloses($0.location, use, lexed) }) else { return nil }
+        var found: [Definition] = []
+        let end = expressionEnd(binding.from, limit: use, conditional: binding.conditional, code)
+        if end > binding.from { found.append(Definition(location: binding.location, from: binding.from, end: end)) }
+        for assignment in bindings.reassignments[name] ?? []
+        where assignment.location > binding.from && assignment.location < use && encloses(binding.location, assignment.location, lexed) {
+            let end = expressionEnd(assignment.from, limit: use, conditional: false, code)
+            if end > assignment.from { found.append(Definition(location: assignment.location, from: assignment.from, end: end)) }
+        }
+        return (binding.location, found)
+    }
+
+    /// ` ⟨name = …⟩` for the request bindings a call reads, so an edit of the request it
+    /// runs, wherever it was built, changes the key: its receiver's binding (whatever it
+    /// holds, as a record a write persists), and each binding read as an argument's leading
+    /// name (`readNames`) that builds a request: outside its closures it has a
+    /// `requestTokens` match or reads a binding that builds one, and names no database handle
+    /// (one that does runs a query, a site of its own, and holds its result). Each comes with
+    /// its plain reassignments before the call, then the same for the request bindings those
+    /// read. A binding is the last one of its name before the use, in the use's declaration or
+    /// one enclosing it. A binding that only holds a value (`accountId`, fetched rows) is not
+    /// carried: its edits change no query.
+    private static func bindingSuffix(_ start: Int, _ end: Int, _ code: Code, _ lexed: Lexed, _ handles: Set<String>,
+                                      _ bindings: Bindings, _ builds: NSRegularExpression) -> String {
+        var memo: [Int: Bool] = [:]
+        func buildsRequest(_ name: String, _ use: Int, _ visiting: Set<Int>) -> Bool {
+            guard let defined = definitions(name, use, code, lexed, bindings) else { return false }
+            let binding = defined.binding
+            if let known = memo[binding] { return known }
+            guard !visiting.contains(binding) else { return false }
+            // Each definition outside its closures (their queries are sites of their own); one
+            // that names a handle runs a query and holds its result, a value.
+            let texts = defined.definitions.map { outsideClosures($0.from, $0.end, code) }
+            let result = !texts.contains { names(in: $0).contains { handles.contains($0) } }
+                && zip(defined.definitions, texts).contains { definition, text in
+                    builds.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) != nil
+                        || readNames(definition.from, definition.end, code, handles).contains {
+                            buildsRequest($0, definition.location, visiting.union([binding]))
+                        }
+                }
+            memo[binding] = result
+            return result
+        }
+
+        var receiverEnd = start
+        while receiverEnd < code.u.count, code.isIdent(code.u[receiverEnd]) { receiverEnd += 1 }
+        var afterReceiver = receiverEnd
+        while afterReceiver < code.u.count, code.isSpace(code.u[afterReceiver]) { afterReceiver += 1 }
+        let receiver = afterReceiver < code.u.count && code.u[afterReceiver] == Code.dot ? code.substring(start, receiverEnd) : ""
+
+        var out = ""
+        var rendered = Set<Int>()
+        var pending = readNames(start, end + 1, code, handles).map { (name: $0, use: start) }
+        var next = 0
+        while next < pending.count {
+            let (name, use) = pending[next]
+            next += 1
+            guard let defined = definitions(name, use, code, lexed, bindings), !rendered.contains(defined.binding),
+                  (next == 1 && name == receiver) || buildsRequest(name, use, []) else { continue }
+            rendered.insert(defined.binding)
+            for definition in defined.definitions {
+                out += " ⟨\(name) = \(render(definition.from, definition.end - 1, code, lexed))⟩"
+                pending += readNames(definition.from, definition.end, code, handles).map { ($0, definition.location) }
+            }
+        }
+        return out
+    }
+
+    // MARK: - Request helpers
+
+    static let requestFunction = Patterns.regex(#"\bfunc\s+([A-Za-z_]\w*)\s*(?:<[^(){}]*>)?\s*\("#)
+    static let requestReturn = Patterns.regex(#"(?s)^(?!.*\b(?:func|var|let|init|subscript|case)\b)\s*(?:async\s+)?(?:(?:re)?throws(?:\s*\([^)]*\))?\s+)?->\s*(?:some\s+|any\s+)?(?:GRDB\.)?(?:QueryInterfaceRequest|SQLRequest|SQLExpression)\b[^{};]*$"#)
+    static let requestProperty = Patterns.regex(#"\bvar\s+([A-Za-z_]\w*)\s*:\s*(?:some\s+|any\s+)?(?:GRDB\.)?(?:QueryInterfaceRequest|SQLRequest|SQLExpression)\b[^={}\n]*\{"#)
+
+    /// Each function or computed property that returns a request or an SQL expression: where
+    /// its `func`/`var` is, its name, and its body's braces.
+    private static func requestHelpers(_ code: Code, _ patterns: Patterns) -> [(start: Int, name: String, open: Int, close: Int)] {
+        var found: [(start: Int, name: String, open: Int, close: Int)] = []
+        for m in patterns.matches(requestFunction, code.text) {
+            let paren = m.range.location + m.range.length - 1
+            guard code.partner[paren] > paren else { continue }
+            var brace = code.partner[paren] + 1
+            while brace < code.u.count, code.u[brace] != Code.openBrace, code.u[brace] != Code.closeBrace { brace += 1 }
+            guard brace < code.u.count, code.u[brace] == Code.openBrace, code.partner[brace] > brace,
+                  patterns.first(requestReturn, code.substring(code.partner[paren] + 1, brace)) else { continue }
+            found.append((m.range.location, code.ns.substring(with: m.range(at: 1)), brace, code.partner[brace]))
+        }
+        for m in patterns.matches(requestProperty, code.text) {
+            let brace = m.range.location + m.range.length - 1
+            guard code.partner[brace] > brace else { continue }
+            found.append((m.range.location, code.ns.substring(with: m.range(at: 1)), brace, code.partner[brace]))
+        }
+        return found
     }
 }

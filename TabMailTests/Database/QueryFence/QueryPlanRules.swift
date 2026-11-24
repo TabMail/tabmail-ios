@@ -18,8 +18,11 @@ import GRDB
 ///   `SELECT` is an `EXISTS` operand), no sort in that `SELECT` (a sort reads the whole set
 ///   before the limit applies), and no filter column outside the seek terms and the partial
 ///   index's condition (a residual filter can skip rows past the limit). Without that proof
-///   it passes as a `COUNT` (it reads the set once, through the index) or as a lone
-///   `MIN`/`MAX` with no residual filter (SQLite reads one end of the index).
+///   it passes as a `COUNT` whose filter is all in the seek terms and the partial index's
+///   condition (it reads the set once, through the index, and no table row), or as a lone
+///   `MIN`/`MAX` with no residual filter (SQLite reads one end of the index). A covering
+///   `COUNT` of a whole folder or account still passes, so its bound lives only in its
+///   registry note.
 /// - any other `SCAN`, or a seek through an automatic index (SQLite builds it with a scan):
 ///   it fails.
 ///
@@ -150,7 +153,10 @@ enum QueryPlanRules {
         for reference in own {
             let scope = statement.scope(at: reference.position)
             let residual = scope.filterColumns(of: table, alias: reference.alias, columns: tableColumns).subtracting(used)
-            if scope.isCount { continue }
+            if scope.isCount {
+                if residual.isEmpty { continue }
+                return "\(shape) of \(table) (\(access)): a count filtered on \(residual.sorted().joined(separator: ", ")) past the seek"
+            }
             if scope.isLoneMinMax, verb == "SEARCH", residual.isEmpty { continue }
             if !scope.isLimited { return "\(shape) of \(table) (\(access)): no LIMIT stops it" }
             if sorted { return "\(shape) of \(table) (\(access)): sorted before its LIMIT" }

@@ -14,13 +14,22 @@ verdict in review, and the plan check keeps a `SEEK` verdict from outliving the 
 
 ## How to apply
 
-1. **When a test names an unregistered site,** add one row: `file`, `context`, `kind`, `ordinal` and `text`
-   exactly as the failure prints them, a verdict and a note that says why. The vocabulary is in the doc
+1. **When a test names an unregistered site,** paste the row the failure prints under the site's place
+   (`file`, `context`, `kind`, `ordinal`, `<verdict>`, `<note>`, full `text`) and replace `<verdict>` and
+   `<note>` with a verdict and a note that says why. The vocabulary is in the doc
    comment of `DatabaseIndexTests+QueryRegistry.swift`: `SEEK`, `BOUNDED: <bound>`, `N+1: <bound>`,
    `SIM: <question>`, `SCAN #<issue>`, `STOPS: <Suite.test>`, `EXEMPT: <reason>` from a fixed list, and
-   `NOT-A-QUERY`. Rows are sorted by file, in scan order within a file.
+   `NOT-A-QUERY`. Rows are sorted by file, in scan order within a file. A `request` row (a function or
+   computed property returning a request or a filter expression) carries what the request reads, as a
+   `sql` row does; a filter expression alone is `NOT-A-QUERY`.
 2. **A stale row** (its site is gone or changed) is updated or removed in the same change. An edit above a
-   site, or of its declaration, keeps its key; an edit of what it queries changes exactly its key.
+   site, or of its declaration, keeps its key; an edit of what it queries changes exactly its key. That
+   includes a request built elsewhere: a call carries ` ⟨name = …⟩` for its receiver's binding and for
+   each binding it reads as an argument that builds a request, with the plain reassignments before the
+   call (`request = request.filter(…)` under an `if`) and the request bindings those were built from; a
+   request helper is a `request` site keyed by its whole body. A binding that holds a value (an id, a
+   fetched row) is not carried, so editing it moves no key. Bindings resolve in the call's own function or
+   one enclosing it, never another function of the file.
 3. **A query that does read a mail-sized set** is filed as its own issue first and registered as
    `SCAN #<issue>`; when that issue is fixed, its rows get the verdict of the fixed code.
 4. **A walk that stops once it has what it needs** (no `LIMIT` in the statement, the code stops the cursor)
@@ -28,8 +37,13 @@ verdict in review, and the plan check keeps a `SEEK` verdict from outliving the 
    `everyStopsVerdictNamesATest` fails when that test is renamed or removed.
 5. **The mail-sized tables and what passes the plan check** live in `QueryPlanRules.swift`: a point read on
    an identity column, a range bounded on both sides, a set read only with a positive `LIMIT` and no
-   `OFFSET`, no sort and no residual filter, a `COUNT`, or a lone `MIN`/`MAX`. The search and memory
-   databases are separate files and are waived from the plan check (`separateDatabaseTables`).
+   `OFFSET`, no sort and no residual filter, a `COUNT` whose filter is all in the seek terms and the
+   partial index's condition, or a lone `MIN`/`MAX`. A covering `COUNT` of a whole folder or account
+   passes the plan check, so its bound lives only in its row's note. The search and memory
+   databases are separate files and are waived from the plan check (`separateDatabaseTables`). The check
+   runs with no planner statistics (a fresh install: no `sqlite_stat1` row that informs the planner, only
+   the "0 0" rows `ANALYZE` leaves for partial indexes) and with large-mailbox statistics, and
+   `regimesCarryTheirStatistics` proves each regime reaches the planner.
 
 Related: [ADR-IOS-029](../../Decisions/Active/adr-ios-029.md) (purpose-built indexes, drop what is superseded),
 [159](159-prove-a-query-change-with-the-dbproof-harness.md) (proving a query change with numbers).
