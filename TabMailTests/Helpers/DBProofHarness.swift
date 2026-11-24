@@ -17,9 +17,11 @@ import SQLite3
 ///    runs `AppDatabase.runMigrations` and the production deferred-index build
 ///    (`SyncEngine.createDeferredIndexes`), then seeds several accounts from a seeded
 ///    generator: inbox, archive, sent and trash folders with a realistic inbox share,
-///    read and unread mail, action tags in every triage bucket, and user labels from
-///    dense to very sparse. `Shape.large` is just over 100,000 headers. Dates are
-///    offsets from `anchor` (pass `Date()`), so nothing goes stale.
+///    read and unread mail, action tags in every triage bucket, user labels from
+///    dense to very sparse, and most headers complete (`headerComplete`, most of those
+///    with their body in, `bodyComplete`) with a share still incomplete, as on a synced
+///    phone. `Shape.large` is just over 100,000 headers. Dates are offsets from `anchor`
+///    (pass `Date()`), so nothing goes stale.
 /// 2. **A measurer.** `compare(unit:modes:in:statistics:repeats:)` runs each mode's
 ///    old and new variant on its own copy of the database, once per statistics state
 ///    (no `sqlite_stat1`, and after the app's `ANALYZE`), each run on a FRESH
@@ -31,6 +33,10 @@ import SQLite3
 ///    visited (`SQLITE_STMTSTATUS_VM_STEP` and `SQLITE_STMTSTATUS_FULLSCAN_STEP`, plus
 ///    sorts and automatic-index inserts, summed over every statement the variant runs).
 ///    A write mode runs on a fresh clone of the file per run and includes its commit.
+///    It also counts the rows each side's result holds (or each side wrote), and
+///    refuses a comparison in which either side's result is empty, unless the mode is
+///    declared empty (`Mode.emptyResult`): two empty results are trivially equal and
+///    prove nothing about the statements.
 /// 3. **One plain-text report per unit** (`report.txt`), plus a `manifest.json` that
 ///    `Scripts/db-proof-mac.py` reads to measure the same files and statements with the
 ///    Mac's own `sqlite3` (`.stats on`).
@@ -84,6 +90,12 @@ enum DBProof {
             (.reply, 0.10), (.none, 0.40), (.archive, 0.30), (.delete, 0.15),
         ]
         static let leftoverTagShare = 0.02
+        /// Share of headers whose header write has finished (`headerComplete`); the rest are
+        /// still incomplete, as mail being synced is. Of the complete ones, the share whose
+        /// body is in too (`bodyComplete`; the body queue fetches only complete headers, so an
+        /// incomplete header never has its body).
+        static let headerCompleteShare = 0.95
+        static let bodyCompleteShare = 0.85
         /// Distinct senders the seed cycles through.
         static let senderCount: UInt64 = 400
     }
@@ -255,6 +267,9 @@ enum DBProof {
                 header.actionTag = pickTag(isInbox: isInbox, rng: &rng)
                 header.tagSortOrder = header.actionTag?.sortOrder ?? header.tagSortOrder
                 if header.actionTag != nil { header.actionTagSetAt = date }
+                header.headerComplete = Double.random(in: 0..<1, using: &rng) < Config.headerCompleteShare
+                let bodyDraw = Double.random(in: 0..<1, using: &rng)
+                header.bodyComplete = header.headerComplete && bodyDraw < Config.bodyCompleteShare
                 try header.insert(db)
 
                 guard labelable else { continue }
@@ -289,20 +304,22 @@ enum DBProof {
         return nil
     }
 
-    /// A content summary of the database: per account, folder, read state and tag, the
-    /// row count and sums over the UIDs, subjects and dates; then per label its member
-    /// count. Two builds with the same shape, seed and anchor give the same summary.
+    /// A content summary of the database: per account, folder, read state, tag and
+    /// completion state, the row count and sums over the UIDs, subjects and dates; then per
+    /// label its member count. Two builds with the same shape, seed and anchor give the
+    /// same summary.
     static func fingerprint(of url: URL) throws -> String {
         let queue = try DatabaseQueue(path: url.path)
         defer { try? queue.close() }
         return try queue.read { db in
             let headers = try Row.fetchAll(db, sql: """
                 SELECT accountId, folderId, isRead, COALESCE(actionTag, '-') AS tag, tagSortOrder,
+                       headerComplete, bodyComplete,
                        count(*) AS n, sum(CAST(messageId AS INTEGER)) AS uids,
                        sum(length(subject)) AS subjects, sum(CAST(strftime('%s', date) AS INTEGER)) AS dates
                 FROM messageHeader
-                GROUP BY accountId, folderId, isRead, tag, tagSortOrder
-                ORDER BY accountId, folderId, isRead, tag, tagSortOrder
+                GROUP BY accountId, folderId, isRead, tag, tagSortOrder, headerComplete, bodyComplete
+                ORDER BY accountId, folderId, isRead, tag, tagSortOrder, headerComplete, bodyComplete
                 """)
             let labels = try Row.fetchAll(db, sql: """
                 SELECT userLabelId, count(*) AS n FROM messageUserLabel
@@ -354,11 +371,14 @@ enum DBProof {
         /// Applied once to this variant's copy of the database before statistics are
         /// set, untimed (for example the index the new code relies on, or dropping it).
         var setupSQL: [String] = []
-        /// The timed statements. A read statement's rows are all stepped through.
+        /// The timed statements. A read statement's rows are all stepped through and
+        /// counted; a write statement counts the rows it changed.
         var sql: [String] = []
         /// A timed Swift body instead of `sql`, for code that cannot be written as plain
-        /// SQL. The Mac script cannot run it; prefer `sql`.
-        var run: (@Sendable (Database) throws -> Void)? = nil
+        /// SQL. It returns the number of rows its result holds (a read) or it wrote (a
+        /// write): the rows the code under test gets, not a count statement's one row. The
+        /// Mac script cannot run it; prefer `sql`.
+        var run: (@Sendable (Database) throws -> Int)? = nil
     }
 
     struct Mode: Sendable {
@@ -366,6 +386,10 @@ enum DBProof {
         let kind: Kind
         let old: Variant
         let new: Variant
+        /// The mode's result is empty on purpose (a lookup of a missing row, say).
+        /// `compare` refuses a mode whose old or new result is empty unless this is set,
+        /// and one whose old or new result is not empty when it is.
+        var emptyResult = false
     }
 
     // MARK: - Measurement
@@ -379,6 +403,8 @@ enum DBProof {
         var fullscanSteps = 0
         var sorts = 0
         var autoindexInserts = 0
+        /// Rows the variant's result held (a read) or it wrote (a write).
+        var resultRows = 0
     }
 
     struct Sample: Sendable {
@@ -459,8 +485,10 @@ enum DBProof {
                 try prepareVariantFile(base: base, setupSQL: mode.old.setupSQL, statistics: state, at: oldFile)
                 try prepareVariantFile(base: base, setupSQL: mode.new.setupSQL, statistics: state, at: newFile)
                 // One warm-up each, then old and new interleaved so drift hits both.
-                _ = try measure(mode.old, kind: mode.kind, file: oldFile)
-                _ = try measure(mode.new, kind: mode.kind, file: newFile)
+                let oldWarmUp = try measure(mode.old, kind: mode.kind, file: oldFile)
+                let newWarmUp = try measure(mode.new, kind: mode.kind, file: newFile)
+                try checkResultRows(mode: mode, statistics: state,
+                                    old: oldWarmUp.resultRows, new: newWarmUp.resultRows)
                 var oldRuns: [RunCost] = []
                 var newRuns: [RunCost] = []
                 for _ in 0..<repeats {
@@ -483,6 +511,16 @@ enum DBProof {
         try (header + report(results)).write(
             to: unitDirectory.appendingPathComponent("report.txt"), atomically: true, encoding: .utf8)
         return results
+    }
+
+    /// Two empty results compare as equal whatever the statements cost to find nothing, so a
+    /// mode is measured only when both sides return rows, or, declared empty, when neither does.
+    static func checkResultRows(mode: Mode, statistics: Statistics, old: Int, new: Int) throws {
+        let accepted = mode.emptyResult ? (old == 0 && new == 0) : (old > 0 && new > 0)
+        guard accepted else {
+            throw DBProofError.resultRows(mode: mode.name, statistics: statistics, old: old, new: new,
+                                          declaredEmpty: mode.emptyResult)
+        }
     }
 
     /// Copies `base` to `url`, applies the variant's setup and the statistics state, and
@@ -543,18 +581,20 @@ enum DBProof {
         defer { sqlite3_trace_v2(handle, 0, nil, nil) }
 
         let start = DispatchTime.now().uptimeNanoseconds
+        var resultRows = 0
         if inWriteTransaction {
             try db.inTransaction {
-                try runBody(variant, db: db)
+                resultRows = try runBody(variant, db: db)
                 return .commit
             }
         } else {
-            try runBody(variant, db: db)
+            resultRows = try runBody(variant, db: db)
         }
         let elapsed = DispatchTime.now().uptimeNanoseconds - start
 
         var cost = withExtendedLifetime(counters) { counters.cost }
         cost.wallMs = Double(elapsed) / 1_000_000
+        cost.resultRows = resultRows
         sqlite3_db_status(handle, SQLITE_DBSTATUS_CACHE_MISS, &current, &highwater, 0)
         cost.pagesRead = Int(current)
         sqlite3_db_status(handle, SQLITE_DBSTATUS_CACHE_WRITE, &current, &highwater, 0)
@@ -562,20 +602,23 @@ enum DBProof {
         return cost
     }
 
-    private static func runBody(_ variant: Variant, db: Database) throws {
+    /// Runs the variant and returns the rows its result held (a read) or it wrote (a write).
+    private static func runBody(_ variant: Variant, db: Database) throws -> Int {
         if let run = variant.run {
-            try run(db)
-            return
+            return try run(db)
         }
+        var resultRows = 0
         for sql in variant.sql {
             let statement = try db.makeStatement(sql: sql)
             if statement.isReadonly {
                 let rows = try Row.fetchCursor(statement)
-                while try rows.next() != nil {}
+                while try rows.next() != nil { resultRows += 1 }
             } else {
                 try statement.execute()
+                resultRows += db.changesCount
             }
         }
+        return resultRows
     }
 
     /// Sums the per-statement counters SQLite keeps, read (and reset) as each
@@ -591,8 +634,21 @@ enum DBProof {
         }
     }
 
-    enum DBProofError: Error {
+    enum DBProofError: Error, CustomStringConvertible {
         case noConnection
+        case resultRows(mode: String, statistics: Statistics, old: Int, new: Int, declaredEmpty: Bool)
+
+        var description: String {
+            switch self {
+            case .noConnection:
+                return "no SQLite connection handle"
+            case let .resultRows(mode, statistics, old, new, declaredEmpty):
+                let rule = declaredEmpty
+                    ? "is declared empty, so both sides must return no rows"
+                    : "compares nothing unless both sides return rows (declare an intended empty result with emptyResult)"
+                return "\(mode), \(statistics.label): old returned \(old) rows, new \(new); the mode \(rule)"
+            }
+        }
     }
 
     // MARK: - Report
@@ -660,6 +716,9 @@ enum DBProof {
             lines.append(row("median ms", format(old.median), format(new.median), result.timeVerdict.rawValue))
             lines.append(row("p90 ms", format(old.p90), format(new.p90), ""))
             lines.append(row("old spread ms", format(old.spread), "", ""))
+            lines.append(row("result rows", String(result.old.count(\.resultRows).median),
+                             String(result.new.count(\.resultRows).median),
+                             result.mode.emptyResult ? "declared empty" : ""))
             let counts: [(String, KeyPath<RunCost, Int>)] = [
                 ("pages read", \.pagesRead), ("pages written", \.pagesWritten),
                 ("VM steps", \.vmSteps), ("full-scan steps", \.fullscanSteps),
