@@ -451,6 +451,17 @@ struct StaleBodyEvictWriterHoldTests {
         let kept = 300
         let narrowHTML = "<p>" + String(repeating: "n", count: 1_000) + "</p>"
         let wideHTML = "<p>" + String(repeating: "w", count: 64_000) + "</p>"
+        // The wide HTML lives on overflow pages, and SQLite reads an overflow page
+        // straight from the database file, past the page cache and so past both
+        // counters here, once a checkpoint has moved it out of the WAL. The wide
+        // update writes far more than the automatic checkpoint's 1,000 pages, so
+        // with it on the HTML would be checkpointed at once and every read of it,
+        // the step's or the control's, would go uncounted. With it off the HTML
+        // stays in the WAL, where every read goes through the page cache. The
+        // control below is read after the run, so it shows that held throughout.
+        try fixture.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
+        }
         try Self.seedKeptInboxBodies(fixture, uids: 1..<(kept + 1), html: narrowHTML)
 
         let narrow = try Self.measuredRun(fixture, meter: meter).writes
