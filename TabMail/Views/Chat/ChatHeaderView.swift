@@ -44,12 +44,12 @@ struct ChatHeaderView: View {
                 Button { onTapNames?() } label: {
                     HStack(spacing: 2) {
                         Text(title)
-                            .font(.caption)
+                            .font(.footnote)
                             .fontWeight(.semibold)
                             .foregroundStyle(Theme.textPrimary)
                             .lineLimit(1)
                         Image(systemName: "chevron.right")
-                            .font(.caption2.weight(.semibold))
+                            .font(.caption.weight(.semibold))
                             .foregroundStyle(Theme.textSecondary)
                     }
                 }
@@ -107,7 +107,7 @@ struct ChatSubjectText: View {
     var body: some View {
         HStack(spacing: ChatViewLayout.subjectLabelGap) {
             Text(subject)
-                .font(.caption)
+                .font(.footnote)
                 .foregroundStyle(Theme.textSecondary)
                 .lineLimit(1)
             ForEach(UserLabelDisplaySegment.expand(labels)) { segment in

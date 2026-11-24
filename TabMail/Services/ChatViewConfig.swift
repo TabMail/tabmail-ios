@@ -94,7 +94,7 @@ enum ChatViewLayout {
     /// Room between the subject and each label chip after it on the subject line.
     static let subjectLabelGap: CGFloat = 4
     /// The AI summaries glyph at the subject line's trailing edge, before Dynamic Type scales it.
-    static let aiNoticeGlyphSize: CGFloat = 13
+    static let aiNoticeGlyphSize: CGFloat = 14
     /// Its tap target, full size whatever the glyph's size (Apple's 44-point minimum).
     static let aiNoticeTapTarget: CGFloat = 44
     /// The popover's width and the room between its title, note and report button.
@@ -150,9 +150,15 @@ enum ChatViewLayout {
     static let fieldLineHeight: CGFloat = 22
     /// The collapsed reply field's corner: a capsule at one line (42 / 2), then fixed as it grows.
     static let fieldCornerRadius: CGFloat = 21
-    /// A new email's paperclip, at the text's end: its glyph's width at the body size. Its tap
-    /// width is the mic's (`fieldMicTapWidth`).
+    /// The field's paperclip, at the text's end on Send's row: its glyph's width at the body size.
+    /// Its tap width is the mic's (`fieldMicTapWidth`).
     static let fieldPaperclipGlyphWidth: CGFloat = 13
+    /// The paperclip while the agent works on a Send from the field: it stays in its place, dimmed
+    /// to this opacity and not tappable.
+    static let fieldPaperclipDimmedOpacity: Double = 0.35
+    /// The paperclip's pop-up (`ChatAttachChoices`): its width and each row's side padding.
+    static let attachChoicesWidth: CGFloat = 200
+    static let attachChoicePadding: CGFloat = 16
     /// A new email's attachments waiting above the field: a photo's thumbnail side, a file chip's
     /// height and widest name, their corner, the room between them, and the remove button's size.
     static let trayThumbnailSize: CGFloat = 56
@@ -232,6 +238,10 @@ enum ChatSuggestionConfig {
     /// Under Reduce Motion the ghost fades in over this as it replaces the working bubble, the only
     /// motion of the fill (the row's height changes at once). No other insertion fades.
     static let ghostFadeDuration: Double = 0.2
+    /// A ghost held while its card was up turning into the sent reply's bubble once the card has
+    /// closed (`ChatHeldGhost`): its spring. Under Reduce Motion the bubble replaces it at once.
+    static let sentMorphResponse: Double = 0.45
+    static let sentMorphDamping: Double = 0.85
     /// The working bubble's dots: each pulses between this opacity and full over the period, the
     /// next one this much later.
     static let dotDimOpacity: Double = 0.3

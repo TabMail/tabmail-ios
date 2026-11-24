@@ -316,34 +316,80 @@ struct ChatNewEmailSubjectLine: View {
     }
 }
 
-/// The field's paperclip, at the end of its text: Photos, Camera or Files. A new email's chat and
-/// every thread's chat show it (`ChatReplyField.paperclip`).
+/// The field's paperclip, at the end of its text on Send's row: Photos, Camera or Files. A new
+/// email's chat and every thread's chat show it (`ChatReplyField.paperclip`).
+///
+/// Its choices open in a pop-up over the field, and the field stays as it is. A system menu here
+/// grows out of the field's glass and takes the field's place while it is open.
 struct ChatPaperclipButton: View {
     let attach: (ChatNewEmailField.AttachSource) -> Void
     @ScaledMetric(relativeTo: .body) private var lineHeight = ChatViewLayout.fieldLineHeight
+    /// The choices' pop-up is open.
+    @State private var showsChoices = false
+    /// The choice made in the pop-up, taken once the pop-up has gone: UIKit refuses a picker
+    /// presented while the pop-up is still closing.
+    @State private var chosen: ChatNewEmailField.AttachSource?
 
     var body: some View {
-        Menu {
-            ForEach(ChatNewEmailField.AttachSource.allCases, id: \.self) { source in
-                Button { attach(source) } label: {
-                    Label(source.title, systemImage: source.systemImage)
-                }
-            }
-        } label: {
+        Button { showsChoices = true } label: {
             Image(systemName: "paperclip")
                 .font(.body)
                 .foregroundStyle(Theme.textSecondary)
                 .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
                 .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .modifier(FieldButtonSlot(
             glyphWidth: ChatViewLayout.fieldPaperclipGlyphWidth, tapWidth: ChatViewLayout.fieldMicTapWidth,
             lineHeight: lineHeight))
         .accessibilityLabel("Attach")
         .accessibilityIdentifier(Self.id)
+        .popover(isPresented: $showsChoices, arrowEdge: .bottom) {
+            ChatAttachChoices { source in
+                chosen = source
+                showsChoices = false
+            }
+            .onDisappear {
+                guard let source = chosen else { return }
+                chosen = nil
+                attach(source)
+            }
+        }
     }
 
     static let id = "chatPaperclip"
+}
+
+/// The paperclip's pop-up: Photos, Camera and Files, one row each.
+struct ChatAttachChoices: View {
+    let choose: (ChatNewEmailField.AttachSource) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(ChatNewEmailField.AttachSource.allCases, id: \.self) { source in
+                Button { choose(source) } label: {
+                    Label(source.title, systemImage: source.systemImage)
+                        .font(.body)
+                        .foregroundStyle(Theme.textPrimary)
+                        .frame(maxWidth: .infinity, minHeight: ChatViewLayout.fieldTapSize, alignment: .leading)
+                        .padding(.horizontal, ChatViewLayout.attachChoicePadding)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(Self.id(source))
+                if source != ChatNewEmailField.AttachSource.allCases.last {
+                    Divider()
+                }
+            }
+        }
+        .frame(width: ChatViewLayout.attachChoicesWidth)
+        .presentationCompactAdaptation(.popover)
+    }
+
+    /// Each choice's row, as tests find it.
+    static func id(_ source: ChatNewEmailField.AttachSource) -> String {
+        "chatAttachChoice.\(source.title)"
+    }
 }
 
 /// A new email's attachments waiting above the field: photos as thumbnails, files as chips, each
