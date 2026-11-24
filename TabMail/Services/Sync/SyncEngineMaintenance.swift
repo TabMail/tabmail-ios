@@ -364,19 +364,22 @@ extension SyncEngine {
     /// archived. Runs after an AI queue drain and in maintenance, off the main
     /// thread.
     ///
-    /// Every read seeks an index (ADR-IOS-029): the expired set through
-    /// `messageAICache_expiry`, a message's headers through
-    /// `messageHeader_rfc822MessageId_date`. Each batch reads the expired set
-    /// again from its start, with no OFFSET: every entry a batch handles is
-    /// deleted or gets `updatedAt = now`, which is after the cutoff, so the
-    /// expired set shrinks with every batch and the loop ends.
+    /// Every read seeks an index (ADR-IOS-029), named with `INDEXED BY` so that
+    /// statistics taken while a table was small cannot turn it into a scan: the
+    /// expired set through `messageAICache_expiry`, a message's copies through
+    /// `messageHeader_rfc822MessageId`. Each batch reads the expired set again
+    /// from its start, with no OFFSET: every entry a batch handles is deleted or
+    /// gets `updatedAt = now`, which is after the cutoff, so the expired set
+    /// shrinks with every batch and the loop ends. A batch reads each entry's key
+    /// and Message-ID only, so an entry whose stored results no longer decode is
+    /// expired like any other instead of failing the batch on every run.
     nonisolated static func runPurgeExpiredAICache(dbPool: PrioritizedDatabase) {
         let now = Date()
         let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: now) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
 
         let count = (try? dbPool.read { db in
-            try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(db)
+            try Int.fetchOne(db, sql: aiCacheExpiredCountSQL, arguments: [cutoff]) ?? 0
         }) ?? 0
         guard count > 0 else { return }
 
@@ -385,29 +388,21 @@ extension SyncEngine {
         while true {
             do {
                 let batchResult = try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
-                    let batch = try MessageAICache
-                        .filter(Column("updatedAt") < cutoff)
-                        .limit(chunkSize)
-                        .fetchAll(db)
+                    let batch = try Row.fetchAll(db, sql: aiCacheExpiredBatchSQL, arguments: [cutoff, chunkSize])
                     guard !batch.isEmpty else { return (0, 0, true) }
 
                     var batchPurged = 0
                     var batchRescued = 0
-                    for var entry in batch {
-                        if let msgId = entry.rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty {
-                            // Every copy of the message, so the answer is exact.
-                            let inboxFlags = try MessageHeader
-                                .select(Column("isInInbox"), as: Bool.self)
-                                .filter(Column("rfc822MessageId") == msgId)
-                                .fetchAll(db)
-                            if inboxFlags.contains(true) {
-                                entry.updatedAt = now
-                                try entry.update(db)
-                                batchRescued += 1
-                                continue
-                            }
+                    for row in batch {
+                        let key: String = row["key"]
+                        let rfc822MessageId: String? = row["rfc822MessageId"]
+                        if let msgId = rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty,
+                           try Bool.fetchOne(db, sql: aiCacheInInboxSQL, arguments: [msgId]) == true {
+                            try db.execute(sql: "UPDATE messageAICache SET updatedAt = ? WHERE key = ?", arguments: [now, key])
+                            batchRescued += 1
+                            continue
                         }
-                        try entry.delete(db)
+                        try db.execute(sql: "DELETE FROM messageAICache WHERE key = ?", arguments: [key])
                         batchPurged += 1
                     }
                     return (batchPurged, batchRescued, false)
@@ -424,6 +419,28 @@ extension SyncEngine {
             BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) expired entries, rescued \(rescued) still-in-inbox (TTL=\(SyncConfig.aiCacheTTLDays)d)")
         }
     }
+
+    /// How many AI cache entries are older than the cutoff: the purge's gate.
+    nonisolated static let aiCacheExpiredCountSQL = """
+        SELECT COUNT(*) FROM messageAICache INDEXED BY messageAICache_expiry
+        WHERE updatedAt < ?
+        """
+
+    /// One batch of expired AI cache entries: their keys and Message-IDs only.
+    nonisolated static let aiCacheExpiredBatchSQL = """
+        SELECT key, rfc822MessageId FROM messageAICache INDEXED BY messageAICache_expiry
+        WHERE updatedAt < ?
+        LIMIT ?
+        """
+
+    /// Whether any copy of a message, in any account, is in an inbox. It reads
+    /// that message's copies only and stops at the first one in an inbox.
+    nonisolated static let aiCacheInInboxSQL = """
+        SELECT EXISTS (
+            SELECT 1 FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+            WHERE rfc822MessageId = ? AND isInInbox = 1
+        )
+        """
 
     // MARK: - Retired calendar operation reclaim
 

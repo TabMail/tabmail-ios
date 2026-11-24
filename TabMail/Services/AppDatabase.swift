@@ -4455,9 +4455,7 @@ final class AppDatabase: Sendable {
         // SCANNED the whole cache. This index serves both: the count is a covering
         // range read and a batch reads only expired entries. Statistics come from
         // the background ANALYZE after the schema change; nothing else to do here.
-        //
-        // IF NOT EXISTS is REQUIRED (see v62): a suspension/kill after the index
-        // commits but before GRDB records the migration would re-run and brick.
+        // IF NOT EXISTS, like every index migration here, keeps the DDL idempotent.
         migrator.registerTimedMigration(
             "v113_messageAICacheExpiryIndex", foreignKeyChecks: .immediate
         ) { db in
