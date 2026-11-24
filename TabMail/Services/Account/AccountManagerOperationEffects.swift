@@ -628,10 +628,11 @@ extension AccountManager {
                  newMessageId: $0.newProviderMessageId)
             })
             // The body-asset manifest keys by the same header id. See the
-            // R12-T7 block above: `pruneOrphans`' recovery leg structurally
-            // cannot see the id-CHANGING shape this function produces, so
-            // without this the next sweep deletes a live message's cached
-            // bodies and attachments.
+            // R12-T7 block above: the recovery leg (`pruneOrphans`', now the
+            // pending-delete worker's) structurally cannot see the id-CHANGING
+            // shape this function produces, so without this the worker deletes
+            // a live message's cached bodies and attachments (the re-key's
+            // header delete queued the old id, #1376).
             var rekeyedAssetKeys = 0
             for record in applied {
                 if BodyAssetStore.rekeyContentKey(
