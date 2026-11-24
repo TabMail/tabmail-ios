@@ -146,15 +146,25 @@ enum NotificationCleanupService {
     // MARK: - Bridging
 
     private static func snapshot(from n: UNNotification) -> DeliveredNotificationSnapshot {
+        snapshot(identifier: n.request.identifier, date: n.date, content: n.request.content)
+    }
+
+    /// The snapshot of a delivered notification from its request's identifier, its
+    /// delivery date and its content. Split from `snapshot(from:)` because a test
+    /// cannot build a `UNNotification`, but can build the content with the app's
+    /// own builders.
+    static func snapshot(
+        identifier: String, date: Date, content: UNNotificationContent
+    ) -> DeliveredNotificationSnapshot {
         DeliveredNotificationSnapshot(
-            identifier: n.request.identifier,
-            date: n.date,
-            interruptionLevel: n.request.content.interruptionLevel,
-            providerTag: n.request.content.userInfo["provider"] as? String,
-            accountEmail: n.request.content.userInfo["accountEmail"] as? String,
-            reconnectState: n.request.content.userInfo["reconnect_state"] as? String,
-            categoryIdentifier: n.request.content.categoryIdentifier,
-            hasReminderHash: n.request.content.userInfo["hash"] != nil
+            identifier: identifier,
+            date: date,
+            interruptionLevel: content.interruptionLevel,
+            providerTag: content.userInfo["provider"] as? String,
+            accountEmail: content.userInfo["accountEmail"] as? String,
+            reconnectState: content.userInfo["reconnect_state"] as? String,
+            categoryIdentifier: content.categoryIdentifier,
+            hasReminderHash: content.userInfo["hash"] != nil
         )
     }
 }
