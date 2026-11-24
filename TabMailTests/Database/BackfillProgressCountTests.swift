@@ -259,17 +259,70 @@ struct BackfillProgressCountTests {
         }
     }
 
-    /// Headers for the embedding plan test: enough that, with the app's `ANALYZE`, the
-    /// planner prefers a skip-scan of this index to the embedding read's own index when
-    /// the read does not name it (it does not at 1,000 rows; it does at 5,000).
+    /// Headers for the embedding plan test: a full chunk in every state, and a small
+    /// mailbox for the fresh state to analyze. A fresh `ANALYZE` of these rows does not
+    /// tip the read without its index name to the skip-scan on the simulator's SQLite;
+    /// the large mailbox's statistics below do.
     private static let embeddingPlanRows = 20_000
+
+    /// `sqlite_stat1` for `messageHeader` as a whole-database `ANALYZE` wrote it, with this
+    /// index present, on the 105,000-header proof database (four accounts, 84,951 headers
+    /// owing an embedding). Under these statistics the proof saw the read without its
+    /// index name skip-scan this index. The app's SQLite keeps no `sqlite_stat4`, so these
+    /// rows are all the planner knows about the table: written over the test's rows, they
+    /// give it a large mailbox's estimates.
+    private static let largeMailboxStatistics: [String: String] = [
+        "idx_messageHeader_bodyStatus": "105000 52500 35000 35000 17500",
+        "messageHeader_accountId_bodyComplete": "105000 26250 13125",
+        "messageHeader_accountId_messageId": "105000 26250 2",
+        "messageHeader_aiIncomplete": "19833 1",
+        "messageHeader_backfillProgress": "105000 26250 13125 13125 13125 8750",
+        "messageHeader_bodyRepopulate": "105000 52500 26250 17500 17500 1",
+        "messageHeader_bodyRepopulateV2": "105000 52500 26250 17500 17500 17500 1",
+        "messageHeader_computedThreadId": "105000 105000",
+        "messageHeader_date": "105000 1",
+        "messageHeader_embeddingIncomplete": "84951 42476 1",
+        "messageHeader_folderId": "105000 6563",
+        "messageHeader_folderId_date": "105000 6563 1",
+        "messageHeader_folderId_isRead": "105000 6563 3388",
+        "messageHeader_folderId_isRead_date": "105000 6563 3388 1",
+        "messageHeader_folderId_messageId": "105000 6563 1",
+        "messageHeader_folderId_providerDate": "105000 6563 1",
+        "messageHeader_folderId_uidInt": "105000 6563 1",
+        "messageHeader_headerIncomplete": "5213 1",
+        "messageHeader_inReplyTo": "105000 105000",
+        "messageHeader_inbox_display": "105000 6563 3282 1",
+        "messageHeader_isInInbox_date": "105000 52500 1",
+        "messageHeader_messageId_accountId": "105000 3 2",
+        "messageHeader_reminderLookup": "0 0 0",
+        "messageHeader_rfc822MessageId": "105000 1",
+        "messageHeader_rfc822MessageId_date": "105000 1 1",
+        "messageHeader_threadId": "105000 105000",
+        "messageHeader_triage_display": "105000 6563 3282 1020 1",
+        "messageHeader_unreadSweep": "9066 605 1",
+        "sqlite_autoindex_messageHeader_1": "105000 1",
+    ]
+
+    /// Replaces the statistics with `largeMailboxStatistics` and reloads them.
+    private static func applyLargeMailboxStatistics(to queue: DatabaseQueue) throws {
+        try queue.writeWithoutTransaction { conn in
+            try conn.execute(sql: "DELETE FROM main.sqlite_stat1")
+            for (name, stat) in largeMailboxStatistics {
+                try conn.execute(
+                    sql: "INSERT INTO main.sqlite_stat1 (tbl, idx, stat) VALUES ('messageHeader', ?, ?)",
+                    arguments: [name, stat])
+            }
+            try conn.execute(sql: "ANALYZE sqlite_schema")
+        }
+    }
 
     /// #1401: with this index present and the app's `ANALYZE` run, SQLite planned the
     /// embedding repopulate read as a skip-scan of this index by account plus a sort of
     /// the whole backlog: 10,831 pages instead of 511 on 105,000 headers. The read names
-    /// `messageHeader_embeddingIncomplete`, so in every statistics state it stays one
-    /// ordered scan of that index, with no sort, stopping at its limit. Red when the
-    /// statement does not name the index: the fresh state then plans the skip-scan.
+    /// `messageHeader_embeddingIncomplete`, so in every statistics state, and under a
+    /// large mailbox's statistics, it stays one ordered scan of that index, with no sort,
+    /// stopping at its limit. Red when the statement does not name the index: the large
+    /// mailbox's statistics then plan the skip-scan.
     @Test("With this index present, the embedding repopulate read keeps its ordered scan of its own index")
     func embeddingRepopulateKeepsItsIndex() throws {
         let accounts = ["acc-a", "acc-b", "acc-c", "acc-d"]
@@ -284,12 +337,7 @@ struct BackfillProgressCountTests {
             bodyMetadataOversized: "0"))
         let sql = BackfillEmbeddingQueue.repopulateSQL(limit: SyncConfig.embeddingRepopulateChunk)
 
-        for statistics in Statistics.allCases {
-            try Self.apply(statistics, to: queue)
-            if statistics == .fresh {
-                let statRows = try Self.indexStatRows(queue)
-                #expect(statRows > 0, "setup: the fresh state is vacuous unless ANALYZE wrote this index's row")
-            }
+        func expectOrderedScan(_ state: String) throws {
             let (plan, rows) = try queue.read { conn in
                 (try Row.fetchAll(conn, sql: "EXPLAIN QUERY PLAN " + sql)
                     .compactMap { $0["detail"] as String? }
@@ -297,10 +345,28 @@ struct BackfillProgressCountTests {
                  try String.fetchAll(conn, sql: sql).count)
             }
             #expect(plan == "SCAN messageHeader USING INDEX messageHeader_embeddingIncomplete",
-                    "\(statistics.rawValue): the embedding read must scan its own index in order, no sort: \(plan)")
+                    "\(state): the embedding read must scan its own index in order, no sort: \(plan)")
             #expect(rows == SyncConfig.embeddingRepopulateChunk,
-                    "\(statistics.rawValue): setup: the read returns a full chunk: \(rows)")
+                    "\(state): setup: the read returns a full chunk: \(rows)")
         }
+
+        for statistics in Statistics.allCases {
+            try Self.apply(statistics, to: queue)
+            if statistics == .fresh {
+                let statRows = try Self.indexStatRows(queue)
+                #expect(statRows > 0, "setup: the fresh state is vacuous unless ANALYZE wrote this index's row")
+            }
+            try expectOrderedScan(statistics.rawValue)
+        }
+
+        let indexes = try queue.read { conn in
+            try String.fetchAll(conn, sql: "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'messageHeader'")
+        }
+        let measured = Set(Self.largeMailboxStatistics.keys)
+        #expect(Set(indexes) == measured,
+                "setup: the large mailbox's statistics name every index of the table and no other, so the planner estimates none by default: \(indexes.sorted())")
+        try Self.applyLargeMailboxStatistics(to: queue)
+        try expectOrderedScan("large mailbox")
     }
 
     // MARK: - Same counts as the old statements
