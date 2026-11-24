@@ -607,37 +607,45 @@ struct DeferredIndexBuildTests {
 
     /// The other half: it must actually arrive, or `markAllAsRead` never gets its
     /// index and the deferral is a silent regression rather than a deferral.
+    /// (Until 2026-11-24 the build was its own step, `runBuildDeferredIndexesIfMissing`,
+    /// reporting `.built` / `.alreadyPresent`; it now runs inside the statistics
+    /// refresh's write, so the refresh's own outcomes carry the claim.)
     @Test("The background maintenance pass builds it, and is idempotent")
     func maintenancePassBuildsTheDeferredIndexAndConverges() async throws {
         let fixture = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
 
-        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .built)
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
         for index in SyncEngine.deferredIndexes {
             #expect(try indexExists(fixture.pool, index.name),
-                    "\(index.name) missing after the pass reported .built")
+                    "\(index.name) missing after the pass reported .refreshed")
         }
 
         // Idempotent, and it reports so. A pass that rebuilt every time would burn
         // the 5,050 ms on every foreground poll — a worse defect than the one this
         // change fixes, and invisible without this assertion.
-        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .alreadyPresent)
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .alreadyFresh)
         for index in SyncEngine.deferredIndexes {
             #expect(try indexExists(fixture.pool, index.name))
         }
     }
 
-    /// 🚨 ONE PASS CONVERGES — the reason the index build runs BEFORE the `ANALYZE`
-    /// in `runWALMaintenance`. `CREATE INDEX` is DDL and bumps `schema_version`,
-    /// which is the marker the statistics refresh latches on. Built first, the
-    /// analysis records the POST-index version and the next pass is `.alreadyFresh`.
-    /// Built after, the analysis would record a version the index immediately
-    /// invalidates and the NEXT pass would pay a second whole-database `ANALYZE`.
+    /// 🚨 ONE PASS CONVERGES. `CREATE INDEX` is DDL and bumps `schema_version`,
+    /// which is the marker the statistics refresh latches on. The build and the
+    /// `ANALYZE` run in ONE write and the marker is read after both, so it records
+    /// the POST-index version and the next pass is `.alreadyFresh`. A build that
+    /// landed after the marker settled would make the NEXT pass pay a second
+    /// whole-database `ANALYZE` for nothing.
     ///
-    /// This asserts the SYSTEM PROPERTY (the second pass is a no-op on both steps),
-    /// not the call order, so it stays honest if the steps are ever restructured.
-    @Test("Index build then ANALYZE converges in a single maintenance pass")
+    /// This asserts the SYSTEM PROPERTY (the second pass is a no-op, and the marker
+    /// equals the live schema version), not the call structure.
+    @Test("Building the deferred indexes and analyzing converge in a single maintenance pass")
     func indexBuildBeforeAnalyzeConvergesInOnePass() async throws {
         let fixture = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
@@ -646,20 +654,54 @@ struct DeferredIndexBuildTests {
         let key = "analyzeMarker-\(UUID().uuidString)"
         defer { defaults.removeObject(forKey: key) }
 
-        // Pass 1, in production order.
-        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .built)
         #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
+        let liveVersion = try fixture.pool.read { db in
+            try Int.fetchOne(db, sql: "PRAGMA schema_version")
+        }
+        let marker = defaults.object(forKey: key) as? Int
+        #expect(marker != nil && marker == liveVersion,
+                "the marker must record the schema version AFTER the index build")
 
         // Pass 2 must do nothing at all. `.alreadyFresh` here is the whole claim: the
         // marker settled ON the post-index schema version.
-        #expect(await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool) == .alreadyPresent)
         #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: defaults, markerKey: key) == .alreadyFresh,
                 """
                 a second maintenance pass re-ran the whole-database ANALYZE — the \
                 index build's schema_version bump landed after the marker settled, \
-                which is the two-pass shape the ordering exists to prevent
+                which is the two-pass shape the single write exists to prevent
                 """)
+    }
+
+    /// A deferred index added by a later release reaches a device whose statistics
+    /// are already fresh. The marker alone says "nothing to do", so the refresh
+    /// must notice the missing index itself, build it, and settle again in the same
+    /// pass; otherwise the new index never arrives at all on that device.
+    @Test("A deferred index added later is built on a device whose statistics are fresh")
+    func newDeferredIndexIsBuiltDespiteFreshStatistics() async throws {
+        let fixture = try makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let defaults = UserDefaults.standard
+        let key = "analyzeMarker-\(UUID().uuidString)"
+        defer { defaults.removeObject(forKey: key) }
+        let added = SyncEngine.DeferredIndex(
+            name: "messageHeader_testDeferredAddition",
+            sql: "CREATE INDEX IF NOT EXISTS messageHeader_testDeferredAddition ON messageHeader(accountId, date)")
+        let later = SyncEngine.deferredIndexes + [added]
+
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key) == .alreadyFresh)
+        #expect(try indexExists(fixture.pool, added.name) == false)
+
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key, indexes: later) == .refreshed)
+        #expect(try indexExists(fixture.pool, added.name),
+                "the later release's deferred index never arrived on a device with fresh statistics")
+        #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, defaults: defaults, markerKey: key, indexes: later) == .alreadyFresh)
     }
 }

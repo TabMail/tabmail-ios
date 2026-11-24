@@ -574,22 +574,19 @@ struct ArchiveOldSweepDifferentialTests {
         let cutoff = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 14 * 86_400).rounded(.down))
         let series = Self.series(shape)
 
-        // The production build step, and the production statistics refresh under a private marker.
+        // The production statistics refresh under a private marker; it also builds the deferred indexes, in the
+        // same write.
         switch statistics {
         case .unanalyzed:
             try Self.insert(series, into: pool, cutoff: cutoff)
-            let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
-            #expect(build == .built, "precondition: the build step built the deferred indexes (\(build))")
+            let refresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(dbPool: dbPool, markerKey: markerKey)
+            #expect(refresh == .refreshed, "precondition: the refresh built the deferred indexes (\(refresh))")
             try await pool.write { db in try db.execute(sql: "DROP TABLE IF EXISTS sqlite_stat1") }
         case .analyzedWithMail:
             try Self.insert(series, into: pool, cutoff: cutoff)
-            let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
-            #expect(build == .built, "precondition: the build step built the deferred indexes (\(build))")
             let refresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(dbPool: dbPool, markerKey: markerKey)
             #expect(refresh == .refreshed, "precondition: the statistics refresh ran (\(refresh))")
         case .analyzedBeforeMail:
-            let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
-            #expect(build == .built, "precondition: the build step built the deferred indexes (\(build))")
             let refresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(dbPool: dbPool, markerKey: markerKey)
             #expect(refresh == .refreshed, "precondition: the statistics refresh ran (\(refresh))")
             try Self.insert(series, into: pool, cutoff: cutoff)

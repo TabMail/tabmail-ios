@@ -224,7 +224,7 @@ extension SyncEngine {
     ///
     /// Without the index every page would scan and sort the whole table inside its
     /// write, the #1354 hold made worse. The index is deferred, built later in the
-    /// same pass (`runBuildDeferredIndexesIfMissing`), so the first pass after an
+    /// same pass (`runRefreshPlannerStatisticsIfStale`), so the first pass after an
     /// upgrade skips the step and the next one evicts; stale bodies stay cached one
     /// pass longer, which changes nothing but disk use. A schema that cannot be read
     /// counts as missing (retried next pass).
@@ -619,7 +619,7 @@ extension SyncEngine {
                 // is a best-effort background sweep, the rows it failed to remove
                 // are inert (`status == failed` is outside `drainCalendarQueue`'s
                 // filter), and the next pass retries. Its two siblings in this
-                // file — `runBuildDeferredIndexesIfMissing`'s success and
+                // file — `runRefreshPlannerStatisticsIfStale`'s success and
                 // abandoned arms — are gated the same way, including the error arm.
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CalendarQueue] Retired-op reclaim failed: \(error)")
@@ -821,19 +821,6 @@ extension SyncEngine {
         let sql: String
     }
 
-    /// What one call to `runBuildDeferredIndexesIfMissing` did. Returned so the
-    /// invariant — *a deferred index is built exactly once and the pass converges* —
-    /// is observable without reaching into `sqlite_master` from the caller.
-    enum DeferredIndexBuild: Equatable, Sendable {
-        /// Every deferred index already exists. Nothing was written.
-        case alreadyPresent
-        /// At least one was missing and the whole set has now been created.
-        case built
-        /// The probe could not read the schema, or the create failed / was cancelled
-        /// / hit a suspension. NOTHING is recorded, so the next pass retries.
-        case abandoned
-    }
-
     /// Indexes moved OFF the blocking migration path (ADR-IOS-029, 2026-08-05
     /// amendment; owner directive *"startup migrations should really have only
     /// things that are absolutely necessary and blocking. Other things should happen
@@ -935,20 +922,22 @@ extension SyncEngine {
     /// The index the stale-body evict step seeks (`deferredIndexes`).
     nonisolated static let staleBodyIndexName = "messageBody_staleEvict"
 
-    /// Creates every deferred index that does not already exist, inside the caller's
-    /// transaction.
+    /// Creates every index in `indexes` (the deferred set unless a test names another)
+    /// that does not already exist, inside the caller's transaction.
     ///
     /// Separate from the `async` pass below so a test can reach the PRODUCTION DDL
     /// through a plain `Database` instead of re-typing the `CREATE INDEX` — a
     /// re-typed copy is a test that passes against a statement the app does not run.
-    nonisolated static func createDeferredIndexes(_ db: Database) throws {
-        for index in deferredIndexes {
+    nonisolated static func createDeferredIndexes(
+        _ db: Database, _ indexes: [DeferredIndex] = SyncEngine.deferredIndexes
+    ) throws {
+        for index in indexes {
             try db.execute(sql: index.sql)
         }
     }
 
-    /// The deferred indexes `sqlite_master` does not have, or `nil` if the schema
-    /// could not be read at all (which is *unknown*, not *present*).
+    /// The indexes of `indexes` that `sqlite_master` does not have, or `nil` if the
+    /// schema could not be read at all (which is *unknown*, not *present*).
     ///
     /// ⚠️ NOT `async`, for the same reason as `plannerStatisticsSchemaVersion` below:
     /// Swift binds the ASYNC overload from an async context, and
@@ -956,9 +945,11 @@ extension SyncEngine {
     /// staging merge before it reads. Inlining this into the async caller silently
     /// drags a multi-second durable merge into a probe that exists to decide whether
     /// to do any work at all.
-    private static func missingDeferredIndexes(_ dbPool: PrioritizedDatabase) -> [String]? {
+    private static func missingDeferredIndexes(
+        _ dbPool: PrioritizedDatabase, among indexes: [DeferredIndex]
+    ) -> [String]? {
         try? dbPool.read { db in
-            try deferredIndexes.filter { index in
+            try indexes.filter { index in
                 try Row.fetchOne(
                     db,
                     sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
@@ -967,98 +958,73 @@ extension SyncEngine {
         }
     }
 
-    /// Builds any missing deferred index. Runs from the background WAL maintenance
-    /// pass, BEFORE the `ANALYZE` step.
-    ///
-    /// 🚨 THE ORDER IS LOAD-BEARING AND IT IS THE ONE THING TO PRESERVE HERE.
-    /// `CREATE INDEX` is DDL, so it bumps SQLite's `schema_version`, which is exactly
-    /// the marker `runRefreshPlannerStatisticsIfStale` latches on. Building the index
-    /// FIRST means the `ANALYZE` that follows in the same pass reads the
-    /// POST-index version and records it, so **one pass converges**: index built,
-    /// statistics computed over it, marker settled. Moving this AFTER the `ANALYZE`
-    /// would have the analysis record version N, the index bump it to N+1, and the
-    /// NEXT pass pay a second whole-database `ANALYZE` for nothing.
-    ///
-    /// ⚠️ NO SINGLE-FLIGHT LATCH, deliberately, and this is where it differs from its
-    /// `ANALYZE` sibling. The two maintenance callers (the foreground poll and the
-    /// BGProcessing drain) really can overlap, but `CREATE INDEX IF NOT EXISTS` is
-    /// idempotent and SQLite serializes writers, so the loser of the race waits for
-    /// the writer and then executes a no-op. The sibling needs a latch because
-    /// `ANALYZE` is NOT a no-op the second time — it re-pays up to 8.5 s. Adding a
-    /// latch here would buy nothing and add a failure mode.
-    ///
-    /// FAILS SAFE. If this is skipped, cancelled or aborted, `markAllAsRead` sorts
-    /// through a temp B-tree — slow, and correct in the sense that matters (identical
-    /// rows, identical order) — and the stale-body evict step waits for its index
-    /// (`runEvictStaleBodiesIfIndexed`), so stale bodies stay cached a pass longer
-    /// (#1354). Nothing is recorded on failure, so the next pass retries. Recovery is
-    /// automatic and needs no user gesture (THE MANTRA: recoverable ⇒ fail closed).
-    ///
-    /// 🚨 IT IS **NOT** "THE ALREADY-SHIPPED BEHAVIOUR UP TO `v83`", WHICH IS WHAT
-    /// THIS SENTENCE SAID UNTIL R16-4 (corrected 2026-08-06) — and the wording
-    /// mattered, because that clause was the entire licence for deferring the build.
-    /// Shipped `markAllAsRead` (`07a4bb703:TabMail/ViewModels/InboxViewModel.swift`,
-    /// an immutable tag) fetched `.filter(folderId == fid && isRead == false)
-    /// .limit(batchSize)` with **no `ORDER BY`**, so it never sorted at all. The
-    /// ordered keyset sweep arrived IN-RANGE with `a790dd61d` (2026-08-03), which
-    /// `git merge-base --is-ancestor a790dd61d 07a4bb703` reports is NOT an ancestor
-    /// of the shipped tag (exit 1). Measured at 357,400 rows / 100,000 unread /
-    /// fresh-install `sqlite_stat1`: shipped **7,889 ms**, current with the index
-    /// **4,610 ms**, current WITHOUT it **43,296 ms** — **5.5× worse than shipped**.
-    /// The deferral is accepted because the window is TRANSIENT and SELF-HEALING,
-    /// never because it equals a shipped baseline. Full argument: `IOS-PERF-005`.
-    ///
-    /// ⚠️ Contrast the sibling below: `runRefreshPlannerStatisticsIfStale`'s
-    /// "ALREADY-SHIPPED regime" claim about stale statistics is TRUE and stays —
-    /// `ANALYZE` really has only ever run inside migration bodies. Two adjacent
-    /// functions, the same argument shape, opposite truth values; that is why each
-    /// one has to be checked against the tag rather than against its neighbour.
-    ///
-    /// COST WHILE IT RUNS: one write transaction; for `messageHeader_unreadSweep`
-    /// 119 ms measured at 360k rows, 5,050 ms on a real 5-account device — which
-    /// is the whole point of it being here rather than on the launch path.
-    /// `messageBody_staleEvict` (#1354) reads every cached body once, since
-    /// `fetchedAt` is stored after the HTML, so its build costs more than those
-    /// figures on a large body cache.
-    @discardableResult
-    nonisolated static func runBuildDeferredIndexesIfMissing(
-        dbPool: PrioritizedDatabase
-    ) async -> DeferredIndexBuild {
-        guard let missing = missingDeferredIndexes(dbPool) else {
-            // Could not read the schema ⇒ nothing is determined. Retry next pass.
-            return .abandoned
-        }
-        guard !missing.isEmpty else { return .alreadyPresent }
-
-        let t0 = CFAbsoluteTimeGetCurrent()
-        // Same cancellation shape as `runRefreshPlannerStatisticsIfStale`: the flag is
-        // a `Mutex` rather than `Task.isCancelled` because GRDB dispatches the write
-        // closure onto its own writer queue, where `Task.isCancelled` always reads
-        // `false`. Abandoning drops no user intention — this write carries none.
-        let cancelledWhileQueued = Mutex<Bool>(false)
-        do {
-            try await withTaskCancellationHandler {
-                try await dbPool.write(label: "BuildDeferredIndexes") { db in
-                    guard !cancelledWhileQueued.withLock({ $0 }),
-                          !DatabaseSuspension.isSuspended else {
-                        throw CancellationError()
-                    }
-                    try createDeferredIndexes(db)
-                }
-            } onCancel: {
-                cancelledWhileQueued.withLock { $0 = true }
-            }
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] built deferred index(es) \(missing.joined(separator: ", ")) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
-            }
-            return .built
-        } catch {
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] deferred index build abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — retrying next pass: \(error)")
-            }
-            return .abandoned
-        }
-    }
+    // MARK: Building a deferred index (inside the statistics write below)
+    //
+    // A missing deferred index is built by `runRefreshPlannerStatisticsIfStale`, in
+    // the SAME write transaction as the whole-database `ANALYZE` and before it, and
+    // the marker is then settled on the schema version read after that `ANALYZE`
+    // (2026-11-24). Until then the build was its own write, run just
+    // before the statistics step, and that left a window: a connection that read
+    // between the two writes loaded the new index with no statistics row beside
+    // current ones for every other index, and SQLite keeps what a connection loads
+    // until the next schema change, because `ANALYZE` alone does not bump
+    // `schema_version`. With the new index looking far more selective than it is,
+    // such a connection planned the unread inbox page and the pending-body count
+    // through it (measured on a 100k-header test database: 71 to 367 pages read for the
+    // unread page), and kept doing so until GRDB closed it at the next background
+    // entry. One write means no connection can load a schema that has a new index
+    // but not its statistics, whatever statistics the database had before. Two
+    // narrower fixes do not hold: an `ANALYZE` of only the new index in the build's write, which is exact
+    // only when every other index's statistics are current (with older or missing
+    // ones the new index looks UNselective, so its own read keeps the old plan and
+    // another read can flip), and an `ANALYZE` of its table there, which is exact but
+    // pays a second statistics run when the whole-database one follows.
+    //
+    // The rest of this note is the build's own history, kept from when it was a
+    // separate step.
+    //
+    // ORDER. `CREATE INDEX` is DDL, so it bumps SQLite's `schema_version`, which is
+    // exactly the marker the statistics step latches on. Building FIRST means the
+    // `ANALYZE` reads the POST-index version and records it, so **one pass
+    // converges**: index built, statistics computed over it, marker settled.
+    // Building after would have the analysis record version N, the index bump it to
+    // N+1, and the NEXT pass pay a second whole-database `ANALYZE` for nothing. Inside
+    // one write the order is the statement order, and the marker is read last.
+    //
+    // FAILS SAFE. If the write is skipped, cancelled or aborted it rolls back whole
+    // (index and statistics), `markAllAsRead` sorts through a temp B-tree — slow, and
+    // correct in the sense that matters (identical rows, identical order) — and the
+    // stale-body evict step waits for its index (`runEvictStaleBodiesIfIndexed`), so
+    // stale bodies stay cached a pass longer (#1354). Nothing is recorded on failure,
+    // so the next pass retries. Recovery is automatic and needs no user gesture (THE
+    // MANTRA: recoverable ⇒ fail closed).
+    //
+    // 🚨 IT IS **NOT** "THE ALREADY-SHIPPED BEHAVIOUR UP TO `v83`", WHICH IS WHAT
+    // THIS SENTENCE SAID UNTIL R16-4 (corrected 2026-08-06) — and the wording
+    // mattered, because that clause was the entire licence for deferring the build.
+    // Shipped `markAllAsRead` (`07a4bb703:TabMail/ViewModels/InboxViewModel.swift`,
+    // an immutable tag) fetched `.filter(folderId == fid && isRead == false)
+    // .limit(batchSize)` with **no `ORDER BY`**, so it never sorted at all. The
+    // ordered keyset sweep arrived IN-RANGE with `a790dd61d` (2026-08-03), which
+    // `git merge-base --is-ancestor a790dd61d 07a4bb703` reports is NOT an ancestor
+    // of the shipped tag (exit 1). Measured at 357,400 rows / 100,000 unread /
+    // fresh-install `sqlite_stat1`: shipped **7,889 ms**, current with the index
+    // **4,610 ms**, current WITHOUT it **43,296 ms** — **5.5× worse than shipped**.
+    // The deferral is accepted because the window is TRANSIENT and SELF-HEALING,
+    // never because it equals a shipped baseline. Full argument: `IOS-PERF-005`.
+    //
+    // ⚠️ Contrast `runRefreshPlannerStatisticsIfStale`'s own doc below: its
+    // "ALREADY-SHIPPED regime" claim about stale statistics is TRUE and stays —
+    // `ANALYZE` really has only ever run inside migration bodies. Two adjacent
+    // functions, the same argument shape, opposite truth values; that is why each
+    // one has to be checked against the tag rather than against its neighbour.
+    //
+    // COST OF A BUILD: inside the statistics write; for `messageHeader_unreadSweep`
+    // 119 ms measured at 360k rows, 5,050 ms on a real 5-account device — which
+    // is the whole point of it being here rather than on the launch path.
+    // `messageBody_staleEvict` (#1354) reads every cached body once, since
+    // `fetchedAt` is stored after the HTML, so its build costs more than those
+    // figures on a large body cache.
 
     // MARK: - Query-planner statistics (ADR-IOS-029 rule 5, deferred timing)
 
@@ -1067,12 +1033,15 @@ extension SyncEngine {
     /// otherwise, and an aborted pass does not consume the obligation* — is
     /// observable without reaching into the marker or into SQLite internals.
     enum PlannerStatisticsRefresh: Equatable, Sendable {
-        /// The schema has not changed since the last completed `ANALYZE`.
+        /// Every deferred index exists and the schema has not changed since the last
+        /// completed `ANALYZE`.
         case alreadyFresh
-        /// `ANALYZE` completed and the marker advanced to the settled schema version.
+        /// `ANALYZE` completed, after building every missing deferred index in the
+        /// same write, and the marker advanced to the settled schema version.
         case refreshed
-        /// The pass could not read the schema version, or `ANALYZE` failed / was
-        /// aborted. The marker is UNCHANGED, so the next pass retries.
+        /// The pass could not read the schema or its version, or the write failed /
+        /// was aborted, which rolls back any index it built with its statistics. The
+        /// marker is UNCHANGED, so the next pass retries.
         case abandoned
         /// Another caller already holds the single-flight latch. This pass did
         /// nothing and consumed no obligation — the in-flight one will advance the
@@ -1154,7 +1123,19 @@ extension SyncEngine {
     /// between an upgrade launch and the first maintenance pass is no worse than
     /// every shipped release, and strictly better once the pass runs.
     ///
-    /// COST WHILE IT RUNS: one write transaction, up to ~8.5 s at 500k headers.
+    /// IT ALSO BUILDS EVERY MISSING DEFERRED INDEX, IN THE SAME WRITE. When an index
+    /// of `indexes` (`deferredIndexes` in the app) is missing, the write creates it
+    /// and then runs the `ANALYZE`, whatever the marker says, so the index and its
+    /// statistics commit together and the marker settles on the post-index schema
+    /// version: no connection can load a schema that has the new index but not its
+    /// statistics (see "Building a deferred index" above). With every deferred index
+    /// present this is the stale-marker `ANALYZE` alone, as before. `indexes` is a
+    /// parameter only so a test can add an index the app does not build yet; the app
+    /// always passes the default.
+    ///
+    /// COST WHILE IT RUNS: one write transaction, up to ~8.5 s at 500k headers, plus,
+    /// on the pass that builds a deferred index, that build (see "COST OF A BUILD"
+    /// above).
     ///
     /// ⚠️ THIS FUNCTION IS `async` FOR ONE REASON, AND THE PREVIOUS VERSION OF THIS
     /// PARAGRAPH WAS WRONG. It used to claim the cost lands *"on the caller's pool
@@ -1179,7 +1160,8 @@ extension SyncEngine {
     nonisolated static func runRefreshPlannerStatisticsIfStale(
         dbPool: PrioritizedDatabase,
         defaults: UserDefaults = .standard,
-        markerKey: String = plannerStatisticsSchemaVersionKey
+        markerKey: String = plannerStatisticsSchemaVersionKey,
+        indexes: [DeferredIndex] = SyncEngine.deferredIndexes
     ) async -> PlannerStatisticsRefresh {
         // SINGLE-FLIGHT. Taken BEFORE the marker read, because the race is two
         // callers both reading the marker stale — taking it after the read would
@@ -1192,6 +1174,11 @@ extension SyncEngine {
         guard acquired else { return .alreadyRunning }
         defer { plannerStatisticsRefreshInFlight.withLock { $0 = false } }
 
+        // Under the latch, so two overlapping callers cannot both build and analyze.
+        guard let missing = missingDeferredIndexes(dbPool, among: indexes) else {
+            // Could not read the schema ⇒ nothing is determined. Retry next pass.
+            return .abandoned
+        }
         guard let currentVersion = plannerStatisticsSchemaVersion(dbPool) else {
             // Could not read the schema version ⇒ nothing is determined. Leave the
             // marker alone and retry next pass.
@@ -1200,7 +1187,8 @@ extension SyncEngine {
         // `object(forKey:)` rather than `integer(forKey:)`: a never-analyzed database
         // has NO stored value, and `integer(forKey:)` cannot tell that apart from a
         // stored 0 — which is a legal `schema_version`.
-        if let analyzed = defaults.object(forKey: markerKey) as? Int,
+        if missing.isEmpty,
+           let analyzed = defaults.object(forKey: markerKey) as? Int,
            analyzed == currentVersion {
             return .alreadyFresh
         }
@@ -1226,7 +1214,8 @@ extension SyncEngine {
         // cancelled … never-drop-user-intention: a half-decided DB write must not be
         // abandoned mid-flight"*). That contract protects writes that CARRY a user
         // intention. `ANALYZE` carries none — it rewrites planner statistics only —
-        // and abandoning it drops nothing: the marker is left where it was, so the
+        // and neither does a deferred index build, so abandoning the write drops
+        // nothing: it rolls back whole, the marker is left where it was, so the
         // obligation stays outstanding and the next pass redoes it. The deviation is
         // confined to this one write for exactly that reason.
         let cancelledWhileQueued = Mutex<Bool>(false)
@@ -1236,6 +1225,11 @@ extension SyncEngine {
                     guard !cancelledWhileQueued.withLock({ $0 }),
                           !DatabaseSuspension.isSuspended else {
                         throw CancellationError()
+                    }
+                    // The missing deferred indexes first, then the statistics over
+                    // them, in this one transaction (see "Building a deferred index").
+                    if !missing.isEmpty {
+                        try createDeferredIndexes(db, indexes)
                     }
                     try db.execute(sql: "ANALYZE")
                     // Read AFTER, inside the same transaction. The FIRST `ANALYZE` on a
@@ -1250,12 +1244,14 @@ extension SyncEngine {
             }
             defaults.set(settled, forKey: markerKey)
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
+                let built = missing.isEmpty ? "" : "built deferred index(es) \(missing.joined(separator: ", ")) and "
+                BackgroundSyncLogger.logDebug("[Maintenance] \(built)ANALYZE refreshed query-planner statistics in one write in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
             }
             return .refreshed
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — statistics stay stale, retrying next pass: \(error)")
+                let built = missing.isEmpty ? "" : " (with the build of \(missing.joined(separator: ", ")), rolled back)"
+                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms\(built) — statistics stay stale, retrying next pass: \(error)")
             }
             return .abandoned
         }
