@@ -356,42 +356,23 @@ extension SyncEngine {
         }
     }
 
-    /// Lazy TTL touch + purge — runs after AI queue drains, not during sync.
-    /// Touches updatedAt on all inbox AI cache entries, then purges expired ones.
-    /// Runs on a background thread to avoid GRDB writer lock contention on MainActor.
-    nonisolated static func refreshAICacheTTLAndPurge(dbPool: PrioritizedDatabase) {
-        // Touch: refresh TTL for all inbox messages' AI cache entries
-        do {
-            let touchedCount = try dbPool.write { db in
-                // Get all inbox folder IDs
-                let inboxFolderIds = try Folder.filter(Column("role") == FolderRole.inbox.rawValue).fetchAll(db).map(\.id)
-                guard !inboxFolderIds.isEmpty else { return 0 }
-
-                // Build prefix patterns for LIKE queries
-                var totalTouched = 0
-                for folderId in inboxFolderIds {
-                    let prefix = "\(folderId):"
-                    let count = try MessageAICache
-                        .filter(Column("key").like("\(prefix)%"))
-                        .updateAll(db, Column("updatedAt").set(to: Date()))
-                    totalTouched += count
-                }
-                return totalTouched
-            }
-            if touchedCount > 0 {
-                BackgroundSyncLogger.logDebug("[AICache] TTL refresh: touched \(touchedCount) inbox AI cache entries")
-            }
-        } catch {
-            BackgroundSyncLogger.logDebug("[AICache] TTL refresh failed: \(error)")
-        }
-
-        // Purge expired entries
-        runPurgeExpiredAICache(dbPool: dbPool)
-    }
-
-    /// Nonisolated purge — runs entirely off the main thread.
+    /// Expire the AI cache (ADR-IOS-078): an entry no one has written for
+    /// `SyncConfig.aiCacheTTLDays` is deleted, unless its message is in an inbox
+    /// now, in which case it is kept and its clock restarts. Membership is read
+    /// from the message's own headers, never from the entry's key: the key names
+    /// the folder the AI ran in, which stays the inbox after the message is
+    /// archived. Runs after an AI queue drain and in maintenance, off the main
+    /// thread.
+    ///
+    /// Every read seeks an index (ADR-IOS-029): the expired set through
+    /// `messageAICache_expiry`, a message's headers through
+    /// `messageHeader_rfc822MessageId_date`. Each batch reads the expired set
+    /// again from its start, with no OFFSET: every entry a batch handles is
+    /// deleted or gets `updatedAt = now`, which is after the cutoff, so the
+    /// expired set shrinks with every batch and the loop ends.
     nonisolated static func runPurgeExpiredAICache(dbPool: PrioritizedDatabase) {
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date()) ?? Date.distantPast
+        let now = Date()
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: now) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
 
         let count = (try? dbPool.read { db in
@@ -399,16 +380,14 @@ extension SyncEngine {
         }) ?? 0
         guard count > 0 else { return }
 
-        let now = Date()
         var purged = 0
         var rescued = 0
-        var skipCount = 0
         while true {
             do {
                 let batchResult = try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
                     let batch = try MessageAICache
                         .filter(Column("updatedAt") < cutoff)
-                        .limit(chunkSize, offset: skipCount)
+                        .limit(chunkSize)
                         .fetchAll(db)
                     guard !batch.isEmpty else { return (0, 0, true) }
 
@@ -416,11 +395,12 @@ extension SyncEngine {
                     var batchRescued = 0
                     for var entry in batch {
                         if let msgId = entry.rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty {
-                            let headers = try MessageHeader
+                            // Every copy of the message, so the answer is exact.
+                            let inboxFlags = try MessageHeader
+                                .select(Column("isInInbox"), as: Bool.self)
                                 .filter(Column("rfc822MessageId") == msgId)
-                                .limit(5)
                                 .fetchAll(db)
-                            if headers.contains(where: { $0.isInInbox }) {
+                            if inboxFlags.contains(true) {
                                 entry.updatedAt = now
                                 try entry.update(db)
                                 batchRescued += 1
@@ -435,7 +415,6 @@ extension SyncEngine {
                 if batchResult.batchEmpty { break }
                 purged += batchResult.purged
                 rescued += batchResult.rescued
-                skipCount += batchResult.rescued
             } catch {
                 BackgroundSyncLogger.logDebug("[AICache] Purge failed: \(error)")
                 break

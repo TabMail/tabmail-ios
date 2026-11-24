@@ -218,6 +218,16 @@ within that directive's intent and are explicitly surfaced for owner veto.
   `runPurgeExpiredAICache` evict by inbox MEMBERSHIP (an expired cache entry is rescued whenever
   its `rfc822MessageId` still matches an `isInInbox == true` header), never by window. The
   owner's preferred behavior already held.
+  - *Correction 2026-11-24 (iOS #1374).* The bullet above held for `runPurgeExpiredAICache`
+    alone. `refreshAICacheTTLAndPurge`, which the AI queue ran each time it drained, first
+    restarted the clock of every entry whose key began with an inbox folder's id. The key names
+    the folder the AI ran in, so the entry of a message archived later kept its inbox prefix and
+    had its clock restarted on every drain: it never expired, the membership check never saw it,
+    and every drain rewrote every such entry. The refresh is removed and the drain runs
+    `runPurgeExpiredAICache`, so membership alone decides. Its inbox check now reads every copy
+    of the message (it read at most five), each batch reads the expired set from its start (the
+    old `OFFSET` skipped unhandled entries after a kept one), and the expired set is read through
+    `messageAICache_expiry` (ADR-IOS-029, 2026-11-24 amendment). Pinned by `AICacheExpiryTests`.
 - **No durable exception state.** Exempt processing is direct and ephemeral — no marker columns,
   no triggers, no redrive. IOS-AI-004's retirement of PR #39's durable machinery stands.
 
