@@ -2424,7 +2424,7 @@ enum NSEDataBridge {
                                             // list (e.g. a peer's precomputed `cachedReply`).
                                             // DO UPDATE touches only these four columns, and only
                                             // when the content actually differs.
-                                            try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
+                                            try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, rfc822MessageId: rfc, db: db)
                                         }
                                     }
                                 } else {
@@ -2466,7 +2466,7 @@ enum NSEDataBridge {
                                         // Value-guarded UPSERT — same rationale as the existing-
                                         // header branch (no REPLACE-clobber of cachedReply, no
                                         // redundant count on a no-op re-write).
-                                        try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, db: db)
+                                        try Self.upsertAICacheFromStaging(msg, cacheKey: cacheKey, rfc822MessageId: msg.rfc822MessageId, db: db)
                                     }
                                 }
                                 return .commit
@@ -3670,16 +3670,23 @@ enum NSEDataBridge {
     /// column. The staged `processedAt` is a number, and SQLite orders every number
     /// below every text value, so binding it raw made the TTL purge's
     /// `updatedAt < cutoff` count a fresh entry as expired (#395).
+    ///
+    /// `rfc822MessageId` is the Message-ID the key was made from. The cache's expiry
+    /// finds the message's copies by it (`SyncEngine.runPurgeExpiredAICache`); an entry
+    /// without one is treated as a message no inbox holds. An existing entry keeps the
+    /// Message-ID it has and gets this one only when it has none.
     static func upsertAICacheFromStaging(
         _ msg: StagedMessage,
         cacheKey: String,
+        rfc822MessageId: String?,
         db: GRDB.Database
     ) throws {
         try db.execute(sql: """
             INSERT INTO messageAICache
-                (key, summaryBlurb, summaryTodos, actionTag, updatedAt)
-                VALUES (?, ?, ?, ?, ?)
+                (key, rfc822MessageId, summaryBlurb, summaryTodos, actionTag, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
+                rfc822MessageId = COALESCE(rfc822MessageId, excluded.rfc822MessageId),
                 summaryBlurb = excluded.summaryBlurb,
                 summaryTodos = excluded.summaryTodos,
                 actionTag = excluded.actionTag,
@@ -3688,7 +3695,7 @@ enum NSEDataBridge {
                OR summaryTodos IS NOT excluded.summaryTodos
                OR actionTag IS NOT excluded.actionTag
             """, arguments: [
-                cacheKey, msg.summaryBlurb, msg.summaryTodos,
+                cacheKey, rfc822MessageId, msg.summaryBlurb, msg.summaryTodos,
                 msg.actionTag, Date(timeIntervalSince1970: msg.processedAt)
             ])
     }

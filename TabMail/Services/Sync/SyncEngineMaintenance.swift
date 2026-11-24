@@ -438,95 +438,125 @@ extension SyncEngine {
         }
     }
 
-    /// Lazy TTL touch + purge — runs after AI queue drains, not during sync.
-    /// Touches updatedAt on all inbox AI cache entries, then purges expired ones.
-    /// Runs on a background thread to avoid GRDB writer lock contention on MainActor.
-    nonisolated static func refreshAICacheTTLAndPurge(dbPool: PrioritizedDatabase) {
-        // Touch: refresh TTL for all inbox messages' AI cache entries
-        do {
-            let touchedCount = try dbPool.write { db in
-                // Get all inbox folder IDs
-                let inboxFolderIds = try Folder.filter(Column("role") == FolderRole.inbox.rawValue).fetchAll(db).map(\.id)
-                guard !inboxFolderIds.isEmpty else { return 0 }
-
-                // Build prefix patterns for LIKE queries
-                var totalTouched = 0
-                for folderId in inboxFolderIds {
-                    let prefix = "\(folderId):"
-                    let count = try MessageAICache
-                        .filter(Column("key").like("\(prefix)%"))
-                        .updateAll(db, Column("updatedAt").set(to: Date()))
-                    totalTouched += count
-                }
-                return totalTouched
-            }
-            if touchedCount > 0 {
-                BackgroundSyncLogger.logDebug("[AICache] TTL refresh: touched \(touchedCount) inbox AI cache entries")
-            }
-        } catch {
-            BackgroundSyncLogger.logDebug("[AICache] TTL refresh failed: \(error)")
-        }
-
-        // Purge expired entries
-        runPurgeExpiredAICache(dbPool: dbPool)
-    }
-
-    /// Nonisolated purge — runs entirely off the main thread.
-    nonisolated static func runPurgeExpiredAICache(dbPool: PrioritizedDatabase) {
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date()) ?? Date.distantPast
+    /// Expire the AI cache (ADR-IOS-078): an entry no one has written for
+    /// `SyncConfig.aiCacheTTLDays` is deleted, unless its message is in an inbox
+    /// now, in which case it is kept and its clock restarts. Membership is read
+    /// from the message's own headers, never from the entry's key: the key names
+    /// the folder the AI ran in, which stays the inbox after the message is
+    /// archived. Runs after an AI queue drain and in maintenance, off the main
+    /// thread.
+    ///
+    /// Every read seeks an index (ADR-IOS-029), named with `INDEXED BY` so that
+    /// statistics taken while a table was small cannot turn it into a scan: the
+    /// expired set through `messageAICache_expiry`, a message's copies through
+    /// `messageHeader_rfc822MessageId`. Each batch reads the expired set again
+    /// from its start, with no OFFSET: every entry a batch handles is deleted or
+    /// gets `updatedAt = now`, which is after the cutoff, so the expired set
+    /// shrinks with every batch and the loop ends. A batch reads each entry's key
+    /// and Message-ID only, so an entry whose stored results no longer decode is
+    /// expired like any other instead of failing the batch on every run.
+    ///
+    /// SQLite's own checkpoint is off (`AppDatabase.makePool`), so the WAL grows
+    /// until something checkpoints it: between two batches, once the earlier one's
+    /// write has committed, the run calls `checkpointWAL` (the throttled
+    /// `checkpointWALThrottled`, as the other batch writers do). It never checkpoints
+    /// after its last batch. The maintenance pass asks for a TRUNCATE checkpoint right
+    /// after the run, and the throttle would skip that TRUNCATE inside the window a
+    /// checkpoint moments before had opened; so a run of one batch, the common case,
+    /// adds no checkpoint at all. To know inside its own transaction whether another
+    /// batch follows, a batch reads one expired entry more than it handles.
+    nonisolated static func runPurgeExpiredAICache(
+        dbPool: PrioritizedDatabase,
+        checkpointWAL: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }
+    ) async {
+        let now = Date()
+        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: now) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
 
-        let count = (try? dbPool.read { db in
-            try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(db)
-        }) ?? 0
+        let count = expiredAICacheCount(dbPool: dbPool, cutoff: cutoff)
         guard count > 0 else { return }
 
-        let now = Date()
         var purged = 0
         var rescued = 0
-        var skipCount = 0
         while true {
             do {
-                let batchResult = try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
-                    let batch = try MessageAICache
-                        .filter(Column("updatedAt") < cutoff)
-                        .limit(chunkSize, offset: skipCount)
-                        .fetchAll(db)
-                    guard !batch.isEmpty else { return (0, 0, true) }
-
-                    var batchPurged = 0
-                    var batchRescued = 0
-                    for var entry in batch {
-                        if let msgId = entry.rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty {
-                            let headers = try MessageHeader
-                                .filter(Column("rfc822MessageId") == msgId)
-                                .limit(5)
-                                .fetchAll(db)
-                            if headers.contains(where: { $0.isInInbox }) {
-                                entry.updatedAt = now
-                                try entry.update(db)
-                                batchRescued += 1
-                                continue
-                            }
-                        }
-                        try entry.delete(db)
-                        batchPurged += 1
-                    }
-                    return (batchPurged, batchRescued, false)
-                }
-                if batchResult.batchEmpty { break }
+                let batchResult = try expireAICacheBatch(dbPool: dbPool, now: now, cutoff: cutoff, chunkSize: chunkSize)
                 purged += batchResult.purged
                 rescued += batchResult.rescued
-                skipCount += batchResult.rescued
+                if !batchResult.more { break }
             } catch {
                 BackgroundSyncLogger.logDebug("[AICache] Purge failed: \(error)")
                 break
             }
+            await checkpointWAL()
         }
         if purged > 0 || rescued > 0 {
             BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) expired entries, rescued \(rescued) still-in-inbox (TTL=\(SyncConfig.aiCacheTTLDays)d)")
         }
     }
+
+    // The purge's database steps are synchronous functions on purpose. Called straight
+    // from the async run, `dbPool.read` and `dbPool.write` would bind
+    // `PrioritizedDatabase`'s async overloads, which merge the extension's staged rows
+    // before a read and queue a write behind the priority tiers. From here they are the
+    // pass-through calls the purge has always made.
+
+    /// How many AI cache entries are older than `cutoff`; 0 when the read fails.
+    private nonisolated static func expiredAICacheCount(dbPool: PrioritizedDatabase, cutoff: Date) -> Int {
+        (try? dbPool.read { db in
+            try Int.fetchOne(db, sql: aiCacheExpiredCountSQL, arguments: [cutoff]) ?? 0
+        }) ?? 0
+    }
+
+    /// One batch of the purge, read and handled in one write transaction: up to
+    /// `chunkSize` expired entries, each deleted or, when its message is in an inbox,
+    /// kept with `updatedAt = now`. It reads one entry more than it handles: `more`
+    /// when that entry exists, so another batch follows.
+    private nonisolated static func expireAICacheBatch(
+        dbPool: PrioritizedDatabase, now: Date, cutoff: Date, chunkSize: Int
+    ) throws -> (purged: Int, rescued: Int, more: Bool) {
+        return try dbPool.write { db -> (purged: Int, rescued: Int, more: Bool) in
+            let rows = try Row.fetchAll(db, sql: aiCacheExpiredBatchSQL, arguments: [cutoff, chunkSize + 1])
+
+            var batchPurged = 0
+            var batchRescued = 0
+            for row in rows.prefix(chunkSize) {
+                let key: String = row["key"]
+                let rfc822MessageId: String? = row["rfc822MessageId"]
+                if let msgId = rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty,
+                   try Bool.fetchOne(db, sql: aiCacheInInboxSQL, arguments: [msgId]) == true {
+                    try db.execute(sql: "UPDATE messageAICache SET updatedAt = ? WHERE key = ?", arguments: [now, key])
+                    batchRescued += 1
+                    continue
+                }
+                try db.execute(sql: "DELETE FROM messageAICache WHERE key = ?", arguments: [key])
+                batchPurged += 1
+            }
+            return (batchPurged, batchRescued, rows.count > chunkSize)
+        }
+    }
+
+    /// How many AI cache entries are older than the cutoff: the purge's gate.
+    nonisolated static let aiCacheExpiredCountSQL = """
+        SELECT COUNT(*) FROM messageAICache INDEXED BY messageAICache_expiry
+        WHERE updatedAt < ?
+        """
+
+    /// One batch of expired AI cache entries: their keys and Message-IDs only.
+    nonisolated static let aiCacheExpiredBatchSQL = """
+        SELECT key, rfc822MessageId FROM messageAICache INDEXED BY messageAICache_expiry
+        WHERE updatedAt < ?
+        LIMIT ?
+        """
+
+    /// Whether any copy of a message, in any account, is in an inbox. It reads
+    /// that message's copies only and stops at the first one in an inbox.
+    nonisolated static let aiCacheInInboxSQL = """
+        SELECT EXISTS (
+            SELECT 1 FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+            WHERE rfc822MessageId = ? AND isInInbox = 1
+        )
+        """
 
     // MARK: - Retired calendar operation reclaim
 

@@ -671,16 +671,126 @@ extension SyncEngine {
 
     // MARK: - FTS Bulk Indexing
 
+    /// The position after the last header of a bulk-index page: that header's
+    /// `date`, exactly as stored, and its rowid. Together they are the key of
+    /// `messageHeader_folderId_date` after the folder, so the next page starts
+    /// right after this header even inside a run of headers that share one date.
+    struct BulkIndexCursor: Equatable, Sendable {
+        let date: DatabaseValue
+        let rowID: Int64
+    }
+
+    /// One page of a folder's headers for the bulk index, and the cursor after
+    /// it (nil when the page is empty: the folder is done).
+    struct BulkIndexPage: Sendable {
+        let headers: [MessageHeader]
+        let next: BulkIndexCursor?
+    }
+
+    /// The bulk index's first page of a folder: its newest headers.
+    ///
+    /// Both page statements read `messageHeader_folderId_date` in its own order:
+    /// `(folderId, date)`, then the rowid SQLite keeps at the end of every index
+    /// entry. A page therefore reads only its own rows and sorts nothing, and the
+    /// next page seeks to the cursor with the row value `(date, rowid) < (?, ?)`.
+    /// Headers that share one date are told apart by the rowid in the index, so a
+    /// page inside a long run of equal dates still reads only its own rows. (A
+    /// tie-break on `id`, which is not in this index, read the whole run again for
+    /// every page.) A header rewritten during the pass (a replace gives it a new
+    /// rowid, a date change moves it) can be skipped or read twice by this pass,
+    /// as with the OFFSET walk before it; VACUUM, which renumbers every row, runs
+    /// only after all mail is deleted.
+    ///
+    /// `INDEXED BY` because `messageHeader_date` gives the same order: a planner
+    /// that took it would walk every folder's headers to fill one page. A
+    /// migration that drops or renames the index makes the statement throw, which
+    /// ends the folder's walk; it never reads the table.
+    static let bulkIndexFirstPageSQL = """
+        SELECT *, rowid AS bulkIndexRowID FROM messageHeader INDEXED BY messageHeader_folderId_date
+        WHERE folderId = ?
+        ORDER BY date DESC, rowid DESC
+        LIMIT ?
+        """
+
+    /// The bulk index's page after a cursor; see `bulkIndexFirstPageSQL`.
+    static let bulkIndexNextPageSQL = """
+        SELECT *, rowid AS bulkIndexRowID FROM messageHeader INDEXED BY messageHeader_folderId_date
+        WHERE folderId = ? AND (date, rowid) < (?, ?)
+        ORDER BY date DESC, rowid DESC
+        LIMIT ?
+        """
+
+    /// One page of `folderId`'s headers, newest first, after `cursor`.
+    ///
+    /// Pages by key, never by OFFSET: an OFFSET page walks every row before it, so
+    /// paging a folder that way read the folder again for every page.
+    nonisolated static func bulkIndexPage(
+        _ db: Database, folderId: String, after cursor: BulkIndexCursor?, limit: Int
+    ) throws -> BulkIndexPage {
+        let rows: [Row]
+        if let cursor {
+            rows = try Row.fetchAll(
+                db, sql: bulkIndexNextPageSQL,
+                arguments: [folderId, cursor.date, cursor.rowID, limit])
+        } else {
+            rows = try Row.fetchAll(db, sql: bulkIndexFirstPageSQL, arguments: [folderId, limit])
+        }
+        let headers = try rows.map { try MessageHeader(row: $0) }
+        let next = rows.last.map { row in
+            BulkIndexCursor(date: row["date"], rowID: row["bulkIndexRowID"])
+        }
+        return BulkIndexPage(headers: headers, next: next)
+    }
+
+    /// Hands every header of `folderIds` to `indexPage`, folder by folder, newest
+    /// first, one page of at most `limit` headers at a time (`bulkIndexPage`),
+    /// with the page's number in the whole walk (from 1). A page that cannot be
+    /// read ends that folder's walk. Returns false when the task is cancelled
+    /// before the end.
+    nonisolated static func bulkIndexWalk(
+        folderIds: [String], dbPool: PrioritizedDatabase, limit: Int,
+        indexPage: (_ headers: [MessageHeader], _ pageNumber: Int) async throws -> Void
+    ) async throws -> Bool {
+        var pageNumber = 0
+        for folderId in folderIds {
+            var cursor: BulkIndexCursor?
+            while true {
+                guard !Task.isCancelled else { return false }
+                let after = cursor
+                let page = try? await dbPool.read { db in
+                    try SyncEngine.bulkIndexPage(db, folderId: folderId, after: after, limit: limit)
+                }
+                guard let page, let next = page.next else { break }
+                pageNumber += 1
+                try await indexPage(page.headers, pageNumber)
+                cursor = next
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        return true
+    }
+
     /// Index existing messages into FTS if the index is sparse.
-    /// Runs once per account, typically on first launch after FTS is added.
-    /// Uses paginated queries to avoid materializing all messages at once.
-    func bulkIndexIfNeeded(account: Account) {
+    ///
+    /// Runs after every sync (step 3 of `sync(account:)`); the task guard below
+    /// only stops two runs for one account from overlapping. The check compares
+    /// the account's header count with its search entry count, and every read
+    /// goes through an index: one `folderId` index range per folder, and one key
+    /// range of the `message_ids` primary key (`documentCountForAccount`). It keeps
+    /// no marker or counter of its own, so each run checks the data itself.
+    /// When the index is sparse, each folder is paged by key (`bulkIndexWalk`),
+    /// so no message is materialized all at once.
+    ///
+    /// Returns the run's task, or nil when a run for the account is under way.
+    /// Production callers discard it; it lets a test wait for the run to end.
+    @discardableResult
+    func bulkIndexIfNeeded(account: Account) -> Task<Void, Never>? {
         // Don't overlap per-account
-        guard bulkIndexTasks[account.id] == nil else { return }
+        guard bulkIndexTasks[account.id] == nil else { return nil }
 
         let accountId = account.id
         // QoS: `.medium` — see SyncEngineBackfill.swift for rationale.
-        bulkIndexTasks[accountId] = Task(priority: .medium) { [weak self] in
+        let task = Task(priority: .medium) { [weak self] in
             do {
                 let folderIds: [String] = try await self?.dbPool.read { db in
                     try String.fetchAll(db,
@@ -699,60 +809,44 @@ extension SyncEngine {
                 let indexCount = try await SearchIndex.shared.documentCountForAccount(accountId: account.id)
 
                 // Phase 1: Index headers that aren't in FTS yet
-                if totalCount > indexCount + 10 {
+                if totalCount > indexCount + 10, let dbPool = await self?.dbPool {
                     BackgroundSyncLogger.logDebug("[FTS Bulk] Indexing \(totalCount) existing messages (FTS has \(indexCount))")
 
-                    let batchSize = SyncConfig.ftsIndexBatchSize
-                    var batchNum = 0
-                    for fi in folderIds {
-                        var offset = 0
-                        while true {
-                            guard !Task.isCancelled else { return }
-                            let currentOffset = offset
-                            let batch: [MessageHeader] = (try? await self?.dbPool.read { db in
-                                try MessageHeader
-                                    .filter(Column("folderId") == fi)
-                                    .order(Column("date").desc)
-                                    .limit(batchSize, offset: currentOffset)
-                                    .fetchAll(db)
-                            }) ?? []
-                            guard !batch.isEmpty else { break }
-
-                            let records = batch.map { header in
-                                FTSHeaderRecord(
-                                    // ⚠ STAGE E1: mint through `ContentKey.forHeader`.
-                                    contentKey: ContentKey(rawValue: header.id),
-                                    headerId: header.id,
-                                    messageId: header.messageId,
-                                    subject: header.subject,
-                                    from: "\(header.from) <\(header.fromAddress)>",
-                                    to: header.to,
-                                    cc: header.cc,
-                                    bcc: header.bcc,
-                                    dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
-                                    folderId: header.folderId
+                    let finished = try await SyncEngine.bulkIndexWalk(
+                        folderIds: folderIds, dbPool: dbPool, limit: SyncConfig.ftsIndexBatchSize
+                    ) { batch, batchNumber in
+                        let records = batch.map { header in
+                            FTSHeaderRecord(
+                                // ⚠ STAGE E1: mint through `ContentKey.forHeader`.
+                                contentKey: ContentKey(rawValue: header.id),
+                                headerId: header.id,
+                                messageId: header.messageId,
+                                subject: header.subject,
+                                from: "\(header.from) <\(header.fromAddress)>",
+                                to: header.to,
+                                cc: header.cc,
+                                bcc: header.bcc,
+                                dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
+                                folderId: header.folderId
+                            )
+                        }
+                        let inserted = try await SearchIndex.shared.indexHeaders(records)
+                        if inserted > 0 {
+                            BackgroundSyncLogger.logDebug("[FTS Bulk] Batch \(batchNumber): indexed \(inserted)")
+                        }
+                        // Mark headers as fully indexed. `[String]` is load-bearing:
+                        // this binds `messageHeader.id` (F2).
+                        let headerIds: [String] = records.map(\.headerId)
+                        try? await AppDatabase.backgroundPool.write { db in
+                            for hid in headerIds {
+                                try db.execute(
+                                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
+                                    arguments: [hid]
                                 )
                             }
-                            let inserted = try await SearchIndex.shared.indexHeaders(records)
-                            if inserted > 0 {
-                                BackgroundSyncLogger.logDebug("[FTS Bulk] Batch \(batchNum + 1): indexed \(inserted)")
-                            }
-                            // Mark headers as fully indexed. `[String]` is load-bearing:
-                            // this binds `messageHeader.id` (F2).
-                            let headerIds: [String] = records.map(\.headerId)
-                            try? await AppDatabase.backgroundPool.write { db in
-                                for hid in headerIds {
-                                    try db.execute(
-                                        sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
-                                        arguments: [hid]
-                                    )
-                                }
-                            }
-                            offset += batch.count
-                            batchNum += 1
-                            try? await Task.sleep(for: .milliseconds(100))
                         }
                     }
+                    guard finished else { return }
                 }
 
                 // Phase 2 (body backfill from MessageBody cache) REMOVED.
@@ -764,6 +858,8 @@ extension SyncEngine {
             }
             await self?.clearBulkIndexTask(accountId: accountId)
         }
+        bulkIndexTasks[accountId] = task
+        return task
     }
 
     /// Backfill folderId for existing FTS entries that were indexed before the folderId column existed.

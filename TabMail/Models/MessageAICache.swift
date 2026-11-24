@@ -132,6 +132,9 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         var cache = try MessageAICache
             .filter(Column("key") == key)
             .fetchOne(db) ?? MessageAICache(key: key, rfc822MessageId: rfc822MessageId)
+        // An entry the extension's merge wrote before it stored the Message-ID gets
+        // it here; the cache's expiry finds the message's copies by it.
+        if cache.rfc822MessageId == nil { cache.rfc822MessageId = rfc822MessageId }
 
         // Only overwrite non-nil values (preserves existing fields on partial updates)
         if let summaryBlurb { cache.summaryBlurb = summaryBlurb }

@@ -39,9 +39,56 @@ struct DBProofHarnessTests {
 
     private static let scanSQL = "SELECT id FROM messageHeader WHERE snippet LIKE '%Snippet 7%'"
 
-    private static var seekSQL: String {
-        let id = MessageIdentity.headerId(accountId: DBProof.accountId(0), folderPath: "INBOX", messageId: "1")
-        return "SELECT id FROM messageHeader WHERE id = '\(id)'"
+    private static var seekID: String {
+        MessageIdentity.headerId(accountId: DBProof.accountId(0), folderPath: "INBOX", messageId: "1")
+    }
+
+    private static var seekSQL: String { "SELECT id FROM messageHeader WHERE id = '\(seekID)'" }
+
+    /// A write of exactly one row.
+    private static var seekWriteSQL: String { "UPDATE messageHeader SET isRead = 1 - isRead WHERE id = '\(seekID)'" }
+
+    private static let missingSQL = "SELECT id FROM messageHeader WHERE id = 'no such message'"
+    private static let missingWriteSQL = "UPDATE messageHeader SET isRead = 1 WHERE id = 'no such message'"
+
+    /// Most headers complete and a share incomplete, bodies only on complete headers and most of
+    /// them in, and in every account's inbox complete rows with their body: what a read of
+    /// complete headers (the inbox list, the label walk) needs to return rows.
+    private static func expectCompletionMix(_ db: Database, shape: DBProof.Shape) throws {
+        let total = try Int.fetchOne(db, sql: "SELECT count(*) FROM messageHeader") ?? 0
+        let complete = try Int.fetchOne(db, sql: "SELECT count(*) FROM messageHeader WHERE headerComplete = 1") ?? 0
+        let bodies = try Int.fetchOne(db, sql: "SELECT count(*) FROM messageHeader WHERE bodyComplete = 1") ?? 0
+        let bodyWithoutHeader = try Int.fetchOne(db, sql: """
+            SELECT count(*) FROM messageHeader WHERE bodyComplete = 1 AND headerComplete = 0
+            """) ?? -1
+        let incompleteInbox = try Int.fetchOne(db, sql: """
+            SELECT count(*) FROM messageHeader WHERE isInInbox = 1 AND headerComplete = 0
+            """) ?? 0
+        let headerShare = Double(complete) / Double(max(total, 1))
+        let bodyShare = Double(bodies) / Double(max(complete, 1))
+        #expect(total == shape.totalHeaders, "precondition: the whole build")
+        #expect(abs(headerShare - DBProof.Config.headerCompleteShare) < 0.03, "complete headers: \(complete) of \(total)")
+        #expect(abs(bodyShare - DBProof.Config.bodyCompleteShare) < 0.05, "bodies: \(bodies) of \(complete) complete headers")
+        #expect(bodyWithoutHeader == 0, "a body only on a complete header")
+        #expect(incompleteInbox > 0, "the inbox has incomplete rows too")
+        for index in shape.accounts.indices {
+            let readable = try Int.fetchOne(db, sql: """
+                SELECT count(*) FROM messageHeader
+                WHERE accountId = ? AND isInInbox = 1 AND headerComplete = 1 AND bodyComplete = 1
+                """, arguments: [DBProof.accountId(index)]) ?? 0
+            #expect(readable > 0, "account \(index): complete inbox rows with their body")
+        }
+    }
+
+    /// One mode, no planner statistics, one timed run per side, in its own unit directory.
+    private static func compareOne(_ mode: DBProof.Mode, base: URL, in directory: URL) throws -> [DBProof.Result] {
+        try DBProof.compare(unit: "one-\(UUID().uuidString)", modes: [mode], base: base, in: directory,
+                            statistics: [.none], repeats: 1)
+    }
+
+    private static func readMode(_ old: String, _ new: String, emptyResult: Bool = false) -> DBProof.Mode {
+        DBProof.Mode(name: "read", kind: .read, old: DBProof.Variant(sql: [old]), new: DBProof.Variant(sql: [new]),
+                     emptyResult: emptyResult)
     }
 
     // MARK: - Building
@@ -156,6 +203,8 @@ struct DBProofHarnessTests {
             let floor = anchor.addingTimeInterval(-DBProof.Config.archiveMaxDays * DBProof.Config.secondsPerDay - 1)
             #expect((oldest ?? .distantPast) >= floor)
             #expect((newest ?? .distantFuture) <= anchor.addingTimeInterval(1))
+
+            try Self.expectCompletionMix(db, shape: shape)
         }
     }
 
@@ -234,6 +283,9 @@ struct DBProofHarnessTests {
         #expect(sorted.sorts >= 1)
         #expect(scanAgain.pagesRead == scan.pagesRead, "a fresh connection per run: the second run is as cold")
         #expect(scan.pagesWritten == 0)
+        #expect(seek.resultRows == 1)
+        #expect(scan.resultRows > 0)
+        #expect(sorted.resultRows == rows)
     }
 
     @Test("A write mode counts the pages its commit writes and never changes the variant file")
@@ -248,15 +300,18 @@ struct DBProofHarnessTests {
         let wide = try DBProof.measure(
             DBProof.Variant(sql: ["UPDATE messageHeader SET isRead = 1 - isRead WHERE isInInbox = 1"]),
             kind: .write, file: file)
-        let none = try DBProof.measure(
-            DBProof.Variant(sql: ["UPDATE messageHeader SET isRead = 1 WHERE id = 'no such message'"]),
-            kind: .write, file: file)
+        let none = try DBProof.measure(DBProof.Variant(sql: [Self.missingWriteSQL]), kind: .write, file: file)
+        let inboxRows = try Self.read(file) {
+            try Int.fetchOne($0, sql: "SELECT count(*) FROM messageHeader WHERE isInInbox = 1") ?? 0
+        }
 
         let after = try DBProof.fingerprint(of: file)
         let leftovers = try FileManager.default.contentsOfDirectory(atPath: directory.path)
             .filter { $0.hasPrefix("run-") }
         #expect(wide.pagesWritten > 0)
         #expect(none.pagesWritten < wide.pagesWritten)
+        #expect(wide.resultRows == inboxRows, "a write counts the rows it changed")
+        #expect(none.resultRows == 0)
         #expect(after == before, "every write ran on its own clone")
         #expect(leftovers.isEmpty)
     }
@@ -281,7 +336,7 @@ struct DBProofHarnessTests {
         defer { try? FileManager.default.removeItem(at: directory) }
         let base = try Self.makeBase(in: directory)
         let wideWrite = "UPDATE messageHeader SET isRead = 1 - isRead WHERE isInInbox = 1"
-        let narrowWrite = "UPDATE messageHeader SET isRead = 1 WHERE id = 'no such message'"
+        let narrowWrite = Self.seekWriteSQL
         let modes = [
             DBProof.Mode(name: "scan vs seek", kind: .read,
                          old: DBProof.Variant(sql: [Self.scanSQL]), new: DBProof.Variant(sql: [Self.seekSQL])),
@@ -305,6 +360,10 @@ struct DBProofHarnessTests {
         #expect(seekFullscan == 0)
         #expect(scanFullscan > 0)
         #expect(wideWritten > narrowWritten)
+        let seekRows = readNone?.new.count(\.resultRows).median ?? 0
+        let narrowRows = writeNone?.new.count(\.resultRows).median ?? 0
+        #expect(seekRows == 1)
+        #expect(narrowRows == 1)
 
         let unitDirectory = directory.appendingPathComponent("harness-self-test")
         let report = try String(contentsOf: unitDirectory.appendingPathComponent("report.txt"), encoding: .utf8)
@@ -313,7 +372,7 @@ struct DBProofHarnessTests {
                 #expect(report.contains("== \(mode.name) (\(mode.kind.rawValue)), \(state.label)"))
             }
         }
-        for label in ["median ms", "p90 ms", "old spread ms", "pages read", "pages written", "VM steps",
+        for label in ["median ms", "p90 ms", "old spread ms", "result rows", "pages read", "pages written", "VM steps",
                       "full-scan steps", "sorts", "autoindex inserts", DBProof.accountId(0)] {
             #expect(report.contains(label), "report line \(label)")
         }
@@ -334,6 +393,54 @@ struct DBProofHarnessTests {
         }
     }
 
+    @Test("compare refuses a mode with an empty side unless it is declared empty, and a declared-empty mode with rows")
+    func compareRefusesAnEmptyComparison() throws {
+        let directory = try Self.scratchDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let base = try Self.makeBase(in: directory)
+
+        // Either side empty: two empty results, or nothing against something, prove nothing.
+        #expect(throws: DBProof.DBProofError.self) {
+            try Self.compareOne(Self.readMode(Self.missingSQL, Self.seekSQL), base: base, in: directory)
+        }
+        #expect(throws: DBProof.DBProofError.self) {
+            try Self.compareOne(Self.readMode(Self.seekSQL, Self.missingSQL), base: base, in: directory)
+        }
+        #expect(throws: DBProof.DBProofError.self) {
+            try Self.compareOne(Self.readMode(Self.missingSQL, Self.missingSQL), base: base, in: directory)
+        }
+        // A Swift body reports its own result; a write counts the rows it changed.
+        let emptyBody = DBProof.Variant(run: { db in
+            try MessageHeader.filter(Column("id") == "no such message").fetchAll(db).count
+        })
+        let bodyMode = DBProof.Mode(name: "body", kind: .read, old: emptyBody, new: DBProof.Variant(sql: [Self.seekSQL]))
+        #expect(throws: DBProof.DBProofError.self) {
+            try Self.compareOne(bodyMode, base: base, in: directory)
+        }
+        let writeMode = DBProof.Mode(name: "write", kind: .write, old: DBProof.Variant(sql: [Self.missingWriteSQL]),
+                                     new: DBProof.Variant(sql: [Self.seekWriteSQL]))
+        #expect(throws: DBProof.DBProofError.self) {
+            try Self.compareOne(writeMode, base: base, in: directory)
+        }
+        // Declared empty: both sides must be empty.
+        #expect(throws: DBProof.DBProofError.self) {
+            try Self.compareOne(Self.readMode(Self.seekSQL, Self.seekSQL, emptyResult: true), base: base, in: directory)
+        }
+        let declared = try Self.compareOne(Self.readMode(Self.missingSQL, Self.missingSQL, emptyResult: true),
+                                           base: base, in: directory)
+        #expect(declared.count == 1)
+
+        // A read of complete inbox headers with their bodies returns a full page on the base as built.
+        let pageSize = 50
+        let completeInbox = """
+            SELECT id FROM messageHeader WHERE isInInbox = 1 AND headerComplete = 1 AND bodyComplete = 1
+            ORDER BY date DESC LIMIT \(pageSize)
+            """
+        let inbox = try Self.compareOne(Self.readMode(completeInbox, completeInbox), base: base, in: directory)
+        let inboxRows = inbox.first?.old.count(\.resultRows).median ?? 0
+        #expect(inboxRows == pageSize)
+    }
+
     // MARK: - The large build (opt-in)
 
     /// Not a check of a change: builds the large proof database into the directory the
@@ -346,5 +453,6 @@ struct DBProofHarnessTests {
         let total = try Self.read(base) { try Int.fetchOne($0, sql: "SELECT count(*) FROM messageHeader") ?? 0 }
         #expect(total == DBProof.Shape.large.totalHeaders)
         #expect(total >= 100_000)
+        try Self.read(base) { try Self.expectCompletionMix($0, shape: .large) }
     }
 }

@@ -4449,6 +4449,19 @@ final class AppDatabase: Sendable {
             }
         }
 
+        // #1374 (ADR-IOS-029): the AI cache purge reads the expired entries,
+        // `messageAICache WHERE updatedAt < ?`, after every AI queue drain and in
+        // maintenance. No index led with `updatedAt`, so its count and every batch
+        // SCANNED the whole cache. This index serves both: the count is a covering
+        // range read and a batch reads only expired entries. Statistics come from
+        // the background ANALYZE after the schema change; nothing else to do here.
+        // IF NOT EXISTS, like every index migration here, keeps the DDL idempotent.
+        migrator.registerTimedMigration(
+            "v113_messageAICacheExpiryIndex", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageAICache_expiry ON messageAICache(updatedAt)")
+        }
+
         // #1376: a message's cached inline images and attachments are deleted BY
         // CONSTRUCTION instead of by a sweep over the whole asset store. The
         // manifest lives in its own App Group database (the notification extension
