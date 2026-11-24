@@ -355,22 +355,36 @@ struct SyncEngineMaintenanceTests {
 
     /// A schema that cannot be read is unknown, not present: the gate does not run
     /// the step, which without its index would scan the table inside its writes.
-    /// The database is closed, so reading its catalog fails.
+    /// No reader can open, so reading the catalog fails, while the writer works:
+    /// a step the gate let through would evict.
     @Test("The evict step does not run when its index cannot be checked")
     func evictStepWaitsWhenItsIndexCannotBeChecked() throws {
-        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture()
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(readersFail: true)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
-        try fixture.pool.close()
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
+        // Read on the writer: no reader opens.
+        func bodyIds() throws -> Set<String> {
+            try fixture.pool.write { db in try Set(String.fetchAll(db, sql: "SELECT id FROM messageBody")) }
+        }
         let catalogRead = Result {
             try fixture.pool.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_master") ?? 0 }
         }
         var catalogReadFailed = false
         if case .failure = catalogRead { catalogReadFailed = true }
-        #expect(catalogReadFailed, "setup: the closed database's catalog cannot be read")
+        #expect(catalogReadFailed, "setup: the catalog cannot be read")
 
         let ran = SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let afterGate = try bodyIds()
         #expect(!ran, "the step ran though its index could not be checked")
+        #expect(afterGate == Set(archived), "a body was evicted though the index could not be checked")
+
+        // Positive control: the writer works, so the step itself evicts here.
+        SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [])
+        let afterStep = try bodyIds()
+        #expect(afterStep == Set(archived.prefix(recent)),
+                "setup: the step evicts on this database, so the gate is what held it back")
     }
 
     /// Production reaches the evict step only through its index gate: a call of

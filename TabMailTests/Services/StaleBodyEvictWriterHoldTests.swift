@@ -115,8 +115,9 @@ struct StaleBodyEvictWriterHoldTests {
     /// A migrated pool with one account, an INBOX and an Archive. The evict step
     /// runs only once its deferred index exists (`runEvictStaleBodiesIfIndexed`),
     /// so the fixture builds the deferred indexes through the production DDL unless
-    /// a test is about their absence.
-    static func makeFixture(buildsDeferredIndexes: Bool = true) throws -> Fixture {
+    /// a test is about their absence. With `readersFail`, no reader connection can
+    /// open, so every read fails while the writer works.
+    static func makeFixture(buildsDeferredIndexes: Bool = true, readersFail: Bool = false) throws -> Fixture {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -125,7 +126,13 @@ struct StaleBodyEvictWriterHoldTests {
         configuration.foreignKeysEnabled = true
         configuration.automaticMemoryManagement = false
         configuration.persistentReadOnlyConnections = true
-        configuration.prepareDatabase { db in connections.register(db) }
+        configuration.prepareDatabase { db in
+            // A pool opens its readers read-only and its writer read-write.
+            if readersFail && db.configuration.readonly {
+                throw DatabaseError(resultCode: .SQLITE_CANTOPEN, message: "the fixture's readers cannot open")
+            }
+            connections.register(db)
+        }
         let pool: DatabasePool
         do {
             pool = try DatabasePool(
@@ -194,9 +201,11 @@ struct StaleBodyEvictWriterHoldTests {
     /// Returns their ids in insertion order, which is also the evict step's page
     /// order unless `fetchedAt` is given: newest first, or oldest first with
     /// `oldestFirst`. `from` continues an earlier call: its messages are older than
-    /// every one that call seeded.
+    /// every one that call seeded. `folderPath` names another non-inbox folder the
+    /// test has added.
     static func seedArchiveBodies(
-        _ fixture: Fixture, count: Int, from: Int = 0, fetchedAt: DatabaseValue? = nil, oldestFirst: Bool = false
+        _ fixture: Fixture, count: Int, from: Int = 0, fetchedAt: DatabaseValue? = nil, oldestFirst: Bool = false,
+        folderPath: String = "Archive"
     ) throws -> [String] {
         try fixture.pool.write { db -> [String] in
             var ids: [String] = []
@@ -207,7 +216,8 @@ struct StaleBodyEvictWriterHoldTests {
                     from: "sender@example.com",
                     fromAddress: "sender@example.com", to: "user@example.com",
                     date: Date().addingTimeInterval(-Double(age) * 86_400), snippet: "",
-                    folderId: fixture.archiveFolderId, accountId: fixture.accountId, folderPath: "Archive",
+                    folderId: MessageIdentity.folderId(accountId: fixture.accountId, folderPath: folderPath),
+                    accountId: fixture.accountId, folderPath: folderPath,
                     isInInbox: false)
                 try header.insert(db)
                 let stored: DatabaseValue = fetchedAt ?? staleFetchedAt.databaseValue
@@ -255,12 +265,19 @@ struct StaleBodyEvictWriterHoldTests {
         _ fixture: Fixture, meter: WriterWorkMeter
     ) throws -> (writes: WriterWorkMeter.Reading, pagesRead: Int) {
         fixture.pool.writeWithoutTransaction { db in meter.start(db) }
+        let run = gatedRun(fixture)
+        #expect(run.ran, "the gated step did not run, though the fixture built its index")
+        return (meter.current, run.pagesRead)
+    }
+
+    /// The gate and whatever it runs, as the maintenance pass calls it: whether the
+    /// step ran, and the pages every connection of the pool fetched from before the
+    /// gate's check to the end.
+    static func gatedRun(_ fixture: Fixture) -> (ran: Bool, pagesRead: Int) {
         let before = fixture.connections.pagesSoFar
         let ran = SyncEngine.runEvictStaleBodiesIfIndexed(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background), undoProtectedBodyIds: [])
-        let after = fixture.connections.pagesSoFar
-        #expect(ran, "the gated step did not run, though the fixture built its index")
-        return (meter.current, after - before)
+        return (ran, fixture.connections.pagesSoFar - before)
     }
 
     static func observedFixture(
@@ -295,9 +312,15 @@ struct StaleBodyEvictWriterHoldTests {
         #expect(afterFirstRun.count == fewKept + recent, "every kept body stays")
 
         try Self.seedKeptInboxBodies(fixture, uids: (fewKept + 1)..<(manyKept + 1))
+        // Victims cached after every kept body, so they come last in the run's page
+        // order, behind more pages of kept bodies than the first run had in all: a
+        // run that stopped after a fixed number of pages would never reach them.
+        let lateVictims = try Self.seedArchiveBodies(fixture, count: olderArchived, from: recent + olderArchived)
         let many = try Self.measuredRun(fixture, meter: meter).writes
         let afterSecondRun = try Self.bodyIds(fixture)
         #expect(afterSecondRun.count == manyKept + recent, "every kept body stays")
+        #expect(afterSecondRun.isDisjoint(with: lateVictims),
+                "the archive bodies behind the \(manyKept) kept ones are evicted")
 
         // Non-vacuous: each run wrote once per page of its stale bodies.
         let pagesFew = fewKept / SyncConfig.pruneChunkSize
@@ -312,6 +335,90 @@ struct StaleBodyEvictWriterHoldTests {
         let ratio = Double(many.mostPagesInOneTransaction) / Double(max(few.mostPagesInOneTransaction, 1))
         #expect(ratio < 2,
                 "one write's writer work grew \(ratio)x with 5x the kept stale bodies (\(few.mostPagesInOneTransaction) -> \(many.mostPagesInOneTransaction) pages)")
+    }
+
+    /// Moves each of these bodies' `fetchedAt` by `hours`, each keeping a time of its own.
+    static func shiftFetchedAt(_ fixture: Fixture, of ids: Set<String>, byHours hours: Int) throws {
+        try fixture.pool.write { db in
+            for id in ids {
+                guard let fetchedAt = try Date.fetchOne(
+                    db, sql: "SELECT fetchedAt FROM messageBody WHERE id = ?", arguments: [id]) else { continue }
+                try db.execute(
+                    sql: "UPDATE messageBody SET fetchedAt = ? WHERE id = ?",
+                    arguments: [fetchedAt.addingTimeInterval(Double(hours) * 3600), id])
+            }
+        }
+    }
+
+    /// What counting every stale body through the evict step's index costs (a
+    /// walk of its stale range), and how many it counted.
+    static func staleRangeRead(_ fixture: Fixture) throws -> (pages: Int, rows: Int) {
+        let cutoff = Date().addingTimeInterval(-Double(SyncConfig.bodyCacheTTLHours) * 3600)
+        let before = fixture.connections.pagesSoFar
+        let rows = try fixture.pool.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM messageBody INDEXED BY \(SyncEngine.staleBodyIndexName) WHERE fetchedAt < ?",
+                arguments: [cutoff]) ?? 0
+        }
+        return (fixture.connections.pagesSoFar - before, rows)
+    }
+
+    /// How many more pages the largest write of the second run below may fetch
+    /// than the first run's. The two runs see the same tables, row for row, so a
+    /// page of the step costs the same in both; only which bodies are stale differs.
+    /// Counting the stale bodies through the index in each write adds several
+    /// times this at the second run's size.
+    static let writeGrowthSlackPages = 20
+
+    @Test("One write of the evict step holds the writer no longer when forty times the bodies are stale")
+    func oneWriteDoesNotGrowWithTheStaleBodies() throws {
+        let meter = WriterWorkMeter()
+        let fixture = try Self.observedFixture(meter)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+
+        let fewStale = 300
+        let allBodies = 40 * fewStale
+        // Inbox bodies, all kept by the rules, small so the table is quick to build.
+        let html = "<p>" + String(repeating: "s", count: 100) + "</p>"
+        try Self.seedKeptInboxBodies(fixture, uids: 1..<(fewStale + 1), html: html)
+        let firstStale = try Self.bodyIds(fixture)
+        try Self.seedKeptInboxBodies(fixture, uids: (fewStale + 1)..<(allBodies + 1), html: html)
+        let restOfThem = try Self.bodyIds(fixture).subtracting(firstStale)
+        #expect(firstStale.count == fewStale && restOfThem.count == allBodies - fewStale)
+        // The rest are cached later than the TTL for the first run, then moved back.
+        let freshForHours = SyncConfig.bodyCacheTTLHours + 2
+        try Self.shiftFetchedAt(fixture, of: restOfThem, byHours: freshForHours)
+
+        let few = try Self.measuredRun(fixture, meter: meter).writes
+        let staleFew = try Self.staleRangeRead(fixture)
+        let afterFirstRun = try Self.bodyIds(fixture)
+        #expect(afterFirstRun.count == allBodies, "every kept body stays")
+
+        try Self.shiftFetchedAt(fixture, of: restOfThem, byHours: -freshForHours)
+        let many = try Self.measuredRun(fixture, meter: meter).writes
+        let staleMany = try Self.staleRangeRead(fixture)
+        let afterSecondRun = try Self.bodyIds(fixture)
+        #expect(afterSecondRun.count == allBodies, "every kept body stays")
+
+        // Non-vacuous: each run wrote once per page of its stale bodies, and
+        // counting the stale bodies through the index (independent of the code under
+        // test) costs more than twice the slack at the second size, so a write that
+        // counted them could not pass the bound below.
+        #expect(staleFew.rows == fewStale && staleMany.rows == allBodies,
+                "the control found the stale bodies: \(staleFew.rows), \(staleMany.rows)")
+        #expect(few.transactions >= fewStale / SyncConfig.pruneChunkSize,
+                "the first run's writes were measured: \(few.transactions)")
+        #expect(many.transactions >= allBodies / SyncConfig.pruneChunkSize,
+                "the second run's writes were measured: \(many.transactions)")
+        #expect(few.mostPagesInOneTransaction > 0)
+        #expect(staleMany.pages - staleFew.pages > 2 * Self.writeGrowthSlackPages,
+                "counting the stale bodies cost \(staleFew.pages) then \(staleMany.pages) pages; the fixture does not grow it enough to discriminate")
+
+        // The property: what a priority write can wait behind does not grow with
+        // the number of stale bodies.
+        #expect(many.mostPagesInOneTransaction - few.mostPagesInOneTransaction <= Self.writeGrowthSlackPages,
+                "one write's writer work grew from \(few.mostPagesInOneTransaction) to \(many.mostPagesInOneTransaction) pages with 40x the stale bodies; the slack is \(Self.writeGrowthSlackPages)")
     }
 
     /// What reading every body's HTML to its end costs, and the number of rows
@@ -429,5 +536,42 @@ struct StaleBodyEvictWriterHoldTests {
                 "a run read \(ratio)x the pages with 10x the fresh bodies (\(few) -> \(many) pages)")
         #expect(many - few <= Self.runGrowthSlackPages,
                 "a run read \(many - few) more pages with 10x the fresh bodies (\(few) -> \(many)); the slack is \(Self.runGrowthSlackPages)")
+    }
+
+    /// The same bound where the run has nothing to evict: with the index built and
+    /// no body stale, the step runs and finds an empty first page; with no index,
+    /// the gate holds the step back. Neither may read the table, on any connection.
+    @Test("A run with nothing stale, or one its gate holds back, reads no more with ten times the bodies",
+          arguments: [true, false])
+    func aRunWithNothingToEvictReadsNoMore(indexed: Bool) throws {
+        let fixture = try Self.makeFixture(buildsDeferredIndexes: indexed)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+
+        let fewFresh = 1_000
+        let manyFresh = 10 * fewFresh
+        try Self.seedFreshBodies(fixture, ids: 0..<fewFresh)
+        let few = Self.gatedRun(fixture)
+        let afterFirstRun = try Self.bodyIds(fixture)
+        let tableFew = try Self.wholeTableRead(fixture)
+
+        try Self.seedFreshBodies(fixture, ids: fewFresh..<manyFresh)
+        let many = Self.gatedRun(fixture)
+        let afterSecondRun = try Self.bodyIds(fixture)
+        let tableMany = try Self.wholeTableRead(fixture)
+
+        #expect(few.ran == indexed && many.ran == indexed,
+                "the gate let the step run \(few.ran), \(many.ran); its index is built: \(indexed)")
+        #expect(afterFirstRun.count == fewFresh && afterSecondRun.count == manyFresh, "every body stays")
+        // Non-vacuous, and independent of the code under test: reading the table
+        // costs over four times the pages at the second size.
+        #expect(tableFew.rows == fewFresh && tableMany.rows == manyFresh,
+                "the control read every body: \(tableFew.rows), \(tableMany.rows)")
+        #expect(tableMany.pages > 4 * tableFew.pages,
+                "reading the table cost \(tableFew.pages) then \(tableMany.pages) pages; the fixture does not grow it enough to discriminate")
+
+        // The property: such a run reads no more as the table grows (a count of
+        // the table, even through a compact index, adds more than the slack).
+        #expect(many.pagesRead - few.pagesRead <= Self.runGrowthSlackPages,
+                "a run read \(few.pagesRead) then \(many.pagesRead) pages with 10x the bodies; the slack is \(Self.runGrowthSlackPages)")
     }
 }

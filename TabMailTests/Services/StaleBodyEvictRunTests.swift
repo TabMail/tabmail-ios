@@ -201,17 +201,27 @@ struct StaleBodyEvictRunTests {
                 arguments: [indexName]) ?? 0
         }
         let statistics = try await fixture.pool.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName]) ?? 0
+            try String.fetchAll(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName])
         }
         #expect(afterFirstPass == Set(archived), "the first pass evicted with no index to seek")
         #expect(built == 1, "the first pass did not build \(indexName)")
-        #expect(statistics == 1, "the first pass's statistics do not cover \(indexName)")
+        #expect(statistics.count == 1, "the first pass's statistics do not cover \(indexName)")
+        // An index's statistics start with the number of rows it held when analyzed.
+        let analyzedRows = statistics.first?.split(separator: " ").first.flatMap { Int($0) }
+        #expect(analyzedRows == archived.count, "setup: the first pass analyzed every body: \(statistics)")
 
         await SyncEngine.runWALMaintenance(
             dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterSecondPass = try Hold.bodyIds(fixture)
+        let statisticsAfterSecondPass = try await fixture.pool.read { db in
+            try String.fetchAll(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName])
+        }
         #expect(afterSecondPass == Set(archived.prefix(recent)),
                 "the next pass evicts the archive bodies past the newest \(recent), and only them")
+        // The first pass's analysis settled: the next pass does not analyze the
+        // whole database again (that would count the bodies left after it).
+        #expect(statisticsAfterSecondPass == statistics,
+                "the next pass analyzed again: \(statistics) -> \(statisticsAfterSecondPass)")
     }
 
     // MARK: - The rules a page applies
@@ -245,6 +255,29 @@ struct StaleBodyEvictRunTests {
                 "the undo-protected body must stay and the other victim must go")
         #expect(complete == [protectedVictim, evictedVictim],
                 "evicting a body must leave its header's bodyComplete as it was: \(complete)")
+    }
+
+    /// Each folder outside the inbox keeps the bodies of its own newest
+    /// `bodyCacheRecentPerFolder` messages: in one run, the second folder's newest
+    /// are judged against that folder's newest, never the first folder's.
+    @Test("Each folder keeps its own newest bodies within one run")
+    func eachFolderKeepsItsOwnNewestBodies() throws {
+        let fixture = try Hold.makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        try fixture.pool.write { db in
+            try Folder(name: "Projects", path: "Projects", role: .custom, accountId: fixture.accountId).insert(db)
+        }
+        // Archive first in page order, then Projects: the run reaches the second
+        // folder after it has looked up the first folder's newest.
+        let archived = try Hold.seedArchiveBodies(fixture, count: recent + 2)
+        let projects = try Hold.seedArchiveBodies(fixture, count: recent + 2, from: 1_000, folderPath: "Projects")
+
+        Self.run(fixture, undoProtected: [])
+        let after = try Hold.bodyIds(fixture)
+
+        #expect(after == Set(archived.prefix(recent)).union(projects.prefix(recent)),
+                "each folder keeps the bodies of its newest \(recent) messages, and only those")
     }
 
     /// A body with no header is evicted only when the account and folder roster
