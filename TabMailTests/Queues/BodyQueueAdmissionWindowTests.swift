@@ -44,9 +44,9 @@ struct BodyQueueAdmissionWindowTests {
         let folderPath = isInInbox ? "INBOX" : "Archive"
         var account = Account(emailAddress: "window@example.com", displayName: "Window", provider: .imap)
         account.id = "acc1"
-        // A refill schedules a dispatch; with no host the account's provider cannot be
-        // built, so nothing here can reach the network.
-        #expect(account.imapHost == nil, "fixture precondition: the account has no imapHost")
+        // A refill schedules a dispatch: every test suppresses the queue's dispatch
+        // (`setDispatchSuppressedForTesting`), so admitted rows stay pending and nothing
+        // reaches the network.
         var folder = Folder(name: folderPath, path: folderPath, role: isInInbox ? .inbox : .archive, accountId: "acc1")
         folder.lastKnownUidValidity = 1000
         let now = Date()
@@ -125,6 +125,7 @@ struct BodyQueueAdmissionWindowTests {
         let (newestFirst, restore) = try seed(isInInbox: true)
         defer { restore() }
         let queue = ActiveBodyQueue()
+        await queue.setDispatchSuppressedForTesting(true)
         try await expectSuccessiveWindows(
             newestFirst,
             orderedAdmission: { try ActiveBodyQueue.admissionItems($0).map(\.headerId) }
@@ -153,5 +154,103 @@ struct BodyQueueAdmissionWindowTests {
             await queue.emptyForTesting()
             return admitted
         }
+    }
+
+    // MARK: - The drain-time refill
+
+    /// What the drain-time refill saw: whether the queue was idle when each of its
+    /// reads began.
+    private actor RefillReads {
+        var idleAtRead: [Bool] = []
+        func record(_ idle: Bool) { idleAtRead.append(idle) }
+    }
+
+    /// One queue's steps, as a batch task takes them.
+    private struct DrainSteps {
+        let queuedIds: () async -> [String]
+        /// One batch dispatched, then every queued item completed as fetched.
+        let dispatchAndCompleteAll: () async -> Void
+        /// The end of that batch (`finishBatch`).
+        let finishBatch: () async -> Void
+        let isIdle: () async -> Bool
+    }
+
+    /// After one full refill, each window is completed by one batch whose end runs the
+    /// drain-time refill: it admits the next window with no other refill, and at each of
+    /// its reads the queue is not idle, so `isIdle` and `awaitDrain` hold until no row
+    /// waits. After the partial last window the read finds nothing and the queue is idle.
+    private func expectDrainAdmitsSuccessiveWindows(
+        _ newestFirst: [String], reads: RefillReads, steps: DrainSteps
+    ) async throws {
+        var remaining = newestFirst
+        for pass in 1...3 {
+            let expected = Array(remaining.prefix(Self.window))
+            let queued = await steps.queuedIds()
+            #expect(queued.count == expected.count, "window \(pass): the queue holds \(queued.count) rows, the window \(expected.count)")
+            let queuedSet = Set(queued)
+            let expectedSet = Set(expected)
+            #expect(queuedSet == expectedSet, "window \(pass): the queue holds exactly the newest waiting rows")
+            try await storeBodies(expected)
+            await steps.dispatchAndCompleteAll()
+            await steps.finishBatch()
+            remaining.removeFirst(expected.count)
+        }
+        let leftQueued = await steps.queuedIds()
+        #expect(leftQueued.isEmpty, "every window was admitted by the drain-time refill: \(leftQueued.count) left queued")
+        let idleAtEnd = await steps.isIdle()
+        #expect(idleAtEnd, "with no row waiting the queue is idle")
+        let idleAtRead = await reads.idleAtRead
+        #expect(idleAtRead == [false, false, false],
+                "the drain-time refill reads before the batch gives up its count, so the queue never looks idle while rows wait: \(idleAtRead)")
+    }
+
+    @Test("ActiveBodyQueue: the end of the last batch admits the next window, and the queue never looks idle while rows wait")
+    func activeDrainRefillAdmitsNextWindowWhileBusy() async throws {
+        let (newestFirst, restore) = try seed(isInInbox: true)
+        defer { restore() }
+        let queue = ActiveBodyQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let reads = RefillReads()
+        await queue.setDrainRefillWillReadForTesting {
+            let idle = await queue.isIdle
+            await reads.record(idle)
+        }
+        await queue.repopulateFromDatabase()
+        try await expectDrainAdmitsSuccessiveWindows(newestFirst, reads: reads, steps: DrainSteps(
+            queuedIds: { await queue.queuedItemsForTesting.map(\.headerId) },
+            dispatchAndCompleteAll: {
+                await queue.noteBatchDispatchedForTesting(accountId: "acc1", folderPath: "INBOX")
+                for item in await queue.queuedItemsForTesting {
+                    await queue.completeItemForTesting(item, shouldRetry: false)
+                }
+            },
+            finishBatch: { await queue.finishBatchForTesting(accountId: "acc1", folderPath: "INBOX") },
+            isIdle: { await queue.isIdle }))
+        await queue.setDrainRefillWillReadForTesting(nil)
+    }
+
+    @Test("BackfillBodyQueue: the end of the last batch admits the next window, and the queue never looks idle while rows wait")
+    func backfillDrainRefillAdmitsNextWindowWhileBusy() async throws {
+        let (newestFirst, restore) = try seed(isInInbox: false)
+        defer { restore() }
+        let queue = BackfillBodyQueue()
+        await queue.setDispatchSuppressedForTesting(true)
+        let reads = RefillReads()
+        await queue.setDrainRefillWillReadForTesting {
+            let idle = await queue.isIdle
+            await reads.record(idle)
+        }
+        await queue.repopulateFromDatabase()
+        try await expectDrainAdmitsSuccessiveWindows(newestFirst, reads: reads, steps: DrainSteps(
+            queuedIds: { await queue.queuedItemsForTesting.map(\.headerId) },
+            dispatchAndCompleteAll: {
+                await queue.noteBatchDispatchedForTesting(accountId: "acc1", folderPath: "Archive")
+                for item in await queue.queuedItemsForTesting {
+                    await queue.completeItemForTesting(item, shouldRetry: false)
+                }
+            },
+            finishBatch: { await queue.finishBatchForTesting(accountId: "acc1", folderPath: "Archive", pacingDelay: { 0 }) },
+            isIdle: { await queue.isIdle }))
+        await queue.setDrainRefillWillReadForTesting(nil)
     }
 }

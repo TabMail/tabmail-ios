@@ -41,9 +41,12 @@ actor BackfillBodyQueue {
     /// stored, confirmed empty or quarantined, so the drain-time refill after a window
     /// completes admits the next newest window. Before the limit, every refill read and
     /// held every pending row, most of the mailbox during a first backfill. The cost of
-    /// the window, accepted as `IOS-BODY-007`: while every row of the newest window
-    /// keeps failing (one account whose sign-in is refused, with that many bodies
-    /// waiting), the older rows wait; signing the account in again releases them.
+    /// the window, accepted as `IOS-BODY-007`: the window moves only as its rows leave
+    /// the predicate. A row of an account with no provider (no host or password, or not
+    /// connected yet) stays pending and stops the drain-time refill, so the window then
+    /// moves only at full refills (launch, foreground, the background job); and while
+    /// every row of the window keeps failing, this queue re-admits the same window with a
+    /// fresh retry budget at each drain and the older rows wait until the cause clears.
     nonisolated static let admissionSQL = """
         SELECT id, accountId, folderPath, messageId, isInInbox
         FROM messageHeader
@@ -216,6 +219,26 @@ actor BackfillBodyQueue {
     private var dispatchSuppressedForTesting = false
     func setDispatchSuppressedForTesting(_ suppressed: Bool) {
         dispatchSuppressedForTesting = suppressed
+    }
+
+    /// Test-only seam: awaited at the start of the drain-time refill's read, so a test
+    /// can see the queue's state at that moment.
+    private var drainRefillWillReadForTesting: (@Sendable () async -> Void)?
+    func setDrainRefillWillReadForTesting(_ hook: (@Sendable () async -> Void)?) {
+        drainRefillWillReadForTesting = hook
+    }
+
+    /// Test-only seam: one batch dispatched for `folderPath` (the counts a real dispatch
+    /// raises) whose items the test completes, then the end of that batch, as the
+    /// batch task runs it, with the inter-batch delay `pacingDelay` returns.
+    func noteBatchDispatchedForTesting(accountId: String, folderPath: String) {
+        activeBatchCount += 1
+        folderActiveBatches[FolderCapKey(accountId: accountId, folderPath: folderPath), default: 0] += 1
+    }
+    func finishBatchForTesting(
+        accountId: String, folderPath: String, pacingDelay: @escaping @Sendable () async -> TimeInterval
+    ) async {
+        await finishBatch(capKey: FolderCapKey(accountId: accountId, folderPath: folderPath), pacingDelay: pacingDelay)
     }
     #endif
 
@@ -838,37 +861,53 @@ actor BackfillBodyQueue {
 
                 // If cancelled by cancelAllInFlight(), counters are already reset to 0.
                 guard !Task.isCancelled else { return }
-
-                activeBatchCount -= 1
-                let remaining = (self.folderActiveBatches[capKey] ?? 1) - 1
-                if remaining <= 0 {
-                    self.folderActiveBatches.removeValue(forKey: capKey)
-                } else {
-                    self.folderActiveBatches[capKey] = remaining
-                }
-
-                // Power-aware inter-batch delay (turbo=0s, normal=3s, low=10s)
-                let delay = await BackfillProfile.current().interCycleActiveDelay
-                if delay > 0 {
-                    try? await Task.sleep(for: .seconds(delay))
-                }
-
-                if storage.pendingCount > 0 {
-                    scheduleDispatch()
-                } else if storage.isEmpty && activeBatchCount == 0 {
-                    // Boot-log mirror: queue went IDLE — if the user-felt "sharp
-                    // again" moments line up with this mark (and stall marks stop
-                    // after it), the backfill-contention hypothesis is confirmed.
-                    BootProfiler.mark("backfillBody queue IDLE (drained) — running drain-time repopulate check")
-                    // Drain-time safety net: re-query GRDB for anything missed
-                    // by the push path (headerComplete=1 set but enqueue lost,
-                    // crash between DB write and enqueue, etc.). Only when this
-                    // returns zero rows is the queue truly idle.
-                    await self.repopulateOnDrain()
-                }
+                await self.finishBatch(capKey: capKey)
             }
             batchTasks.removeAll { $0.isCancelled }
             batchTasks.append(batchTask)
+        }
+    }
+
+    /// The end of one batch, after its items are done. The last batch to end with the
+    /// queue empty first reads the next window of waiting rows (`repopulateOnDrain`),
+    /// then gives up its batch count, then waits the inter-batch delay, then dispatches.
+    /// A refill reads one window (`SyncConfig.bodyFetchRepopulateLimit`), so with more
+    /// rows waiting the queue empties once per window; reading before the count drops
+    /// and before the delay keeps `isIdle` and `awaitDrain` false until no row waits
+    /// (#1400). `pacingDelay` is the delay's source; tests pass their own.
+    private func finishBatch(
+        capKey: FolderCapKey,
+        pacingDelay: @Sendable () async -> TimeInterval = { await BackfillProfile.current().interCycleActiveDelay }
+    ) async {
+        if storage.isEmpty && activeBatchCount == 1 {
+            // Boot-log mirror: queue went IDLE — if the user-felt "sharp
+            // again" moments line up with this mark (and stall marks stop
+            // after it), the backfill-contention hypothesis is confirmed.
+            BootProfiler.mark("backfillBody queue IDLE (drained) — running drain-time repopulate check")
+            // Drain-time safety net: re-query GRDB for anything missed
+            // by the push path (headerComplete=1 set but enqueue lost,
+            // crash between DB write and enqueue, etc.), and the next window.
+            // Only when this returns zero rows is the queue truly idle.
+            await repopulateOnDrain()
+            // cancelAllInFlight() during the read has already reset the counters.
+            guard !Task.isCancelled else { return }
+        }
+        activeBatchCount -= 1
+        let remaining = (folderActiveBatches[capKey] ?? 1) - 1
+        if remaining <= 0 {
+            folderActiveBatches.removeValue(forKey: capKey)
+        } else {
+            folderActiveBatches[capKey] = remaining
+        }
+
+        // Power-aware inter-batch delay (turbo=0s, normal=3s, low=10s)
+        let delay = await pacingDelay()
+        if delay > 0 {
+            try? await Task.sleep(for: .seconds(delay))
+        }
+
+        if storage.pendingCount > 0 {
+            scheduleDispatch()
         }
     }
 
@@ -1274,12 +1313,16 @@ actor BackfillBodyQueue {
     }
 
     /// Drain-time self-repopulate: re-run the work-remaining query and enqueue any
-    /// hits. Called only when `storage.isEmpty && activeBatchCount == 0`, so no
-    /// in-flight overlap. `QueueStorage.enqueue` dedups against `enqueued`
-    /// (already contains any in-flight items) as a safety net.
+    /// hits. Called only by the last batch to end, with the queue empty and before it
+    /// gives up its count (`finishBatch`), so no in-flight overlap; the caller
+    /// dispatches what it admits, after the inter-batch delay. `QueueStorage.enqueue`
+    /// dedups against `enqueued` (already contains any in-flight items) as a safety net.
     /// Mirrors `ActiveBodyQueue.repopulateOnDrain` — same pattern, different scope
     /// (non-inbox instead of inbox).
     private func repopulateOnDrain() async {
+        #if DEBUG
+        if let hook = drainRefillWillReadForTesting { await hook() }
+        #endif
         do {
             let items: [Item] = try await dbPool.read { db in
                 try Self.admissionItems(db)
@@ -1291,7 +1334,6 @@ actor BackfillBodyQueue {
             }
             if added > 0 {
                 BackgroundSyncLogger.logDebug("[BackfillBody] Drain-time self-repopulate enqueued \(added) items")
-                scheduleDispatch()
             }
         } catch {
             BackgroundSyncLogger.logDebug("[BackfillBody] Drain-time repopulate failed: \(error)")

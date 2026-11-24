@@ -442,6 +442,20 @@ struct BackfillProgressCountTests {
         }
         try Self.applyLargeMailboxStatistics(to: queue)
         try expectWindowSeek("large mailbox")
+
+        // Control: without its index the same reads plan differently, so the exact plan
+        // checked above is not one every database yields.
+        try queue.write { conn in
+            try conn.execute(sql: "DROP INDEX messageHeader_bodyRepopulateV2")
+        }
+        for (name, sql) in reads {
+            let plan = try queue.read { conn in
+                try Row.fetchAll(conn, sql: "EXPLAIN QUERY PLAN " + sql)
+                    .compactMap { $0["detail"] as String? }
+                    .joined(separator: " | ")
+            }
+            #expect(plan != seek, "setup: \(name) plans differently without its index, or the plan check pins nothing: \(plan)")
+        }
     }
 
     // MARK: - Same counts as the old statements
