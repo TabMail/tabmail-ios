@@ -4,6 +4,7 @@
 
 import Foundation
 import GRDB
+import SQLite3
 
 /// Client-side `inbox_read` tool matching TB addon's `inbox_read.js`.
 /// Queries GRDB for inbox messages and formats them for LLM consumption.
@@ -16,7 +17,7 @@ struct InboxReadTool: AgentTool, Sendable {
         self.ctx = context ?? ToolContext()
     }
 
-    private enum Config {
+    enum Config {
         /// TB uses pageSize=50 (inboxPageSizeDefault=100 clamped by inboxPageSizeMax=50)
         static let pageSize = 50
     }
@@ -31,28 +32,22 @@ struct InboxReadTool: AgentTool, Sendable {
             pageIndex = 1
         }
 
-        // Query inbox: count + single page via LIMIT/OFFSET (bounded memory).
+        // Query inbox: total + one page, in one read (`readListing`).
         // Demo boundary (ADR-IOS-038): demo lists ONLY demo rows; normal mode
         // never lists them (real rows are also isInInbox during coexistence).
         let demoActive = DemoModeStore.isDemoActive
-        let totalCount = try await ctx.db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .filter(DemoToolGuard.accountScope(demoActive: demoActive))
-                .fetchCount(db)
+        let started = CFAbsoluteTimeGetCurrent()
+        let (listing, cost) = try await ctx.db.read { db in
+            var cost = ReadCost()
+            let listing = try Self.readListing(db, pageIndex: pageIndex, demoActive: demoActive, cost: &cost)
+            return (listing, cost)
         }
-        let totalPages = max(1, (totalCount + Config.pageSize - 1) / Config.pageSize)
-        let safePage = min(max(pageIndex - 1, 0), totalPages - 1)
-        let offset = safePage * Config.pageSize
-
-        let pageItems: [MessageHeader] = try await ctx.db.read { db in
-            try MessageHeader
-                .filter(Column("isInInbox") == true)
-                .filter(DemoToolGuard.accountScope(demoActive: demoActive))
-                .order(Column("date").desc)
-                .limit(Config.pageSize, offset: offset)
-                .fetchAll(db)
-        }
+        let readMs = Int((CFAbsoluteTimeGetCurrent() - started) * 1000)
+        let totalCount = listing.totalCount
+        let totalPages = listing.totalPages
+        let safePage = listing.page
+        let pageItems = listing.rows
+        BackgroundSyncLogger.logDebug("[InboxReadTool] read page \(safePage + 1) of \(totalPages) (rows=\(pageItems.count) total=\(totalCount)) in \(readMs)ms statements=\(cost.statements) vmSteps=\(cost.vmSteps) fullscanSteps=\(cost.fullscanSteps)")
 
         // Format matching TB's formatMailList in helpers.js
         let translator = ctx.translator
@@ -99,4 +94,115 @@ struct InboxReadTool: AgentTool, Sendable {
         return ToolJSON.string(from: resultDict)
     }
 
+    // MARK: - Listing read
+
+    /// One page of the inbox listing, as the tool reports it.
+    struct Listing: Sendable {
+        let rows: [MessageHeader]
+        /// Inbox rows in the account scope.
+        let totalCount: Int
+        /// The zero-based page returned: the requested page, clamped to the last.
+        let page: Int
+
+        var totalPages: Int { InboxReadTool.totalPages(for: totalCount) }
+    }
+
+    /// What the listing's statements made SQLite do, summed, for the debug timing line.
+    struct ReadCost: Sendable {
+        var statements = 0
+        /// Virtual machine steps: grows with the index entries and rows a statement visits.
+        var vmSteps = 0
+        /// Rows stepped through by a full table scan (0 when every statement seeks an index).
+        var fullscanSteps = 0
+    }
+
+    static func totalPages(for totalCount: Int) -> Int {
+        max(1, (totalCount + Config.pageSize - 1) / Config.pageSize)
+    }
+
+    /// The requested 1-based page as a 0-based page, clamped to the listing's pages.
+    static func clampedPage(_ pageIndex: Int, totalCount: Int) -> Int {
+        min(max(pageIndex - 1, 0), totalPages(for: totalCount) - 1)
+    }
+
+    /// Reads one page of the inbox listing and its total.
+    ///
+    /// Same total and rows, in the same order, as counting the inbox rows in the account scope
+    /// and paging them by `date` with LIMIT/OFFSET; but in normal mode neither the count nor the
+    /// rows OFFSET skips read a table row per inbox message:
+    /// - The inbox count comes from `messageHeader_isInInbox_date` alone.
+    /// - When it is at most one page, the scoped page at offset 0 is the whole listing, whatever
+    ///   the scope removes, so its rows are the total.
+    /// - Otherwise the scope (`accountId` is not the demo account) is applied as "rowid is not one
+    ///   of the demo account's rows", which the inbox index carries, so the count and the rows
+    ///   OFFSET skips stay in the index. The demo rowids come from an `accountId` index alone, and
+    ///   only when a demo account row exists: without it there is no demo message row (`accountId`
+    ///   references `account`; `DemoSeed.wipe` deletes the account last), and the total is the
+    ///   inbox count. The page's order adds `rowid DESC`, the index's own order among equal dates,
+    ///   so the order is total.
+    /// - Demo mode lists the demo account's few rows with the scoped count and page as they are.
+    static func readListing(_ db: Database, pageIndex: Int, demoActive: Bool, cost: inout ReadCost) throws -> Listing {
+        let pageSize = Config.pageSize
+        let inbox = MessageHeader.filter(Column("isInInbox") == true)
+        let inScope = inbox.filter(DemoToolGuard.accountScope(demoActive: demoActive))
+        if !demoActive {
+            let inboxCount = try fetchCount(db, inbox, cost: &cost)
+            guard inboxCount > pageSize else {
+                let rows = try fetchAll(db, inScope.order(Column("date").desc).limit(pageSize), cost: &cost)
+                return Listing(rows: rows, totalCount: rows.count, page: 0)
+            }
+            let demoRowIDs = try DemoSeed.hasDemoData(db)
+                ? fetchRowIDs(db, MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId), cost: &cost)
+                : []
+            let listed = demoRowIDs.isEmpty ? inbox : inbox.filter(!demoRowIDs.contains(Column.rowID))
+            let totalCount = demoRowIDs.isEmpty ? inboxCount : try fetchCount(db, listed, cost: &cost)
+            let page = clampedPage(pageIndex, totalCount: totalCount)
+            let rows = try fetchAll(
+                db,
+                listed.order(Column("date").desc, Column.rowID.desc).limit(pageSize, offset: page * pageSize),
+                cost: &cost)
+            return Listing(rows: rows, totalCount: totalCount, page: page)
+        }
+        let totalCount = try fetchCount(db, inScope, cost: &cost)
+        let page = clampedPage(pageIndex, totalCount: totalCount)
+        let rows = try fetchAll(
+            db, inScope.order(Column("date").desc).limit(pageSize, offset: page * pageSize), cost: &cost)
+        return Listing(rows: rows, totalCount: totalCount, page: page)
+    }
+
+    private static func fetchRowIDs(
+        _ db: Database, _ request: QueryInterfaceRequest<MessageHeader>, cost: inout ReadCost
+    ) throws -> [Int64] {
+        let statement = try request.select(Column.rowID, as: Int64.self)
+            .makePreparedRequest(db, forSingleResult: false).statement
+        return try measured(statement, cost: &cost) { try Int64.fetchAll(statement) }
+    }
+
+    private static func fetchCount(
+        _ db: Database, _ request: QueryInterfaceRequest<MessageHeader>, cost: inout ReadCost
+    ) throws -> Int {
+        let statement = try request.select(SQL(sql: "COUNT(*)"), as: Int.self)
+            .makePreparedRequest(db, forSingleResult: false).statement
+        return try measured(statement, cost: &cost) { try Int.fetchOne(statement) ?? 0 }
+    }
+
+    private static func fetchAll(
+        _ db: Database, _ request: QueryInterfaceRequest<MessageHeader>, cost: inout ReadCost
+    ) throws -> [MessageHeader] {
+        let statement = try request.makePreparedRequest(db, forSingleResult: false).statement
+        return try measured(statement, cost: &cost) { try MessageHeader.fetchAll(statement) }
+    }
+
+    /// Runs `fetch` on `statement` and adds what it made SQLite do to `cost`. The counters are
+    /// reset first, as a cached statement keeps them from earlier runs.
+    private static func measured<T>(_ statement: Statement, cost: inout ReadCost, _ fetch: () throws -> T) throws -> T {
+        let handle = statement.sqliteStatement
+        sqlite3_stmt_status(handle, SQLITE_STMTSTATUS_VM_STEP, 1)
+        sqlite3_stmt_status(handle, SQLITE_STMTSTATUS_FULLSCAN_STEP, 1)
+        let value = try fetch()
+        cost.statements += 1
+        cost.vmSteps += Int(sqlite3_stmt_status(handle, SQLITE_STMTSTATUS_VM_STEP, 0))
+        cost.fullscanSteps += Int(sqlite3_stmt_status(handle, SQLITE_STMTSTATUS_FULLSCAN_STEP, 0))
+        return value
+    }
 }
