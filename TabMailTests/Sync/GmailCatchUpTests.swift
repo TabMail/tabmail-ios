@@ -937,6 +937,55 @@ struct GmailCatchUpTests {
         }
     }
 
+    /// #1110: a label outside the syncable set is checked after every folder of
+    /// the set, whatever its last try, so its first check never holds back a
+    /// due check of the set. Driven through the engine's own run, which tells
+    /// the provider which folders are outside the set.
+    @Test("An older-mail slice works a due folder of the syncable set before a due label outside it tried longer ago, so one shared budget goes to the syncable folder")
+    func olderMailWorksTheSyncableFolderFirst() async throws {
+        let clock = Clock()
+        let seeds = [Self.seed("s1", clock.daysAgo(30), [inboxPath]), Self.seed("o1", clock.daysAgo(30), [labelPath])]
+        let local = [Local(id: "s1", path: inboxPath, date: clock.daysAgo(30)), Local(id: "o1", path: labelPath, date: clock.daysAgo(30))]
+        try await Self.withWorld(
+            "gcu-later", seeds: seeds, local: local, folders: [(inboxPath, .inbox), (labelPath, .custom)]
+        ) { world async throws in
+            let syncable = SyncEngine.isSyncable(try Self.folder(world, labelPath))
+            #expect(!syncable, "setup: the label is outside the syncable set")
+            // Both are due (never listed); the label was tried longer ago, so
+            // only its place after the syncable set puts it second.
+            let inboxTried = clock.hoursAgo(1)
+            let inboxDue = GmailCatchUpState(lastAttemptAt: inboxTried).encoded()
+            let labelDue = GmailCatchUpState(lastAttemptAt: clock.daysAgo(2)).encoded()
+            let inboxId = world.folderId(inboxPath)
+            let labelId = world.folderId(labelPath)
+            try await world.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [inboxDue, inboxId])
+                try db.execute(sql: "UPDATE folder SET catchUpState = ? WHERE id = ?", arguments: [labelDue, labelId])
+            }
+
+            // One older-mail slice, through the engine's own run, with a budget
+            // of one request: the run's clock moves one second per request.
+            let server = world.server
+            let before = server.http.recordedCalls().count
+            let base = Date()
+            let run = SyncEngine.CatchUpRun.snapshot(
+                deadline: base.addingTimeInterval(1),
+                clock: { base.addingTimeInterval(TimeInterval(server.http.recordedCalls().count - before)) })
+            let accountId = world.accountId
+            let stored = try await world.pool.read { db in try Account.fetchOne(db, key: accountId) }
+            let account = try #require(stored)
+            _ = await world.engine.runCatchUpRun(account: account, run: run)
+
+            let spent = server.http.recordedCalls().count - before
+            let inboxState = try Self.state(world, inboxPath)
+            let labelState = try Self.folder(world, labelPath).catchUpState
+            let inboxWorked = inboxState?.lastAttemptAt.map { $0 > inboxTried } ?? false
+            #expect(spent == 1, "setup: the slice had a budget of one request: \(spent)")
+            #expect(inboxWorked, "the slice worked the Inbox, a due folder of the syncable set")
+            #expect(labelState == labelDue, "and left the label, tried longer ago, for later")
+        }
+    }
+
     // MARK: - Schedule
 
     /// A Gmail folder is listed in exactly three cases: its first listing (no

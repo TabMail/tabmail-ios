@@ -1042,7 +1042,12 @@ struct OtherFolderIMAPTests {
             if case .notRun = runFirst?.status { runFirstNotRun = true }
             #expect(runFirstNotRun && runFirst?.readCut == true,
                     "a run: the folder whose STATUS answered after the read's end is cut")
-            #expect(runSecond?.readCut != true, "a run: the folder never reached is not cut")
+            // Reported, not left out: an absent second folder would pass a bare
+            // "not cut" check.
+            var runSecondNotRun = false
+            if case .notRun = runSecond?.status { runSecondNotRun = true }
+            #expect(runSecondNotRun && runSecond?.readCut == false,
+                    "a run: the folder never reached is reported not run, with no cut mark")
 
             let pass = try await Self.readCutAtTheFirstFolder(w, scope: .all)
             let passFirst = pass?[first]
@@ -1411,9 +1416,19 @@ struct OtherFolderSliceRuleTests {
                 accountId: accountId, path: path, role: role, pool: pool, lastKnownUidNext: 1, lastKnownUidValidity: 1)
         }
         await AccountManager.shared.clearRecentlyCompletedForTesting()
-        try await body(World(pool: pool, accountId: accountId, mock: MockEmailProvider()))
-        await AccountManager.shared.clearRecentlyCompletedForTesting()
-        await UnreadCountManager.shared.awaitIdleForTesting()
+        // The shared state is cleaned on every exit, a throw included, before
+        // the database is restored.
+        func cleanUp() async {
+            await AccountManager.shared.clearRecentlyCompletedForTesting()
+            await UnreadCountManager.shared.awaitIdleForTesting()
+        }
+        do {
+            try await body(World(pool: pool, accountId: accountId, mock: MockEmailProvider()))
+        } catch {
+            await cleanUp()
+            throw error
+        }
+        await cleanUp()
     }
 
     /// The reader's answer: `statuses` by folder id, `.notRun` (nothing sent) for the rest.
