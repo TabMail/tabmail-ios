@@ -959,6 +959,24 @@ extension SyncEngine {
             sql: """
                 CREATE INDEX IF NOT EXISTS messageBody_staleEvict
                 ON messageBody(fetchedAt)
+                """),
+        // #1401: the backfill progress counts (`backfillProgressCounts`) count
+        // `MessageHeader.bodySettledRequest` and `.pendingBodyRequest` for one account
+        // on every progress update. This index holds every column either predicate
+        // tests, so both counts read its entries and never a header row: the pending
+        // count seeks all five columns, the settled count reads the account's entries
+        // and tests its OR in each. No other index has `accountId` with
+        // `bodyEmptyConfirmed` and `bodyMetadataOversized`. It extends v40's
+        // `messageHeader_accountId_bodyComplete` and keeps its prefix, so it serves
+        // every plan that one does; v40's stays (ADR-IOS-029 rules 3 and 4). Deferred:
+        // the build reads every header once, and its absence changes no result, only
+        // how much the counts read.
+        DeferredIndex(
+            name: "messageHeader_backfillProgress",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_backfillProgress
+                ON messageHeader(accountId, bodyComplete, bodyEmptyConfirmed,
+                                 bodyMetadataOversized, headerComplete)
                 """)
     ]
 

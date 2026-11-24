@@ -46,4 +46,8 @@ Performance; migrations; `v83_markAllAsReadUnreadSweepIndex`; `messageHeader_unr
 **One-time hold.** The build is one background-tier write. Point (ii) above applies unchanged: it runs in the first maintenance pass after the upgrade that completes it, from a foreground poll (scheduled after the poll's read stage) or from the `.full` BGProcessing drain, whichever comes first (never in the notification extension), and a `.priority` write issued during it (a Send) waits for it once.
 
 **The order in the real pass.** `indexBuildBeforeAnalyzeConvergesInOnePass` calls the two helpers in the order it supplies itself. `StaleBodyEvictRunTests.theMaintenancePassBuildsTheIndexThenTheNextPassEvicts` pins the order `runWALMaintenance` uses: the first pass's statistics cover `messageBody_staleEvict`, and the next pass leaves them as they were (it does not analyze again).
+
+## Amendment 2026-11-24 (#1401): `messageHeader_backfillProgress` joins the deferred set
+
+`SyncEngine.deferredIndexes` gains `messageHeader_backfillProgress` on `messageHeader(accountId, bodyComplete, bodyEmptyConfirmed, bodyMetadataOversized, headerComplete)`, the index the backfill progress counts read (`SyncEngine.backfillProgressCounts`; ADR-IOS-029 amendment of the same date). It qualifies under this row's rule: its absence changes no result, no write depends on it, and nothing names it in an `INDEXED BY`. Its build reads every header once. During this row's transient window the counts read header rows as they did before, with the same results, so nothing is gated on it. Point (ii) above applies unchanged to the one-time build.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
