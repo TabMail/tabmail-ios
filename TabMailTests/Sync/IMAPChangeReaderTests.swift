@@ -65,10 +65,6 @@ struct IMAPChangeReaderTests {
             let mine = uids(folderId)
             return ids.compactMap(Int.init).filter(mine.contains).map(row)
         }
-        func rows(folderId: String, after afterId: String?, limit: Int) async throws -> [CatchUpLocalRow] {
-            let floor = afterId.flatMap(Int.init) ?? 0
-            return Array(uids(folderId).filter { $0 > floor }.sorted().prefix(limit)).map(row)
-        }
         func rows(folderId: String, orderDatesFrom lower: Date, before upper: Date) async throws -> [CatchUpLocalRow] { [] }
         func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow] { [] }
     }
