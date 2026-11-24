@@ -244,8 +244,10 @@ struct BackfillProgressIndexProofTests {
         case none
         /// A whole-database `ANALYZE` with the index present: after the maintenance pass.
         case fresh
-        /// Analyzed before the index existed, then the index built: a connection that loaded
-        /// the schema between the pass's index build and its `ANALYZE`.
+        /// Analyzed before the index existed, then the index built: until 2026-11-24, a
+        /// connection that loaded the schema between the pass's index build and its
+        /// `ANALYZE`. The build now commits with the `ANALYZE` in one write, so the pass no
+        /// longer leaves this state; the census keeps it as the worst case.
         case staleBeforeIndex
 
         var label: String {
