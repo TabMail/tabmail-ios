@@ -530,18 +530,19 @@ struct TabMailApp: App {
 /// handlers hung on `awaitLaunchReady()`.
 ///
 /// It runs in two phases on a background task:
-///   1. **Probe** — open the pool and cheaply check for upgrade work: pending
-///      migration work or a missing deferred index
-///      (`AppDatabase.hasPendingUpgradeWork`). While this runs the UI shows a
-///      blank launch screen (matching the empty `UILaunchScreen`).
-///   2. **Migrate + load** — run the migrations/resets and the DB-dependent
-///      launch steps. ONLY if Phase 1 found real work on an existing DB do we
+///   1. **Probe** — open the pool and cheaply decide whether this is an upgrade
+///      launch (`AppDatabase.isUpgradeLaunch`): a database that existed before
+///      this launch, with pending migration work or a missing deferred index.
+///      While this runs the UI shows a blank launch screen (matching the empty
+///      `UILaunchScreen`).
+///   2. **Migrate + load** — build the database (`AppDatabase.openForLaunch`) and
+///      run the DB-dependent launch steps. ONLY on an upgrade launch do we
 ///      flip `isMigrating` to show `SplashView(mode: .migrating)`; otherwise the
 ///      blank launch screen holds until `isReady` flips straight to the inbox.
 ///      This keeps the migration splash from flashing on every normal launch.
 ///      On that same upgrade launch, after the migrations and before publication,
-///      the upgrade step (`AppDatabase.runUpgradeStep`) builds the missing deferred
-///      indexes and refreshes the planner statistics in one write.
+///      the build's upgrade step (`AppDatabase.runUpgradeStep`) builds the missing
+///      deferred indexes and refreshes the planner statistics in one write.
 ///
 /// CRITICAL invariant: callers must receive true from `ensureDatabaseReady()`
 /// before touching `AppDatabase.dbPool`; failure leaves the pool unpublished.
@@ -557,11 +558,13 @@ final class AppStartup {
     /// has run. Drives the splash → inbox transition.
     private(set) var isReady = false
 
-    /// True once we've confirmed there is real, potentially-slow migration work
-    /// to run on an EXISTING database — drives the one-time "Updating…" splash.
-    /// Stays false on the common path (already-migrated DB) and on fresh
-    /// installs, so the launch screen shows blank until the inbox is ready
-    /// instead of flashing the migration splash on every launch.
+    /// True on an upgrade launch (`AppDatabase.isUpgradeLaunch`): real,
+    /// potentially-slow upgrade work (migrations, resets or a missing deferred
+    /// index) on an EXISTING database — drives the one-time "Updating…" splash.
+    /// Stays false on the common path (a migrated DB with every deferred index)
+    /// and on a fresh install's first launch, so the launch screen shows blank
+    /// until the inbox is ready instead of flashing the migration splash on
+    /// every launch.
     private(set) var isMigrating = false
 
     /// Set on a catastrophic DB open/migration failure; drives the failure view.
@@ -589,7 +592,7 @@ final class AppStartup {
     #if DEBUG
     // Instance-only operation boundaries; tests run the live readiness algorithm
     // without publishing a database or starting unrelated process-global upkeep.
-    private var testProbe: (@Sendable () async throws -> (pool: DatabasePool, pending: Bool))?
+    private var testProbe: (@Sendable () async throws -> (pool: DatabasePool, isUpgradeLaunch: Bool))?
     private var testBuildAndPublish: (@Sendable (DatabasePool) async throws -> Void)?
     private var testPreparation: (@MainActor () async -> Void)?
     private var testUpkeep: (@MainActor () -> Void)?
@@ -597,7 +600,7 @@ final class AppStartup {
     private(set) var paintPollCountForTesting = 0
 
     init(
-        probe: @escaping @Sendable () async throws -> (pool: DatabasePool, pending: Bool),
+        probe: @escaping @Sendable () async throws -> (pool: DatabasePool, isUpgradeLaunch: Bool),
         buildAndPublish: @escaping @Sendable (DatabasePool) async throws -> Void,
         preparation: @escaping @MainActor () async -> Void,
         upkeep: @escaping @MainActor () -> Void
@@ -641,21 +644,22 @@ final class AppStartup {
         let dbExisted = FileManager.default.fileExists(atPath: AppDatabase.databaseURL.path)
         BootProfiler.mark("ensureDatabaseReady enter (dbExisted=\(dbExisted))")
 
-        // Phase 1 (off main): open the pool + cheaply probe for pending migration
-        // work. Fast — opens the connection and reads the migrator's applied set
-        // + the one-time-reset flags. The heavy migration passes are Phase 2.
+        // Phase 1 (off main): open the pool + cheaply decide whether this is an
+        // upgrade launch. Fast — opens the connection and reads the migrator's
+        // applied set, the one-time-reset flags and the schema table's index
+        // names. The heavy migration passes are Phase 2.
         #if DEBUG
         let probeHook = testProbe
         #endif
-        let probe: (pool: DatabasePool, pending: Bool)? =
+        let probe: (pool: DatabasePool, isUpgradeLaunch: Bool)? =
             await Task.detached(priority: .userInitiated) {
                 do {
                     #if DEBUG
                     if let probeHook { return try await probeHook() }
                     #endif
                     let pool = try AppDatabase.makePool()
-                    let pending = try AppDatabase.hasPendingUpgradeWork(pool)
-                    return (pool, pending)
+                    let isUpgradeLaunch = try AppDatabase.isUpgradeLaunch(pool, dbExisted: dbExisted)
+                    return (pool, isUpgradeLaunch)
                 } catch {
                     BackgroundSyncLogger.log("AppStartup: pool open/probe FAILED: \(error)")
                     return nil
@@ -668,17 +672,17 @@ final class AppStartup {
             return false
         }
 
-        // Only NOW — knowing there is real (and potentially slow) migration work
+        // Only NOW — knowing there is real (and potentially slow) upgrade work
         // on an existing mailbox — switch from the blank launch screen to the
-        // "Updating…" splash. The common case (already-migrated DB) skips this
+        // "Updating…" splash. The common case (already-upgraded DB) skips this
         // and stays blank until `isReady` flips straight to the inbox.
-        BootProfiler.mark("db.probe done (pendingMigration=\(probe.pending))")
+        BootProfiler.mark("db.probe done (upgradeLaunch=\(probe.isUpgradeLaunch))")
         // The upgrade launch: the splash below and the upgrade step in Phase 2 run on
         // exactly this condition.
-        let isUpgradeLaunch = probe.pending && dbExisted
+        let isUpgradeLaunch = probe.isUpgradeLaunch
         if isUpgradeLaunch {
             isMigrating = true
-            BackgroundSyncLogger.log("AppStartup: pending migration work on existing DB — showing migration splash")
+            BackgroundSyncLogger.log("AppStartup: upgrade work on existing DB — showing migration splash")
         }
 
         // Phase 2 (off main): run schema + data-repair migrations + one-time
@@ -696,11 +700,11 @@ final class AppStartup {
                     return true
                 }
                 #endif
-                let db = try AppDatabase(pool: pool, runStartupResets: true)
-                // Behind the same splash, before publication: build the missing
-                // deferred indexes and refresh the planner statistics in one write.
-                let upgrade = await AppDatabase.runUpgradeStep(pool: pool, isUpgradeLaunch: isUpgradeLaunch)
-                BootProfiler.mark("db.upgradeStep \(upgrade.map { "\($0)" } ?? "not an upgrade launch")")
+                // Behind the same splash, before publication: the build runs the
+                // upgrade step (missing deferred indexes and planner statistics in
+                // one write) before it returns the database.
+                let db = try await AppDatabase.openForLaunch(
+                    pool: pool, isUpgradeLaunch: isUpgradeLaunch, runStartupResets: true)
                 AppDatabase.shared.withLock { $0 = db }
                 return true
             } catch {

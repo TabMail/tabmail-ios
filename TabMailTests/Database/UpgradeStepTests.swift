@@ -138,4 +138,66 @@ struct UpgradeStepTests {
         #expect(try Self.schemaVersion(fixture.pool) == versionBefore)
         #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
     }
+
+    /// The migration-built `messageHeader` indexes that cover every row (no
+    /// `WHERE`), each of which gets a statistics row from a whole-database
+    /// `ANALYZE` over the seeded mail.
+    private static func fullMessageHeaderIndexes(_ pool: DatabasePool) throws -> Set<String> {
+        try pool.read { db in
+            Set(try String.fetchAll(db, sql: """
+                SELECT name FROM sqlite_master
+                WHERE type = 'index' AND tbl_name = 'messageHeader'
+                  AND sql IS NOT NULL AND sql NOT LIKE '%WHERE%'
+                """))
+        }
+    }
+
+    @Test("The launch build runs the upgrade step before it returns the database: deferred indexes, whole-database statistics and the marker")
+    func launchBuildRunsTheStepBeforeReturning() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: try Self.existingIndexes(fixture.pool)),
+                "the fixture must start without the deferred indexes, or the build proves nothing")
+        let migrationBuilt = try Self.fullMessageHeaderIndexes(fixture.pool)
+        #expect(!migrationBuilt.isEmpty, "the schema must have a migration-built messageHeader index")
+        #expect(try Self.statisticsRows(fixture.pool).isEmpty)
+
+        let db = try await AppDatabase.openForLaunch(
+            pool: fixture.pool, isUpgradeLaunch: true, runStartupResets: false, defaults: fixture.defaults)
+        #expect(db.dbPool === fixture.pool)
+
+        // Everything below is already true when the build returns, before any caller
+        // could publish the database.
+        let missing = deferred.subtracting(try Self.existingIndexes(fixture.pool))
+        #expect(missing.isEmpty, "deferred indexes missing after the launch build: \(missing.sorted())")
+        let statistics = try Self.statisticsRows(fixture.pool)
+        let deferredWithout = deferred.subtracting(statistics)
+        #expect(deferredWithout.isEmpty,
+                "deferred indexes with no sqlite_stat1 row after the launch build: \(deferredWithout.sorted())")
+        // The ANALYZE covers the whole database, not only the indexes it built.
+        let migrationBuiltWithout = migrationBuilt.subtracting(statistics)
+        #expect(migrationBuiltWithout.isEmpty,
+                "migration-built messageHeader indexes with no sqlite_stat1 row: \(migrationBuiltWithout.sorted())")
+        let marker = fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) as? Int
+        let liveVersion = try Self.schemaVersion(fixture.pool)
+        #expect(marker != nil && marker == liveVersion,
+                "the marker must hold the schema version after the build: marker \(String(describing: marker)), live \(String(describing: liveVersion))")
+    }
+
+    @Test("On any other launch the launch build runs no step: indexes, statistics and marker untouched")
+    func launchBuildOnOtherLaunchRunsNoStep() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let indexesBefore = try Self.existingIndexes(fixture.pool)
+        let statisticsBefore = try Self.statisticsRows(fixture.pool)
+
+        let db = try await AppDatabase.openForLaunch(
+            pool: fixture.pool, isUpgradeLaunch: false, runStartupResets: false, defaults: fixture.defaults)
+        #expect(db.dbPool === fixture.pool)
+
+        #expect(try Self.existingIndexes(fixture.pool) == indexesBefore)
+        #expect(try Self.statisticsRows(fixture.pool) == statisticsBefore)
+        #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
+    }
 }

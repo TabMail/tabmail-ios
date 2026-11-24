@@ -436,6 +436,72 @@ struct StartupMigrationsTests {
         #expect(try AppDatabase.hasPendingUpgradeWork(migrated) == true)
     }
 
+    // MARK: - The upgrade launch: file existed before this launch x upgrade work
+
+    @Test("isUpgradeLaunch: a brand-new file is not an upgrade launch, though it reports upgrade work")
+    func brandNewFileIsNoUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        // As the launch does it: whether the file exists is read before the pool
+        // creates it.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("upgradelaunch_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("new.sqlite").path
+        let dbExisted = FileManager.default.fileExists(atPath: path)
+        let pool = try DatabasePool(path: path)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: directory) }
+
+        #expect(dbExisted == false)
+        #expect(try AppDatabase.hasPendingUpgradeWork(pool) == true,
+                "a brand-new file reports upgrade work, or this case proves nothing")
+        #expect(try AppDatabase.isUpgradeLaunch(pool, dbExisted: dbExisted) == false)
+    }
+
+    @Test("isUpgradeLaunch: no existing file and no upgrade work is not an upgrade launch")
+    func noFileNoWorkIsNoUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated) == false)
+        #expect(try AppDatabase.isUpgradeLaunch(migrated, dbExisted: false) == false)
+    }
+
+    @Test("isUpgradeLaunch: an existing file with upgrade work is an upgrade launch, a missing deferred index alone included")
+    func existingFileWithWorkIsAnUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        // Only a deferred index is missing: no migration work, so only the index
+        // check can make it an upgrade launch.
+        let migrated = try TestDatabase.make()
+        #expect(try AppDatabase.hasPendingMigrationWork(migrated) == false)
+        #expect(try AppDatabase.isUpgradeLaunch(migrated, dbExisted: true) == true)
+
+        // Migration work with every deferred index present.
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        UserDefaults.standard.set(false, forKey: "didCleanResetMessageData_v1")
+        #expect(try AppDatabase.isUpgradeLaunch(migrated, dbExisted: true) == true)
+    }
+
+    @Test("isUpgradeLaunch: an existing file with no upgrade work is not an upgrade launch (common launch)")
+    func existingFileWithoutWorkIsNoUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated) == false)
+        #expect(try AppDatabase.isUpgradeLaunch(migrated, dbExisted: true) == false)
+    }
+
     // MARK: - Legacy per-subsystem log files (GitHub #83)
 
     /// The names `AppLogStore`'s header records as the files it replaced,

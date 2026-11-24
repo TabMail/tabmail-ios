@@ -96,10 +96,10 @@ final class AppDatabase: Sendable {
     /// True if migrating `pool` will do real work: pending GRDB schema
     /// migrations OR pending one-time data resets. Cheap + read-only (checks the
     /// migrator's applied set + the reset flags); `pool` must be freshly opened
-    /// and not yet migrated. Callers gate the migration splash on this AND on the
+    /// and not yet migrated. The migration splash is gated on this AND on the
     /// DB pre-existing — a fresh/empty DB migrates instantly so it never warrants
-    /// the splash (see `AppStartup`). On a brand-new file the migrator reports
-    /// "not completed", which is why the caller's pre-existing check matters.
+    /// the splash (see `isUpgradeLaunch`). On a brand-new file the migrator reports
+    /// "not completed", which is why the pre-existing check matters.
     static func hasPendingMigrationWork(_ reader: some DatabaseReader) throws -> Bool {
         var migrator = DatabaseMigrator()
         registerAllMigrations(on: &migrator)
@@ -112,11 +112,23 @@ final class AppDatabase: Sendable {
     /// migration work (`hasPendingMigrationWork`), or a deferred index
     /// (`SyncEngine.deferredIndexes`) the database does not have yet, as after a
     /// release that adds only a deferred index. The second check reads the schema
-    /// table alone. The same caveat applies: a brand-new file reports pending, so the
-    /// caller also requires that the file existed before this launch (`AppStartup`).
+    /// table alone. The same caveat applies: a brand-new file reports pending, so
+    /// `isUpgradeLaunch` also requires that the file existed before this launch.
     static func hasPendingUpgradeWork(_ reader: some DatabaseReader) throws -> Bool {
         if try hasPendingMigrationWork(reader) { return true }
         return try reader.read { db in try !SyncEngine.missingDeferredIndexNames(db).isEmpty }
+    }
+
+    /// The upgrade launch (ADR-IOS-029, amendment of 2026-11-24, #1392), decided in
+    /// this one place: the "Updating…" screen and the upgrade step both run on its
+    /// answer. True when the database file existed before this launch
+    /// (`dbExisted`, checked before the pool is opened) and has upgrade work
+    /// (`hasPendingUpgradeWork`). A fresh install's first launch is never one: its
+    /// brand-new file migrates instantly and holds no mail. Any later launch whose
+    /// database still lacks a deferred index is one.
+    static func isUpgradeLaunch(_ reader: some DatabaseReader, dbExisted: Bool) throws -> Bool {
+        guard dbExisted else { return false }
+        return try hasPendingUpgradeWork(reader)
     }
 
     /// The upgrade step (ADR-IOS-029, amendment of 2026-11-24, #1392). On a launch that
@@ -139,6 +151,21 @@ final class AppDatabase: Sendable {
         guard isUpgradeLaunch else { return nil }
         return await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: PrioritizedDatabase(pool: pool, priority: .priority), defaults: defaults)
+    }
+
+    /// The launch's database build: the designated initializer (migrations, resets,
+    /// residue recovery), then the upgrade step (`runUpgradeStep`), and only then the
+    /// database the caller publishes. The step is bound to the build so that it
+    /// always runs before publication: the caller has nothing to publish until the
+    /// step has finished.
+    static func openForLaunch(
+        pool: DatabasePool, isUpgradeLaunch: Bool, runStartupResets: Bool,
+        defaults: UserDefaults = .standard
+    ) async throws -> AppDatabase {
+        let db = try AppDatabase(pool: pool, runStartupResets: runStartupResets)
+        let upgrade = await runUpgradeStep(pool: pool, isUpgradeLaunch: isUpgradeLaunch, defaults: defaults)
+        BootProfiler.mark("db.upgradeStep \(upgrade.map { "\($0)" } ?? "not an upgrade launch")")
+        return db
     }
 
     /// Designated initializer. Wraps an already-open `pool`, runs schema
