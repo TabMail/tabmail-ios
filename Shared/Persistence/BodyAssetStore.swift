@@ -27,11 +27,13 @@ import Synchronization
 ///   `AppDatabase` so NSE can write rows without reaching into the main-app
 ///   sandbox.
 ///
-/// **LRU at the message level.** `bodyAsset.lastAccessedAt` is the same
-/// timestamp on every row sharing a `headerId`. Bumped only on user tap
+/// **LRU at the message level.** A bump sets `bodyAsset.lastAccessedAt` on
+/// every row sharing a `headerId`. Bumped only on user tap
 /// (open message body, tap attachment) — one `UPDATE … WHERE headerId = ?`
 /// touches all of a message's assets. Initial writes leave it NULL so
-/// never-tapped messages evict first.
+/// never-tapped messages evict first; an asset written after its message's
+/// last bump is NULL too, so eviction places a message by its rows' latest
+/// access (`evictionVictims`).
 ///
 /// **Write/delete idempotency** — a manifest-side preparation lease is
 /// persisted before file materialization, then publication replaces that lease
@@ -108,27 +110,7 @@ enum BodyAssetStore {
         let queue: DatabaseQueue
         do {
             queue = try DatabaseQueue(path: dbURL.path, configuration: config)
-            try queue.write { db in
-                try db.execute(sql: """
-                    CREATE TABLE IF NOT EXISTS bodyAsset (
-                        id                TEXT PRIMARY KEY,
-                        headerId          TEXT NOT NULL,
-                        kind              INTEGER NOT NULL,
-                        contentId         TEXT,
-                        attachmentSection TEXT,
-                        contentType       TEXT NOT NULL,
-                        sizeBytes         INTEGER NOT NULL,
-                        createdAt         INTEGER NOT NULL,
-                        lastAccessedAt    INTEGER,
-                        identityStamp     TEXT
-                    )
-                    """)
-                try migratePreparationSchema(db)
-                try migrateAttachmentIdentitySchema(db)
-                try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_header ON bodyAsset (headerId)")
-                try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_lru ON bodyAsset (lastAccessedAt)")
-                try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_attachmentLookup ON bodyAsset (headerId, kind, attachmentSection)")
-            }
+            try queue.write { db in try migrateManifestSchema(db) }
         } catch {
             #if DEBUG
             print("[BodyAssetStore] manifest DB open/migrate failed: \(error)")
@@ -137,6 +119,38 @@ enum BodyAssetStore {
         }
         queueCache.withLock { $0 = queue }
         return queue
+    }
+
+    /// The manifest's whole schema: the fresh-install path and the upgrade path in one, run by
+    /// `manifestQueue()` on every open and by `_makeTestQueue()`, so tests plan their queries on
+    /// the schema devices have.
+    ///
+    /// `idx_bodyAsset_lruSize` serves the two reads eviction makes in every maintenance run
+    /// (ios#1382). `usedBytes`' `SUM(sizeBytes)` reads only this index's entries, never the table
+    /// rows. `evictionVictims` walks it in access order, so it never aggregates and sorts every
+    /// message to find the oldest few. It replaces `idx_bodyAsset_lru (lastAccessedAt)`, which is
+    /// its prefix: an existing manifest builds the new index once, then drops the old one.
+    static func migrateManifestSchema(_ db: Database) throws {
+        try db.execute(sql: """
+            CREATE TABLE IF NOT EXISTS bodyAsset (
+                id                TEXT PRIMARY KEY,
+                headerId          TEXT NOT NULL,
+                kind              INTEGER NOT NULL,
+                contentId         TEXT,
+                attachmentSection TEXT,
+                contentType       TEXT NOT NULL,
+                sizeBytes         INTEGER NOT NULL,
+                createdAt         INTEGER NOT NULL,
+                lastAccessedAt    INTEGER,
+                identityStamp     TEXT
+            )
+            """)
+        try migratePreparationSchema(db)
+        try migrateAttachmentIdentitySchema(db)
+        try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_header ON bodyAsset (headerId)")
+        try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_lruSize ON bodyAsset (lastAccessedAt, headerId, sizeBytes)")
+        try db.execute(sql: "DROP INDEX IF EXISTS idx_bodyAsset_lru")
+        try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_attachmentLookup ON bodyAsset (headerId, kind, attachmentSection)")
     }
 
     /// Ad-hoc migration for the prepare→publish lease table.
@@ -202,7 +216,7 @@ enum BodyAssetStore {
     /// `PRAGMA table_info` + `ALTER TABLE ADD COLUMN` idiom the reference used.
     ///
     /// CONVERGENCE: a FRESH manifest is created by the `CREATE TABLE` in
-    /// `manifestQueue()` / `_makeTestQueue()`, which already lists `identityStamp`,
+    /// `migrateManifestSchema`, which already lists `identityStamp`,
     /// so the `ALTER` here is skipped; an EXISTING manifest gets the column added
     /// here. Both end with the identical schema — the create statements and this
     /// addition list must be kept in lockstep.
@@ -254,6 +268,8 @@ enum BodyAssetStore {
     }
 
     /// Total bytes across both kinds. Cached; invalidated on any write/delete.
+    /// The sum reads only `idx_bodyAsset_lruSize`'s entries, which carry `sizeBytes`, never the
+    /// table rows (ios#1382). It is recomputed from the rows, never kept as a running total.
     static var usedBytes: Int64 {
         if let cached = usedBytesCache.withLock({ $0 }) { return cached }
         guard let queue = manifestQueue() else { return 0 }
@@ -1000,38 +1016,70 @@ enum BodyAssetStore {
         let inlineCount: Int
     }
 
-    /// Returns the oldest-accessed messages with at least one asset, paged.
-    /// Used by `BodyAssetMaintenance.evictIfOverCap`. NULL `lastAccessedAt`
-    /// sorts first (never-tapped messages evict first).
-    static func oldestAccessedMessages(limit: Int) -> [VictimSummary] {
-        guard let queue = manifestQueue() else { return [] }
+    /// The least recently accessed messages with assets, oldest first, until their assets add up
+    /// to `bytes` or `limit` messages are chosen. Used by `BodyAssetMaintenance.evictIfOverCap`.
+    ///
+    /// A message's place is its MOST RECENT asset access, `MAX(COALESCE(lastAccessedAt, 0))` over
+    /// its rows: NULL (never opened) counts as 0, so never-opened messages go first. Rows of one
+    /// message can differ, because an asset published after the message's last bump starts NULL.
+    ///
+    /// It walks `idx_bodyAsset_lruSize` in access order and stops as soon as it has enough
+    /// (ios#1382), instead of aggregating and sorting every message that has assets. A row that
+    /// is not its message's most recent access is passed over: the message is met again at that
+    /// later row, which is its place. Each message's totals come from one `headerId` lookup, so the
+    /// order is exactly the aggregate's, with no value kept outside the rows. Messages whose
+    /// assets add up to 0 bytes are skipped, as before: dropping them reclaims nothing.
+    static func evictionVictims(coveringBytes bytes: Int64, limit: Int) -> [VictimSummary] {
+        guard bytes > 0, limit > 0, let queue = manifestQueue() else { return [] }
         do {
             return try queue.read { db in
-                let rows = try Row.fetchAll(
-                    db,
-                    sql: """
-                    SELECT headerId,
-                           SUM(sizeBytes) AS totalBytes,
-                           SUM(CASE WHEN kind = 0 THEN 1 ELSE 0 END) AS inlineCount
-                    FROM bodyAsset
-                    GROUP BY headerId
-                    HAVING totalBytes > 0
-                    ORDER BY MAX(COALESCE(lastAccessedAt, 0)) ASC
-                    LIMIT ?
-                    """,
-                    arguments: [limit]
+                var totals: [ContentKey: (victim: VictimSummary, lastAccess: Int64)] = [:]
+                var decided = Set<ContentKey>()
+                var victims: [VictimSummary] = []
+                var covered: Int64 = 0
+                let walk = try Row.fetchCursor(
+                    db, sql: "SELECT headerId, lastAccessedAt FROM bodyAsset ORDER BY lastAccessedAt"
                 )
-                return rows.map {
-                    VictimSummary(
-                        contentKey: $0["headerId"],
-                        totalBytes: $0["totalBytes"],
-                        inlineCount: $0["inlineCount"]
-                    )
+                while let row = try walk.next() {
+                    let contentKey: ContentKey = row["headerId"]
+                    guard !decided.contains(contentKey) else { continue }
+                    let rowAccess: Int64 = row["lastAccessedAt"] ?? 0
+                    let message: (victim: VictimSummary, lastAccess: Int64)
+                    if let known = totals[contentKey] {
+                        message = known
+                    } else {
+                        guard let summary = try Row.fetchOne(
+                            db,
+                            sql: """
+                            SELECT COALESCE(SUM(sizeBytes), 0) AS totalBytes,
+                                   COALESCE(SUM(CASE WHEN kind = 0 THEN 1 ELSE 0 END), 0) AS inlineCount,
+                                   MAX(COALESCE(lastAccessedAt, 0)) AS lastAccess
+                            FROM bodyAsset WHERE headerId = ?
+                            """,
+                            arguments: [contentKey]
+                        ) else { continue }
+                        message = (
+                            VictimSummary(
+                                contentKey: contentKey,
+                                totalBytes: summary["totalBytes"],
+                                inlineCount: summary["inlineCount"]
+                            ),
+                            summary["lastAccess"] ?? 0
+                        )
+                        totals[contentKey] = message
+                    }
+                    guard rowAccess >= message.lastAccess else { continue }
+                    decided.insert(contentKey)
+                    guard message.victim.totalBytes > 0 else { continue }
+                    victims.append(message.victim)
+                    covered += message.victim.totalBytes
+                    if covered >= bytes || victims.count >= limit { break }
                 }
+                return victims
             }
         } catch {
             #if DEBUG
-            print("[BodyAssetStore] oldestAccessedMessages failed: \(error)")
+            print("[BodyAssetStore] evictionVictims failed: \(error)")
             #endif
             return []
         }
@@ -1378,27 +1426,7 @@ enum BodyAssetStore {
 
     static func _makeTestQueue() throws -> DatabaseQueue {
         let queue = try DatabaseQueue()
-        try queue.write { db in
-            try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS bodyAsset (
-                    id                TEXT PRIMARY KEY,
-                    headerId          TEXT NOT NULL,
-                    kind              INTEGER NOT NULL,
-                    contentId         TEXT,
-                    attachmentSection TEXT,
-                    contentType       TEXT NOT NULL,
-                    sizeBytes         INTEGER NOT NULL,
-                    createdAt         INTEGER NOT NULL,
-                    lastAccessedAt    INTEGER,
-                    identityStamp     TEXT
-                )
-                """)
-            try migratePreparationSchema(db)
-            try migrateAttachmentIdentitySchema(db)
-            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_header ON bodyAsset (headerId)")
-            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_lru ON bodyAsset (lastAccessedAt)")
-            try db.execute(sql: "CREATE INDEX IF NOT EXISTS idx_bodyAsset_attachmentLookup ON bodyAsset (headerId, kind, attachmentSection)")
-        }
+        try queue.write { db in try migrateManifestSchema(db) }
         return queue
     }
 
