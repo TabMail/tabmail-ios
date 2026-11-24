@@ -1099,8 +1099,18 @@ struct GmailCatchUpTests {
     /// What breaks the rule in `sql`'s plan: a scan, a sort of everything the seek
     /// admits, or a plan without the exact seek of its range. A sort of the last ORDER BY
     /// term only (`messageId` among rows of one date) is not a sort of the folder.
+    ///
+    /// Planned on a fresh connection, never a pool reader: a connection loads
+    /// `sqlite_stat1` when it loads the schema, and `ANALYZE` does not move
+    /// `schema_version` once that table exists, so a pool reader that read before the
+    /// caller's `ANALYZE` would plan the analyzed case with the statistics it loaded
+    /// earlier.
     private static func rangeReadViolations(_ sql: String, later: Bool, in pool: DatabasePool) throws -> [String] {
-        let plan = try pool.read { db in
+        var configuration = Configuration()
+        configuration.readonly = true
+        let fresh = try DatabaseQueue(path: pool.path, configuration: configuration)
+        defer { try? fresh.close() }
+        let plan = try fresh.read { db in
             try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).map { $0["detail"] as String }
         }
         var broken = plan.filter { $0.hasPrefix("SCAN ") || $0.contains("USE TEMP B-TREE FOR ORDER BY") }
