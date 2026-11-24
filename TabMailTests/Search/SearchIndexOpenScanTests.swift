@@ -18,7 +18,8 @@ import Synchronization
 ///
 /// EVERY recorded statement is classified (`violation(of:)`), none is skipped: a statement that can read rows
 /// (`SELECT`, `WITH`, `INSERT`, `UPDATE`, `DELETE`, `REPLACE`) is planned with `EXPLAIN QUERY PLAN` on a separate
-/// connection, and only the schema and an FTS shard's settings table may be scanned; transaction control and
+/// connection, and only the schema and an FTS shard's settings table may be read, by a `SCAN` or a `SEARCH` line
+/// (an open-ended index or rowid range is a whole-table read that plans as `SEARCH`); transaction control and
 /// settings pragmas are allowed by name; schema statements are allowed only when they read no rows (an index that
 /// already exists, a new empty table); anything else (`ANALYZE`, `VACUUM`, `ALTER`, an unlisted pragma) fails.
 /// The negative controls run statements that do scan through the same classification, so the check cannot pass by
@@ -133,8 +134,8 @@ struct SearchIndexOpenScanTests {
                 return "DELETE with no WHERE empties a whole table: \(sql)"
             }
             do {
-                let scanned = try scannedTables(sql, in: probe)
-                return scanned.isEmpty ? nil : "scans \(scanned): \(sql)"
+                let read = try readTables(sql, in: probe)
+                return read.isEmpty ? nil : "reads \(read): \(sql)"
             } catch {
                 return "could not plan (\(error)): \(sql)"
             }
@@ -143,15 +144,25 @@ struct SearchIndexOpenScanTests {
         return "\(verb) is not allowed when an existing index opens: \(sql)"
     }
 
-    /// The tables, other than schema-sized ones, that a SCAN line of `sql`'s plan reads.
-    private static func scannedTables(_ sql: String, in probe: DatabaseQueue) throws -> [String] {
+    /// The tables, other than schema-sized ones, that a `SCAN` or `SEARCH` line of `sql`'s plan reads. A plan names
+    /// a table with its schema (`main.x`) when the statement does, as FTS5's own settings read does.
+    private static func readTables(_ sql: String, in probe: DatabaseQueue) throws -> [String] {
         try probe.inDatabase { db in
             try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).compactMap { row -> String? in
                 let detail: String = row["detail"]
-                guard detail.hasPrefix("SCAN ") else { return nil }
-                var rest = detail.dropFirst("SCAN ".count)
+                var rest: Substring
+                if detail.hasPrefix("SCAN ") {
+                    rest = detail.dropFirst("SCAN ".count)
+                } else if detail.hasPrefix("SEARCH ") {
+                    rest = detail.dropFirst("SEARCH ".count)
+                } else {
+                    return nil
+                }
                 if rest.hasPrefix("TABLE ") { rest = rest.dropFirst("TABLE ".count) }
-                let table = rest.split(separator: " ").first.map(String.init) ?? ""
+                var table = rest.split(separator: " ").first.map(String.init) ?? ""
+                for schema in ["main.", "temp."] where table.hasPrefix(schema) {
+                    table = String(table.dropFirst(schema.count))
+                }
                 if table.hasPrefix("(") || table == "CONSTANT" || isSchemaSized(table) { return nil }
                 return table
             }
@@ -200,11 +211,14 @@ struct SearchIndexOpenScanTests {
         try await index.initialize()
         let opened = tape.all
 
-        // The open took the path of a database with mail: it found the shard by name and read its columns.
+        // The open took the path of a database with mail: it found the shard by name and read its columns. The
+        // tokenizer check runs only on a reader connection, so the trace also covered the readers.
         let foundTheShards = opened.contains { $0.contains("messages\\_fts\\_") }
         let readTheShard = opened.contains { $0.contains("table_info(messages_fts_") }
+        let tracedAReader = opened.contains { $0.contains("SELECT name, sql FROM sqlite_master") }
         #expect(foundTheShards, "precondition: the trace recorded the shard lookup (\(opened))")
         #expect(readTheShard, "precondition: the open read the seeded shard's columns (\(opened))")
+        #expect(tracedAReader, "precondition: the trace recorded the readers' tokenizer check (\(opened))")
 
         var broken: [String] = []
         for sql in opened {
@@ -227,6 +241,9 @@ struct SearchIndexOpenScanTests {
 
     @Test("Negative controls: statements that read the mail fail the same classification", arguments: [
         "SELECT COUNT(*) FROM message_meta",
+        "SELECT * FROM main.message_meta",
+        "SELECT COUNT(*) FROM message_meta WHERE shardYear > 0",
+        "SELECT COUNT(*) FROM message_meta WHERE rowid > 0",
         "/* diagnostic */ SELECT COUNT(*) FROM message_meta",
         "-- diagnostic\nSELECT COUNT(*) FROM message_meta",
         "UPDATE message_meta SET headerId = headerId WHERE length(headerId) < 0",
@@ -268,6 +285,28 @@ struct SearchIndexOpenScanTests {
 
         let why = Self.violation(of: sql, existing: existing, in: probe)
         #expect(why == nil, "the classification refused a statement that reads no mail: \(why ?? "")")
+        try probe.close()
+    }
+
+    /// FTS5 reads a shard's settings table when it opens the shard, naming it with its schema, and SQLite traces that
+    /// read as a statement of its own. Its plan line reads `SCAN main.messages_fts_<year>_config`.
+    @Test("Positive control: FTS5's read of a shard's settings table, schema-qualified, passes the classification")
+    func shardSettingsReadPasses() async throws {
+        let directory = try await Self.makeExistingIndexDatabase()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let probe = try DatabaseQueue(path: directory.appendingPathComponent("fts.db").path)
+        let existing = try Self.schemaObjects(in: probe)
+        let year = Calendar(identifier: .gregorian).dateComponents(in: TimeZone(identifier: "UTC")!, from: Date()).year
+        let shardYear = try #require(year)
+
+        for sql in [
+            "SELECT k, v FROM 'main'.'messages_fts_\(shardYear)_config'",
+            "SELECT k, v FROM main.messages_fts_\(shardYear)_config",
+            "SELECT k, v FROM messages_fts_\(shardYear)_config",
+        ] {
+            let why = Self.violation(of: sql, existing: existing, in: probe)
+            #expect(why == nil, "the classification refused FTS5's settings read: \(why ?? "")")
+        }
         try probe.close()
     }
 }
