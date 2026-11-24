@@ -458,9 +458,11 @@ actor SyncEngine {
     /// overload instead — which has no tier at all and holds SQLite's single writer
     /// ahead of every queued `.priority` write. (This sentence read *"ONLY because
     /// its last step is"* while `ANALYZE` was the only deferred step;
-    /// `runBuildDeferredIndexesIfMissing` joined it on 2026-08-06.) Every other step
-    /// here is unchanged and still synchronous. Both callers already run inside
-    /// detached tasks, so this adds no new concurrency.
+    /// `runBuildDeferredIndexesIfMissing` joined it on 2026-08-06.) The AI cache
+    /// expiry is async as well, only so it can await a WAL checkpoint between its
+    /// batches; its reads and writes stay synchronous. Every other step here is
+    /// unchanged and still synchronous. Both callers already run inside detached
+    /// tasks, so this adds no new concurrency.
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
         includePrune: Bool,
@@ -543,10 +545,16 @@ actor SyncEngine {
     /// merge / a user action can't inherit a checkpoint stall (the ~1-2s "tic"). Hanging it
     /// off the constantly-running backfill — not just the sparse per-poll maintenance, which
     /// ran 0x in a 44-min capture — is what bounds the WAL reliably.
+    ///
+    /// A TRUNCATE is never throttled. Its one caller, the end of the foreground poll's
+    /// maintenance pass, asks for it once per pass, and the batch writers checkpoint
+    /// PASSIVE all the time: the AI cache expiry in that same pass checkpoints after
+    /// every batch, moments before. Throttled, the TRUNCATE would lose its turn to that
+    /// PASSIVE checkpoint, and the WAL file would keep its full size until a later pass.
     nonisolated static func checkpointWALThrottled(truncate: Bool = false) async {
         let now = CFAbsoluteTimeGetCurrent()
         let go = walCheckpointState.withLock { last -> Bool in
-            guard now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
+            guard truncate || now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
             last = now
             return true
         }

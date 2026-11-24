@@ -34,6 +34,8 @@ enum AICacheExpiryStatistics: String, CaseIterable, Sendable {
 ///   next run;
 /// - the AI queue runs it once its work is done, and no other cache upkeep;
 /// - an entry whose stored results no longer decode is expired like any other;
+/// - it checkpoints the app's WAL after each batch it commits, and the TRUNCATE the
+///   maintenance pass asks for right after a run still empties the WAL file;
 /// - every statement it runs reads through an index, whatever the statistics (ADR-IOS-029).
 @Suite("AI cache expiry")
 struct AICacheExpiryTests {
@@ -151,12 +153,12 @@ struct AICacheExpiryTests {
         let tape: SQLTape
     }
 
-    private func makeEnv() throws -> Env {
+    private func makeEnv(configuration base: Configuration = Configuration()) throws -> Env {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ai-cache-expiry-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let tape = SQLTape()
-        var configuration = Configuration()
+        var configuration = base
         configuration.foreignKeysEnabled = true
         configuration.prepareDatabase { db in
             let onWriter = !db.configuration.readonly
@@ -227,7 +229,8 @@ struct AICacheExpiryTests {
 
     /// One run of the expiry. Its WAL checkpoint is a no-op here: the real one acts on
     /// the app's own database, not on this test's (`eachBatchIsFollowedByACheckpoint`
-    /// checks where the run calls it).
+    /// checks where the run calls it, `expiryCheckpointsTheAppDatabase` runs the real one
+    /// with a test database installed as the app's).
     private func purge(_ env: Env) async {
         await SyncEngine.runPurgeExpiredAICache(dbPool: pool(env), checkpointWAL: {})
     }
@@ -272,7 +275,7 @@ struct AICacheExpiryTests {
         let recentClock = try #require(after[recentKey], "an entry inside the TTL was deleted")
         let recentDrift = abs(recentClock.timeIntervalSince(fresh))
         #expect(recentDrift < 0.002, "an entry inside the TTL was rewritten")
-        let kept = try env.pool.read { try MessageAICache.fetchOne($0, key: inboxKey) }
+        let kept = try await env.pool.read { try MessageAICache.fetchOne($0, key: inboxKey) }
         #expect(kept?.summaryBlurb == "summary", "a kept entry lost its summary")
         #expect(kept?.actionTag == .reply, "a kept entry lost its action")
     }
@@ -336,7 +339,7 @@ struct AICacheExpiryTests {
         let key = try #require(MessageAICache.cacheKey(accountId: Self.accountId, folderPath: "INBOX", rfc822MessageId: rfc))
         try insertEntry(env, rfc: nil, key: key, updatedAt: expired)
 
-        try env.pool.write { db in
+        try await env.pool.write { db in
             try MessageAICache.writeThrough(
                 accountId: Self.accountId, folderPath: "INBOX", rfc822MessageId: rfc,
                 cachedReply: "a reply", db: db)
@@ -345,7 +348,7 @@ struct AICacheExpiryTests {
         }
         await purge(env)
 
-        let after = try env.pool.read { try MessageAICache.fetchOne($0, key: key) }
+        let after = try await env.pool.read { try MessageAICache.fetchOne($0, key: key) }
         #expect(after?.rfc822MessageId == rfc, "the write-through left the entry without a Message-ID")
         #expect(after?.cachedReply == "a reply", "the entry of a message in the inbox was deleted")
     }
@@ -392,7 +395,7 @@ struct AICacheExpiryTests {
         }
         let limit = cutoff
         let counter = CacheWritesPerCommit()
-        try env.pool.write { $0.add(transactionObserver: counter, extent: .databaseLifetime) }
+        try await env.pool.write { $0.add(transactionObserver: counter, extent: .databaseLifetime) }
 
         await purge(env)
 
@@ -427,14 +430,14 @@ struct AICacheExpiryTests {
             if !copy.isInInbox { archived.append((rfc: copy.rfc, key: key)) }
         }
         let writer = WriteAfterFirstBatch(pool: env.pool, candidates: archived, limit: cutoff)
-        try env.pool.write { $0.add(transactionObserver: writer, extent: .databaseLifetime) }
+        try await env.pool.write { $0.add(transactionObserver: writer, extent: .databaseLifetime) }
 
         await purge(env)
 
         let outcome = writer.outcome
         #expect(outcome.failure == nil, "the write between batches failed: \(outcome.failure ?? "")")
         let rewritten = try #require(outcome.rewritten, "no archived entry was left after the first batch")
-        let after = try env.pool.read { try MessageAICache.fetchAll($0) }
+        let after = try await env.pool.read { try MessageAICache.fetchAll($0) }
         let kept = after.first { $0.key == rewritten }
         #expect(kept?.summaryBlurb == "rewritten", "the run deleted an entry written after its first batch")
         let left = Set(after.map { $0.key })
@@ -513,7 +516,7 @@ struct AICacheExpiryTests {
             try insertEntry(env, rfc: copy.rfc, updatedAt: expired.addingTimeInterval(-Double(i)))
         }
         let counter = CacheWritesPerCommit()
-        try env.pool.write { $0.add(transactionObserver: counter, extent: .databaseLifetime) }
+        try await env.pool.write { $0.add(transactionObserver: counter, extent: .databaseLifetime) }
         let log = CheckpointLog()
 
         await SyncEngine.runPurgeExpiredAICache(dbPool: pool(env), checkpointWAL: {
@@ -545,20 +548,22 @@ struct AICacheExpiryTests {
         // Fewer entries than one batch, so the run is one batch. Deleting the second
         // archived entry fails, once.
         let failing = keys[3]
-        try env.pool.write { db in
+        try await env.pool.write { db in
             try db.execute(sql: """
                 CREATE TEMP TRIGGER failExpiry BEFORE DELETE ON messageAICache
                 WHEN OLD.key = '\(failing)' BEGIN SELECT RAISE(ABORT, 'injected'); END
                 """)
         }
 
-        await purge(env)
+        let checkpoints = CheckpointLog()
+        await SyncEngine.runPurgeExpiredAICache(dbPool: pool(env), checkpointWAL: { checkpoints.record(0) })
 
         let afterFailure = try entries(env)
         #expect(Set(afterFailure.keys) == Set(keys), "the failed batch deleted entries")
+        #expect(checkpoints.all.isEmpty, "the run checkpointed after a batch that failed: \(checkpoints.all.count)")
         #expect(afterFailure.values.allSatisfy { $0 < limit }, "the failed batch restarted clocks")
 
-        try env.pool.write { try $0.execute(sql: "DROP TRIGGER temp.failExpiry") }
+        try await env.pool.write { try $0.execute(sql: "DROP TRIGGER temp.failExpiry") }
         await purge(env)
 
         let after = try entries(env)
@@ -583,7 +588,7 @@ struct AICacheExpiryTests {
         let brokenKey = try #require(MessageAICache.cacheKey(
             accountId: Self.accountId, folderPath: "INBOX", rfc822MessageId: "broken@example.com"))
         let oldest = expired.addingTimeInterval(-60)
-        try env.pool.write { db in
+        try await env.pool.write { db in
             try db.execute(sql: """
                 INSERT INTO messageAICache (key, rfc822MessageId, actionTag, updatedAt)
                 VALUES (?, ?, 'not-an-action', ?)
@@ -593,7 +598,7 @@ struct AICacheExpiryTests {
 
         await purge(env)
 
-        let left = try env.pool.read { try String.fetchAll($0, sql: "SELECT key FROM messageAICache") }
+        let left = try await env.pool.read { try String.fetchAll($0, sql: "SELECT key FROM messageAICache") }
         #expect(!left.contains(brokenKey), "the undecodable entry outlived the TTL")
         #expect(!left.contains(plainKey), "an undecodable entry stopped the expiry of the others")
     }
@@ -621,6 +626,61 @@ struct AICacheExpiryTests {
         #expect(inboxClock > cutoff, "maintenance deleted an inbox message's entry or left it expired")
     }
 
+    /// The size of the file at `path`, in bytes.
+    private func fileSize(_ path: String) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        return (attributes[.size] as? NSNumber)?.intValue ?? -1
+    }
+
+    /// The expiry's real WAL checkpoint, end to end, on a database configured as the
+    /// app's (SQLite's own checkpoint off) and installed as the app's database. A run
+    /// checkpoints that database after a batch it committed, and the TRUNCATE the
+    /// foreground maintenance pass asks for right after the run still empties the WAL
+    /// file, although the run's last PASSIVE checkpoint was a moment before it.
+    @Test("The expiry checkpoints the app's database, and the maintenance pass's TRUNCATE right after it still runs", .processGlobalState)
+    func expiryCheckpointsTheAppDatabase() async throws {
+        let env = try makeEnv(configuration: AppDatabase.makeConfiguration())
+        defer { finish(env) }
+        let total = SyncConfig.pruneChunkSize * 2 + 10
+        var copies: [Copy] = []
+        for i in 0..<total {
+            copies.append(Copy(uid: "\(i + 1)", folderPath: i % 2 == 0 ? "INBOX" : "Archive", rfc: "k\(i)@example.com"))
+        }
+        try insert(env, copies: copies)
+        for (i, copy) in copies.enumerated() {
+            try insertEntry(env, rfc: copy.rfc, updatedAt: expired.addingTimeInterval(-Double(i)))
+        }
+        let appDatabase = try AppDatabase(dbPool: env.pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current
+            current = appDatabase
+            return prev
+        }
+        defer { AppDatabase.shared.withLock { $0 = previous } }
+        // A checkpoint another test took a moment ago would hold the throttle's window.
+        try await Task.sleep(for: .seconds(SyncConfig.walCheckpointMinIntervalSeconds))
+        _ = env.tape.drain()
+
+        await SyncEngine.runPurgeExpiredAICache(dbPool: AppDatabase.backgroundPool)
+
+        let writer = env.tape.drainWithConnection().filter { $0.onWriter }.map { $0.sql }
+        let firstChange = writer.firstIndex {
+            $0.hasPrefix("UPDATE messageAICache") || $0.hasPrefix("DELETE FROM messageAICache")
+        }
+        let change = try #require(firstChange, "the run changed no entry")
+        let checkpointed = writer[change...].contains { $0.contains("wal_checkpoint(PASSIVE)") }
+        let checkpoints = writer.filter { $0.contains("wal_checkpoint") }
+        #expect(checkpointed, "no checkpoint of the app's database after a batch: \(checkpoints)")
+        let walPath = env.pool.path + "-wal"
+        let walBefore = try fileSize(walPath)
+        #expect(walBefore > 0, "the WAL file was already empty, so the TRUNCATE below proves nothing")
+
+        await SyncEngine.checkpointWALThrottled(truncate: true)
+
+        let walAfter = try fileSize(walPath)
+        #expect(walAfter == 0, "the TRUNCATE right after the run left the WAL file at \(walAfter) bytes")
+    }
+
     // MARK: - How it reads
 
     /// A statement that reads or writes a mail-sized table, however GRDB or the source
@@ -644,13 +704,13 @@ struct AICacheExpiryTests {
         try insert(env, copies: [Copy(uid: "1", folderPath: "Archive", rfc: "archived@example.com")])
         try insertEntry(env, rfc: "archived@example.com", updatedAt: expired)
         if statistics == .staleSmall {
-            try env.pool.write { try $0.execute(sql: "ANALYZE") }
+            try await env.pool.write { try $0.execute(sql: "ANALYZE") }
         }
         try insert(env, copies: (2...40).map { Copy(uid: "\($0)", folderPath: $0 == 2 ? "INBOX" : "Archive", rfc: "m\($0)@example.com") })
         for uid in 2...40 {
             try insertEntry(env, rfc: "m\(uid)@example.com", updatedAt: uid == 2 ? expired : Date())
         }
-        try env.pool.write { db in
+        try await env.pool.write { db in
             switch statistics {
             case .none:
                 if try db.tableExists("sqlite_stat1") {
@@ -668,7 +728,7 @@ struct AICacheExpiryTests {
         await purge(env)
 
         let statements = env.tape.drain().filter(Self.touchesMailTables)
-        let planned = try env.pool.read { db in
+        let planned = try await env.pool.read { db in
             try statements.map { (sql: $0, plan: try Self.plan(db, $0)) }
         }
         let scans = planned.filter { $0.plan.contains("SCAN messageAICache") || $0.plan.contains("SCAN messageHeader") }.map { "\($0.sql) -> \($0.plan)" }
@@ -700,7 +760,7 @@ struct AICacheExpiryTests {
 
         // Instrument check: the same reads with their index hint taken away scan, so the
         // assertions above can fail.
-        let unhinted = try env.pool.read { db in
+        let unhinted = try await env.pool.read { db in
             try (counts + batches + inboxChecks).map { read in
                 try Self.plan(db, read.sql
                     .replacingOccurrences(of: "INDEXED BY messageAICache_expiry", with: "NOT INDEXED")

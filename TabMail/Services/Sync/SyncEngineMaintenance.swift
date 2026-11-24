@@ -386,35 +386,14 @@ extension SyncEngine {
         let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: now) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
 
-        let count = (try? dbPool.read { db in
-            try Int.fetchOne(db, sql: aiCacheExpiredCountSQL, arguments: [cutoff]) ?? 0
-        }) ?? 0
+        let count = expiredAICacheCount(dbPool: dbPool, cutoff: cutoff)
         guard count > 0 else { return }
 
         var purged = 0
         var rescued = 0
         while true {
             do {
-                let batchResult = try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
-                    let batch = try Row.fetchAll(db, sql: aiCacheExpiredBatchSQL, arguments: [cutoff, chunkSize])
-                    guard !batch.isEmpty else { return (0, 0, true) }
-
-                    var batchPurged = 0
-                    var batchRescued = 0
-                    for row in batch {
-                        let key: String = row["key"]
-                        let rfc822MessageId: String? = row["rfc822MessageId"]
-                        if let msgId = rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty,
-                           try Bool.fetchOne(db, sql: aiCacheInInboxSQL, arguments: [msgId]) == true {
-                            try db.execute(sql: "UPDATE messageAICache SET updatedAt = ? WHERE key = ?", arguments: [now, key])
-                            batchRescued += 1
-                            continue
-                        }
-                        try db.execute(sql: "DELETE FROM messageAICache WHERE key = ?", arguments: [key])
-                        batchPurged += 1
-                    }
-                    return (batchPurged, batchRescued, false)
-                }
+                let batchResult = try expireAICacheBatch(dbPool: dbPool, now: now, cutoff: cutoff, chunkSize: chunkSize)
                 if batchResult.batchEmpty { break }
                 purged += batchResult.purged
                 rescued += batchResult.rescued
@@ -426,6 +405,47 @@ extension SyncEngine {
         }
         if purged > 0 || rescued > 0 {
             BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) expired entries, rescued \(rescued) still-in-inbox (TTL=\(SyncConfig.aiCacheTTLDays)d)")
+        }
+    }
+
+    // The purge's database steps are synchronous functions on purpose. Called straight
+    // from the async run, `dbPool.read` and `dbPool.write` would bind
+    // `PrioritizedDatabase`'s async overloads, which merge the extension's staged rows
+    // before a read and queue a write behind the priority tiers. From here they are the
+    // pass-through calls the purge has always made.
+
+    /// How many AI cache entries are older than `cutoff`; 0 when the read fails.
+    private nonisolated static func expiredAICacheCount(dbPool: PrioritizedDatabase, cutoff: Date) -> Int {
+        (try? dbPool.read { db in
+            try Int.fetchOne(db, sql: aiCacheExpiredCountSQL, arguments: [cutoff]) ?? 0
+        }) ?? 0
+    }
+
+    /// One batch of the purge, read and handled in one write transaction: up to
+    /// `chunkSize` expired entries, each deleted or, when its message is in an inbox,
+    /// kept with `updatedAt = now`. `batchEmpty` when no expired entry was left.
+    private nonisolated static func expireAICacheBatch(
+        dbPool: PrioritizedDatabase, now: Date, cutoff: Date, chunkSize: Int
+    ) throws -> (purged: Int, rescued: Int, batchEmpty: Bool) {
+        return try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
+            let batch = try Row.fetchAll(db, sql: aiCacheExpiredBatchSQL, arguments: [cutoff, chunkSize])
+            guard !batch.isEmpty else { return (0, 0, true) }
+
+            var batchPurged = 0
+            var batchRescued = 0
+            for row in batch {
+                let key: String = row["key"]
+                let rfc822MessageId: String? = row["rfc822MessageId"]
+                if let msgId = rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty,
+                   try Bool.fetchOne(db, sql: aiCacheInInboxSQL, arguments: [msgId]) == true {
+                    try db.execute(sql: "UPDATE messageAICache SET updatedAt = ? WHERE key = ?", arguments: [now, key])
+                    batchRescued += 1
+                    continue
+                }
+                try db.execute(sql: "DELETE FROM messageAICache WHERE key = ?", arguments: [key])
+                batchPurged += 1
+            }
+            return (batchPurged, batchRescued, false)
         }
     }
 
