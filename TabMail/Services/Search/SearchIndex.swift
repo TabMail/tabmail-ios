@@ -818,14 +818,17 @@ actor SearchIndex {
     /// entries are exactly the `message_ids` keys in `accountHeaderIdRange`.
     func documentCountForAccount(accountId: String) throws -> Int {
         guard let dbPool else { return 0 }
-        let range = Self.accountHeaderIdRange(accountId: accountId)
-        return try dbPool.read { db in
-            try Int.fetchOne(
-                db,
-                sql: Self.accountDocumentCountSQL,
-                arguments: [range.lower, range.upper]
-            ) ?? 0
-        }
+        return try dbPool.read { db in try Self.accountDocumentCount(db, accountId: accountId) }
+    }
+
+    /// The read behind `documentCountForAccount`, on a connection to the index's database.
+    nonisolated static func accountDocumentCount(_ db: Database, accountId: String) throws -> Int {
+        let range = accountHeaderIdRange(accountId: accountId)
+        return try Int.fetchOne(
+            db,
+            sql: accountDocumentCountSQL,
+            arguments: [range.lower, range.upper]
+        ) ?? 0
     }
 
     /// Counts one account's `message_ids` entries by a key range on the table's

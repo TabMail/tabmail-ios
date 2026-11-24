@@ -5,6 +5,8 @@
 import Testing
 import Foundation
 import GRDB
+import SQLite3
+import Synchronization
 @testable import TabMail
 
 /// Tests for FTS header record mapping logic used by SyncEngineFTS.
@@ -167,162 +169,271 @@ struct SyncEngineFTSTests {
     }
 }
 
-// MARK: - Bulk Index Query Tests
+// MARK: - Bulk Index Walk Tests
 
-@Suite("SyncEngineFTS - Bulk Index Queries")
+/// The statistics a device may hold when the bulk index walks a folder: none
+/// (before its first `ANALYZE`), stale (taken when the table was nearly empty),
+/// or fresh.
+enum BulkIndexWalkStatistics: String, CaseIterable, Sendable {
+    case none, stale, fresh
+}
+
+/// The bulk index's walk, `SyncEngine.bulkIndexWalk`, run for real on a migrated
+/// on-disk database: which headers it hands on, in what order, and what each page
+/// reads. The fixtures hold only example.com data.
+@Suite("SyncEngineFTS - Bulk Index Walk")
 struct SyncEngineFTSBulkIndexTests {
 
-    /// Pages `folderId` to the end exactly as `bulkIndexIfNeeded` does: the
-    /// production request, and the next cursor from `BulkIndexCursor(after:)`. At
-    /// most `maxPages` pages, so a cursor that stops advancing fails the test
-    /// instead of hanging it.
-    private func pageAll(
-        _ db: DatabaseQueue, folderId: String, limit: Int, maxPages: Int = 50
-    ) throws -> [[String]] {
+    private static let accountId = "acc1"
+    private static let inbox = "acc1:INBOX"
+    private static let sent = "acc1:Sent"
+    /// More pages than any fixture here needs: a walk past it is stuck, not slow.
+    private static let pageCap = 40
+
+    /// Every statement the pool ran, with its bound values inlined so it can be
+    /// planned and run again (`expandedDescription`; see `SearchScopedPageTests.SQLTape`).
+    private final class SQLTape: Sendable {
+        private let statements = Mutex<[String]>([])
+        func record(_ sql: String) { statements.withLock { $0.append(sql) } }
+        @discardableResult
+        func drain() -> [String] {
+            statements.withLock { buffer in
+                let all = buffer
+                buffer = []
+                return all
+            }
+        }
+    }
+
+    private struct Env {
+        let pool: DatabasePool
+        let directory: URL
+        let tape: SQLTape
+        var database: PrioritizedDatabase { PrioritizedDatabase(pool: pool, priority: .background) }
+    }
+
+    private struct WalkPastPageCap: Error {}
+
+    private func makeEnv() throws -> Env {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bulk-index-walk-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let tape = SQLTape()
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        configuration.prepareDatabase { db in
+            db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
+        }
+        let pool = try DatabasePool(
+            path: directory.appendingPathComponent("test.sqlite").path, configuration: configuration)
+        try AppDatabase.runMigrations(on: pool)
+        try pool.write { db in
+            var account = Account(emailAddress: "user@example.com", displayName: "User", provider: .imap)
+            account.id = Self.accountId
+            try account.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: Self.accountId).insert(db)
+            try Folder(name: "Sent", path: "Sent", role: .sent, accountId: Self.accountId).insert(db)
+        }
+        return Env(pool: pool, directory: directory, tape: tape)
+    }
+
+    private func finish(_ env: Env) {
+        TestDatabaseTeardown.closeThenUnlinkNow(pool: env.pool, directory: env.directory)
+    }
+
+    /// Inserts one header per `(messageId, date)`, in order, so each gets a higher
+    /// rowid than the one before it, and returns their ids.
+    @discardableResult
+    private func insert(_ env: Env, folderPath: String, _ entries: [(String, Date)]) throws -> [String] {
+        try env.pool.write { db in
+            try entries.map { messageId, date in
+                let header = MessageHeader(
+                    messageId: messageId, subject: "s", from: "a@example.com",
+                    fromAddress: "a@example.com", to: "user@example.com", date: date,
+                    snippet: "", folderId: "\(Self.accountId):\(folderPath)",
+                    accountId: Self.accountId, folderPath: folderPath,
+                    isInInbox: folderPath == "INBOX")
+                try header.insert(db)
+                return header.id
+            }
+        }
+    }
+
+    /// Runs the production walk and returns the header ids of every page it handed
+    /// on. `afterPage` runs after each page is handed on, before the next is read.
+    private func walk(
+        _ env: Env, folderIds: [String], limit: Int,
+        afterPage: (Int) throws -> Void = { _ in }
+    ) async throws -> (pages: [[String]], finished: Bool) {
         var pages: [[String]] = []
-        var cursor: SyncEngine.BulkIndexCursor?
-        for _ in 0..<maxPages {
-            let after = cursor
-            let page: [MessageHeader] = try db.read { conn in
-                try SyncEngine.bulkIndexPageRequest(folderId: folderId, after: after, limit: limit)
-                    .fetchAll(conn)
-            }
-            guard let next = SyncEngine.BulkIndexCursor(after: page) else { return pages }
-            pages.append(page.map(\.id))
-            cursor = next
+        let finished = try await SyncEngine.bulkIndexWalk(
+            folderIds: folderIds, dbPool: env.database, limit: limit
+        ) { headers, pageNumber in
+            pages.append(headers.map(\.id))
+            guard pageNumber <= Self.pageCap else { throw WalkPastPageCap() }
+            try afterPage(pageNumber)
         }
-        Issue.record("bulk index paging did not reach the end of the folder in \(maxPages) pages")
-        return pages
+        return (pages, finished)
     }
 
-    @Test("Bulk index paging visits every header of the folder once, newest first, ties included")
-    func bulkIndexPagingVisitsEveryHeaderOnce() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
+    /// A whole second, so dates built from it by whole milliseconds keep their order once stored.
+    private func wholeSecondNow() -> Date {
+        Date(timeIntervalSince1970: Date().timeIntervalSince1970.rounded(.down))
+    }
 
-        // Whole seconds, so the stored dates compare equal to the inserted ones.
-        let now = Date(timeIntervalSince1970: (Date().timeIntervalSince1970).rounded(.down))
+    @Test("The walk hands on every header of each folder once, newest first, equal dates across pages included")
+    func walkVisitsEveryHeaderOnce() async throws {
+        let env = try makeEnv()
+        defer { finish(env) }
+        let now = wholeSecondNow()
         let hour: TimeInterval = 3600
-        // Three headers share one date and straddle the boundary between pages 1
-        // and 2 (limit 2); two more share another. Their message ids sort as
-        // strings in a different order than they are inserted ("100" < "30" < "4").
-        let plan: [(messageId: String, date: Date)] = [
+        // INBOX, in insertion order. Three headers share one date and straddle the
+        // first page boundary. "9", "12" and "13" fall in one second; "12" and "13"
+        // share one millisecond and straddle the second page boundary.
+        let inbox = try insert(env, folderPath: "INBOX", [
             ("7", now),
-            ("30", now.addingTimeInterval(-hour)),
-            ("4", now.addingTimeInterval(-hour)),
-            ("100", now.addingTimeInterval(-hour)),
-            ("9", now.addingTimeInterval(-2 * hour)),
-            ("12", now.addingTimeInterval(-2 * hour)),
-            ("5", now.addingTimeInterval(-3 * hour)),
+            ("30", now - hour), ("4", now - hour), ("100", now - hour),
+            ("9", now - 2 * hour + 0.004),
+            ("12", now - 2 * hour + 0.002), ("13", now - 2 * hour + 0.002),
+            ("5", now - 3 * hour),
+        ])
+        // Sent is walked after INBOX and holds a header newer than any in INBOX: a
+        // cursor carried over from INBOX would skip it.
+        let sent = try insert(env, folderPath: "Sent", [
+            ("8", now + hour), ("6", now - 4 * hour), ("2", now - 5 * hour),
+        ])
+
+        let result = try await walk(env, folderIds: [Self.inbox, Self.sent], limit: 3)
+
+        // Newest first; among equal dates, the later insert (the higher rowid) first.
+        let expected: [[String]] = [
+            [inbox[0], inbox[3], inbox[2]],
+            [inbox[1], inbox[4], inbox[6]],
+            [inbox[5], inbox[7]],
+            [sent[0], sent[1], sent[2]],
         ]
-        var inserted: [MessageHeader] = []
-        for entry in plan {
-            let header = try TestDatabase.insertMessageHeader(
-                db, messageId: entry.messageId, date: entry.date, folderId: "acc1:INBOX")
-            inserted.append(header)
+        #expect(result.finished)
+        #expect(result.pages == expected)
+    }
+
+    @Test("Headers deleted or added between pages neither skip nor repeat the rest of the folder")
+    func walkIsNotShiftedByChangesBetweenPages() async throws {
+        let env = try makeEnv()
+        defer { finish(env) }
+        let now = wholeSecondNow()
+        let entries: [(String, Date)] = (0..<6).map { ("\(10 + $0)", now - Double($0) * 60) }
+        let ids = try insert(env, folderPath: "INBOX", entries)
+
+        // After page 1 its first header is deleted: an OFFSET walk would then skip
+        // a header. After page 2 a header newer than all is added: an OFFSET walk
+        // would then read a header twice.
+        let result = try await walk(env, folderIds: [Self.inbox], limit: 2) { pageNumber in
+            switch pageNumber {
+            case 1:
+                try env.pool.write { db in
+                    try db.execute(sql: "DELETE FROM messageHeader WHERE id = ?", arguments: [ids[0]])
+                }
+            case 2:
+                try self.insert(env, folderPath: "INBOX", [("99", now + 60)])
+            default:
+                break
+            }
         }
-        // Another folder's header, newer than all of them, must never appear.
-        let other = try TestDatabase.insertMessageHeader(
-            db, messageId: "8", date: now.addingTimeInterval(hour),
-            folderId: "acc1:Sent", folderPath: "Sent", isInInbox: false)
 
-        // SQLite's BINARY order on `id` is UTF-8 byte order; Swift's `<` on
-        // `String` is not (see `InboxOrdering`).
-        let expected = inserted
-            .sorted { $0.date != $1.date ? $0.date > $1.date : $0.id.utf8.lexicographicallyPrecedes($1.id.utf8) }
-            .map(\.id)
-        let pages = try pageAll(db, folderId: "acc1:INBOX", limit: 2)
-        let visited = pages.flatMap { $0 }
+        #expect(result.finished)
+        #expect(result.pages == [[ids[0], ids[1]], [ids[2], ids[3]], [ids[4], ids[5]]])
+    }
 
-        #expect(visited == expected)
+    @Test(
+        "Every page reads through the folder's date index and costs what the first page costs, inside a long run of equal dates too",
+        arguments: BulkIndexWalkStatistics.allCases)
+    func everyPageReadsOnlyItsOwnRows(statistics: BulkIndexWalkStatistics) async throws {
+        let env = try makeEnv()
+        defer { finish(env) }
+        let now = wholeSecondNow()
+        let tieSize = 2_000
+        let limit = 200
+        let olderCount = 50
+        let day: TimeInterval = 86_400
+
+        let older: [(String, Date)] = (0..<olderCount).map { ("old-\($0)", now - Double($0 + 1) * day) }
+        try insert(env, folderPath: "INBOX", older)
+        if statistics == .stale {
+            try env.pool.write { db in try db.execute(sql: "ANALYZE") }
+        }
+        // A long run of headers that share one date, and a newer folder that a walk
+        // of `messageHeader_date` would read before reaching any of them.
+        let tie: [(String, Date)] = (0..<tieSize).map { ("tie-\($0)", now) }
+        let tieIds = try insert(env, folderPath: "INBOX", tie)
+        let newer: [(String, Date)] = (0..<300).map { ("sent-\($0)", now + 60) }
+        try insert(env, folderPath: "Sent", newer)
+        try env.pool.write { db in
+            switch statistics {
+            case .none:
+                if try db.tableExists("sqlite_stat1") {
+                    try db.execute(sql: "DELETE FROM sqlite_stat1")
+                    try db.execute(sql: "ANALYZE sqlite_master")
+                }
+            case .stale:
+                break
+            case .fresh:
+                try db.execute(sql: "ANALYZE")
+            }
+        }
+
+        env.tape.drain()
+        let result = try await walk(env, folderIds: [Self.inbox], limit: limit)
+        let pageStatements = env.tape.drain().filter { $0.contains("bulkIndexRowID") }
+
+        #expect(result.finished)
+        let visited = result.pages.flatMap { $0 }
+        #expect(visited.count == tieSize + olderCount)
         #expect(Set(visited).count == visited.count)
-        #expect(!visited.contains(other.id))
-        let pageSizes = pages.map(\.count)
-        #expect(pageSizes == [2, 2, 2, 1])
-    }
+        // Every page handed on, then the empty read that ends the folder.
+        #expect(pageStatements.count == result.pages.count + 1)
 
-    @Test("A bulk index page after a cursor seeks the folder's date index at the cursor, with no OFFSET")
-    func bulkIndexPageSeeksAtTheCursor() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "1", folderId: "acc1:INBOX")
-        let cursor = try #require(SyncEngine.BulkIndexCursor(after: [header]))
-
-        // Planned with no statistics: what a device has until its first ANALYZE.
-        let planned: (sql: String, plan: String) = try db.write { conn in
-            if try conn.tableExists("sqlite_stat1") {
-                try conn.execute(sql: "DELETE FROM sqlite_stat1")
-                try conn.execute(sql: "ANALYZE sqlite_master")
+        // Each page statement exactly as it ran, planned and run again on the
+        // writer, which holds this regime's statistics.
+        let measured: [(plan: String, steps: Int32)] = try env.pool.write { db in
+            try pageStatements.map { sql in
+                let plan = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql)
+                    .map { $0["detail"] as String }
+                    .joined(separator: " | ")
+                let statement = try db.makeStatement(sql: sql)
+                let rows = try Row.fetchCursor(statement)
+                while try rows.next() != nil {}
+                return (plan: plan, steps: sqlite3_stmt_status(statement.sqliteStatement, SQLITE_STMTSTATUS_VM_STEP, 0))
             }
-            let statement = try SyncEngine
-                .bulkIndexPageRequest(folderId: "acc1:INBOX", after: cursor, limit: 200)
-                .makePreparedRequest(conn, forSingleResult: false)
-                .statement
-            let plan = try Row.fetchAll(
-                conn, sql: "EXPLAIN QUERY PLAN " + statement.sql, arguments: statement.arguments)
-                .map { $0["detail"] as String }
-                .joined(separator: " | ")
-            return (statement.sql, plan)
+        }
+        // Control: the statement these pages replaced, whose tie-break on `id` is not
+        // in the index, at a cursor in the middle of the run, through the same measure.
+        let middle = tieIds.sorted { $0.utf8.lexicographicallyPrecedes($1.utf8) }[tieSize / 2]
+        let control: Int32 = try env.pool.write { db in
+            let statement = try db.makeStatement(sql: """
+                SELECT * FROM messageHeader
+                WHERE folderId = ? AND date <= ? AND (date < ? OR (date = ? AND id > ?))
+                ORDER BY date DESC, id ASC LIMIT \(limit)
+                """)
+            statement.arguments = [Self.inbox, now, now, now, middle]
+            let rows = try Row.fetchCursor(statement)
+            while try rows.next() != nil {}
+            return sqlite3_stmt_status(statement.sqliteStatement, SQLITE_STMTSTATUS_VM_STEP, 0)
         }
 
-        let seeksAtCursor = planned.plan.contains("messageHeader_folderId_date (folderId=? AND date<?)")
-        #expect(seeksAtCursor, "the page no longer seeks to the cursor's date: \(planned.plan)")
-        #expect(!planned.plan.contains("SCAN"), "the page scans: \(planned.plan)")
-        #expect(!planned.sql.uppercased().contains("OFFSET"), "the page uses OFFSET: \(planned.sql)")
-    }
-
-    @Test("Bulk index iterates each folder separately")
-    func bulkIndexPerFolderIteration() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-
-        // Insert messages into different folders
-        for i in 1...3 {
-            try TestDatabase.insertMessageHeader(
-                db,
-                messageId: "inbox-\(i)",
-                subject: "Inbox \(i)",
-                snippet: "Snippet",
-                folderId: "acc1:INBOX"
-            )
+        guard let first = measured.first else {
+            Issue.record("no page statement was recorded")
+            return
         }
-        for i in 1...2 {
-            try TestDatabase.insertMessageHeader(
-                db,
-                messageId: "sent-\(i)",
-                subject: "Sent \(i)",
-                snippet: "Snippet",
-                folderId: "acc1:Sent"
-            )
+        for (index, page) in measured.enumerated() {
+            let pageNumber = index + 1
+            #expect(page.plan.contains("USING INDEX messageHeader_folderId_date"), "page \(pageNumber): \(page.plan)")
+            #expect(!page.plan.contains("SCAN"), "page \(pageNumber) scans: \(page.plan)")
+            #expect(!page.plan.contains("TEMP B-TREE"), "page \(pageNumber) sorts: \(page.plan)")
+            #expect(page.steps <= 2 * first.steps,
+                    "page \(pageNumber) took \(page.steps) VM steps, the first page \(first.steps)")
         }
-
-        // Fetch folder IDs for the account (same query as bulkIndexIfNeeded)
-        let folderIds: [String] = try db.read { dbConn in
-            try String.fetchAll(dbConn,
-                Folder.select(Column("id")).filter(Column("accountId") == "acc1")
-            )
-        }
-        #expect(folderIds.count == 2)
-
-        // Count messages per folder
-        var counts: [String: Int] = [:]
-        for fi in folderIds {
-            let count = try db.read { dbConn in
-                try MessageHeader.filter(Column("folderId") == fi).fetchCount(dbConn)
-            }
-            counts[fi] = count
-        }
-        #expect(counts["acc1:INBOX"] == 3)
-        #expect(counts["acc1:Sent"] == 2)
-
-        // Verify total
-        let totalCount = counts.values.reduce(0, +)
-        #expect(totalCount == 5)
+        #expect(control > 4 * first.steps,
+                "the measure cannot see a page that re-reads a run of equal dates: \(control) vs \(first.steps)")
     }
 }
 

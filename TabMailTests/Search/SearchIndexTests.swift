@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 // MARK: - Data Struct Tests (no database needed)
@@ -381,35 +382,76 @@ struct SearchIndexCRUDTests {
         try await index.removeMessages(contentKeys: keys)
     }
 
+    /// Statements a connection ran, with their bound values inlined so each can be
+    /// planned afterwards (`expandedDescription`; see `SearchScopedPageTests.SQLTape`).
+    private final class SQLTape: Sendable {
+        private let statements = Mutex<[String]>([])
+        func record(_ sql: String) { statements.withLock { $0.append(sql) } }
+        func drain() -> [String] {
+            statements.withLock { buffer in
+                let all = buffer
+                buffer = []
+                return all
+            }
+        }
+    }
+
     @Test("documentCountForAccount seeks a two-sided range of the message_ids key; the LIKE form scanned")
     func documentCountForAccountSeeksKeyRange() async throws {
-        _ = try await index.documentCountForAccount(accountId: "test_acct_plan")
-        // The shared index's own database, opened read-only, so the plan is about
-        // the real `message_ids` schema and not a copy of it.
+        // The index is open and holds a known count for the account, so the probe
+        // below reads the database the actor reads, never an absent or stale file.
+        try await index.initialize()
+        let accountId = "test_acct_plan"
+        let ids = ["\(accountId):INBOX:1", "\(accountId):Archive:2"]
+        let keys = ids.map(ContentKey.init(rawValue:))
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let records = ids.enumerated().map { offset, hid in
+            FTSHeaderRecord(contentKey: ContentKey(rawValue: hid), headerId: hid, messageId: "plan\(offset)",
+                            subject: "S", from: "a@example.com", to: "b@example.com", dateMs: nowMs)
+        }
+        try await index.removeMessages(contentKeys: keys)
+        let inserted = try await index.indexHeaders(records)
+        #expect(inserted == ids.count)
+        let actorCount = try await index.documentCountForAccount(accountId: accountId)
+        #expect(actorCount == ids.count)
+
+        // The read behind `documentCountForAccount`, run on a traced read-only
+        // connection to the same database: the statement planned below is the one
+        // that read, with the values it was given.
         let appSupport = try #require(
             FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+        let tape = SQLTape()
         var config = Configuration()
         config.readonly = true
+        config.prepareDatabase { db in
+            db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
+        }
         let queue = try DatabaseQueue(
             path: appSupport.appendingPathComponent("tabmail_fts/fts.db").path, configuration: config)
-        let range = SearchIndex.accountHeaderIdRange(accountId: "test_acct_plan")
-        let plans: (range: String, like: String) = try await queue.read { db in
-            func plan(_ sql: String, _ arguments: StatementArguments) throws -> String {
-                try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
+        let probe: (count: Int, plans: [String], likePlan: String) = try await queue.read { db in
+            _ = tape.drain()
+            let count = try SearchIndex.accountDocumentCount(db, accountId: accountId)
+            let executed = tape.drain().filter { $0.contains("message_ids") }
+            func plan(_ sql: String) throws -> String {
+                try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql)
                     .map { $0["detail"] as String }
                     .joined(separator: " | ")
             }
-            let rangePlan = try plan(SearchIndex.accountDocumentCountSQL, [range.lower, range.upper])
-            let likePlan = try plan("SELECT COUNT(*) FROM message_ids WHERE headerId LIKE ?", ["test_acct_plan:%"])
-            return (rangePlan, likePlan)
+            let plans = try executed.map(plan)
+            // Negative control through the same probe: the LIKE form it replaced.
+            let likePlan = try plan("SELECT COUNT(*) FROM message_ids WHERE headerId LIKE '\(accountId):%'")
+            return (count, plans, likePlan)
         }
+        try await index.removeMessages(contentKeys: keys)
 
-        let seeksRange = plans.range.contains("SEARCH message_ids USING COVERING INDEX")
-            && plans.range.contains("(headerId>? AND headerId<?)")
-        #expect(seeksRange, "the account count no longer seeks its key range: \(plans.range)")
-        #expect(!plans.range.contains("SCAN"), "the account count scans: \(plans.range)")
-        // Negative control through the same probe: the LIKE form it replaced scans.
-        #expect(plans.like.contains("SCAN message_ids"), "the probe cannot see a scan: \(plans.like)")
+        #expect(probe.count == ids.count)
+        #expect(probe.plans.count == 1, "expected one message_ids read, saw \(probe.plans)")
+        let plan = probe.plans.first ?? ""
+        let seeksRange = plan.contains("SEARCH message_ids USING COVERING INDEX")
+            && plan.contains("(headerId>? AND headerId<?)")
+        #expect(seeksRange, "the account count no longer seeks its key range: \(plan)")
+        #expect(!plan.contains("SCAN"), "the account count scans: \(plan)")
+        #expect(probe.likePlan.contains("SCAN message_ids"), "the probe cannot see a scan: \(probe.likePlan)")
     }
 
     @Test("removeMessagesForAccount removes all messages for given account")
