@@ -102,7 +102,11 @@ migration; this only shrank one that no released database ran (main stops at v11
 database that ran the first version converges: its column is filled and its index built with the
 same SQL, so the deferred step finds the index and skips the fill and the build, and building the
 index changed `schema_version`, so the pass still runs `ANALYZE` for it. The trigger SQL is the same
-in both versions.
+in both versions. The index's shape changed later too (decision 3: partial, after the first version
+was built over every header); `CREATE INDEX IF NOT EXISTS` skips a name that exists, so a development
+database that built the earlier, full index keeps it under the same name. That is a harmless leftover,
+like `messageBody_staleEvict` (decision 5): it serves the evict's page as before, and no released or
+TestFlight build created it.
 
 **Proof of need (why a column, triggers and an index):** no existing field says whether a header's
 HTML is cached or when. `bodyComplete` is the search-text pair (ADR-IOS-050) and is set for messages
@@ -115,8 +119,8 @@ from a second flag: it is a pair column on the house pattern for state held else
 returns the header id. The change that makes content keys differ must re-point the triggers at the
 content key the header holds; `HTMLCachePairTests.contentKeysAreHeaderIds` fails that day.
 
-**Write cost:** a body save, re-save or delete also rewrites its header row and moves one entry of the
-new index; a header insert, and a header id change, probe `messageBody` by primary key and, when a
+**Write cost:** a body save, re-save or delete also rewrites its header row and, for a header outside
+the inbox, moves at most one entry of the new index (an inbox header is not in it); a header insert, and a header id change, probe `messageBody` by primary key and, when a
 body is there, read its `fetchedAt` through the body's pages (it is stored after the HTML); a
 whole-table body delete fires the delete trigger per row (SQLite's truncate shortcut is off while a
 trigger exists). Account removal and the full wipe delete the headers first, so their body deletes

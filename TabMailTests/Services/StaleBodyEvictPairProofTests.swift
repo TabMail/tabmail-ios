@@ -1175,7 +1175,7 @@ struct StaleBodyEvictPairProofTests {
             lines.append("  its statements apart, \(migration.fillMs.count) runs each: fill median \(ms(fill.median)) ms (p90 \(ms(fill.p90))); index median \(ms(index.median)) (p90 \(ms(index.p90))); ANALYZE median \(ms(analyze.median)) (p90 \(ms(analyze.p90)))")
             lines.append("  body pages (messageBody and its primary key): \(pagesText(migration.bodyPages)); per MB of them: fill \(perMB(fill.median)) ms, step \(perMB(stepWall.median)) ms")
             lines.append("  after the step \(pagesText(migration.steppedPages)) (+\(migration.steppedPages - migration.migratedPages) over v116); free after dropping messageBody_staleEvict \(pagesText(migration.pairFreePages))")
-            lines.append("  index messageHeader_htmlCachedAt (isInInbox, htmlCachedAt), partial, cached outside the inbox: \(pagesText(migration.pairIndexPages)); (htmlCachedAt) alone, full:\(pagesText(migration.columnOnlyIndexPages)); messageBody_staleEvict (old): \(pagesText(migration.oldIndexPages))")
+            lines.append("  index messageHeader_htmlCachedAt (isInInbox, htmlCachedAt), partial, cached outside the inbox: \(pagesText(migration.pairIndexPages)); (htmlCachedAt) alone, full: \(pagesText(migration.columnOnlyIndexPages)); messageBody_staleEvict (old): \(pagesText(migration.oldIndexPages))")
             lines.append("  the column's fill: \(pagesText(migration.steppedPages - migration.migratedPages - migration.pairIndexPages)) (the step's growth less its index, the statistics table included)")
             lines.append("  headers filled: \(migration.headersFilled); pair mismatches after the fill: \(migration.mismatches)")
             lines.append("")
