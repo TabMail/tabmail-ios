@@ -101,7 +101,13 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-11-20, #1062): unchanged at 6 `open` records.** Adds two
+> **Current tracker census (2026-11-24, #1376): unchanged at 6 `open` records.** Adds two
+> `accepted` records: `IOS-ASSET-003`, the pending-delete worker can delete a moved message's cached
+> assets inside the move's re-key window (tracked by #1410); `IOS-ASSET-004`, three rare extension-side
+> cases leave a staged content key's cached assets unqueued, and an app killed inside a publish between
+> the file move and the commit leaves a store file no row names; harmless leftovers.
+>
+> *Preserved:* **Current tracker census (2026-11-20, #1062): unchanged at 6 `open` records.** Adds two
 > `accepted` records: `IOS-CATCHUP-004`, the IMAP older-mail check loads nothing in a folder whose
 > UIDVALIDITY is not known; `IOS-CATCHUP-005`, a folder with no bookmark whose first UIDNEXT read reports
 > none is listed only up to its last local UID and never settles.
@@ -224,11 +230,13 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 |---|---|---|
 | [IOS-COMPOSE-002](Companion/Process/Current/KnownIssues/Amendments/ios-compose-002.md) | `open` | 🔓 OPEN (2026-08-12) — Gmail interpolates regular `attachment.filename` into two quoted-string parameters unescaped and propagates provider-parsed `attachment.mimeType` without outbound validation. No hostile sender is required: Files import preserves APFS-legal `"`/`\`; outbox send and saved-draft upload both reach the builder. Arbitrary original Content-Type bytes were not proven to survive provider parsing, and a CRLF retained by the persisted-draft metadata splitter has no proven production writer, so MIME header injection remains a lead. Gmail's `alt.mimeType` arm is legacy/model-state capable, not current UI/forward reachable. SwiftMail carries six raw filename and four raw content-type interpolations; two of each are TabMail-reachable, including its calendar route. The proven filename effect is confined to one part's parameter list because controls are refused. DEFERRED as not-minimal; the related SwiftMail residual is tracked separately by the still-open `IOS-IMAP-016` record |
 
-### ASSET (1)
+### ASSET (3)
 
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-ASSET-002](Companion/Process/Current/KnownIssues/Amendments/ios-asset-002.md) | `accepted` | 📋 ACCEPTED LIMITATION (2026-08-12) — P1d binds the `tabmail-asset://` scheme handler to the rendered body's `MessageBody.id`, and the ownership predicate reads the **mutable** `bodyAsset.headerId` column. `AccountManagerQueue` publishes the message-header re-key and the asset-manifest re-key as two steps, so in the window between them a view already rebound to the **destination** `ContentKey` meets rows still carrying the **source** key: every asset request resolves a real row, fails the comparison, and is refused `not-owned`. **Effect: for a moment after archiving or moving a message you had just read, its cached inline images render broken.** No wrong image is ever shown, nothing is deleted, and it self-corrects the instant the manifest re-key lands — or on one ordinary reopen — so it is registered under THE MANTRA rather than mechanised, consistent with ADR-IOS-076 decision 5. ⚠️ **Do NOT "fix" it by widening the predicate** — accepting the source key too re-opens the cross-message read C5 forbids, and re-deriving ownership from the URL's `headerHash` is worse than useless: `rekeyContentKey` preserves the row id and the bytes, so the baked URL keeps the OLD hash forever and a computed hash would reject **every** moved message's images. The correct narrowing is publisher-side ordering. Pinned in both directions by `BodyAssetOwnershipTests.movedMessageAssetsStayServableUnderTheDestinationKey` |
+| [IOS-ASSET-003](Companion/Process/Current/KnownIssues/Amendments/ios-asset-003.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-24, #1376).** A move re-keys the message's header row and queues its old id on `bodyAssetPendingDelete` in one transaction, but re-keys the asset manifest (its own database) only after that commit. If the pending-delete worker reaches the old id inside that window, or the app stops inside it, the moved message's cached inline images and attachments are deleted; the worker's cross-database check has the same gap for a key that comes back to life mid-step. **Effect: rarely, a just-moved message's inline images render broken until its cached body expires and is fetched again; attachments refetch when opened.** Nothing is lost on the server and no other message is affected. The whole-store sweep had the same window. Fix direction (not built): record the new id beside the old one in the re-key transaction. Tracked by #1410 (P4) |
+| [IOS-ASSET-004](Companion/Process/Current/KnownIssues/Amendments/ios-asset-004.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-24, #1376).** The merge queues a pushed message's staged content key wherever it lets the staging row go, but three rare extension-side cases leave it unqueued: an extension killed between publishing inline images and recording the message (the placeholder row carries no folder path), the extension's own identity replacement (IOS-NSE-005), and a late extension run that renders a message again after the merge; and an app killed inside `BodyAssetStore.publish` between the `rename` and the manifest COMMIT leaves a store file no row names. **Effect: none the user can see; cached copies of server content stay on disk, never shown and not growing with use.** "Nuke database" and the image cache wipe remove them |
 
 ### ATTACH (1)
 

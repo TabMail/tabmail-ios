@@ -29,10 +29,151 @@ extension SyncEngine {
     /// non-numeric `messageId` in an IMAP folder would read as 0 and so sort
     /// first, pruned before every UID; no IMAP path writes one.
     nonisolated static func pruneOrderSQL(_ mode: StaleWindowMode) -> String {
+        "\(pruneKeySQL(mode)) ASC"
+    }
+
+    /// The prune order's key, as its index stores it: `messageHeader_folderId_uidInt`
+    /// for `.uid`, `messageHeader_folderId_date` for `.date`. Rows that share a key
+    /// come out of either index in `rowid` order.
+    nonisolated static func pruneKeySQL(_ mode: StaleWindowMode) -> String {
         switch mode {
-        case .uid: return "CAST(messageId AS INTEGER) ASC"
-        case .date: return "date ASC"
+        case .uid: return "CAST(messageId AS INTEGER)"
+        case .date: return "date"
         }
+    }
+
+    /// The last row a body-pass page returned: its prune key as stored (compared
+    /// in the column's own representation, never re-encoded) and its `rowid`.
+    struct PruneCursor: Sendable {
+        let key: DatabaseValue
+        let rowId: Int64
+    }
+
+    /// The rows after the cursor in (prune key, `rowid`) order. On `date` it is the
+    /// row value `(date, rowid) > (?, ?)`, which the index seeks in full, so rows
+    /// that share a date are never read twice. SQLite does not match a row value
+    /// against an indexed expression: `(CAST(messageId AS INTEGER), rowid) > (?, ?)`
+    /// seeks only `folderId` and walks the folder from its start. So on `.uid` it is
+    /// a range on the key, which the index seeks, plus a test of the `rowid` among
+    /// the rows that share the cursor's key: one row in an IMAP folder, whose UIDs
+    /// are unique.
+    private nonisolated static func pruneCursorPredicate(_ mode: StaleWindowMode, afterCursor: Bool) -> String {
+        guard afterCursor else { return "" }
+        switch mode {
+        case .uid:
+            let key = pruneKeySQL(mode)
+            return " AND \(key) >= ? AND (\(key) > ? OR rowid > ?)"
+        case .date:
+            return " AND (date, rowid) > (?, ?)"
+        }
+    }
+
+    /// One body-pass page: the next `limit` rows of a folder after the cursor, in
+    /// the prune order with ties in `rowid` order, as a seek on the order's index
+    /// (#1402). Arguments: `pruneArguments`.
+    nonisolated static func prunePageSQL(_ mode: StaleWindowMode, afterCursor: Bool) -> String {
+        let key = pruneKeySQL(mode)
+        return """
+            SELECT rowid AS pruneRowId, id, \(key) AS pruneKey FROM messageHeader
+            WHERE folderId = ?\(pruneCursorPredicate(mode, afterCursor: afterCursor))
+            ORDER BY \(key), rowid LIMIT ?
+            """
+    }
+
+    /// How many of a folder's rows lie after the cursor (all of them without one),
+    /// counted up to `limit` only: it reads at most `limit` index entries, whatever
+    /// the folder's size (#1402). Arguments: `pruneArguments`.
+    nonisolated static func pruneRemainderSQL(_ mode: StaleWindowMode, afterCursor: Bool) -> String {
+        let key = pruneKeySQL(mode)
+        return """
+            SELECT count(*) FROM (SELECT 1 FROM messageHeader
+            WHERE folderId = ?\(pruneCursorPredicate(mode, afterCursor: afterCursor))
+            ORDER BY \(key), rowid LIMIT ?)
+            """
+    }
+
+    /// `[folderId, limit]` without a cursor; after one, `[folderId, key, key, rowid,
+    /// limit]` on `.uid` and `[folderId, key, rowid, limit]` on `.date`.
+    nonisolated static func pruneArguments(
+        _ mode: StaleWindowMode, folderId: String, cursor: PruneCursor?, limit: Int
+    ) -> StatementArguments {
+        guard let cursor else { return [folderId, limit] }
+        switch mode {
+        case .uid: return [folderId, cursor.key, cursor.key, cursor.rowId, limit]
+        case .date: return [folderId, cursor.key, cursor.rowId, limit]
+        }
+    }
+
+    /// Whether more than `floor` of the folder's rows lie after the cursor (all of
+    /// them without one). It reads at most `floor + 1` index entries. Until #1402
+    /// the prune counted the whole folder for this: once per folder in the body
+    /// pass, and before every chunk of the header pass.
+    nonisolated static func pruneRowsBeyondFloor(
+        _ db: Database, folderId: String, mode: StaleWindowMode, after cursor: PruneCursor?, floor: Int
+    ) throws -> Bool {
+        let counted = try Int.fetchOne(
+            db, sql: pruneRemainderSQL(mode, afterCursor: cursor != nil),
+            arguments: pruneArguments(mode, folderId: folderId, cursor: cursor, limit: floor + 1)) ?? 0
+        return counted > floor
+    }
+
+    /// One folder's body pass: deletes the cached bodies of its rows oldest first
+    /// in the prune order, a page of `chunkSize` rows at a time, while more than
+    /// `floor` rows lie after the last page (`pruneRowsBeyondFloor`) and, asked
+    /// after that, `isOverBudget()` holds. Returns how many bodies it deleted.
+    /// `isOverBudget` is `StorageEstimator.isOverBudget` in the pass; a test passes
+    /// its own to stop after a given number of pages.
+    ///
+    /// A page is the next `chunkSize` rows after a cursor (`prunePageSQL`), a seek
+    /// on the order's index, so it costs the same wherever it lies in the folder,
+    /// and a pass reads each row once (#1402). Until #1402 the page was
+    /// `LIMIT chunkSize OFFSET n` after a full count of the folder: each page
+    /// stepped over every row before it, so a folder of n rows read about
+    /// n² / (2 · chunkSize) index entries. In a folder no other writer changes during
+    /// the pass, the pages, their order and the stops are the same: the rows after
+    /// the cursor are the folder's count less the offset, so "more than `floor` of
+    /// them" is exactly the former `offset < count - floor`, and rows that share a
+    /// key come in `rowid` order, as the index returned them. When sync writes the
+    /// folder meanwhile, the check counts the rows after the cursor as they are then,
+    /// where the former walk kept its start-of-pass count and offset: a row deleted
+    /// before the cursor no longer makes the walk skip rows or run into the floor, a
+    /// row deleted after it stops the pass earlier, a row inserted before it is no
+    /// longer re-read, and a row inserted after it can let the pass prune up to that
+    /// many more older bodies, rounded to pages, each outside the floor when checked.
+    /// A row deleted between a check and its page can still put that page inside the
+    /// floor, as the last page may be; the former walk had the whole pass for that.
+    /// As before, the last page is a whole page even when fewer rows are left above
+    /// the floor, so it can delete the bodies of rows inside the floor.
+    ///
+    /// A read that fails ends the folder's pass, as a failed count or page did.
+    nonisolated static func pruneFolderBodies(
+        dbPool: PrioritizedDatabase, folderId: String, mode: StaleWindowMode,
+        floor: Int, chunkSize: Int, isOverBudget: () -> Bool
+    ) -> Int {
+        var removed = 0
+        var cursor: PruneCursor?
+        while (try? dbPool.read({ db in
+            try pruneRowsBeyondFloor(db, folderId: folderId, mode: mode, after: cursor, floor: floor)
+        })) ?? false, isOverBudget() {
+            let page: [(id: String, cursor: PruneCursor)] = (try? dbPool.read { db in
+                try Row.fetchAll(
+                    db, sql: prunePageSQL(mode, afterCursor: cursor != nil),
+                    arguments: pruneArguments(mode, folderId: folderId, cursor: cursor, limit: chunkSize)
+                ).map { row -> (id: String, cursor: PruneCursor) in
+                    let key: DatabaseValue = row["pruneKey"]
+                    let rowId: Int64 = row["pruneRowId"]
+                    return (id: row["id"], cursor: PruneCursor(key: key, rowId: rowId))
+                }
+            }) ?? []
+            guard let last = page.last else { break }
+            let headerIds = page.map(\.id)
+            let deleted = (try? dbPool.write { db in
+                try MessageBody.filter(headerIds.contains(Column("id"))).deleteAll(db)
+            }) ?? 0
+            removed += deleted
+            cursor = last.cursor
+        }
+        return removed
     }
 
     /// Nonisolated prune — runs entirely off the main thread. `pruneOrder` is each
@@ -68,34 +209,13 @@ extension SyncEngine {
             // An account with no registered provider (it failed to register,
             // e.g. missing credentials) is still pruned, oldest date first as
             // before #1062: no catch-up of it runs to reload what is pruned.
-            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
+            let mode = pruneOrder[account.id] ?? .date
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
-                let totalInFolder = (try? dbPool.read { db in
-                    try MessageHeader.filter(Column("folderId") == folder.id).fetchCount(db)
-                }) ?? 0
-                guard totalInFolder > floor else { continue }
-                let pruneCount = totalInFolder - floor
-
-                var offset = 0
-                while offset < pruneCount, StorageEstimator.isOverBudget() {
-                    let headerIds: [String] = (try? dbPool.read { db in
-                        try String.fetchAll(db,
-                            MessageHeader
-                                .select(Column("id"))
-                                .filter(Column("folderId") == folder.id)
-                                .order(sql: orderSQL)
-                                .limit(pruneChunkSize, offset: offset)
-                        )
-                    }) ?? []
-                    guard !headerIds.isEmpty else { break }
-                    let deleted = (try? dbPool.write { db in
-                        try MessageBody.filter(headerIds.contains(Column("id"))).deleteAll(db)
-                    }) ?? 0
-                    bodiesRemoved += deleted
-                    offset += headerIds.count
-                }
+                bodiesRemoved += pruneFolderBodies(
+                    dbPool: dbPool, folderId: folder.id, mode: mode,
+                    floor: floor, chunkSize: pruneChunkSize, isOverBudget: StorageEstimator.isOverBudget)
             }
         }
         if bodiesRemoved > 0 {
@@ -107,15 +227,19 @@ extension SyncEngine {
             // An account with no registered provider (it failed to register,
             // e.g. missing credentials) is still pruned, oldest date first as
             // before #1062: no catch-up of it runs to reload what is pruned.
-            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
+            let mode = pruneOrder[account.id] ?? .date
+            let orderSQL = pruneOrderSQL(mode)
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
                 while StorageEstimator.isOverBudget() {
-                    let currentCount = (try? dbPool.read { db in
-                        try MessageHeader.filter(Column("folderId") == folder.id).fetchCount(db)
-                    }) ?? 0
-                    guard currentCount > floor else { break }
+                    // At most `floor + 1` index entries, not a count of the whole
+                    // folder before every chunk (#1402). A failed read stops the
+                    // folder, as the count's `?? 0` did.
+                    let beyondFloor = (try? dbPool.read { db in
+                        try pruneRowsBeyondFloor(db, folderId: folder.id, mode: mode, after: nil, floor: floor)
+                    }) ?? false
+                    guard beyondFloor else { break }
                     let batch: [MessageHeader] = (try? dbPool.read { db in
                         try MessageHeader
                             .filter(Column("folderId") == folder.id)
@@ -672,24 +796,25 @@ extension SyncEngine {
     ///
     /// Gmail duplicate-label safety: if the same rfc822MessageId still
     /// exists in inbox, the tag is legitimate (Gmail shows the same
-    /// message in both Inbox and All Mail) and we skip it.
-    func sweepStaleActionTags(account: Account, provider _: any EmailProvider) async {
+    /// message in both Inbox and All Mail) and we skip it. Each candidate
+    /// (a tagged non-inbox row past the TTL with a Message-ID) is checked on
+    /// its own with `inboxCopySQL`, a seek on the Message-ID index; a sweep
+    /// with no candidate reads no inbox row at all (#1404). A check that
+    /// fails keeps that tag; the next full sync's sweep checks it again.
+    ///
+    /// `inboxCopyExists` replaces that check (tests); nil reads `inboxCopySQL`.
+    func sweepStaleActionTags(
+        account: Account,
+        provider _: any EmailProvider,
+        inboxCopyExists: (@Sendable (_ rfc822MessageId: String, _ accountId: String) async throws -> Bool)? = nil
+    ) async {
         let maxPerSweep = SyncConfig.pruneChunkSize
-
-        // Collect inbox rfc822MessageIds for the duplicate-label guard.
-        let inboxRfc822Ids: Set<String> = (try? await dbPool.read { db in
-            let inboxHeaders = try MessageHeader
-                .filter(Column("accountId") == account.id && Column("isInInbox") == true)
-                .limit(SyncConfig.maxLoadedMessages)
-                .fetchAll(db)
-            var ids = Set<String>()
-            for msg in inboxHeaders {
-                if let rfc = msg.rfc822MessageId, !rfc.isEmpty {
-                    ids.insert(rfc)
-                }
+        let pool = dbPool
+        let inboxCopyExists = inboxCopyExists ?? { rfc822MessageId, accountId in
+            try await pool.read { db in
+                try Self.inboxCopyExists(db, rfc822MessageId: rfc822MessageId, accountId: accountId)
             }
-            return ids
-        }) ?? []
+        }
 
         let folders = (try? await dbPool.read { db in
             try Folder.filter(Column("accountId") == account.id && Column("role") != FolderRole.inbox.rawValue).fetchAll(db)
@@ -714,11 +839,6 @@ extension SyncEngine {
             for msg in msgs where msg.actionTag != nil {
                 guard cleared < maxPerSweep else { break }
 
-                // Gmail safety: if this rfc822MessageId is still in inbox, skip.
-                if let rfc = msg.rfc822MessageId, !rfc.isEmpty, inboxRfc822Ids.contains(rfc) {
-                    continue
-                }
-
                 // TTL guard: only reclaim once the tag is older than
                 // SyncConfig.actionTagTTLSeconds. A NULL `actionTagSetAt`
                 // (legacy pre-migration row, or a writer that failed to stamp
@@ -729,6 +849,15 @@ extension SyncEngine {
                 // timestamp is likewise treated as expired (ADR-IOS-008).
                 if let setAt = msg.actionTagSetAt, setAt > cutoff {
                     continue
+                }
+
+                // Gmail safety: if this rfc822MessageId is still in inbox, skip.
+                // Checked after the TTL so a young tag costs no read; a failed
+                // check keeps the tag (fail closed).
+                if let rfc = msg.rfc822MessageId, !rfc.isEmpty {
+                    guard let inInbox = try? await inboxCopyExists(rfc, account.id), !inInbox else {
+                        continue
+                    }
                 }
 
                 // Clear local state — action tags are local-only (ADR-IOS-036),
@@ -752,6 +881,27 @@ extension SyncEngine {
         if cleared > 0 {
             BackgroundSyncLogger.logDebug("[StaleTagSweep] Swept \(cleared) stale tags for \(account.emailAddress)")
         }
+    }
+
+    /// Whether `accountId` has an inbox row with this Message-ID: the stale-tag
+    /// sweep's Gmail duplicate guard, read once per candidate.
+    ///
+    /// It names its index, as `aiCacheInInboxSQL` does, so it always seeks the
+    /// Message-ID (the few copies of one message) whatever the planner statistics
+    /// hold. Left to the planner, the read walks `messageHeader_isInInbox_date`
+    /// (every inbox row of every account) with no statistics, and scans the whole
+    /// table with statistics recorded while `messageHeader` held a row or two (a
+    /// fresh install's first maintenance pass); nothing re-analyzes the table
+    /// while its schema is unchanged. `messageHeader_rfc822MessageId` is built by
+    /// the migrations, never deferred.
+    nonisolated static let inboxCopySQL = """
+        SELECT 1 FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND accountId = ? AND isInInbox = 1
+        LIMIT 1
+        """
+
+    nonisolated static func inboxCopyExists(_ db: Database, rfc822MessageId: String, accountId: String) throws -> Bool {
+        try Int.fetchOne(db, sql: inboxCopySQL, arguments: [rfc822MessageId, accountId]) != nil
     }
 
     // MARK: - Chat Session Eviction
@@ -947,6 +1097,24 @@ extension SyncEngine {
                 CREATE INDEX IF NOT EXISTS messageBody_staleEvict
                 ON messageBody(fetchedAt)
                 """),
+        // #1401: the backfill progress counts (`backfillProgressCounts`) count
+        // `MessageHeader.bodySettledRequest` and `.pendingBodyRequest` for one account
+        // on every progress update. This index holds every column either predicate
+        // tests, so both counts read its entries and never a header row: the pending
+        // count seeks all five columns, the settled count reads the account's entries
+        // and tests its OR in each. No other index has `accountId` with
+        // `bodyEmptyConfirmed` and `bodyMetadataOversized`. It extends v40's
+        // `messageHeader_accountId_bodyComplete` and keeps its prefix, so it serves
+        // every plan that one does; v40's stays (ADR-IOS-029 rules 3 and 4). Deferred:
+        // the build reads every header once, and its absence changes no result, only
+        // how much the counts read.
+        DeferredIndex(
+            name: "messageHeader_backfillProgress",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_backfillProgress
+                ON messageHeader(accountId, bodyComplete, bodyEmptyConfirmed,
+                                 bodyMetadataOversized, headerComplete)
+                """),
         // Serves `SyncEngine.ftsBodyMembershipCandidateSQL`, the start-up search
         // self-check's newest 2,000 complete headers (#1397). With it that read walks
         // this index newest first, takes `id` from it (covering: no table page is read)
@@ -970,7 +1138,7 @@ extension SyncEngine {
                 CREATE INDEX IF NOT EXISTS messageHeader_completeByDate
                 ON messageHeader(date, id)
                 WHERE headerComplete = 1 AND bodyComplete = 1
-                """),
+                """)
     ]
 
     /// The index the stale-body evict step seeks (`deferredIndexes`).
