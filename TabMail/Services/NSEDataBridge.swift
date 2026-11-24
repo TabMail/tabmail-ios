@@ -1390,15 +1390,19 @@ enum NSEDataBridge {
         guard !rows.isEmpty else { return }
         let stagingIds = Set(rows.map(\.id))
         let headerIds = Set(rows.map(\.headerId))
-        do {
-            try await nseDB.write { db in
-                for id in stagingIds {
-                    try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+        // #1376: the staged keys go on the pending-delete list first; if that
+        // write fails the staging rows stay, and the next wake drops them again.
+        if await queueStagedAssetKeys(headerIds) {
+            do {
+                try await nseDB.write { db in
+                    for id in stagingIds {
+                        try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+                    }
                 }
-            }
-        } catch {
-            if !error.isDatabaseSuspensionAbort {
-                BackgroundSyncLogger.logDebug("[NSEDataBridge] Old-epoch staged row delete failed: \(error) — retried next wake (idempotent)")
+            } catch {
+                if !error.isDatabaseSuspensionAbort {
+                    BackgroundSyncLogger.logDebug("[NSEDataBridge] Old-epoch staged row delete failed: \(error) — retried next wake (idempotent)")
+                }
             }
         }
         latestStagedRows.withLock { rowsBox in
@@ -1409,6 +1413,57 @@ enum NSEDataBridge {
         }
         stageMemo.withLock { memo in
             for id in stagingIds { memo.removeValue(forKey: id) }
+        }
+    }
+
+    // MARK: - Staged inline images (#1376)
+    //
+    // The notification extension writes a message's inline images under its
+    // STAGED content key (`ContentKey.forHeader` over the staged account, folder
+    // and provider id, which is `MessageIdentity.headerId`). When the merge lands
+    // the message on a header with a different id (`DurableIdentityLookup.find`
+    // steps 2 and 3), or discards it, no header ever had that key, so no
+    // `messageHeader` trigger (v114) queues it and nothing else would ever name
+    // those assets again. So when the merge is DONE with a staged message, before
+    // its staging row is deleted, its key goes on `bodyAssetPendingDelete`
+    // unless a header holds it (that header's own delete queues it later). The
+    // pending-delete worker then re-keys or deletes the assets. Never for a row
+    // the merge keeps (a gradual row), so the worker cannot run ahead of a later
+    // merge of that row.
+
+    /// The content key the notification extension wrote the staged message's
+    /// inline images under.
+    static func stagedContentKey(_ msg: StagedMessage) -> String {
+        MessageIdentity.headerId(accountId: msg.accountId, folderPath: msg.folderPath, messageId: msg.messageId)
+    }
+
+    /// Inside a main-database write: queue `stagedKey` unless a header holds it.
+    static func queueStagedAssetKey(_ stagedKey: String, db: Database) throws {
+        try db.execute(sql: """
+            INSERT INTO bodyAssetPendingDelete (contentKey)
+            SELECT ? WHERE NOT EXISTS (SELECT 1 FROM messageHeader WHERE id = ?)
+            """, arguments: [stagedKey, stagedKey])
+    }
+
+    /// Before a staging delete made outside the merge's own write transactions:
+    /// queue every key in one write. `false` when that write failed; the caller
+    /// then keeps its staging rows, and the next wake drops them again (both
+    /// steps are idempotent).
+    static func queueStagedAssetKeys(_ stagedKeys: some Collection<String>) async -> Bool {
+        guard !stagedKeys.isEmpty else { return true }
+        let keys = Array(stagedKeys)
+        do {
+            try await AppDatabase.dbPool.write(label: "merge.stagedAssetKeys") { db in
+                for key in keys {
+                    try queueStagedAssetKey(key, db: db)
+                }
+            }
+            return true
+        } catch {
+            if !error.isDatabaseSuspensionAbort {
+                BackgroundSyncLogger.logDebug("[NSEDataBridge] Staged asset-key queue failed: \(error) — staging rows kept, retried next wake")
+            }
+            return false
         }
     }
 
@@ -1649,18 +1704,21 @@ enum NSEDataBridge {
             // enter `writeSet` or `skipSet`.
             processed = processed.filter { !staleStagingIds.contains($0.id) }
 
-            // (b) Delete the stale staging rows directly (no main-GRDB write
-            // involved). Idempotent: a failure just leaves them staged for
+            // (b) Delete the stale staging rows directly, after queueing their
+            // staged asset keys (#1376, see `queueStagedAssetKeys`). Idempotent:
+            // a failure of either step just leaves them staged for
             // re-evaluation (and re-exclusion) next wake.
-            do {
-                try await nseDB.write { db in
-                    for id in staleStagingIds {
-                        try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+            if await Self.queueStagedAssetKeys(staleHeaderIds) {
+                do {
+                    try await nseDB.write { db in
+                        for id in staleStagingIds {
+                            try db.execute(sql: "DELETE FROM nse_processed_message WHERE id = ?", arguments: [id])
+                        }
                     }
-                }
-            } catch {
-                if !error.isDatabaseSuspensionAbort {
-                    BackgroundSyncLogger.logDebug("[NSEDataBridge] Stale-by-move staging delete failed: \(error) — retried next wake (idempotent)")
+                } catch {
+                    if !error.isDatabaseSuspensionAbort {
+                        BackgroundSyncLogger.logDebug("[NSEDataBridge] Stale-by-move staging delete failed: \(error) — retried next wake (idempotent)")
+                    }
                 }
             }
 
@@ -2428,7 +2486,14 @@ enum NSEDataBridge {
                             // main-app AI queue will finish the AI). Recent
                             // aiCompleted=0 rows are KEPT so the next wake merges the
                             // AI stage as the NSE fills it in.
+                            //
+                            // #1376: its staged asset key is queued in this same
+                            // transaction, so the key is on the list exactly when
+                            // the merge that lets the row go commits. A failed
+                            // queue keeps the row; a later wake drops it through
+                            // the skip-set cleanup, which queues it again.
                             if msg.aiCompleted || msg.processedAt < abandonedCutoff {
+                                try Self.queueStagedAssetKey(Self.stagedContentKey(msg), db: db)
                                 localMergedIds.append(msg.id)
                             }
                         } catch is NSERfcMismatchDiscovered {
@@ -2637,10 +2702,13 @@ enum NSEDataBridge {
             // no main-GRDB write involved, so this doesn't reintroduce the
             // writer contention the skip exists to avoid.
             // ============================================================
-            let skipSetDeleteIds = skipSet
-                .filter { $0.aiCompleted || $0.processedAt < abandonedCutoff }
-                .map(\.id)
-            if !skipSetDeleteIds.isEmpty {
+            let skipSetDeletes = skipSet.filter { $0.aiCompleted || $0.processedAt < abandonedCutoff }
+            let skipSetDeleteIds = skipSetDeletes.map(\.id)
+            // #1376: their staged asset keys go on the pending-delete list first
+            // (see `queueStagedAssetKeys`); if that fails the rows stay for the
+            // next wake.
+            if !skipSetDeleteIds.isEmpty,
+               await Self.queueStagedAssetKeys(skipSetDeletes.map(Self.stagedContentKey)) {
                 do {
                     try await nseDB.write { db in
                         for id in skipSetDeleteIds {
