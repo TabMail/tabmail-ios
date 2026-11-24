@@ -35,13 +35,8 @@ struct InboxReadTool: AgentTool, Sendable {
         // Demo boundary (ADR-IOS-038): demo lists ONLY demo rows; normal mode
         // never lists them (real rows are also isInInbox during coexistence).
         let demoActive = DemoModeStore.isDemoActive
-        let (listing, costLine): (Listing, String?) = try await ctx.db.read { db in
-            let meter = ReadCostMeter.start(db)
-            let listing = try Self.readListing(db, pageIndex: pageIndex, demoActive: demoActive, meter: meter)
-            return (listing, meter?.line("InboxReadTool", [
-                "page": listing.page + 1, "pages": listing.totalPages, "rows": listing.rows.count,
-                "total": listing.totalCount, "demo": demoActive ? 1 : 0,
-            ]))
+        let (listing, costLine) = try await ctx.db.read { db in
+            try Self.readListingWithCost(db, pageIndex: pageIndex, demoActive: demoActive)
         }
         if let costLine { ReadCostMeter.log([costLine]) }
         let totalCount = listing.totalCount
@@ -114,6 +109,21 @@ struct InboxReadTool: AgentTool, Sendable {
     /// The requested 1-based page as a 0-based page, clamped to the listing's pages.
     static func clampedPage(_ pageIndex: Int, totalCount: Int) -> Int {
         min(max(pageIndex - 1, 0), totalPages(for: totalCount) - 1)
+    }
+
+    /// `readListing` and, while debug logging is on, its cost line: a meter (`ReadCostMeter.start`)
+    /// counts the listing's statements and the line holds the page, pages, rows, total and demo
+    /// flag as integers, then the meter's counts. With debug logging off no meter is made,
+    /// `readListing` gets nil and the line is nil. The caller logs the line after the read returns.
+    static func readListingWithCost(
+        _ db: Database, pageIndex: Int, demoActive: Bool
+    ) throws -> (listing: Listing, costLine: String?) {
+        let meter = ReadCostMeter.start(db)
+        let listing = try readListing(db, pageIndex: pageIndex, demoActive: demoActive, meter: meter)
+        return (listing, meter?.line("InboxReadTool", [
+            "page": listing.page + 1, "pages": listing.totalPages, "rows": listing.rows.count,
+            "total": listing.totalCount, "demo": demoActive ? 1 : 0,
+        ]))
     }
 
     /// Reads one page of the inbox listing and its total.
