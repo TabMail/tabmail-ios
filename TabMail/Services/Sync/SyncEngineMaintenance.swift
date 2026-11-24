@@ -377,7 +377,7 @@ extension SyncEngine {
                         // is the only change; the work, its ordering and its failure
                         // handling are untouched.
                         let keys = chunkIds.map(ContentKey.init(rawValue:))
-                        await Task.detached(priority: .medium) {
+                        await Task.detached(priority: .medium) { () -> Void in
                             await MessageContentStore.releaseUnowned(
                                 keys, stores: [.searchIndex, .body], pool: dbPool)
                         }.value

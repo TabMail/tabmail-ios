@@ -98,7 +98,7 @@ struct StoragePruneTargetTests {
         func set(_ newValue: Value) { value.withLock { $0 = newValue } }
     }
 
-    static func counts(_ fixture: Paging.Fixture) throws -> (headers: Int, bodies: Int) {
+    private static func counts(_ fixture: Paging.Fixture) throws -> (headers: Int, bodies: Int) {
         try Paging.readNow(fixture) { db in
             (headers: try MessageHeader.fetchCount(db), bodies: try MessageBody.fetchCount(db))
         }
