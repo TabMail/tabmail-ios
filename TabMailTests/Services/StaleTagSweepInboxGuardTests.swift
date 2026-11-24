@@ -265,11 +265,6 @@ struct StaleTagSweepFixture: Sendable {
         }
         pool = try DatabasePool(path: directory.appendingPathComponent("test.sqlite").path, configuration: configuration)
         let appDatabase = try AppDatabase(dbPool: pool)
-        previous = AppDatabase.shared.withLock { current -> AppDatabase? in
-            let previous = current
-            current = appDatabase
-            return previous
-        }
 
         var account = Account(emailAddress: "recipient@example.com", displayName: "Test", provider: .gmail)
         account.id = "sweep-guard-\(UUID().uuidString)"
@@ -280,6 +275,12 @@ struct StaleTagSweepFixture: Sendable {
             try other.insert(db)
         }
         self.account = account
+        // Last, so a failed setup never leaves the shared database swapped with no `restore()` to undo it.
+        previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let previous = current
+            current = appDatabase
+            return previous
+        }
     }
 
     func restore() {

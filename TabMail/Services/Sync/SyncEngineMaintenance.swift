@@ -762,15 +762,17 @@ extension SyncEngine {
     /// Whether `accountId` has an inbox row with this Message-ID: the stale-tag
     /// sweep's Gmail duplicate guard, read once per candidate.
     ///
-    /// The unary `+` keeps `accountId` and `isInInbox` out of index selection, so
-    /// the read seeks a Message-ID index on the Message-ID (a few rows) with or
-    /// without planner statistics (`messageHeader_rfc822MessageId_date` on SQLite
-    /// 3.54). Without the `+` and without statistics, the planner walks
-    /// `messageHeader_isInInbox_date` instead: every inbox row of every account,
-    /// for each candidate.
+    /// It names its index, as `aiCacheInInboxSQL` does, so it always seeks the
+    /// Message-ID (the few copies of one message) whatever the planner statistics
+    /// hold. Left to the planner, the read walks `messageHeader_isInInbox_date`
+    /// (every inbox row of every account) with no statistics, and scans the whole
+    /// table with statistics recorded while `messageHeader` held a row or two (a
+    /// fresh install's first maintenance pass); nothing re-analyzes the table
+    /// while its schema is unchanged. `messageHeader_rfc822MessageId` is built by
+    /// the migrations, never deferred.
     nonisolated static let inboxCopySQL = """
-        SELECT 1 FROM messageHeader
-        WHERE rfc822MessageId = ? AND +accountId = ? AND +isInInbox = 1
+        SELECT 1 FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND accountId = ? AND isInInbox = 1
         LIMIT 1
         """
 

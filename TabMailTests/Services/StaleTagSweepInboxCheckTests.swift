@@ -98,16 +98,24 @@ struct StaleTagSweepInboxCheckTests {
         #expect(stored["young"] == .some(.reply))
     }
 
-    /// The check seeks a Message-ID index on the Message-ID, never an index on `isInInbox` or `accountId` (every
-    /// inbox row of every account, or every row of the account), with no planner statistics and after the app's
-    /// ANALYZE. Planned on a fresh connection, which loads the statistics as they are.
-    @Test("The check seeks a Message-ID index, with and without planner statistics",
-          arguments: DBProof.Statistics.allCases)
-    func checkSeeksTheMessageIdIndex(statistics: DBProof.Statistics) async throws {
+    /// The check seeks the Message-ID index on the Message-ID, never an index on `isInInbox` or `accountId` (every
+    /// inbox row of every account, or every row of the account) and never the whole table: with no planner
+    /// statistics, with statistics recorded while `messageHeader` held one row (then grown), and after the app's
+    /// ANALYZE over the real rows. Planned on a fresh connection, which loads the statistics as they are.
+    @Test("The check seeks the Message-ID index, with no, stale or current planner statistics",
+          arguments: StaleTagSweepCheckStatistics.allCases)
+    func checkSeeksTheMessageIdIndex(statistics: StaleTagSweepCheckStatistics) async throws {
         let fixture = try StaleTagSweepFixture()
         defer { fixture.restore() }
         let folders = try fixture.makeFolders()
         let expired = Date().addingTimeInterval(-(SyncConfig.actionTagTTLSeconds + 3600))
+        if statistics == .staleSmall {
+            try await fixture.pool.write { db in
+                try fixture.insert(db, folder: folders.inbox, messageId: "first",
+                                   rfc: "<first@example.com>", tag: nil, setAt: nil)
+                try DBProof.apply(.analyzed, to: db)
+            }
+        }
         try await fixture.pool.write { db in
             for j in 0..<300 {
                 try fixture.insert(db, folder: folders.inbox, messageId: "inbox-\(j)",
@@ -120,14 +128,20 @@ struct StaleTagSweepInboxCheckTests {
                                    rfc: StaleTagSweepFixture.otherInboxMessageId(k), tag: nil, setAt: nil,
                                    accountId: StaleTagSweepFixture.otherAccountId)
             }
-            try DBProof.apply(statistics, to: db)
+            switch statistics {
+            case .none: try DBProof.apply(.none, to: db)
+            case .staleSmall: break
+            case .analyzed: try DBProof.apply(.analyzed, to: db)
+            }
         }
         let path = fixture.directory.appendingPathComponent("test.sqlite").path
         let queue = try DatabaseQueue(path: path)
         defer { try? queue.close() }
-        let (statRows, plan, found, missing) = try await queue.read { db in
-            let statRows = try db.tableExists("sqlite_stat1")
-                ? try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_stat1") ?? 0 : 0
+        let (headerRows, indexStat, plan, found, missing) = try await queue.read { db in
+            let headerRows = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader") ?? 0
+            let indexStat = try db.tableExists("sqlite_stat1")
+                ? try String.fetchOne(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = 'messageHeader_rfc822MessageId'")
+                : nil
             let plan = try Row.fetchAll(
                 db, sql: "EXPLAIN QUERY PLAN \(SyncEngine.inboxCopySQL)",
                 arguments: [StaleTagSweepFixture.inboxMessageId(7), fixture.accountId]
@@ -136,15 +150,30 @@ struct StaleTagSweepInboxCheckTests {
                 db, rfc822MessageId: StaleTagSweepFixture.inboxMessageId(7), accountId: fixture.accountId)
             let missing = try SyncEngine.inboxCopyExists(
                 db, rfc822MessageId: StaleTagSweepFixture.otherInboxMessageId(0), accountId: fixture.accountId)
-            return (statRows, plan, found, missing)
+            return (headerRows, indexStat, plan, found, missing)
         }
-        #expect((statRows > 0) == (statistics == .analyzed), "precondition: \(statistics.label), \(statRows) sqlite_stat1 rows")
+        // The row count the statistics recorded for the index: the first number of its `stat`.
+        let recordedRows = indexStat?.split(separator: " ").first.flatMap { Int($0) }
+        let preconditionHolds = switch statistics {
+        case .none: recordedRows == nil
+        case .staleSmall: recordedRows.map { (1...4).contains($0) } ?? false
+        case .analyzed: recordedRows.map { $0 >= headerRows } ?? false
+        }
+        #expect(preconditionHolds, "precondition: \(statistics), index statistics \(indexStat ?? "none"), \(headerRows) rows")
         #expect(found, "the check missed an inbox copy")
         #expect(!missing, "the check found another account's inbox copy")
-        #expect(plan.count == 1, "\(statistics.label): \(plan)")
-        let seek = plan.first ?? ""
-        #expect(seek.hasPrefix("SEARCH messageHeader USING INDEX messageHeader_rfc822MessageId")
-                    && seek.hasSuffix("(rfc822MessageId=?)"),
-                "\(statistics.label): the check does not seek a Message-ID index on the Message-ID: \(plan)")
+        let seek = ["SEARCH messageHeader USING INDEX messageHeader_rfc822MessageId (rfc822MessageId=?)"]
+        #expect(plan == seek, "\(statistics): the check does not seek the Message-ID index on the Message-ID: \(plan)")
     }
+}
+
+/// The planner statistics `checkSeeksTheMessageIdIndex` plans under. `staleSmall` is a fresh install's: statistics
+/// recorded while `messageHeader` held one row, after which the table grew; nothing re-analyzes the table while its
+/// schema is unchanged. At file scope because a `@Test` argument cannot name a member of its own suite.
+enum StaleTagSweepCheckStatistics: String, CaseIterable, Sendable, CustomTestStringConvertible {
+    case none
+    case staleSmall
+    case analyzed
+
+    var testDescription: String { rawValue }
 }
