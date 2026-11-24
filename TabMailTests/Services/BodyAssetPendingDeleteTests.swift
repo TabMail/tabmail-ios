@@ -687,7 +687,7 @@ struct BodyAssetPendingDeleteTests {
         // Manifest: `contentKeysWithAssets` (the worker) and `manifestContentKeys` (the sweep's pages).
         for analyzed in [false, true] {
             if analyzed {
-                try manifest.write { db in
+                try await manifest.write { db in
                     for index in 0..<200 {
                         try db.execute(
                             sql: """
@@ -707,7 +707,7 @@ struct BodyAssetPendingDeleteTests {
             let assetReads = statements.filter { $0.contains("FROM bodyAsset ") }
             #expect(assetReads.count >= 3, "precondition: the three calls' reads were captured: \(statements)")
             for sql in assetReads {
-                let plan = try manifest.read { db in try Self.plan(db, sql, []) }
+                let plan = try await manifest.read { db in try Self.plan(db, sql, []) }
                 #expect(plan.contains("SEARCH bodyAsset USING COVERING INDEX") && !plan.contains("TEMP B-TREE"),
                         "analyzed=\(analyzed): \(sql): \(plan)")
             }
