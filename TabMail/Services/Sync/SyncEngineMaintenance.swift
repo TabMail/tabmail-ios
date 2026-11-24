@@ -1023,9 +1023,10 @@ extension SyncEngine {
         // or merged again; nothing is deleted and no message is shown another's content
         // (`HTMLCachePair`, "Before the deferred index step"). The fill reads every
         // cached body once, as `messageBody_staleEvict`'s build did, and also rewrites
-        // one header row per cached body, and the index covers every header, all in
-        // the one write, so this build costs more than that one did
-        // (`StaleBodyEvictPairProofTests` reports it).
+        // one header row per cached body, and the index build reads every header (the
+        // index holds only the cached ones outside the inbox: partial, see
+        // `HTMLCachePair.indexSQL`), all in the one write, so this build costs more than
+        // that one did (`StaleBodyEvictPairProofTests` reports it).
         DeferredIndex(
             name: HTMLCachePair.indexName,
             sql: HTMLCachePair.indexSQL,

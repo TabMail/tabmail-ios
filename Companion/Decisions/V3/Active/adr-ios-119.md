@@ -26,12 +26,17 @@ inbox instead reads about 85k rows at 105k.
    inserted again), AFTER UPDATE OF `id` when the id changed (set it from the body at the new id).
    Each trigger writes the state at the end of its own statement, so any order of header and body
    writes ends exact. A `REPLACE` fires the insert triggers and so ends exact too.
-3. **Index.** `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)`, NULLs included (not
-   partial), a deferred index (`SyncEngine.deferredIndexes`; decision 7). The evict seeks `isInInbox = 0 AND htmlCachedAt < cutoff` in keyset pages on
-   `(htmlCachedAt, rowid)` (`HTMLCachePair.evictCandidatesPageSQL`); "no cached HTML" is
-   `htmlCachedAt IS NULL` under one `isInInbox` value. Leading with `isInInbox` keeps the evict from
-   reading old inbox entries only to skip them; `StaleBodyEvictPairProofTests` measures it against
-   the column alone.
+3. **Index.** `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt) WHERE isInInbox = 0 AND
+   htmlCachedAt IS NOT NULL`, a partial deferred index (`SyncEngine.deferredIndexes`; decision 7)
+   holding only the cached headers outside the inbox. The evict seeks `isInInbox = 0 AND htmlCachedAt <
+   cutoff` in keyset pages on `(htmlCachedAt, rowid)` (`HTMLCachePair.evictCandidatesPageSQL`, which
+   keeps the literal `isInInbox = 0` so SQLite matches the partial WHERE). Partial, because the first,
+   full version was planned for an `isInInbox = 1` read without statistics (the inbox lookup of a
+   notification action walked every inbox header); no such read can use this one. `isInInbox` stays
+   its first column, one value throughout, so without statistics the page is still an equality and
+   range seek on it rather than `messageHeader_isInInbox_date` and a sort. A header enters it only
+   while it is outside the inbox with cached HTML. `StaleBodyEvictPairProofTests` measures it against
+   a full index on the column alone (ADR-IOS-029, amendment of 2026-11-24 for #1433).
 4. **One reader.** `HTMLCachePair` answers every "is this message's HTML cached?" question
    (`isCached`, `evictCandidatesPage`): the `fetchBody` already-loaded check, the thread-message
    check in `MessageDetailViewModel`, `NSEDataBridge.verifyDurable`, the no-search-text diagnostic
@@ -69,7 +74,7 @@ inbox instead reads about 85k rows at 105k.
    is upgrade work for the deferred step, not the blocking migration chain; and an index built in
    a migration would have no planner statistics until the next `ANALYZE` (#1401). It reads every
    cached body as `messageBody_staleEvict`'s build did, and it also rewrites one header row per
-   cached body, and the index covers every header, all in the one write, so it costs more than
+   cached body, and the index build reads every header, all in the one write, so it costs more than
    that build. It runs in the first background maintenance pass after the upgrade
    (`runWALMaintenance`, `.background`), never on the launch path; a `.priority` write issued
    while it holds the writer (a Send) waits for it once. After it commits, the step calls

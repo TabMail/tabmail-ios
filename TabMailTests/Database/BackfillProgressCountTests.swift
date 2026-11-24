@@ -279,7 +279,8 @@ struct BackfillProgressCountTests {
     /// `messageHeader_htmlCachedAt` (#1433, a deferred index) comes from the same `ANALYZE`
     /// of the same database with v116's column and the deferred step's fill and index
     /// added (Mac sqlite3 3.54):
-    /// that database caches no HTML, so every header's value is NULL, and every other
+    /// that database caches no HTML, so every header's value is NULL and the partial
+    /// index (cached headers outside the inbox only) holds no entry, and every other
     /// index's row came out unchanged.
     private static let largeMailboxStatistics: [String: String] = [
         "idx_messageHeader_bodyStatus": "105000 52500 35000 26250 13125",
@@ -301,7 +302,7 @@ struct BackfillProgressCountTests {
         "messageHeader_folderId_providerDate": "105000 6563 1",
         "messageHeader_folderId_uidInt": "105000 6563 1",
         "messageHeader_headerIncomplete": "5213 1",
-        "messageHeader_htmlCachedAt": "105000 52500 52500",
+        "messageHeader_htmlCachedAt": "0 0 0",
         "messageHeader_inReplyTo": "105000 105000",
         "messageHeader_inbox_display": "105000 6563 3282 1",
         "messageHeader_isInInbox_date": "105000 52500 1",

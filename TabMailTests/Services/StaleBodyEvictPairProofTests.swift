@@ -19,13 +19,14 @@ import Testing
 /// - old: the schema before v116, with `messageBody_staleEvict`, as a phone holds it
 ///   today. The old step runs (`StaleBodyEvictDifferentialTests.legacyEvictPage`), one
 ///   write per page as it ran.
-/// - pair (isInInbox, htmlCachedAt): the same file after the app's migration chain ran
+/// - pair, the partial index `(isInInbox, htmlCachedAt)` of the cached headers outside the
+///   inbox (`HTMLCachePair.indexSQL`): the same file after the app's migration chain ran
 ///   v116 on it and the maintenance pass's deferred step ran
 ///   (`SyncEngine.runRefreshPlannerStatisticsIfStale`: the fill, the index and `ANALYZE`
 ///   in one write), then without `messageBody_staleEvict` (nothing reads it any more).
 ///   The production step runs.
-/// - pair (htmlCachedAt): the same with the index on the column alone, the other shape
-///   the issue left to this measurement.
+/// - pair (htmlCachedAt): the same with a full index on the column alone, the other
+///   shape the issue left to this measurement.
 ///
 /// Reported per schema: the evict pass (rows visited, statements, pages read, wall
 /// time, how long each write holds SQLite's writer); what the triggers and the index add
@@ -75,6 +76,13 @@ struct StaleBodyEvictPairProofTests {
         static let oldIndexSQL = "CREATE INDEX IF NOT EXISTS messageBody_staleEvict ON messageBody(fetchedAt)"
         static let pairIndexName = "messageHeader_htmlCachedAt"
         static let columnOnlyIndexName = "messageHeader_htmlCachedAtOnly"
+        /// The census control's index: the pair's index under its own name but over every
+        /// header (not partial), the shape #1433 first had. With no statistics row it
+        /// takes `isInInbox = 1` reads; the partial production index cannot take one.
+        static let controlFullIndexSQL = """
+            CREATE INDEX IF NOT EXISTS messageHeader_htmlCachedAt
+            ON messageHeader(isInInbox, htmlCachedAt)
+            """
         static let columnOnlySetupSQL = [
             "DROP INDEX messageHeader_htmlCachedAt",
             "CREATE INDEX messageHeader_htmlCachedAtOnly ON messageHeader(htmlCachedAt)",
@@ -110,7 +118,7 @@ struct StaleBodyEvictPairProofTests {
         var label: String {
             switch self {
             case .old: return "old (body walk, messageBody_staleEvict)"
-            case .pairInboxFirst: return "pair, index (isInInbox, htmlCachedAt)"
+            case .pairInboxFirst: return "pair, partial index (isInInbox, htmlCachedAt), cached outside the inbox"
             case .pairColumnOnly: return "pair, index (htmlCachedAt)"
             }
         }
@@ -513,9 +521,10 @@ struct StaleBodyEvictPairProofTests {
         case before
         /// The old file after the upgrade and the deferred step, as a phone has it.
         case after
-        /// The control: the old file analyzed, then v116 and the pair's fill and index
-        /// with no `ANALYZE` after them, so the index has no statistics row (the index
-        /// built in a migration, as #1433 first had it).
+        /// The control: the old file analyzed, then v116, the pair's fill and the index
+        /// over every header (`Config.controlFullIndexSQL`) with no `ANALYZE` after them,
+        /// so the index has no statistics row (built in a migration and not partial, as
+        /// #1433 first had it).
         case indexWithoutStatistics
     }
 
@@ -559,15 +568,15 @@ struct StaleBodyEvictPairProofTests {
         try queue.writeWithoutTransaction { db in try DBProof.apply(.analyzed, to: db) }
     }
 
-    /// The control's schema on `url`: the migration chain, then the pair's fill and
-    /// index with no `ANALYZE` after them.
+    /// The control's schema on `url`: the migration chain, then the pair's fill and the
+    /// full index (`Config.controlFullIndexSQL`) with no `ANALYZE` after them.
     static func buildPairWithoutStatistics(_ url: URL) throws {
         let pool = try DatabasePool(path: url.path, configuration: AppDatabase.makeConfiguration())
         defer { try? pool.close() }
         try AppDatabase.runMigrations(on: pool)
         try pool.write { db in
             try db.execute(sql: HTMLCachePair.fillSQL)
-            try db.execute(sql: HTMLCachePair.indexSQL)
+            try db.execute(sql: Config.controlFullIndexSQL)
         }
     }
 
@@ -790,8 +799,6 @@ struct StaleBodyEvictPairProofTests {
                     ("folder newest", folderNewest),
                     ("is cached (HTMLCachePair.isCached)", try plan(
                         "SELECT htmlCachedAt IS NOT NULL FROM messageHeader WHERE id = ?", ["x"])),
-                    ("not cached, one inbox state", try plan(
-                        "SELECT id FROM messageHeader WHERE isInInbox = ? AND htmlCachedAt IS NULL", [true])),
                 ]
             }
         }
@@ -1072,8 +1079,8 @@ struct StaleBodyEvictPairProofTests {
             }
         }
         let larger = try await Self.measureLargerHTML(in: unitDirectory)
-        // The control: with the index and no statistics row for it, an inbox read moves
-        // onto it, so the census above can see such a change.
+        // The control: with the index over every header and no statistics row for it, an
+        // inbox read moves onto it, so the census above can see such a change.
         let flips = sections.flatMap { section in
             section.planCensus.filter { $0.isInboxRead && $0.controlOnPairIndex }.map { "\(section.name) \($0.read)" }
         }
@@ -1168,11 +1175,11 @@ struct StaleBodyEvictPairProofTests {
             lines.append("  its statements apart, \(migration.fillMs.count) runs each: fill median \(ms(fill.median)) ms (p90 \(ms(fill.p90))); index median \(ms(index.median)) (p90 \(ms(index.p90))); ANALYZE median \(ms(analyze.median)) (p90 \(ms(analyze.p90)))")
             lines.append("  body pages (messageBody and its primary key): \(pagesText(migration.bodyPages)); per MB of them: fill \(perMB(fill.median)) ms, step \(perMB(stepWall.median)) ms")
             lines.append("  after the step \(pagesText(migration.steppedPages)) (+\(migration.steppedPages - migration.migratedPages) over v116); free after dropping messageBody_staleEvict \(pagesText(migration.pairFreePages))")
-            lines.append("  index messageHeader_htmlCachedAt (isInInbox, htmlCachedAt): \(pagesText(migration.pairIndexPages)); (htmlCachedAt) alone: \(pagesText(migration.columnOnlyIndexPages)); messageBody_staleEvict (old): \(pagesText(migration.oldIndexPages))")
+            lines.append("  index messageHeader_htmlCachedAt (isInInbox, htmlCachedAt), partial, cached outside the inbox: \(pagesText(migration.pairIndexPages)); (htmlCachedAt) alone, full:\(pagesText(migration.columnOnlyIndexPages)); messageBody_staleEvict (old): \(pagesText(migration.oldIndexPages))")
             lines.append("  the column's fill: \(pagesText(migration.steppedPages - migration.migratedPages - migration.pairIndexPages)) (the step's growth less its index, the statistics table included)")
             lines.append("  headers filled: \(migration.headersFilled); pair mismatches after the fill: \(migration.mismatches)")
             lines.append("")
-            lines.append("-- the other reads' plans: before #1433 (old file, analyzed), after the upgrade and the deferred step, and the control (v116 with the index built and no ANALYZE after it)")
+            lines.append("-- the other reads' plans: before #1433 (old file, analyzed), after the upgrade and the deferred step, and the control (v116 with the index built over every header, not partial, and no ANALYZE after it)")
             for line in section.planCensus {
                 let before = line.plans[.before] ?? ""
                 let after = line.plans[.after] ?? ""

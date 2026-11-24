@@ -68,8 +68,8 @@ always kept, so once past the TTL they were all visited again on every pass (#14
 headers 18,764 bodies, 65.8k pages read, 7.5 s and 377 writes per pass; at 525k about 93,000 bodies,
 33 to 37 s and 1,861 writes, single writes up to 715 ms). **Fix (ADR-IOS-119):** the header records
 when its HTML was cached (`messageHeader.htmlCachedAt`, kept exact by SQLite triggers), and each write's
-page is a keyset seek on `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)` for headers outside an
-inbox cached before the cutoff (`HTMLCachePair.evictCandidatesPage`). Inbox bodies are not read at all;
+page is a keyset seek on `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)`, a partial index of the
+cached headers outside the inbox, for those cached before the cutoff (`HTMLCachePair.evictCandidatesPage`). Inbox bodies are not read at all;
 the page reads only candidates, the rules (undo set, a folder's newest) are unchanged, and the orphan
 leg is gone. The write stays the synchronous pass-through write through `passThroughWrite`, bounded per
 page as before, and the WAL checkpoint between pages is unchanged. The evict waits for

@@ -42,14 +42,29 @@ enum HTMLCachePair {
     /// The index the evict's page seeks, built by the deferred index step.
     static let indexName = "messageHeader_htmlCachedAt"
 
-    /// `(isInInbox, htmlCachedAt)` holds every header, NULLs included (not a partial
-    /// index): the evict seeks `isInInbox = 0 AND htmlCachedAt < cutoff`, and "no cached
-    /// HTML" is `htmlCachedAt IS NULL` under one `isInInbox` value. Leading with
-    /// `isInInbox` keeps the evict from walking old inbox entries it would only skip.
-    /// Building it reads `messageHeader` once.
+    /// A partial index: it holds only the headers outside every inbox whose HTML is
+    /// cached, the set the evict seeks (`isInInbox = 0 AND htmlCachedAt < cutoff`), so
+    /// only a statement whose WHERE implies `isInInbox = 0 AND htmlCachedAt IS NOT NULL`
+    /// can use it. Built over every header, it was also chosen for an `isInInbox = 1`
+    /// read without planner statistics (the query plan check: `NotificationActionRouter`'s
+    /// inbox lookup then walked every inbox header). `isInInbox` stays its first column, one value
+    /// throughout: the evict's `isInInbox = 0` is then an equality on the index, so
+    /// without statistics the planner still seeks it (equality and range) rather than
+    /// `messageHeader_isInInbox_date` (equality only) and a sort. A header enters it only
+    /// while it is outside the inbox with cached HTML, so an inbox header's writes and a
+    /// header with no cached HTML never write to it. Building it reads `messageHeader`
+    /// once.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query, index,
+    /// table or column added here, and every query that reads them, must be as cheap as
+    /// the data allows. It must not add a new table or index scan unless no index or
+    /// plainer query can avoid it; then state why at the query. Prove a query or index
+    /// change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     static let indexSQL = """
         CREATE INDEX IF NOT EXISTS messageHeader_htmlCachedAt
         ON messageHeader(isInInbox, htmlCachedAt)
+        WHERE isInInbox = 0 AND htmlCachedAt IS NOT NULL
         """
 
     /// Records the bodies cached before v116: each body's header gets its `fetchedAt`.
@@ -100,8 +115,10 @@ enum HTMLCachePair {
 
     /// The evict's page: the next `limit` headers outside an inbox whose HTML was cached
     /// before the cutoff, after the cursor, in `messageHeader_htmlCachedAt` order
-    /// (`isInInbox`, `htmlCachedAt`, then rowid). A seek on that index that starts at
-    /// the cursor and stops after `limit` entries; old inbox entries are never visited.
+    /// (`htmlCachedAt`, then rowid). A seek on that index that starts at the cursor and
+    /// stops after `limit` entries; inbox headers are not in it. The WHERE keeps the
+    /// literal `isInInbox = 0`: SQLite matches a partial index's WHERE against literal
+    /// terms, not against parameters bound after the statement is prepared.
     /// Arguments: `[cutoff, limit]` for the first page, and
     /// `[cutoff, cursor cachedAt, cursor rowid, limit]` after it.
     static func evictCandidatesPageSQL(afterCursor: Bool) -> String {

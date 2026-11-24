@@ -176,7 +176,7 @@ fills the column from `messageBody` (`HTMLCachePair.fillSQL`, run by `createDefe
 while the index is missing), then builds the index, then runs `ANALYZE`, so no connection ever loads
 it without a statistics row (#1401). The index existing is the proof the fill ran. The fill reads
 every cached body once (`fetchedAt` is stored after the HTML), as `messageBody_staleEvict`'s build
-did, and it also rewrites one header row per cached body, and the index covers every header, all in
+did, and it also rewrites one header row per cached body, and the index build reads every header, all in
 the one write, so the step costs more than that build did. It runs where that build ran: in the
 first background maintenance pass after the upgrade (`runWALMaintenance`, `.background`), never on
 the launch path; a `.priority` write issued while it holds the writer (a Send) waits for it once.
@@ -186,16 +186,32 @@ throttle's interval and leave the WAL file at its largest. `StaleBodyEvictPairPr
 v116's time and the step's (whole, its three statements apart, and per MB of body pages), the WAL
 size its write leaves and its checkpoint's time, at 105k and 525k headers, and
 the step again at 105k with bodies of 24 to 40 KB. Rule 1: it serves exactly the evict's keyset page
-(`isInInbox = 0 AND htmlCachedAt < ?` in `(htmlCachedAt, rowid)` order) and "no cached HTML"
-(`htmlCachedAt IS NULL` under one `isInInbox` value); `SyncEngineMaintenanceTests.staleBodyPageSeeksItsIndex`
+(`isInInbox = 0 AND htmlCachedAt < ?` in `(htmlCachedAt, rowid)` order). `SyncEngineMaintenanceTests.staleBodyPageSeeksItsIndex`
 pins the page's plan without statistics. Its size and its write cost against the old schema are
 measured in `StaleBodyEvictPairProofTests`.
 
 **Rule 5 (other reads).** The same proof reads the plan of every hot read the #1401 census lists
 (`BackfillProgressIndexProofTests.probes`, the evict's own excepted) and the chat pill's reminder
 count on the old file analyzed, then after v116 and the step: none may change. Its control builds
-the index after v116 with no `ANALYZE`, the state a migration-built index would leave, and must move
-at least one `isInInbox = 1` read onto it, so the census is shown to see such a change.
+the index over every header (not partial) after v116 with no `ANALYZE`, the state the first,
+migration-built version would leave, and must move at least one `isInInbox = 1` read onto it, so the
+census is shown to see such a change.
+
+**A partial index, for its scope (as `messageHeader_completeByDate` above).** The index is
+`(isInInbox, htmlCachedAt) WHERE isInInbox = 0 AND htmlCachedAt IS NOT NULL`: it holds only the cached
+headers outside the inbox, so only a statement whose WHERE implies both terms can use it.
+- **The full-index version failed.** Built over every header, the query plan check without statistics
+  (`DatabaseIndexTests.seekVerdictsHoldInThePlan`, `.noStatistics`) planned
+  `NotificationActionRouter.resolveDurableInboxHeader` (`isInInbox = 1`) onto it as a walk of every inbox
+  header, instead of `messageHeader_accountId_messageId`. A partial index cannot serve that read.
+- **`isInInbox` stays its first column,** one value throughout. The page's `isInInbox = 0` is then an
+  equality on the index, so without statistics the planner seeks it (equality and range) and not
+  `messageHeader_isInInbox_date` (equality only) with a sort, which the index on `htmlCachedAt` alone
+  got. The page keeps the literal `isInInbox = 0`: SQLite matches a partial index's WHERE against
+  literal terms.
+- **Fewer writes.** A header enters the index only while it is outside the inbox with cached HTML: an
+  inbox header's writes and a header with no cached HTML never write to it.
+- "No cached HTML" (`htmlCachedAt IS NULL`) is not served; no statement reads it.
 
 **The evict waits for it** (`runEvictStaleBodiesIfIndexed`, as it waited for `messageBody_staleEvict`).
 

@@ -33,6 +33,7 @@ struct QueryCostNoteFenceTests {
         ("TabMail/Services/Search/SearchIndex.swift", "private func migrateSchema("),
         ("TabMail/Services/Search/MemoryIndex.swift", "private func createSchema("),
         ("TabMail/Services/Sync/SyncEngineMaintenance.swift", "nonisolated static let deferredIndexes"),
+        ("TabMail/Services/HTMLCachePair.swift", "static let indexSQL"),
     ]
 
     /// The app's source folders: the app, the code it shares with the notification extension, and the extension.
