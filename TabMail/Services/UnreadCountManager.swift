@@ -268,33 +268,75 @@ actor UnreadCountManager {
         guard isActive else { return }
 
         let ids: [String]
+        let costLine: String?
         do {
-            ids = try await dbPool.read { db -> [String] in
-                let inboxFolderIds = try String.fetchAll(db,
-                    sql: "SELECT id FROM folder WHERE role = ?",
-                    arguments: [FolderRole.inbox.rawValue])
-                guard !inboxFolderIds.isEmpty else { return [] }
-                let placeholders = inboxFolderIds.map { _ in "?" }.joined(separator: ", ")
-                // LIMIT is a trusted compile-time Int constant (not user input),
-                // inlined to avoid mixing String + Int statement arguments.
-                let rows = try Row.fetchAll(db, sql: """
-                    SELECT accountId, messageId, rfc822MessageId
-                    FROM messageHeader
-                    WHERE folderId IN (\(placeholders)) AND isRead = 0
-                    ORDER BY date DESC
-                    LIMIT \(SyncConfig.nseBadgeDedupRecentLimit)
-                    """, arguments: StatementArguments(inboxFolderIds))
-                return rows.map { row in
-                    NSEBadge.countedId(
-                        accountId: row["accountId"],
-                        messageId: row["messageId"],
-                        rfc822MessageId: row["rfc822MessageId"])
-                }
-            }
+            (ids, costLine) = try await dbPool.read { db in try Self.recentUnreadCountedIdsWithCost(db) }
         } catch {
             return
         }
+        if let costLine { ReadCostMeter.log([costLine]) }
         guard !ids.isEmpty, let stagingDB = NSEDataBridge.openStagingDB() else { return }
         NSEBadge.markCounted(db: stagingDB, ids: ids)
+    }
+
+    /// `recentUnreadCountedIds` and, while debug logging is on, its cost line: a meter
+    /// (`ReadCostMeter.start`) counts the read's statements and the line holds the inbox
+    /// folder count, the rows returned and the limit as integers, then the meter's counts.
+    /// With debug logging off no meter is made and the line is nil. The caller logs the
+    /// line after the read returns.
+    static func recentUnreadCountedIdsWithCost(_ db: Database) throws -> (ids: [String], costLine: String?) {
+        let meter = ReadCostMeter.start(db)
+        let read = try recentUnreadCountedIds(db, meter: meter)
+        return (read.ids, meter?.line("BadgeDedupRead", [
+            "folders": read.inboxFolders, "rows": read.ids.count, "limit": SyncConfig.nseBadgeDedupRecentLimit,
+        ]))
+    }
+
+    /// The `NSEBadge.countedId`s of the newest unread inbox headers, newest first, at most
+    /// `SyncConfig.nseBadgeDedupRecentLimit`, over every inbox-role folder, and the number of
+    /// those folders. Every statement is prepared through `meter` (nil counts nothing).
+    static func recentUnreadCountedIds(
+        _ db: Database, meter: ReadCostMeter? = nil
+    ) throws -> (inboxFolders: Int, ids: [String]) {
+        let inboxFolderIds = try String.fetchAll(
+            ReadCostMeter.statement(db, sql: "SELECT id FROM folder WHERE role = ?", meter: meter),
+            arguments: [FolderRole.inbox.rawValue])
+        guard !inboxFolderIds.isEmpty else { return (0, []) }
+        let rows = try Row.fetchAll(
+            ReadCostMeter.statement(db, sql: recentUnreadForNSESQL(inboxFolderCount: inboxFolderIds.count), meter: meter),
+            arguments: StatementArguments(inboxFolderIds))
+        let ids = rows.map { row in
+            NSEBadge.countedId(
+                accountId: row["accountId"],
+                messageId: row["messageId"],
+                rfc822MessageId: row["rfc822MessageId"])
+        }
+        return (inboxFolderIds.count, ids)
+    }
+
+    /// The newest unread headers of `inboxFolderCount` inbox folders, newest first.
+    ///
+    /// `INDEXED BY messageHeader_folderId_isRead_date` (IOS-PERF-009): with two or more
+    /// folders the planner otherwise picks `messageHeader_folderId_isRead`, which has no
+    /// `date`, and reads and sorts every unread inbox header to keep the limit. Through
+    /// the date index SQLite walks each folder newest first and its top-N sort stops each
+    /// folder once the limit is full, so the read is bounded by the limit per folder. With
+    /// one folder the planner already picks this index.
+    ///
+    /// The index is built by a blocking migration (v62) and must never move to
+    /// `SyncEngine.deferredIndexes`: `INDEXED BY` errors when the index is missing (here the
+    /// read would fail and the dedup be skipped). No tie-break on equal dates: the read has
+    /// never ordered them, and a second sort key defeats the early stop.
+    static func recentUnreadForNSESQL(inboxFolderCount: Int) -> String {
+        let placeholders = Array(repeating: "?", count: inboxFolderCount).joined(separator: ", ")
+        // LIMIT is a trusted compile-time Int constant (not user input),
+        // inlined to avoid mixing String + Int statement arguments.
+        return """
+            SELECT accountId, messageId, rfc822MessageId
+            FROM messageHeader INDEXED BY messageHeader_folderId_isRead_date
+            WHERE folderId IN (\(placeholders)) AND isRead = 0
+            ORDER BY date DESC
+            LIMIT \(SyncConfig.nseBadgeDedupRecentLimit)
+            """
     }
 }
