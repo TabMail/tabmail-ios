@@ -196,16 +196,16 @@ struct ArchiveOldSweepReadTests {
         try TestDatabase.insertAccount(queue, id: "acc1", email: "one@example.com")
         try TestDatabase.insertAccount(queue, id: "acc2", email: "two@example.com")
         let now = Date()
-        let cutoff = now.addingTimeInterval(-14 * day)
+        let cutoff = now.addingTimeInterval(-14 * Self.day)
         // (account, messageId, stored date). A stored date GRDB did not write is set with a raw UPDATE.
-        let numericOld = (now.addingTimeInterval(-40 * day)).timeIntervalSince1970
-        let numericTied = (now.addingTimeInterval(-35 * day)).timeIntervalSince1970
+        let numericOld = (now.addingTimeInterval(-40 * Self.day)).timeIntervalSince1970
+        let numericTied = (now.addingTimeInterval(-35 * Self.day)).timeIntervalSince1970
         let textTied = Self.secondsText(daysAgo: 30)
         let rows: [(String, String, DatabaseValue)] = [
             ("acc1", "1", numericTied.databaseValue), ("acc1", "2", textTied.databaseValue),
             ("acc1", "3", numericOld.databaseValue), ("acc1", "4", numericTied.databaseValue),
             ("acc1", "5", textTied.databaseValue), ("acc1", "6", Self.secondsText(daysAgo: 25).databaseValue),
-            ("acc1", "7", now.addingTimeInterval(-20 * day).databaseValue),
+            ("acc1", "7", now.addingTimeInterval(-20 * Self.day).databaseValue),
             ("acc2", "1", textTied.databaseValue), ("acc2", "2", numericTied.databaseValue),
             ("acc2", "3", textTied.databaseValue), ("acc2", "4", numericTied.databaseValue),
         ]
@@ -217,7 +217,7 @@ struct ArchiveOldSweepReadTests {
             }
         }
         _ = try TestDatabase.insertMessageHeader(
-            queue, messageId: "9", date: now.addingTimeInterval(-1 * day), folderId: "acc1:INBOX", accountId: "acc1",
+            queue, messageId: "9", date: now.addingTimeInterval(-1 * Self.day), folderId: "acc1:INBOX", accountId: "acc1",
             folderPath: "INBOX")                                         // newer than the cutoff
 
         // The replaced statement's selection and order, one folder after another in the read's folder order.
