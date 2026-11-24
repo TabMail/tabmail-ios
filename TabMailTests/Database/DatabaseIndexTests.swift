@@ -267,15 +267,14 @@ struct DatabaseIndexTests {
 
     // MARK: - R13-U12 — the two plans this range regressed
 
-    /// `EXPLAIN QUERY PLAN` for `sql`, as one line. SQLite still binds
-    /// placeholders when explaining, so every `?` gets a throwaway value; the
-    /// plan does not depend on them (no partial indexes are involved here).
+    /// `EXPLAIN QUERY PLAN` for `sql`, as one line, read by the query fence's plan
+    /// reader (`queryPlans`): it binds a throwaway value to each placeholder SQLite
+    /// reports, so a `?` inside a string literal or a numbered `?1` is counted as
+    /// SQLite counts it. The plan does not depend on the values (no partial indexes
+    /// are involved here).
     private func plan(_ db: DatabaseQueue, _ sql: String) throws -> String {
-        let arguments = StatementArguments(Array(repeating: "x", count: sql.filter { $0 == "?" }.count))
-        return try db.read { dbConn in
-            try Row.fetchAll(dbConn, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
-                .map { $0["detail"] as String }
-                .joined(separator: " | ")
+        try db.read { dbConn in
+            try Self.queryPlans(dbConn, sql).flatMap { $0.rows }.map { $0.detail }.joined(separator: " | ")
         }
     }
 
