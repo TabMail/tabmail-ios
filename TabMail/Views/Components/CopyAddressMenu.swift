@@ -32,15 +32,15 @@ enum AddressCopy {
     /// Everyone the address fields name, in order, each once: header values such as
     /// `"Doe, John" <john@example.com>, jane@example.com`, read with SwiftMail's parser as the
     /// email view's names are (`MessageViewHelpers.extractNames`); a group gives its members. Text
-    /// that names no mailbox gives nobody.
+    /// that names no mailbox gives nobody. A person with no name is shown by their address;
+    /// SwiftMail's `EmailAddress` stores an empty name (`"" <a@example.com>`) as no name.
     static func entries(in fields: [String]) -> [Entry] {
         var seen = Set<String>()
         return fields
             .flatMap { AddressParser.parseAddressList($0).flatMap(\.mailboxes) }
             .filter { seen.insert($0.address.lowercased()).inserted }
             .map { mailbox in
-                let name = mailbox.name.flatMap { $0.isEmpty ? nil : $0 } ?? mailbox.address
-                return Entry(name: name, address: mailbox.address)
+                Entry(name: mailbox.name ?? mailbox.address, address: mailbox.address)
             }
     }
 
