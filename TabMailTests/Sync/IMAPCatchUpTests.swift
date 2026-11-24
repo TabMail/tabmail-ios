@@ -1110,7 +1110,7 @@ struct CatchUpApplyTests {
                 "setup: the same folder under a UID-order provider is seeded, so the check above can see a seed")
     }
 
-    @Test("The local-row reader reads by range, by ids and in order")
+    @Test("The local-row reader reads by range and by ids")
     func reader() async throws {
         let w = try Self.world("cua-reader", storedEpoch: Self.epoch)
         defer { AppDatabase.shared.withLock { $0 = w.previous }; TestDatabaseTeardown.retire(pool: w.pool, directory: w.dir) }
@@ -1122,8 +1122,5 @@ struct CatchUpApplyTests {
         #expect(try await reader.firstNumericId(folderId: w.folderId, atLeast: 11) == 200)
         #expect(try await reader.firstNumericId(folderId: w.folderId, atLeast: 201) == nil)
         #expect(Set(try await reader.rows(folderId: w.folderId, ids: ["3", "200", "404"]).map(\.messageId)) == ["3", "200"])
-        let first = try await reader.rows(folderId: w.folderId, after: nil, limit: 2).map(\.messageId)
-        let rest = try await reader.rows(folderId: w.folderId, after: first.last, limit: 10).map(\.messageId)
-        #expect(first + rest == ["1", "10", "2", "200", "3"], "an ordered scan visits every row once")
     }
 }

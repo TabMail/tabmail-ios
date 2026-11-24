@@ -46,9 +46,6 @@ protocol CatchUpLocalRowReader: Sendable {
     func lastNumericId(folderId: String) async throws -> Int?
     /// Rows for exactly these provider ids. Ids with no local row are absent.
     func rows(folderId: String, ids: [String]) async throws -> [CatchUpLocalRow]
-    /// Up to `limit` rows in ascending provider-id order, after `afterId`
-    /// (nil starts at the beginning) — an ordered scan of the whole folder.
-    func rows(folderId: String, after afterId: String?, limit: Int) async throws -> [CatchUpLocalRow]
     /// Every row whose provider order date (`MessageHeader.providerDate`) is at or
     /// after `lower` and before `upper`, ascending by that date and then by id.
     /// Each row carries its `orderDate`. For a provider that windows by date.
