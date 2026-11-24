@@ -298,7 +298,9 @@ struct SyncEngineMaintenanceTests {
     /// write. The first pass after an upgrade skips the step and builds the index
     /// (`runBuildDeferredIndexesIfMissing`, later in the same pass); the next pass
     /// evicts by the unchanged rules.
-    @Test("The evict step waits for its index, then evicts")
+    /// `.processGlobalState`: the build gives up while
+    /// `DatabaseSuspension.isSuspended`, which `DatabaseSuspensionTests` holds.
+    @Test("The evict step waits for its index, then evicts", .processGlobalState)
     func evictStepWaitsForItsIndex() async throws {
         let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }

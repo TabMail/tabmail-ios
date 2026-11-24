@@ -292,9 +292,9 @@ struct ContentOwnershipSweepTests {
     ///
     /// The bounded wait is deliberate. `206ec48cf` had to repair a sibling sweep whose
     /// loop stopped terminating when the Stage C gate added a third per-row outcome;
-    /// this sweep is cursored (`LIMIT/OFFSET`) and a KEEP counts as a SKIP, so the
-    /// offset still advances — asserted here as an OUTCOME (the sweep returns) rather
-    /// than by reading the loop.
+    /// this sweep is cursored (a `(fetchedAt, rowid)` keyset since #1354, `LIMIT/OFFSET`
+    /// before it) and the cursor moves past a KEEP as past any other row — asserted
+    /// here as an OUTCOME (the sweep returns) rather than by reading the loop.
     @Test("#37 — the stale-body evictor keeps what it cannot prove dead, and still reclaims what is")
     func evictStaleBodiesGatesItsOrphanLegAndStillReclaims() async throws {
         let accountId = "stageD-evict"

@@ -20,10 +20,12 @@ import Testing
 /// Two properties are pinned here, both measured as pages fetched (pager cache
 /// hits plus misses), which is deterministic, unlike a wall-clock wait:
 /// - what a `.priority` write can wait behind: the writer work of any ONE write of
-///   the step. It must not grow with the number of kept stale bodies;
+///   the step. It must not grow with the number of kept stale bodies, nor with
+///   the size of their HTML;
 /// - what a run costs in disk reads: the pages every connection of the pool
 ///   fetches during one run. It must not grow with the bodies that are NOT stale,
-///   wherever the run reads them (writer or reader).
+///   wherever the run reads them (writer or reader), by a ratio or by more than a
+///   few pages.
 @Suite("Stale-body evict: what one write holds and what a run reads")
 struct StaleBodyEvictWriterHoldTests {
 
@@ -165,7 +167,11 @@ struct StaleBodyEvictWriterHoldTests {
     static let bodyHTML = "<p>" + String(repeating: "x", count: 16_000) + "</p>"
 
     /// Inbox messages with a stale body: the rules keep every one of them.
-    static func seedKeptInboxBodies(_ fixture: Fixture, uids: Range<Int>) throws {
+    /// `fetchedAt` is stored as given (a shared value makes a tie); by default each
+    /// body gets a stale time of its own, in insertion order.
+    static func seedKeptInboxBodies(
+        _ fixture: Fixture, uids: Range<Int>, html: String = bodyHTML, fetchedAt: DatabaseValue? = nil
+    ) throws {
         try fixture.pool.write { db in
             for uid in uids {
                 let header = MessageHeader(
@@ -175,30 +181,39 @@ struct StaleBodyEvictWriterHoldTests {
                     folderId: fixture.inboxFolderId, accountId: fixture.accountId, folderPath: "INBOX",
                     isInInbox: true)
                 try header.insert(db)
+                let stored: DatabaseValue = fetchedAt ?? staleFetchedAt.databaseValue
                 try db.execute(
                     sql: "INSERT INTO messageBody (id, htmlContent, attachmentsJSON, fetchedAt, icsText) VALUES (?, ?, NULL, ?, NULL)",
-                    arguments: [header.id, bodyHTML, staleFetchedAt])
+                    arguments: [header.id, html, stored])
             }
         }
     }
 
     /// Archive messages with a stale body, a day apart: the newest
     /// `bodyCacheRecentPerFolder` keep theirs, the older ones are evicted.
-    /// Returns their ids, newest first.
-    static func seedArchiveBodies(_ fixture: Fixture, count: Int) throws -> [String] {
+    /// Returns their ids in insertion order, which is also the evict step's page
+    /// order unless `fetchedAt` is given: newest first, or oldest first with
+    /// `oldestFirst`. `from` continues an earlier call: its messages are older than
+    /// every one that call seeded.
+    static func seedArchiveBodies(
+        _ fixture: Fixture, count: Int, from: Int = 0, fetchedAt: DatabaseValue? = nil, oldestFirst: Bool = false
+    ) throws -> [String] {
         try fixture.pool.write { db -> [String] in
             var ids: [String] = []
             for index in 0..<count {
+                let age = oldestFirst ? from + count - index : from + index + 1
                 let header = MessageHeader(
-                    messageId: String(900_000 + index), subject: "Archived \(index)", from: "sender@example.com",
+                    messageId: String(900_000 + from + index), subject: "Archived \(from + index)",
+                    from: "sender@example.com",
                     fromAddress: "sender@example.com", to: "user@example.com",
-                    date: Date().addingTimeInterval(-Double(index + 1) * 86_400), snippet: "",
+                    date: Date().addingTimeInterval(-Double(age) * 86_400), snippet: "",
                     folderId: fixture.archiveFolderId, accountId: fixture.accountId, folderPath: "Archive",
                     isInInbox: false)
                 try header.insert(db)
+                let stored: DatabaseValue = fetchedAt ?? staleFetchedAt.databaseValue
                 try db.execute(
                     sql: "INSERT INTO messageBody (id, htmlContent, attachmentsJSON, fetchedAt, icsText) VALUES (?, ?, NULL, ?, NULL)",
-                    arguments: [header.id, bodyHTML, staleFetchedAt])
+                    arguments: [header.id, bodyHTML, stored])
                 ids.append(header.id)
             }
             return ids
@@ -296,6 +311,68 @@ struct StaleBodyEvictWriterHoldTests {
                 "one write's writer work grew \(ratio)x with 5x the kept stale bodies (\(few.mostPagesInOneTransaction) -> \(many.mostPagesInOneTransaction) pages)")
     }
 
+    /// What reading every body's HTML to its end costs, and the number of rows
+    /// whose HTML it read.
+    static func wholeHTMLRead(_ fixture: Fixture) throws -> (pages: Int, rows: Int) {
+        let before = fixture.connections.pagesSoFar
+        let rows = try fixture.pool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageBody NOT INDEXED WHERE htmlContent LIKE '%</p>'") ?? 0
+        }
+        return (fixture.connections.pagesSoFar - before, rows)
+    }
+
+    @Test("One write of the evict step holds the writer no longer when the kept bodies are 64 times wider")
+    func oneWriteDoesNotGrowWithTheKeptBodiesWidth() throws {
+        let meter = WriterWorkMeter()
+        let fixture = try Self.observedFixture(meter)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+
+        let kept = 300
+        let narrowHTML = "<p>" + String(repeating: "n", count: 1_000) + "</p>"
+        let wideHTML = "<p>" + String(repeating: "w", count: 64_000) + "</p>"
+        try Self.seedKeptInboxBodies(fixture, uids: 1..<(kept + 1), html: narrowHTML)
+
+        let narrow = try Self.measuredRun(fixture, meter: meter).writes
+        let afterNarrowRun = try Self.bodyIds(fixture)
+        #expect(afterNarrowRun.count == kept, "every kept body stays")
+        let narrowRead = try Self.wholeHTMLRead(fixture)
+
+        // Same rows, same `fetchedAt`, 64 times the HTML.
+        try fixture.pool.write { db in
+            try db.execute(sql: "UPDATE messageBody SET htmlContent = ?", arguments: [wideHTML])
+        }
+        let wide = try Self.measuredRun(fixture, meter: meter).writes
+        let afterWideRun = try Self.bodyIds(fixture)
+        #expect(afterWideRun.count == kept, "every kept body stays")
+        let wideRead = try Self.wholeHTMLRead(fixture)
+
+        // Non-vacuous: each run wrote once per page of its stale bodies, and
+        // reading the kept HTML (independent of the code under test) costs over four
+        // times the pages at the second width, so a write that read it could not
+        // pass the ratio below.
+        let pages = kept / SyncConfig.pruneChunkSize
+        #expect(narrow.transactions >= pages, "the first run's writes were measured: \(narrow.transactions)")
+        #expect(wide.transactions >= pages, "the second run's writes were measured: \(wide.transactions)")
+        #expect(narrow.mostPagesInOneTransaction > 0)
+        #expect(narrowRead.rows == kept && wideRead.rows == kept,
+                "the control read every kept body's HTML: \(narrowRead.rows), \(wideRead.rows)")
+        #expect(wideRead.pages > 4 * narrowRead.pages,
+                "reading the kept HTML cost \(narrowRead.pages) then \(wideRead.pages) pages; the fixture does not widen it enough to discriminate")
+
+        // The property: what a priority write can wait behind does not grow with
+        // the width of the kept bodies.
+        let ratio = Double(wide.mostPagesInOneTransaction) / Double(max(narrow.mostPagesInOneTransaction, 1))
+        #expect(ratio < 2,
+                "one write's writer work grew \(ratio)x with 64x wider kept bodies (\(narrow.mostPagesInOneTransaction) -> \(wide.mostPagesInOneTransaction) pages)")
+    }
+
+    /// How many more pages the second run below may read than the first. The two
+    /// runs read the same number of stale bodies and evict the same number, so
+    /// only a deeper B-tree under ten times the rows separates them (a few pages).
+    /// Walking even a compact index of the whole table (a `COUNT(*)`) adds several
+    /// times this at these sizes, which the ratio alone would let through.
+    static let runGrowthSlackPages = 20
+
     @Test("A run reads no more with ten times the bodies that are not stale")
     func aRunReadsOnlyTheStaleBodies() throws {
         let meter = WriterWorkMeter()
@@ -303,35 +380,51 @@ struct StaleBodyEvictWriterHoldTests {
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
 
         let kept = 30
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        let victimsPerRun = 5
         let fewFresh = 1_000
         let manyFresh = 10 * fewFresh
         try Self.seedKeptInboxBodies(fixture, uids: 1..<(kept + 1))
+        // The newest `recent` archive bodies are kept by every run; the older ones
+        // are each run's victims, so each run is seen to evict.
+        let archived = try Self.seedArchiveBodies(fixture, count: recent + victimsPerRun)
         try Self.seedFreshBodies(fixture, ids: 0..<fewFresh)
+        let keptIds = try Self.bodyIds(fixture).subtracting(archived.suffix(victimsPerRun))
 
         let few = try Self.measuredRun(fixture, meter: meter).pagesRead
         let afterFirstRun = try Self.bodyIds(fixture)
-        #expect(afterFirstRun.count == kept + fewFresh, "the rules keep every stale inbox body; fresh ones are not stale")
+        #expect(afterFirstRun == keptIds,
+                "the run evicts the \(victimsPerRun) older archive bodies and keeps the rest; fresh ones are not stale")
         let tableFew = try Self.wholeTableRead(fixture)
 
+        let secondVictims = try Self.seedArchiveBodies(fixture, count: victimsPerRun, from: recent + victimsPerRun)
         try Self.seedFreshBodies(fixture, ids: fewFresh..<manyFresh)
+        let keptAfterGrowth = try Self.bodyIds(fixture).subtracting(secondVictims)
         let many = try Self.measuredRun(fixture, meter: meter).pagesRead
         let afterSecondRun = try Self.bodyIds(fixture)
-        #expect(afterSecondRun.count == kept + manyFresh, "the rules keep every stale inbox body; fresh ones are not stale")
+        #expect(afterSecondRun == keptAfterGrowth,
+                "the run evicts the \(victimsPerRun) new older archive bodies and keeps the rest; fresh ones are not stale")
+        #expect(afterSecondRun.count == kept + recent + manyFresh)
         let tableMany = try Self.wholeTableRead(fixture)
 
         // Non-vacuous, and independent of the code under test: reading the table
         // costs over four times the pages at the second size, so a run that read
-        // it could not pass the ratio below.
-        #expect(tableFew.rows == kept + fewFresh && tableMany.rows == kept + manyFresh,
+        // it could not pass the bounds below.
+        let tableRowsFew = kept + recent + fewFresh
+        let tableRowsMany = kept + recent + manyFresh
+        #expect(tableFew.rows == tableRowsFew && tableMany.rows == tableRowsMany,
                 "the control read every body: \(tableFew.rows), \(tableMany.rows)")
         #expect(tableMany.pages > 4 * tableFew.pages,
                 "reading the table cost \(tableFew.pages) then \(tableMany.pages) pages; the fixture does not grow it enough to discriminate")
 
         // The property: the pages a run reads, on any connection, stay with the
         // stale bodies (with the search walking the table they grow about ten
-        // times here).
+        // times here, and walking a compact index of it still adds more than the
+        // slack).
         let ratio = Double(many) / Double(max(few, 1))
         #expect(ratio < 2,
                 "a run read \(ratio)x the pages with 10x the fresh bodies (\(few) -> \(many) pages)")
+        #expect(many - few <= Self.runGrowthSlackPages,
+                "a run read \(many - few) more pages with 10x the fresh bodies (\(few) -> \(many)); the slack is \(Self.runGrowthSlackPages)")
     }
 }
