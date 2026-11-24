@@ -671,9 +671,52 @@ extension SyncEngine {
 
     // MARK: - FTS Bulk Indexing
 
+    /// The position after the last header of a bulk-index page: the whole
+    /// `ORDER BY date DESC, id ASC` key, so headers that share a date are neither
+    /// skipped nor read twice at a page boundary.
+    struct BulkIndexCursor: Equatable, Sendable {
+        let date: Date
+        let id: String
+
+        /// The cursor after `page`, or nil when the page is empty (the folder is done).
+        init?(after page: [MessageHeader]) {
+            guard let last = page.last else { return nil }
+            date = last.date
+            id = last.id
+        }
+    }
+
+    /// One page of a folder's headers for the bulk index, newest first, after `cursor`.
+    ///
+    /// Pages by key, never by OFFSET: an OFFSET page walks every row before it, so
+    /// paging a folder that way read the folder again for every page. The predicate
+    /// leads with the sargable `date <= ?`, so the page seeks into
+    /// `messageHeader_folderId_date (folderId, date)` at the cursor and the tie-break
+    /// on `id` filters only the rows that share the cursor's date: the same shape as
+    /// the keyset predicate of `InboxListReader.durableQuerySQL`.
+    static func bulkIndexPageRequest(
+        folderId: String, after cursor: BulkIndexCursor?, limit: Int
+    ) -> QueryInterfaceRequest<MessageHeader> {
+        var request = MessageHeader.filter(Column("folderId") == folderId)
+        if let cursor {
+            request = request.filter(
+                Column("date") <= cursor.date
+                    && (Column("date") < cursor.date
+                        || (Column("date") == cursor.date && Column("id") > cursor.id)))
+        }
+        return request.order(Column("date").desc, Column("id").asc).limit(limit)
+    }
+
     /// Index existing messages into FTS if the index is sparse.
-    /// Runs once per account, typically on first launch after FTS is added.
-    /// Uses paginated queries to avoid materializing all messages at once.
+    ///
+    /// Runs after every sync (step 3 of `sync(account:)`); the task guard below
+    /// only stops two runs for one account from overlapping. The check compares
+    /// the account's header count with its search entry count, and every read
+    /// goes through an index: one `folderId` index range per folder, and one key
+    /// range of the `message_ids` primary key (`documentCountForAccount`). It keeps
+    /// no marker or counter of its own, so each run checks the data itself.
+    /// When the index is sparse, each folder is paged by key
+    /// (`bulkIndexPageRequest`), so no message is materialized all at once.
     func bulkIndexIfNeeded(account: Account) {
         // Don't overlap per-account
         guard bulkIndexTasks[account.id] == nil else { return }
@@ -705,18 +748,16 @@ extension SyncEngine {
                     let batchSize = SyncConfig.ftsIndexBatchSize
                     var batchNum = 0
                     for fi in folderIds {
-                        var offset = 0
+                        var cursor: BulkIndexCursor?
                         while true {
                             guard !Task.isCancelled else { return }
-                            let currentOffset = offset
+                            let after = cursor
                             let batch: [MessageHeader] = (try? await self?.dbPool.read { db in
-                                try MessageHeader
-                                    .filter(Column("folderId") == fi)
-                                    .order(Column("date").desc)
-                                    .limit(batchSize, offset: currentOffset)
+                                try SyncEngine
+                                    .bulkIndexPageRequest(folderId: fi, after: after, limit: batchSize)
                                     .fetchAll(db)
                             }) ?? []
-                            guard !batch.isEmpty else { break }
+                            guard let next = BulkIndexCursor(after: batch) else { break }
 
                             let records = batch.map { header in
                                 FTSHeaderRecord(
@@ -748,7 +789,7 @@ extension SyncEngine {
                                     )
                                 }
                             }
-                            offset += batch.count
+                            cursor = next
                             batchNum += 1
                             try? await Task.sleep(for: .milliseconds(100))
                         }

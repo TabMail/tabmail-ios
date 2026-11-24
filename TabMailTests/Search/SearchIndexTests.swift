@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 // MARK: - Data Struct Tests (no database needed)
@@ -352,6 +353,63 @@ struct SearchIndexCRUDTests {
         #expect(countNone == 0)
 
         try await index.removeMessages( contentKeys: records.map(\.headerId).map(ContentKey.init(rawValue:)))
+    }
+
+    @Test("documentCountForAccount counts exactly the account's own ids, no case or wildcard neighbours")
+    func documentCountForAccountIsExact() async throws {
+        // `_` is a LIKE wildcard and LIKE ignores ASCII case, so a prefix match on
+        // "test_acct_exact:" also counted the last two ids. The key range does not.
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let ids = [
+            "test_acct_exact:INBOX:1",
+            "test_acct_exact:Archive:2",
+            "testXacct_exact:INBOX:1",
+            "TEST_ACCT_EXACT:INBOX:1",
+        ]
+        let records = ids.enumerated().map { offset, hid in
+            FTSHeaderRecord(contentKey: ContentKey(rawValue: hid), headerId: hid, messageId: "exact\(offset)",
+                            subject: "S", from: "a@example.com", to: "b@example.com", dateMs: nowMs)
+        }
+        let keys = ids.map(ContentKey.init(rawValue:))
+        try await index.removeMessages(contentKeys: keys)
+        let inserted = try await index.indexHeaders(records)
+        #expect(inserted == ids.count)
+
+        let count = try await index.documentCountForAccount(accountId: "test_acct_exact")
+        #expect(count == 2)
+
+        try await index.removeMessages(contentKeys: keys)
+    }
+
+    @Test("documentCountForAccount seeks a two-sided range of the message_ids key; the LIKE form scanned")
+    func documentCountForAccountSeeksKeyRange() async throws {
+        _ = try await index.documentCountForAccount(accountId: "test_acct_plan")
+        // The shared index's own database, opened read-only, so the plan is about
+        // the real `message_ids` schema and not a copy of it.
+        let appSupport = try #require(
+            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+        var config = Configuration()
+        config.readonly = true
+        let queue = try DatabaseQueue(
+            path: appSupport.appendingPathComponent("tabmail_fts/fts.db").path, configuration: config)
+        let range = SearchIndex.accountHeaderIdRange(accountId: "test_acct_plan")
+        let plans: (range: String, like: String) = try await queue.read { db in
+            func plan(_ sql: String, _ arguments: StatementArguments) throws -> String {
+                try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
+                    .map { $0["detail"] as String }
+                    .joined(separator: " | ")
+            }
+            let rangePlan = try plan(SearchIndex.accountDocumentCountSQL, [range.lower, range.upper])
+            let likePlan = try plan("SELECT COUNT(*) FROM message_ids WHERE headerId LIKE ?", ["test_acct_plan:%"])
+            return (rangePlan, likePlan)
+        }
+
+        let seeksRange = plans.range.contains("SEARCH message_ids USING COVERING INDEX")
+            && plans.range.contains("(headerId>? AND headerId<?)")
+        #expect(seeksRange, "the account count no longer seeks its key range: \(plans.range)")
+        #expect(!plans.range.contains("SCAN"), "the account count scans: \(plans.range)")
+        // Negative control through the same probe: the LIKE form it replaced scans.
+        #expect(plans.like.contains("SCAN message_ids"), "the probe cannot see a scan: \(plans.like)")
     }
 
     @Test("removeMessagesForAccount removes all messages for given account")

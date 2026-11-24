@@ -172,68 +172,106 @@ struct SyncEngineFTSTests {
 @Suite("SyncEngineFTS - Bulk Index Queries")
 struct SyncEngineFTSBulkIndexTests {
 
-    @Test("Paginated fetch returns messages ordered by date descending with limit and offset")
-    func bulkIndexPaginatedFetch() throws {
+    /// Pages `folderId` to the end exactly as `bulkIndexIfNeeded` does: the
+    /// production request, and the next cursor from `BulkIndexCursor(after:)`. At
+    /// most `maxPages` pages, so a cursor that stops advancing fails the test
+    /// instead of hanging it.
+    private func pageAll(
+        _ db: DatabaseQueue, folderId: String, limit: Int, maxPages: Int = 50
+    ) throws -> [[String]] {
+        var pages: [[String]] = []
+        var cursor: SyncEngine.BulkIndexCursor?
+        for _ in 0..<maxPages {
+            let after = cursor
+            let page: [MessageHeader] = try db.read { conn in
+                try SyncEngine.bulkIndexPageRequest(folderId: folderId, after: after, limit: limit)
+                    .fetchAll(conn)
+            }
+            guard let next = SyncEngine.BulkIndexCursor(after: page) else { return pages }
+            pages.append(page.map(\.id))
+            cursor = next
+        }
+        Issue.record("bulk index paging did not reach the end of the folder in \(maxPages) pages")
+        return pages
+    }
+
+    @Test("Bulk index paging visits every header of the folder once, newest first, ties included")
+    func bulkIndexPagingVisitsEveryHeaderOnce() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db, name: "INBOX", path: "INBOX", role: .inbox)
+        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
+
+        // Whole seconds, so the stored dates compare equal to the inserted ones.
+        let now = Date(timeIntervalSince1970: (Date().timeIntervalSince1970).rounded(.down))
+        let hour: TimeInterval = 3600
+        // Three headers share one date and straddle the boundary between pages 1
+        // and 2 (limit 2); two more share another. Their message ids sort as
+        // strings in a different order than they are inserted ("100" < "30" < "4").
+        let plan: [(messageId: String, date: Date)] = [
+            ("7", now),
+            ("30", now.addingTimeInterval(-hour)),
+            ("4", now.addingTimeInterval(-hour)),
+            ("100", now.addingTimeInterval(-hour)),
+            ("9", now.addingTimeInterval(-2 * hour)),
+            ("12", now.addingTimeInterval(-2 * hour)),
+            ("5", now.addingTimeInterval(-3 * hour)),
+        ]
+        var inserted: [MessageHeader] = []
+        for entry in plan {
+            let header = try TestDatabase.insertMessageHeader(
+                db, messageId: entry.messageId, date: entry.date, folderId: "acc1:INBOX")
+            inserted.append(header)
+        }
+        // Another folder's header, newer than all of them, must never appear.
+        let other = try TestDatabase.insertMessageHeader(
+            db, messageId: "8", date: now.addingTimeInterval(hour),
+            folderId: "acc1:Sent", folderPath: "Sent", isInInbox: false)
+
+        // SQLite's BINARY order on `id` is UTF-8 byte order; Swift's `<` on
+        // `String` is not (see `InboxOrdering`).
+        let expected = inserted
+            .sorted { $0.date != $1.date ? $0.date > $1.date : $0.id.utf8.lexicographicallyPrecedes($1.id.utf8) }
+            .map(\.id)
+        let pages = try pageAll(db, folderId: "acc1:INBOX", limit: 2)
+        let visited = pages.flatMap { $0 }
+
+        #expect(visited == expected)
+        #expect(Set(visited).count == visited.count)
+        #expect(!visited.contains(other.id))
+        let pageSizes = pages.map(\.count)
+        #expect(pageSizes == [2, 2, 2, 1])
+    }
+
+    @Test("A bulk index page after a cursor seeks the folder's date index at the cursor, with no OFFSET")
+    func bulkIndexPageSeeksAtTheCursor() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "1", folderId: "acc1:INBOX")
+        let cursor = try #require(SyncEngine.BulkIndexCursor(after: [header]))
 
-        // Insert 5 messages with distinct dates
-        let baseDateInterval: TimeInterval = 1700000000
-        for i in 1...5 {
-            try TestDatabase.insertMessageHeader(
-                db,
-                messageId: "\(i)",
-                subject: "Message \(i)",
-                date: Date(timeIntervalSince1970: baseDateInterval + Double(i) * 3600),
-                snippet: "Snippet \(i)"
-            )
+        // Planned with no statistics: what a device has until its first ANALYZE.
+        let planned: (sql: String, plan: String) = try db.write { conn in
+            if try conn.tableExists("sqlite_stat1") {
+                try conn.execute(sql: "DELETE FROM sqlite_stat1")
+                try conn.execute(sql: "ANALYZE sqlite_master")
+            }
+            let statement = try SyncEngine
+                .bulkIndexPageRequest(folderId: "acc1:INBOX", after: cursor, limit: 200)
+                .makePreparedRequest(conn, forSingleResult: false)
+                .statement
+            let plan = try Row.fetchAll(
+                conn, sql: "EXPLAIN QUERY PLAN " + statement.sql, arguments: statement.arguments)
+                .map { $0["detail"] as String }
+                .joined(separator: " | ")
+            return (statement.sql, plan)
         }
 
-        // First page: limit 2, offset 0 — should get the 2 most recent (5, 4)
-        let page1: [MessageHeader] = try db.read { dbConn in
-            try MessageHeader
-                .filter(Column("folderId") == "acc1:INBOX")
-                .order(Column("date").desc)
-                .limit(2, offset: 0)
-                .fetchAll(dbConn)
-        }
-        #expect(page1.count == 2)
-        #expect(page1[0].messageId == "5")
-        #expect(page1[1].messageId == "4")
-
-        // Second page: limit 2, offset 2 — should get (3, 2)
-        let page2: [MessageHeader] = try db.read { dbConn in
-            try MessageHeader
-                .filter(Column("folderId") == "acc1:INBOX")
-                .order(Column("date").desc)
-                .limit(2, offset: 2)
-                .fetchAll(dbConn)
-        }
-        #expect(page2.count == 2)
-        #expect(page2[0].messageId == "3")
-        #expect(page2[1].messageId == "2")
-
-        // Third page: limit 2, offset 4 — should get (1)
-        let page3: [MessageHeader] = try db.read { dbConn in
-            try MessageHeader
-                .filter(Column("folderId") == "acc1:INBOX")
-                .order(Column("date").desc)
-                .limit(2, offset: 4)
-                .fetchAll(dbConn)
-        }
-        #expect(page3.count == 1)
-        #expect(page3[0].messageId == "1")
-
-        // Beyond last page: offset 5 — should be empty
-        let page4: [MessageHeader] = try db.read { dbConn in
-            try MessageHeader
-                .filter(Column("folderId") == "acc1:INBOX")
-                .order(Column("date").desc)
-                .limit(2, offset: 5)
-                .fetchAll(dbConn)
-        }
-        #expect(page4.isEmpty)
+        let seeksAtCursor = planned.plan.contains("messageHeader_folderId_date (folderId=? AND date<?)")
+        #expect(seeksAtCursor, "the page no longer seeks to the cursor's date: \(planned.plan)")
+        #expect(!planned.plan.contains("SCAN"), "the page scans: \(planned.plan)")
+        #expect(!planned.sql.uppercased().contains("OFFSET"), "the page uses OFFSET: \(planned.sql)")
     }
 
     @Test("Bulk index iterates each folder separately")
