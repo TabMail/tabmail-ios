@@ -152,6 +152,33 @@ struct ContentOwnershipSweepTests {
         BodyAssetStore.allManifestContentKeys()
     }
 
+    /// #1376: the asset side no longer sweeps the whole manifest. A key is judged
+    /// when it is on `bodyAssetPendingDelete`, where a header delete's trigger, the
+    /// notification extension's merge or the one-time sweep puts it. These fixtures
+    /// write assets for keys no header ever named, so they queue the keys the way
+    /// the one-time sweep would, then run one worker pass. The shared list also
+    /// holds the ids other suites' header deletes queued, so the pass gets a budget
+    /// that cannot run out before this fixture's entries.
+    private func queueAndProcessPendingDeletes(_ keys: [ContentKey]) async throws {
+        try await AppDatabase.dbPool.write { db in
+            for key in keys {
+                try db.execute(
+                    sql: "INSERT INTO bodyAssetPendingDelete (contentKey) VALUES (?)",
+                    arguments: [key.rawValue])
+            }
+        }
+        await BodyAssetMaintenance.processPendingDeletes(
+            passBudgetSeconds: 120, foreground: { true })
+    }
+
+    private func pendingDeleteEntries(for key: ContentKey) async -> Int {
+        (try? await AppDatabase.dbPool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM bodyAssetPendingDelete WHERE contentKey = ?",
+                arguments: [key.rawValue])
+        } ?? 0) ?? 0
+    }
+
     private func cleanup(accountId: String, keys: [ContentKey]) async {
         try? await SearchIndex.shared.removeMessages(contentKeys: keys)
         try? await AppDatabase.dbPool.write { db in
@@ -168,6 +195,11 @@ struct ContentOwnershipSweepTests {
             // not reach it. Scoped by the same accountId as everything else here.
             try db.execute(sql: "DELETE FROM userLabel WHERE accountId = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM account WHERE id = ?", arguments: [accountId])
+            // Last: the header delete above queued its ids (v114 trigger, #1376), and
+            // a kept (protected) entry stays on the list by design.
+            try db.execute(
+                sql: #"DELETE FROM bodyAssetPendingDelete WHERE contentKey LIKE ? ESCAPE '\'"#,
+                arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
         }
     }
 
@@ -235,10 +267,12 @@ struct ContentOwnershipSweepTests {
             data: Data(repeating: 7, count: 64),
             identityStamp: "rfc:quarantine-9002@example.com") != nil)
 
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([key])
 
         #expect(manifestKeys().contains(key),
                 "a quarantined folder's cached attachments must survive the orphan sweep")
+        #expect(await pendingDeleteEntries(for: key) == 1,
+                "a kept key stays queued so a later pass judges it again once the reset settles")
         await cleanup(accountId: accountId, keys: [key])
     }
 
@@ -261,10 +295,11 @@ struct ContentOwnershipSweepTests {
 
         let engine = SyncEngine()
         _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([key])
 
         #expect(await ftsRowid(key) == nil, "unowned FTS row must still be pruned")
         #expect(!manifestKeys().contains(key), "unowned asset rows must still be pruned")
+        #expect(await pendingDeleteEntries(for: key) == 0, "a deleted key leaves the list")
         await cleanup(accountId: accountId, keys: [key])
     }
 
@@ -456,7 +491,7 @@ struct ContentOwnershipSweepTests {
         try await seedHeader(
             accountId: accountId, folderPath: "Archive", messageId: providerMessageId)
 
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([oldKey])
 
         let keys = manifestKeys()
         #expect(!keys.contains(oldKey), "the stale key must not remain in the manifest")
@@ -1135,7 +1170,7 @@ struct ContentOwnershipSweepTests {
 
         let engine = SyncEngine()
         _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([key])
 
         #expect(await ftsRowid(key) != nil, "the indexed body must survive the transition")
         #expect(await ftsBody(key)?.contains("f4 body text") == true)
@@ -1307,7 +1342,8 @@ struct ContentOwnershipSweepTests {
     /// answers in ONE run so no leg can pass by a policy the others contradict.
     /// A manifest holding a live key, a protected-but-dead key, a dead key inside
     /// a resolvable scope and a dead key whose scope resolves to nothing must come
-    /// out of `pruneOrphans()` holding exactly the first two.
+    /// out of a pass of the pending-delete worker (`processPendingDeletes`, which
+    /// replaced `pruneOrphans()` in #1376) holding exactly the first two.
     ///
     /// ⚑ WHY THIS IS AN INVARIANT TEST AND NOT A MECHANISM ONE (`MIS-015`). It says
     /// nothing about how the sweep decides — not which keys the ownership gate is
@@ -1355,7 +1391,7 @@ struct ContentOwnershipSweepTests {
                 && seeded.contains(deadKey) && seeded.contains(unscopedKey),
                 "precondition: all four keys are in the manifest before the sweep")
 
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([liveKey, quarantinedKey, deadKey, unscopedKey])
 
         let after = manifestKeys()
         #expect(after.contains(liveKey),
@@ -1366,6 +1402,11 @@ struct ContentOwnershipSweepTests {
                 "a key nothing owns, in a settled folder, must still be reclaimed")
         #expect(!after.contains(unscopedKey),
                 "a key no folder claims must still be reclaimable — otherwise a removed account leaks forever")
+        // The list: the live key, and both deleted keys, leave it; the protected key stays.
+        #expect(await pendingDeleteEntries(for: liveKey) == 0)
+        #expect(await pendingDeleteEntries(for: quarantinedKey) == 1)
+        #expect(await pendingDeleteEntries(for: deadKey) == 0)
+        #expect(await pendingDeleteEntries(for: unscopedKey) == 0)
 
         await cleanup(
             accountId: accountId,

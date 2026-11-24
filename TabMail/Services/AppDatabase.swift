@@ -2579,8 +2579,8 @@ final class AppDatabase: Sendable {
             // deterministic (`headerHash(contentKey)/assetHash(cid|section)`) and
             // written with `ON CONFLICT(id) DO UPDATE`, so a re-fetch re-attaches
             // the SAME rows and the SAME files — it cannot duplicate either. The
-            // assets stay owned (their headers are untouched, so
-            // `BodyAssetMaintenance.pruneOrphans` correctly protects them), stay
+            // assets stay owned (their headers are untouched, so no delete queues
+            // their keys on `bodyAssetPendingDelete`, #1376), stay
             // bounded (`evictIfOverCap` against `attachmentsBudgetMB`, default
             // 1024 MB), and are still reclaimed when their header dies via the
             // routed `MessageContentStore.releaseUnowned(… .assets)` sites. Clearing

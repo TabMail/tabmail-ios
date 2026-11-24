@@ -568,10 +568,12 @@ actor SyncEngine {
         }
     }
 
-    /// NON-WAL BodyAssetStore maintenance: evict attachments over the user's cap, then
-    /// sweep cross-DB/filesystem orphans (NSE-written assets whose push got dropped,
-    /// eviction crashes, etc.). Both are no-ops on cold/empty state and idempotent;
-    /// order matters (evict first so the sweep skips freshly-evicted files).
+    /// NON-WAL BodyAssetStore maintenance: evict attachments over the user's cap,
+    /// recover abandoned writes (their leases and staging files), run the one-time
+    /// orphan sweep if it has not completed, then delete the assets of the keys
+    /// queued on `bodyAssetPendingDelete` (#1376; nothing walks the whole store any
+    /// more). All are no-ops on cold/empty state and idempotent; the sweep runs
+    /// before the worker so the keys it queues are handled in the same pass.
     ///
     /// FOREGROUND-ONLY. The manifest is a non-WAL `DatabaseQueue` in the App-Group
     /// container (shared with the NSE); its read holds a SQLite lock that RunningBoard
@@ -594,10 +596,17 @@ actor SyncEngine {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            await BodyAssetMaintenance.pruneOrphans()
+            BodyAssetStore.recoverAbandonedPreparations()
+        }
+        if shouldRun() {
+            await BodyAssetMaintenance.runOrphanSweepOnce()
         }
         let t2 = CFAbsoluteTimeGetCurrent()
-        BackgroundSyncLogger.logDebug("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms assetSweep=\(Int((t2-t1)*1000))ms")
+        if shouldRun() {
+            await BodyAssetMaintenance.processPendingDeletes()
+        }
+        let t3 = CFAbsoluteTimeGetCurrent()
+        BackgroundSyncLogger.logDebug("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms recoverAndSweepOnce=\(Int((t2-t1)*1000))ms pendingDeletes=\(Int((t3-t2)*1000))ms")
     }
 
     /// Two-tier sync: tries delta sync first (fast), falls back to full sync (robust).
