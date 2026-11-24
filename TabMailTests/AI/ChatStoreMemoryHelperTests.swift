@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// Tests for `ChatStore` memory helpers:
@@ -19,13 +20,26 @@ struct ChatStoreMemoryHelperTests {
 
     // MARK: - Fixtures
 
+    /// Every statement the pool runs, recorded by GRDB's statement trace.
+    private final class SQLTape: Sendable {
+        private let statements = Mutex<[String]>([])
+        func record(_ sql: String) { statements.withLock { $0.append(sql) } }
+        var all: [String] { statements.withLock { $0 } }
+        func clear() { statements.withLock { $0.removeAll() } }
+    }
+
     @MainActor
-    private func installTempDB() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
+    private func installTempDB(trace tape: SQLTape? = nil) throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let path = dir.appendingPathComponent("tabmail.sqlite").path
         var config = Configuration()
         config.foreignKeysEnabled = true
+        if let tape {
+            config.prepareDatabase { db in
+                db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
+            }
+        }
         let pool = try DatabasePool(path: path, configuration: config)
         let appDb = try AppDatabase(dbPool: pool)
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
@@ -108,6 +122,42 @@ struct ChatStoreMemoryHelperTests {
         let cutoff = Int64(Date().timeIntervalSince1970 * 1000)
         let result = try await ChatStore.shared.historyTurnIdsForSelfHeal(olderThan: cutoff)
         #expect(result == Set(["inbox-t", "msg-t", "compose-t"]))
+    }
+
+    /// The per-scope breakdown is a second, grouped read of the same chat-history range that
+    /// only feeds a debug log line. With debug logging off it must not run at all; the ids
+    /// returned are the same either way. The logging-on half is the control: it proves the
+    /// trace sees the breakdown when it does run, so the logging-off half cannot pass vacuously.
+    @Test("historyTurnIdsForSelfHeal runs the scope breakdown read only while debug logging is on")
+    func historyTurnIdsForSelfHeal_scopeBreakdownOnlyWithDebugLogging() async throws {
+        let tape = SQLTape()
+        let (pool, dir, previous) = try await MainActor.run { try installTempDB(trace: tape) }
+        defer {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            Task { @MainActor in tearDown(pool: pool, dir: dir, previous: previous) }
+        }
+
+        let oldTs = Double(Int64(Date().timeIntervalSince1970 * 1000) - 10_000_000)
+        try await MainActor.run {
+            try insertHistoryTurn(pool, id: "inbox-t", timestamp: oldTs, sessionId: "inbox-sess")
+            try insertHistoryTurn(pool, id: "msg-t", timestamp: oldTs, sessionId: "msg:acc1:foo")
+        }
+        let cutoff = Int64(Date().timeIntervalSince1970 * 1000)
+        let expected: Set<String> = ["inbox-t", "msg-t"]
+
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = false }
+        tape.clear()
+        let quiet = try await ChatStore.shared.historyTurnIdsForSelfHeal(olderThan: cutoff)
+        let quietBreakdowns = tape.all.filter { $0.contains("GROUP BY scope") }
+        #expect(quiet == expected)
+        #expect(quietBreakdowns.isEmpty, "the breakdown ran with debug logging off: \(quietBreakdowns)")
+
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        tape.clear()
+        let logged = try await ChatStore.shared.historyTurnIdsForSelfHeal(olderThan: cutoff)
+        let loggedBreakdowns = tape.all.filter { $0.contains("GROUP BY scope") }
+        #expect(logged == expected)
+        #expect(loggedBreakdowns.count == 1, "the trace did not see the breakdown with debug logging on: \(tape.all)")
     }
 
     // MARK: - allHistoryTurnIds
