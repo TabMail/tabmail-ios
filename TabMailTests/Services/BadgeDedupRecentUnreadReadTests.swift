@@ -252,9 +252,10 @@ struct BadgeDedupRecentUnreadReadTests {
     func fixturesAreWhatTheyClaim() throws {
         let directory = try Self.scratchDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
-        func ids(_ fixture: Fixture) throws -> (folders: Int, ids: [String]) {
+        func ids(_ fixture: Fixture) throws -> (folders: Int, ids: [String], url: URL) {
             let url = try Self.makeDatabase(fixture, statistics: .none, in: directory)
-            return try Self.read(url) { db in (try Self.inboxFolderIds(db).count, try Self.oracle(db)) }
+            let read = try Self.read(url) { db in (try Self.inboxFolderIds(db).count, try Self.oracle(db)) }
+            return (read.0, read.1, url)
         }
         let noFolder = try ids(.noInboxFolder)
         #expect(noFolder.folders == 0 && noFolder.ids.isEmpty)
@@ -271,8 +272,7 @@ struct BadgeDedupRecentUnreadReadTests {
         let ties = try ids(.tiesAcrossTheLimit)
         #expect(ties.folders == 3 && ties.ids.count == Self.limit)
         // The limit cuts a run of equal dates: the last date returned has more unread rows than were returned.
-        let url = try Self.makeDatabase(.tiesAcrossTheLimit, statistics: .none, in: directory)
-        let cut = try Self.read(url) { db -> (returned: Int, atDate: Int) in
+        let cut = try Self.read(ties.url) { db -> (returned: Int, atDate: Int) in
             let dates = try Self.unreadDates(db)
             let returned = try Self.oracle(db).compactMap { dates[$0] }
             guard let boundary = returned.last else { return (0, 0) }
