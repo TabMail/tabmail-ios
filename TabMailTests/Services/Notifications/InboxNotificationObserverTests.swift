@@ -234,10 +234,14 @@ struct InboxNotificationObserverTests {
         let reopened = try AppDatabase(dbPool: relaunch)
         let statements = tape.all
         // A read of messageHeader rows by inbox membership (DDL and triggers that
-        // merely name the column are not reads).
+        // merely name the column are not reads). Quotes, backticks and brackets are
+        // dropped and case ignored, so a read written through the query interface
+        // (`FROM "messageHeader"`) is caught as well as one written by hand.
         let inboxReads = statements.filter { sql in
-            let flat = sql.split(whereSeparator: \.isWhitespace).joined(separator: " ")
-            return flat.contains("SELECT") && flat.contains("FROM messageHeader") && flat.contains("isInInbox")
+            let flat = sql.filter { !"\"`[]".contains($0) }.lowercased()
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            return !flat.hasPrefix("create ")
+                && flat.contains("select") && flat.contains("from messageheader") && flat.contains("isininbox")
         }
         #expect(!statements.isEmpty, "the trace saw no statement, so the check below would pass vacuously")
         #expect(inboxReads.isEmpty, "opening the database read inbox rows: \(inboxReads)")
