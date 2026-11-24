@@ -284,6 +284,7 @@ struct BackfillProgressCountTests {
         "messageHeader_backfillProgress": "105000 26250 13125 8750 6563 5250",
         "messageHeader_bodyRepopulate": "105000 52500 26250 17500 13125 1",
         "messageHeader_bodyRepopulateV2": "105000 52500 26250 17500 13125 10500 1",
+        "messageHeader_completeByDate": "84951 1 1",
         "messageHeader_computedThreadId": "105000 105000",
         "messageHeader_date": "105000 1",
         "messageHeader_embeddingIncomplete": "82382 41191 1",
