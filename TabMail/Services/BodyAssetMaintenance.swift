@@ -279,12 +279,13 @@ enum BodyAssetMaintenance {
         while CFAbsoluteTimeGetCurrent() < deadline, foreground() {
             // Raw pool: an async `dbPool.read` would first run the NSE merge.
             let entries: [(rowid: Int64, contentKey: ContentKey)]
+            let cursor = after
             do {
                 entries = try await AppDatabase.rawPool.read { db in
                     try Row.fetchAll(
                         db,
                         sql: "SELECT id, contentKey FROM bodyAssetPendingDelete WHERE id > ? ORDER BY id LIMIT ?",
-                        arguments: [after, batchSize]
+                        arguments: [cursor, batchSize]
                     ).map { (rowid: $0["id"], contentKey: ContentKey(rawValue: $0["contentKey"])) }
                 }
             } catch {
