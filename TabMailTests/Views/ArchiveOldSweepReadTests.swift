@@ -363,3 +363,284 @@ struct ArchiveOldSweepEntryPointReadTests {
         InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
     }
 }
+
+/// The mail a differential case holds. File scope: a test's arguments cannot name a member of the suite type they
+/// are attached to.
+enum ArchiveOldDataShape: String, CaseIterable, Sendable, CustomTestStringConvertible {
+    case empty
+    case oneRow
+    /// Runs of seven equal dates in two inboxes, with page breaks of the production page size inside a run in both,
+    /// the same dates across the two inboxes and in an archive, and rows dated exactly at the cutoff.
+    case ties
+    /// Three accounts, each with inbox mail on both sides of the cutoff and old archive mail.
+    case severalAccounts
+    /// 99,999 rows over three accounts, two of three in the inbox, dates on both sides of the cutoff.
+    case large
+
+    var testDescription: String { rawValue }
+}
+
+/// The planner statistics a differential case runs under.
+enum ArchiveOldStatistics: String, CaseIterable, Sendable, CustomTestStringConvertible {
+    /// No `sqlite_stat1` at all.
+    case unanalyzed
+    /// The maintenance pass's statistics refresh ran with the mail present (an upgraded device).
+    case analyzedWithMail
+    /// The refresh ran on an empty table and the mail arrived afterwards (a fresh install).
+    case analyzedBeforeMail
+
+    var testDescription: String { rawValue }
+}
+
+/// Differential (#1387): the paged read returns what the read it replaced returned, as the sweep uses it.
+///
+/// The replaced read is kept below as the oracle, as the sweep ran it: one statement over every inbox folder,
+/// `date < cutoff`, ordered by `date`. The sweep groups the rows by account and moves each account's rows as one
+/// operation in the order read, so the contract is: per account, the same rows, oldest first. The replaced read left
+/// rows of equal dates in no fixed order, so each account's rows are compared as runs of equal dates, oldest run first,
+/// each run as a set of whole rows. Databases are built by the production migrations, the production deferred-index
+/// build and the production statistics refresh: five shapes of mail under three statistics states. Every page the read
+/// runs must also keep the bounded seek under those statistics, and the oracle must be the plan the rule rejects.
+///
+/// Serialized and process-global: the statistics refresh runs under a process-wide single-flight latch.
+@Suite("Archive old messages: the paged read returns the replaced read's rows", .serialized, .processGlobalState)
+struct ArchiveOldSweepDifferentialTests {
+
+    private static let accounts = ["acc1", "acc2", "acc3"]
+
+    /// The read this fix replaced, exactly as `SettingsView.archiveOldMessages` ran it. The oracle.
+    private static func replacedRead(_ db: Database, folderIds: Set<String>, cutoff: Date) throws -> [MessageHeader] {
+        try MessageHeader
+            .filter(folderIds.contains(Column("folderId")))
+            .filter(Column("date") < cutoff)
+            .order(Column("date").asc)
+            .fetchAll(db)
+    }
+
+    /// Generated mail of one account and folder: row `n` (0 to `count - 1`) has message id `<prefix><n>` and is dated
+    /// `(n / run) * minutesPerRun` minutes before `newestMinutesAfterCutoff` minutes after the cutoff, so the dates come
+    /// in runs of `run` equal values, newest first.
+    private struct Series {
+        let account: String
+        let folder: String
+        let prefix: String
+        let count: Int
+        let run: Int
+        let minutesPerRun: Int
+        let newestMinutesAfterCutoff: Int
+
+        /// How many of its rows the sweep must read: inbox rows dated strictly before the cutoff, counted in whole
+        /// minutes, so a row dated exactly at the cutoff is not one.
+        var oldInboxRows: Int {
+            guard folder == "INBOX" else { return 0 }
+            return (0..<count).filter { ($0 / run) * minutesPerRun > newestMinutesAfterCutoff }.count
+        }
+    }
+
+    private static func series(_ shape: ArchiveOldDataShape) -> [Series] {
+        let sixDaysOld = -6 * 24 * 60
+        switch shape {
+        case .empty:
+            return []
+        case .oneRow:
+            return [Series(account: "acc1", folder: "INBOX", prefix: "o", count: 1, run: 1, minutesPerRun: 1,
+                           newestMinutesAfterCutoff: sixDaysOld)]
+        case .ties:
+            // Oldest first, acc1's inbox starts with a run of two (rows 1001 and 1002) and acc2's with a run of four
+            // (rows 504 to 507), then runs of seven: positions 499 and 500 of both inboxes' reads, and 999 and 1000 of
+            // acc1's, share a date.
+            return [
+                Series(account: "acc1", folder: "INBOX", prefix: "t", count: 1_003, run: 7, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: sixDaysOld),
+                Series(account: "acc2", folder: "INBOX", prefix: "t", count: 508, run: 7, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: sixDaysOld),
+                Series(account: "acc1", folder: "Archive", prefix: "t", count: 50, run: 7, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: sixDaysOld),
+                // At the cutoff (not old), then one and two minutes before it.
+                Series(account: "acc1", folder: "INBOX", prefix: "c", count: 1, run: 1, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: 0),
+                Series(account: "acc2", folder: "INBOX", prefix: "c", count: 12, run: 4, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: 0),
+                Series(account: "acc3", folder: "INBOX", prefix: "n", count: 5, run: 1, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: 10),
+            ]
+        case .severalAccounts:
+            return accounts.enumerated().flatMap { offset, account in [
+                Series(account: account, folder: "INBOX", prefix: "s", count: 30, run: 1, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: 7 * (offset + 1)),
+                Series(account: account, folder: "Archive", prefix: "s", count: 10, run: 1, minutesPerRun: 1,
+                       newestMinutesAfterCutoff: sixDaysOld),
+            ] }
+        case .large:
+            // Runs of five, two minutes apart, from four days after the cutoff: an inbox spans about six days, so a
+            // third of it is old; the archives span the same dates.
+            return accounts.flatMap { account in [
+                Series(account: account, folder: "INBOX", prefix: "g", count: 22_222, run: 5, minutesPerRun: 2,
+                       newestMinutesAfterCutoff: 4 * 24 * 60),
+                Series(account: account, folder: "Archive", prefix: "g", count: 11_111, run: 5, minutesPerRun: 2,
+                       newestMinutesAfterCutoff: 4 * 24 * 60),
+            ] }
+        }
+    }
+
+    /// A migrated on-disk database with three accounts, traced into `tape`. On disk: the production build and refresh
+    /// steps take a `PrioritizedDatabase`, which wraps a `DatabasePool`.
+    private static func makePool(trace tape: ArchiveOldSQLTape) throws -> (pool: DatabasePool, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("archiveOld-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        config.prepareDatabase { db in
+            db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
+        }
+        let pool = try DatabasePool(path: directory.appendingPathComponent("test.sqlite").path, configuration: config)
+        try AppDatabase.runMigrations(on: pool)
+        try pool.write { db in
+            for (index, id) in accounts.enumerated() {
+                var account = Account(emailAddress: "user\(index)@example.com", displayName: "Test", provider: .imap)
+                account.id = id
+                try account.insert(db)
+            }
+        }
+        return (pool, directory)
+    }
+
+    /// Writes `series` with one statement each, from a template row that is deleted afterwards.
+    private static func insert(_ series: [Series], into pool: DatabasePool, cutoff: Date) throws {
+        try pool.write { db in
+            let columns = try db.columns(in: MessageHeader.databaseTableName).map(\.name)
+            let generated: [String: String] = [
+                "id": "t.folderId || ':' || g.m",
+                "messageId": "g.m",
+                "date": "strftime('%Y-%m-%d %H:%M:%f', t.date, '-' || g.minutes || ' minutes')",
+            ]
+            let names = columns.map { "\"\($0)\"" }.joined(separator: ", ")
+            let values = columns.map { generated[$0] ?? "t.\"\($0)\"" }.joined(separator: ", ")
+            for item in series {
+                let template = MessageHeader(
+                    messageId: "template", subject: "Old", from: "Sender", fromAddress: "sender@example.com",
+                    to: "recipient@example.com",
+                    date: cutoff.addingTimeInterval(TimeInterval(item.newestMinutesAfterCutoff * 60)), snippet: "",
+                    folderId: "\(item.account):\(item.folder)", accountId: item.account, folderPath: item.folder,
+                    isInInbox: item.folder == "INBOX")
+                try template.insert(db)
+                let templateRow = db.lastInsertedRowID
+                try db.execute(
+                    sql: """
+                    WITH RECURSIVE seq(n) AS (SELECT 0 UNION ALL SELECT n + 1 FROM seq WHERE n + 1 < ?),
+                    g AS (SELECT n, ? || n AS m, (n / ?) * ? AS minutes FROM seq)
+                    INSERT INTO messageHeader (\(names))
+                    SELECT \(values) FROM messageHeader AS t, g WHERE t.rowid = ?
+                    """,
+                    arguments: [item.count, item.prefix, item.run, item.minutesPerRun, templateRow])
+                try db.execute(sql: "DELETE FROM messageHeader WHERE rowid = ?", arguments: [templateRow])
+            }
+        }
+    }
+
+    /// One account's rows of equal date, in the order read, as the sorted rows themselves.
+    private struct DateRun: Equatable {
+        let date: Date
+        var headers: [MessageHeader]
+    }
+
+    /// Each account's rows in the order read (the sweep's own grouping), cut into runs of equal dates, each run's rows
+    /// sorted by id.
+    private static func runsByAccount(_ headers: [MessageHeader]) -> [String: [DateRun]] {
+        Dictionary(grouping: headers, by: \.accountId).mapValues { accountHeaders in
+            var runs: [DateRun] = []
+            for header in accountHeaders {
+                if let last = runs.indices.last, runs[last].date == header.date {
+                    runs[last].headers.append(header)
+                } else {
+                    runs.append(DateRun(date: header.date, headers: [header]))
+                }
+            }
+            return runs.map { DateRun(date: $0.date, headers: $0.headers.sorted { $0.id < $1.id }) }
+        }
+    }
+
+    @Test("Differential: per account, the paged read returns the replaced read's rows, oldest first",
+          arguments: ArchiveOldDataShape.allCases, ArchiveOldStatistics.allCases)
+    func pagedReadReturnsTheReplacedReadsRows(shape: ArchiveOldDataShape, statistics: ArchiveOldStatistics) async throws {
+        let tape = ArchiveOldSQLTape()
+        let (pool, directory) = try Self.makePool(trace: tape)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: directory) }
+        let dbPool = PrioritizedDatabase(pool: pool, priority: .background)
+        let markerKey = "archiveOldDifferential-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removeObject(forKey: markerKey) }
+        // Whole seconds, so every generated date is an exact number of minutes from the cutoff.
+        let cutoff = Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 14 * 86_400).rounded(.down))
+        let series = Self.series(shape)
+
+        // The production build step, and the production statistics refresh under a private marker.
+        switch statistics {
+        case .unanalyzed:
+            try Self.insert(series, into: pool, cutoff: cutoff)
+            let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
+            #expect(build == .built, "precondition: the build step built the deferred indexes (\(build))")
+            try await pool.write { db in try db.execute(sql: "DROP TABLE IF EXISTS sqlite_stat1") }
+        case .analyzedWithMail:
+            try Self.insert(series, into: pool, cutoff: cutoff)
+            let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
+            #expect(build == .built, "precondition: the build step built the deferred indexes (\(build))")
+            let refresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(dbPool: dbPool, markerKey: markerKey)
+            #expect(refresh == .refreshed, "precondition: the statistics refresh ran (\(refresh))")
+        case .analyzedBeforeMail:
+            let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
+            #expect(build == .built, "precondition: the build step built the deferred indexes (\(build))")
+            let refresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(dbPool: dbPool, markerKey: markerKey)
+            #expect(refresh == .refreshed, "precondition: the statistics refresh ran (\(refresh))")
+            try Self.insert(series, into: pool, cutoff: cutoff)
+        }
+        let hasStatistics = try await pool.read { db in
+            try Row.fetchOne(db, sql: "SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'") != nil
+        }
+        #expect(hasStatistics == (statistics != .unanalyzed), "precondition: sqlite_stat1 present only when analyzed")
+
+        let folderIds = Set(Self.accounts.map { "\($0):INBOX" })
+        tape.clear()
+        let paged = try await pool.read { db in
+            try SettingsView.oldInboxMessages(
+                db, folderIds: folderIds, cutoff: cutoff, pageSize: SyncConfig.archiveOldReadPageSize)
+        }
+        let pages = tape.all.filter { $0.contains("INDEXED BY \(ArchiveOldPlanRule.pinnedIndex)") }
+        tape.clear()
+        let oracle = try await pool.read { db in try Self.replacedRead(db, folderIds: folderIds, cutoff: cutoff) }
+        let oracleReads = tape.all.filter { $0.contains("FROM \"messageHeader\"") }
+
+        let expected = series.reduce(0) { $0 + $1.oldInboxRows }
+        #expect(oracle.count == expected, "precondition: the oracle read \(oracle.count) rows, the mail holds \(expected) old inbox rows")
+        #expect(paged.count == oracle.count, "\(shape), \(statistics): the paged read returned \(paged.count) rows, the oracle \(oracle.count)")
+        let pagedRuns = Self.runsByAccount(paged)
+        let oracleRuns = Self.runsByAccount(oracle)
+        #expect(pagedRuns == oracleRuns, "\(shape), \(statistics): an account's rows, or their order by date, differ from the replaced read's")
+
+        if shape == .ties {
+            // The comparison crosses page breaks inside a run of equal dates in both large inboxes.
+            for account in ["acc1", "acc2"] {
+                let rows = paged.filter { $0.accountId == account }
+                #expect(rows.count > 500, "precondition: \(account) has more than one page (\(rows.count))")
+                guard rows.count > 500 else { continue }
+                #expect(rows[499].date == rows[500].date, "precondition: \(account)'s first page break is inside a run")
+            }
+        }
+
+        // The oracle is the plan this fix replaced, and every page of the paged read is the bounded seek, under these
+        // statistics.
+        #expect(oracleReads.count == 1, "precondition: the oracle ran one statement on messageHeader (\(oracleReads))")
+        if let oracleRead = oracleReads.first {
+            let lines = try ArchiveOldPlanRule.violations(oracleRead, continued: false, in: pool)
+            #expect(!lines.isEmpty, "precondition: the oracle's plan is one the rule rejects")
+        }
+        let firstPages = pages.filter { !ArchiveOldPlanRule.isContinued($0) }
+        #expect(firstPages.count == folderIds.count, "precondition: one first page per inbox (\(pages.count) pages)")
+        var broken: [String] = []
+        for sql in pages {
+            let lines = try ArchiveOldPlanRule.violations(sql, continued: ArchiveOldPlanRule.isContinued(sql), in: pool)
+            if !lines.isEmpty { broken.append("\(lines) by \(sql.prefix(300))") }
+        }
+        #expect(broken.isEmpty, "\(shape), \(statistics): a page of the read did not seek its bounds: \(broken)")
+    }
+}
