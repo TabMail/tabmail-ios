@@ -69,7 +69,7 @@ queues, optimistic UI, retries, reconciliation, Undo, Outbox, drafts, or notific
 | ADR-IOS-031 | Active | Background Tasks Touching GRDB MUST Use `.medium` Priority (Never `.low` / `.utility` / `.background`) | [read in full](Companion/Decisions/Active/adr-ios-031.md) |
 | ADR-IOS-032 | Partially superseded by 034; Swift stack retained, session-document model replaced; search amendments 2026-10-21 to 10-24 (#240, #242, #265, #304) | Memory Search Reuses iOS Swift Hybrid FTS Stack (No Rust FFI) | [read in full](Companion/Decisions/Active/adr-ios-032.md) |
 | ADR-IOS-034 | Active | Memory Index Moves to Per-Turn Granularity (Supersedes v2 Session-Document Model) | [read in full](Companion/Decisions/Active/adr-ios-034.md) |
-| ADR-IOS-036 | Active | Action Tags Are Local-Only (Supersedes ADR-IOS-004) | [read in full](Companion/Decisions/Active/adr-ios-036.md) |
+| ADR-IOS-036 | Active | Action Tags Are Local-Only (Supersedes ADR-IOS-004); 2026-11-24 (#1404): the stale-tag sweep checks each candidate's inbox copy (`inboxCopySQL`, `INDEXED BY messageHeader_rfc822MessageId`, Gmail duplicate guard, fail closed) | [read in full](Companion/Decisions/Active/adr-ios-036.md) |
 | ADR-IOS-037 | Active | NSE/Main-App AI Ownership Lease (Cross-Process Coordination); amended 2026-11-19: gate reads the whole AI setting (`AIConsentPolicy`) | [read in full](Companion/Decisions/Active/adr-ios-037.md) |
 | ADR-IOS-038 | Active | Demo Mode — Custom JWT + Local Mock Provider + Pre-Baked AI Cache; amended 2026-10-21 to 10-31: guided tutorial (`isTutorialPractice`, `TutorialChatScript`), demo switch = one prompt-semaphore hold (`enterDemo`/`leaveDemo`); amended 2026-11-19: the AI setting is the device's (demo too), cleared at a sign-in with no mail account | [read in full](Companion/Decisions/Active/adr-ios-038.md) |
 | ADR-IOS-039 | Active | Idempotent HTML Render Fit + Scroll-Phase Height Freeze | [read in full](Companion/Decisions/Active/adr-ios-039.md) |
@@ -79,7 +79,7 @@ queues, optimistic UI, retries, reconciliation, Undo, Outbox, drafts, or notific
 | ADR-IOS-043 | Active | Outgoing Thread Binding — One Header Builder, Gmail Carries `threadId`; Outlook threading as Graph extended properties, not internetMessageHeaders (amendment 2026-11-07, #419) | [read in full](Companion/Decisions/Active/adr-ios-043.md) |
 | ADR-IOS-044 | Active | Inbox Usage-Throttle Banner — Driven by Cached `/whoami`, Tier-Branched CTA | [read in full](Companion/Decisions/Active/adr-ios-044.md) |
 | ADR-IOS-045 | Active | Attachment QuickLook Is Presented Imperatively (Detached From the SwiftUI Tree) | [read in full](Companion/Decisions/Active/adr-ios-045.md) |
-| ADR-IOS-046 | Active | Background Drain Loops Are Abandon-on-Suspend — Never Hold a Lease to "Look Cooperative" | [read in full](Companion/Decisions/Active/adr-ios-046.md) |
+| ADR-IOS-046 | Active | Background Drain Loops Are Abandon-on-Suspend — Never Hold a Lease to "Look Cooperative" (amended 2026-11-24: body-asset pending-delete worker, one-time orphan sweep, foreground-only manifest access) | [read in full](Companion/Decisions/Active/adr-ios-046.md) |
 | ADR-IOS-047 | Active | Two-Phase NSE Merge — Header+Snippet Visibility Is Decoupled From the Body-Blob Write | [read in full](Companion/Decisions/Active/adr-ios-047.md) |
 | ADR-IOS-049 | Active instant-insert path; display compensation amended by 055 | Instant Inbox Insert — Render NSE-Staged Mail In-Memory, Before the Durable Merge Write | [read in full](Companion/Decisions/Active/adr-ios-049.md) |
 | ADR-IOS-050 | Active | `bodyComplete` Is the FTS-Indexed Truth — Display-Cache Eviction Never Touches It | [read in full](Companion/Decisions/Active/adr-ios-050.md) |
@@ -104,7 +104,7 @@ These ADR bodies exist only on the mature pre-v3 line, so they are not in `v1.6.
 | ADR-IOS-063 | Deferred follow-up; recorded but not implemented | Account-Removal Orphan-Frontier Hardening — DEFERRED Out of F2b L4 (Fix-Pack FIX 5) | [read in full](Companion/Decisions/Deferred/adr-ios-063.md) |
 | ADR-IOS-064 | Active withdrawal record | The F2b L-series is withdrawn — inert code is removed, applied migrations are not | [read in full](Companion/Decisions/Active/adr-ios-064.md) |
 | ADR-IOS-065 | Superseded on v3 (#1086) | Undo-Send close decision — restore the shipped prompt without rotating the epoch; v3 saves the draft to Drafts when Undo Send is confirmed; Close decides through `ComposeDraftGuards.closeDecision(CloseState)` (unsaved content compares against an empty baseline) | [read in full](Companion/Decisions/Active/adr-ios-065.md) |
-| ADR-IOS-066 | Active | Content is addressed by the message it belongs to, never by the slot it occupies | [read in full](Companion/Decisions/Active/adr-ios-066.md) |
+| ADR-IOS-066 | Active | Content is addressed by the message it belongs to, never by the slot it occupies (amended 2026-11-24: staged asset writes, lease expiry reclaims staging) | [read in full](Companion/Decisions/Active/adr-ios-066.md) |
 | ADR-IOS-067 | Active | A queued intention leaves the queue for exactly three reasons, and a failure is never one of them | [read in full](Companion/Decisions/Active/adr-ios-067.md) |
 
 ## Numbering and non-ADR material

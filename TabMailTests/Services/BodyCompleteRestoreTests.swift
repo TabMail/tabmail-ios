@@ -284,4 +284,24 @@ struct BodyCompleteRestoreTests {
                 "eviction must NOT reset bodyComplete — that re-enqueues the row into the backfill body queue (the refetch loop)")
         await cleanup(headerId: headerId)
     }
+
+    @Test("A missing asset file drops the cached body (unfetched, so the next open fetches it), keeps the header, never touches bodyComplete")
+    func missingAssetFileDropsTheCachedBody() async throws {
+        let acct = "bcr-missing-\(UUID().uuidString.prefix(8))"
+        let headerId = try await insertHeader(accountId: acct, messageId: "m1", bodyComplete: true)
+        try await AppDatabase.dbPool.write { db in
+            let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: "<p>cached html with images</p>")
+            try body.insert(db)
+        }
+
+        await BodyAssetMaintenance.dropMessageWithMissingFile(ContentKey(rawValue: headerId)).value
+
+        let (bodyRow, headerRow) = try await AppDatabase.dbPool.read { db in
+            (try MessageBody.fetchOne(db, key: headerId) != nil, try MessageHeader.fetchOne(db, key: headerId) != nil)
+        }
+        #expect(bodyRow == false, "the cached body names the missing image, so it goes")
+        #expect(headerRow == true)
+        #expect(await bodyCompleteFlag(headerId) == true, "never a flag write (data-integrity rule 1)")
+        await cleanup(headerId: headerId)
+    }
 }
