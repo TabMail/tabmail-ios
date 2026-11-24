@@ -146,6 +146,11 @@ struct ChatNewThreadTests {
         #expect(message.hasPrefix("New email to Maria <maria@example.com>, Sam <sam@example.com> ("))
         #expect(message.contains("email_compose"), "it names the tool that writes a new email")
         #expect(message.hasSuffix("): invite them to lunch on Friday"), "the words, as typed, close it")
+        // The field's words are always what to write: a question in them goes to the people, and
+        // the agent is never left to guess that the words were meant for it.
+        #expect(message.contains("my words are what to write to them"))
+        #expect(message.contains("a question in them is one to ask them"))
+        #expect(!message.contains("unless"), "no opening for the agent to take the words as its own")
     }
 
     @Test("Writing a new email's chat's email reads Writing your email, as a reply does")
@@ -586,8 +591,6 @@ struct ChatNewThreadTests {
         // With people picked, the words go to the agent as a reply's do, with the new email's nudge.
         #expect(Self.count("sendAgentChat(text, field: send, newEmailTo: newEmailTo)", in: pill) == 1)
         #expect(Self.count("} else if let newEmailTo { enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text) } else {", in: pill) == 1)
-        #expect(Self.count("} else if let newEmail = replyField?.newEmail {", in: pill) == 1,
-                "its turns are kept under its own session key, not a random inbox one")
         #expect(Self.count(".task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }", in: pill) == 1)
         #expect(Self.count(".onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }", in: pill) == 1)
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")

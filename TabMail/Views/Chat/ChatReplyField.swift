@@ -171,13 +171,15 @@ struct ChatNewEmailField {
     static func isSessionKey(_ key: String) -> Bool { key.hasPrefix(sessionKeyPrefix) }
 
     /// The agent's message for words sent in a new email's field: the words, with a nudge that
-    /// they are for a new email to `people`, so the agent writes it (`email_compose`, the words as
-    /// its request) unless the words ask something else. The sibling of
-    /// `ChatReplyField.agentMessage`.
+    /// they are what to write in a new email to `people`, so the agent writes it (`email_compose`,
+    /// the words as its request). The field's words are always what to write, decided by where
+    /// they were typed, never by guessing intent: a question in them is one to ask the people.
+    /// The sibling of `ChatReplyField.agentMessage`.
     static func agentMessage(to people: [ChatThread.Person], text: String) -> String {
         let recipients = people.map { "\($0.name) <\($0.address)>" }.joined(separator: ", ")
-        return "New email to \(recipients) (typed in its field; unless I am asking something else, "
-            + "write this new email to them with email_compose, my words as the request): \(text)"
+        return "New email to \(recipients) (typed in its field: my words are what to write to them, "
+            + "and a question in them is one to ask them; write this new email with email_compose, "
+            + "my words as the request): \(text)"
     }
 }
 
