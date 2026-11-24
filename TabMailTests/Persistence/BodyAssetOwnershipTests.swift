@@ -416,6 +416,75 @@ struct BodyAssetSchemeHandlerWireTests {
                 "…while the log distinguishes all five, or a failed smoke test is undiagnosable")
     }
 
+    /// #1376: the keys `onMissingFile` was told.
+    private final class KeyBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storage: [ContentKey] = []
+        func append(_ key: ContentKey) { lock.lock(); storage.append(key); lock.unlock() }
+        var keys: [ContentKey] { lock.lock(); defer { lock.unlock() }; return storage }
+    }
+
+    @Test("Only a missing file of the document's OWN inline image reports the document, once per handler; the wire answer stays the uniform failure")
+    func missingOwnFileReportsTheDocumentOnce() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+        func write(_ key: ContentKey, _ cid: String, type: String = "image/png") -> String? {
+            BodyAssetStore.writeInlineImage(contentKey: key, contentId: cid, contentType: type, data: Data("x".utf8))
+        }
+        func removeFile(_ assetId: String) throws {
+            guard let url = BodyAssetStore.urlOnDisk(assetId: assetId) else { Issue.record("no on-disk URL"); return }
+            try FileManager.default.removeItem(at: url)
+        }
+        guard let strangerVanished = write(Self.strangerKey, "s@example.com"),
+              let badMIME = write(Self.ownerKey, "b@example.com", type: "text/html"),
+              let vanished = write(Self.ownerKey, "c@example.com"),
+              let alsoVanished = write(Self.ownerKey, "d@example.com"),
+              let served = write(Self.ownerKey, "e@example.com"),
+              let attachment = BodyAssetStore.writeAttachment(
+                contentKey: Self.ownerKey, section: "2", contentType: "image/png",
+                data: Data("x".utf8), identityStamp: "rfc:missing@example.com")
+        else { Issue.record("write failed"); return }
+        try removeFile(strangerVanished)
+        try removeFile(vanished)
+        try removeFile(alsoVanished)
+        try removeFile(attachment)
+        // The canonical shape with an asset hash no row has.
+        let unknown = String(vanished.dropLast(4)) + (vanished.hasSuffix("0000") ? "1111" : "0000")
+
+        let told = KeyBox()
+        let handler = BodyAssetSchemeHandler(ownerKey: Self.ownerKey, onMissingFile: { told.append($0) })
+        func request(_ urlString: String) -> RecordingURLSchemeTask? {
+            guard let url = URL(string: urlString) else { Issue.record("URL parse failed"); return nil }
+            let task = RecordingURLSchemeTask(url: url)
+            handler.webView(WKWebView(), start: task)
+            return task
+        }
+
+        // Refused before the file is read: another document's asset (its file gone
+        // too), an attachment, a disallowed type, an id with no row, a malformed URL.
+        for urlString in [
+            BodyAssetStore.absoluteURL(forAssetId: strangerVanished),
+            BodyAssetStore.absoluteURL(forAssetId: attachment),
+            BodyAssetStore.absoluteURL(forAssetId: badMIME),
+            BodyAssetStore.absoluteURL(forAssetId: unknown),
+            "\(BodyAssetConfig.urlScheme)://not-hex/also-not-hex",
+        ] {
+            _ = request(urlString)
+        }
+        _ = request(BodyAssetStore.absoluteURL(forAssetId: served))
+        #expect(told.keys.isEmpty, "nothing but the document's own missing file reports it")
+
+        let first = request(BodyAssetStore.absoluteURL(forAssetId: vanished))
+        let second = request(BodyAssetStore.absoluteURL(forAssetId: alsoVanished))
+        #expect(told.keys == [Self.ownerKey], "reported once, with the document's own key")
+        for task in [first, second] {
+            let codes = task?.errors.map(\.code) ?? []
+            #expect(task?.responses.isEmpty == true)
+            #expect(task?.finished == false)
+            #expect(codes == [URLError.resourceUnavailable.rawValue])
+        }
+    }
+
     @Test("The owner IS served, with nosniff and the normalized type")
     func theOwnerIsServed() throws {
         let dir = try Self.setupTest()

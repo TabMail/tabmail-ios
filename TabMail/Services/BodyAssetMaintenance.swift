@@ -132,6 +132,20 @@ enum BodyAssetMaintenance {
         return BodyAssetStore.deleteAllAssets(forContentKey: contentKey)
     }
 
+    /// #1376: the scheme handler found that a rendered message's own inline image
+    /// has a manifest row but no file. Drops the message's cached body and assets
+    /// (`dropMessage`; the body goes because it names that image), which marks the
+    /// content unfetched, never fetched, so the next open fetches both again. Off
+    /// the main thread: the handler calls this from its synchronous answer.
+    @discardableResult
+    static func dropMessageWithMissingFile(_ contentKey: ContentKey) -> Task<Void, Never> {
+        Task.detached(priority: .utility) {
+            BackgroundSyncLogger.logDebug("[BodyAssetMaintenance] missing asset file for \(contentKey.rawValue.prefix(12))…: dropping the cached body")
+            // inlineCount 1: the missing asset is an inline image the body names.
+            _ = await dropMessage(contentKey: contentKey, inlineCount: 1)
+        }
+    }
+
     /// Wipe all assets for a specific kind.
     /// - `.inlineImage`: deletes manifest rows + files + (in main DB) MessageBody
     ///   rows for every affected header. `bodyComplete` is NOT touched (see the
