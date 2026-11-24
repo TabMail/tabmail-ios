@@ -347,11 +347,14 @@ extension SyncEngine {
     /// (`staleBodyIndexName`) exists. Returns whether it ran.
     ///
     /// Without the index every page would scan and sort the whole table inside its
-    /// write, the #1354 hold made worse. The index is deferred, built later in the
-    /// same pass (`runRefreshPlannerStatisticsIfStale`), so the first pass after an
-    /// upgrade skips the step and the next one evicts; stale bodies stay cached one
-    /// pass longer, which changes nothing but disk use. A schema that cannot be read
-    /// counts as missing (retried next pass).
+    /// write, the #1354 hold made worse. The index is deferred: an upgrade launch
+    /// builds it before the first pass (`AppDatabase.runUpgradeStep`), and that pass
+    /// evicts. Where the index is still missing (a fresh install's first session, or
+    /// an upgrade step that did not complete), it is built later in the same pass
+    /// (`runRefreshPlannerStatisticsIfStale`), so that pass skips the step and the
+    /// next one evicts; stale bodies stay cached one pass longer, which changes
+    /// nothing but disk use. A schema that cannot be read counts as missing
+    /// (retried next pass).
     @discardableResult
     nonisolated static func runEvictStaleBodiesIfIndexed(
         dbPool: PrioritizedDatabase, undoProtectedBodyIds: Set<String>
@@ -1004,7 +1007,11 @@ extension SyncEngine {
     /// Indexes moved OFF the blocking migration path (ADR-IOS-029, 2026-08-05
     /// amendment; owner directive *"startup migrations should really have only
     /// things that are absolutely necessary and blocking. Other things should happen
-    /// durably in the heal/sync/background queues."*).
+    /// durably in the heal/sync/background queues."*). Since the 2026-11-24
+    /// amendment (#1392) an upgrade launch builds the missing ones behind the
+    /// "Updating…" screen, after the migrations and before the database is published
+    /// (`AppDatabase.runUpgradeStep`); the background pass builds whatever is still
+    /// missing (a fresh install's first session, or a step that did not complete).
     ///
     /// `messageHeader_unreadSweep` is `v83`'s index. On the owner's device upgrading
     /// v67 → v83 (5 accounts / 78 folders) `MigrationTimingLedger` attributed
@@ -1177,14 +1184,21 @@ extension SyncEngine {
     private static func missingDeferredIndexes(
         _ dbPool: PrioritizedDatabase, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
     ) -> [String]? {
-        try? dbPool.read { db in
-            try indexes.filter { index in
-                try Row.fetchOne(
-                    db,
-                    sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
-                    arguments: [index.name]) == nil
-            }.map(\.name)
-        }
+        try? dbPool.read { db in try missingDeferredIndexNames(db, among: indexes) }
+    }
+
+    /// The names of the indexes of `indexes` that `sqlite_master` does not have: one
+    /// lookup per index on the schema table, no data read. Also the launch probe's
+    /// check (`AppDatabase.hasPendingUpgradeWork`).
+    nonisolated static func missingDeferredIndexNames(
+        _ db: Database, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
+    ) throws -> [String] {
+        try indexes.filter { index in
+            try Row.fetchOne(
+                db,
+                sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                arguments: [index.name]) == nil
+        }.map(\.name)
     }
 
     // MARK: Building a deferred index (inside the statistics write below)
@@ -1250,7 +1264,9 @@ extension SyncEngine {
     //
     // COST OF A BUILD: inside the statistics write; for `messageHeader_unreadSweep`
     // 119 ms measured at 360k rows, 5,050 ms on a real 5-account device — which
-    // is the whole point of it being here rather than on the launch path.
+    // is why it is not paid on every launch path: on an upgrade launch it is paid
+    // once behind the "Updating…" screen (`AppDatabase.runUpgradeStep`, #1392),
+    // otherwise here in the background pass.
     // `messageBody_staleEvict` (#1354) reads every cached body once, since
     // `fetchedAt` is stored after the HTML, so its build costs more than those
     // figures on a large body cache.
@@ -1314,12 +1330,31 @@ extension SyncEngine {
     /// using `UserDefaults` as a durable one-shot latch here.
     nonisolated static let plannerStatisticsSchemaVersionKey = "didAnalyzeAtSchemaVersion_v1"
 
+    /// True when the last completed whole-database `ANALYZE` was not at
+    /// `currentVersion`, the SQLite `schema_version` now: no marker at all, or one
+    /// recorded at another version. The one comparison both callers make, this
+    /// pass (`runRefreshPlannerStatisticsIfStale`) and the launch probe
+    /// (`AppDatabase.hasPendingUpgradeWork`), so the two cannot disagree on what
+    /// stale means.
+    ///
+    /// `object(forKey:)` rather than `integer(forKey:)`: a never-analyzed database
+    /// has NO stored value, and `integer(forKey:)` cannot tell that apart from a
+    /// stored 0, which is a legal `schema_version`.
+    nonisolated static func plannerStatisticsAreStale(
+        currentVersion: Int, defaults: UserDefaults,
+        markerKey: String = plannerStatisticsSchemaVersionKey
+    ) -> Bool {
+        guard let analyzed = defaults.object(forKey: markerKey) as? Int else { return true }
+        return analyzed != currentVersion
+    }
+
     /// Whole-database `ANALYZE`, moved OFF the blocking migration path and run here
     /// at most once per schema change (ADR-IOS-029, 2026-08-05 amendment; owner
     /// directive *"startup migrations should really have only things that are
     /// absolutely necessary and blocking"*). `v83_markAllAsReadUnreadSweepIndex` used
     /// to carry it inline and measured ~850 ms at 360k rows and 8,522 ms at 500k,
-    /// before any UI appeared.
+    /// before any UI appeared. Since the 2026-11-24 amendment (#1392) an upgrade
+    /// launch runs it once behind the "Updating…" screen (see the last paragraph).
     ///
     /// ⚠️ WHY IT IS ON THIS SIDE OF THE MAINTENANCE SPLIT. `ANALYZE` rewrites
     /// `sqlite_stat1` — an ordinary WAL write on the MAIN database, which at the
@@ -1379,12 +1414,22 @@ extension SyncEngine {
     /// Being `async` is what makes the sentence true: the awaited overload enters
     /// `DatabaseWriteQueue` at the caller's tier (`.background` from both
     /// maintenance callers), so a user action's `.priority` write jumps ahead of
-    /// this instead of waiting behind it.
+    /// this instead of waiting behind it. The third caller, the upgrade step, passes
+    /// `.priority`: it runs before the database is published, or at the first
+    /// foreground of a process launched in the background, before the inbox shows;
+    /// either way the user is waiting for it, and a write issued after it waits for
+    /// this one write.
     ///
     /// The schema-version READ stays synchronous deliberately — see
     /// `plannerStatisticsSchemaVersion`, which exists only to keep that binding.
     ///
-    /// It runs at most once per schema change and never on the launch path.
+    /// It runs at most once per schema change: on an upgrade launch, behind the
+    /// "Updating…" screen and before the database is published
+    /// (`AppDatabase.runUpgradeStep`, ADR-IOS-029 amendment of 2026-11-24, #1392), or
+    /// behind it at the first foreground of a process launched in the background,
+    /// and otherwise from the background maintenance pass, which also finishes
+    /// whatever an interrupted upgrade launch left. On a launch that is not an
+    /// upgrade it never runs on the launch path.
     @discardableResult
     nonisolated static func runRefreshPlannerStatisticsIfStale(
         dbPool: PrioritizedDatabase,
@@ -1413,12 +1458,8 @@ extension SyncEngine {
             // marker alone and retry next pass.
             return .abandoned
         }
-        // `object(forKey:)` rather than `integer(forKey:)`: a never-analyzed database
-        // has NO stored value, and `integer(forKey:)` cannot tell that apart from a
-        // stored 0 — which is a legal `schema_version`.
         if missing.isEmpty,
-           let analyzed = defaults.object(forKey: markerKey) as? Int,
-           analyzed == currentVersion {
+           !plannerStatisticsAreStale(currentVersion: currentVersion, defaults: defaults, markerKey: markerKey) {
             return .alreadyFresh
         }
         let t0 = CFAbsoluteTimeGetCurrent()

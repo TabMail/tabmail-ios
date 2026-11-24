@@ -96,16 +96,97 @@ final class AppDatabase: Sendable {
     /// True if migrating `pool` will do real work: pending GRDB schema
     /// migrations OR pending one-time data resets. Cheap + read-only (checks the
     /// migrator's applied set + the reset flags); `pool` must be freshly opened
-    /// and not yet migrated. Callers gate the migration splash on this AND on the
+    /// and not yet migrated. The migration splash is gated on this AND on the
     /// DB pre-existing — a fresh/empty DB migrates instantly so it never warrants
-    /// the splash (see `AppStartup`). On a brand-new file the migrator reports
-    /// "not completed", which is why the caller's pre-existing check matters.
+    /// the splash (see `isUpgradeLaunch`). On a brand-new file the migrator reports
+    /// "not completed", which is why the pre-existing check matters.
     static func hasPendingMigrationWork(_ reader: some DatabaseReader) throws -> Bool {
         var migrator = DatabaseMigrator()
         registerAllMigrations(on: &migrator)
         let schemaComplete = try reader.read { try migrator.hasCompletedMigrations($0) }
         if !schemaComplete { return true }
         return !StartupMigrations.allResetsComplete
+    }
+
+    /// True if this launch has upgrade work for the "Updating…" screen: pending
+    /// migration work (`hasPendingMigrationWork`), a deferred index
+    /// (`SyncEngine.deferredIndexes`) the database does not have yet, as after a
+    /// release that adds only a deferred index, or planner statistics older than the
+    /// schema (`SyncEngine.plannerStatisticsAreStale`), as after a release whose only
+    /// schema change is a migration. The last two checks read the schema table and
+    /// `schema_version` alone. The same caveat applies: a brand-new file reports
+    /// pending, so `isUpgradeLaunch` also requires that the file existed before this
+    /// launch.
+    static func hasPendingUpgradeWork(
+        _ reader: some DatabaseReader, defaults: UserDefaults = .standard
+    ) throws -> Bool {
+        if try hasPendingMigrationWork(reader) { return true }
+        return try reader.read { db in
+            if try !SyncEngine.missingDeferredIndexNames(db).isEmpty { return true }
+            let schemaVersion = try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0
+            return SyncEngine.plannerStatisticsAreStale(currentVersion: schemaVersion, defaults: defaults)
+        }
+    }
+
+    /// The upgrade launch (ADR-IOS-029, amendment of 2026-11-24, #1392), decided in
+    /// this one place: the "Updating…" screen and the upgrade step both run on its
+    /// answer. True when the app is launching into the foreground
+    /// (`isForegroundLaunch`), the database file existed before this launch
+    /// (`dbExisted`, checked before the pool is opened), and it has upgrade work
+    /// (`hasPendingUpgradeWork`). A fresh install's first launch is never one: its
+    /// brand-new file migrates instantly and holds no mail. A launch in the
+    /// background (a silent push, a background refresh, a notification action) is
+    /// never one either: it migrates as before, so a wake the user does not see
+    /// spends no time on the step, and the process's first foreground asks again as
+    /// a foreground launch (`AppStartup.runIfNeeded`) and runs the step then. Any
+    /// later foreground launch whose database still lacks a deferred index, or whose
+    /// statistics are older than its schema, is one.
+    static func isUpgradeLaunch(
+        _ reader: some DatabaseReader, dbExisted: Bool, isForegroundLaunch: Bool,
+        defaults: UserDefaults = .standard
+    ) throws -> Bool {
+        guard dbExisted, isForegroundLaunch else { return false }
+        return try hasPendingUpgradeWork(reader, defaults: defaults)
+    }
+
+    /// The upgrade step (ADR-IOS-029, amendment of 2026-11-24, #1392). On a launch that
+    /// shows the "Updating…" screen, after the migration chain and the startup resets
+    /// and before the database is published, it builds every missing deferred index
+    /// and runs the whole-database `ANALYZE` in one write, through the same function
+    /// the background maintenance pass calls, which also records the statistics
+    /// marker. The pass then finds the statistics fresh and does not hold the writer
+    /// for an `ANALYZE` while the user works. On any other launch it does nothing and
+    /// returns nil.
+    ///
+    /// On a launch in the foreground nothing else can reach the database here (it is
+    /// not published yet), so the write's tier only names that the user is waiting for
+    /// it. At the first foreground of a process launched in the background
+    /// (`AppStartup.runIfNeeded`) the database is published, and the tier puts the
+    /// step ahead of queued background writes while the inbox waits for it. If the
+    /// write fails or is abandoned it rolls back whole and leaves the marker stale,
+    /// and the maintenance pass does the work as before.
+    @discardableResult
+    static func runUpgradeStep(
+        pool: DatabasePool, isUpgradeLaunch: Bool, defaults: UserDefaults = .standard
+    ) async -> SyncEngine.PlannerStatisticsRefresh? {
+        guard isUpgradeLaunch else { return nil }
+        return await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: PrioritizedDatabase(pool: pool, priority: .priority), defaults: defaults)
+    }
+
+    /// The launch's database build: the designated initializer (migrations, resets,
+    /// residue recovery), then the upgrade step (`runUpgradeStep`), and only then the
+    /// database the caller publishes. The step is bound to the build so that it
+    /// always runs before publication: the caller has nothing to publish until the
+    /// step has finished.
+    static func openForLaunch(
+        pool: DatabasePool, isUpgradeLaunch: Bool, runStartupResets: Bool,
+        defaults: UserDefaults = .standard
+    ) async throws -> AppDatabase {
+        let db = try AppDatabase(pool: pool, runStartupResets: runStartupResets)
+        let upgrade = await runUpgradeStep(pool: pool, isUpgradeLaunch: isUpgradeLaunch, defaults: defaults)
+        BootProfiler.mark("db.upgradeStep \(upgrade.map { "\($0)" } ?? "not an upgrade launch")")
+        return db
     }
 
     /// Designated initializer. Wraps an already-open `pool`, runs schema

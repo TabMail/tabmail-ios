@@ -396,6 +396,218 @@ struct StartupMigrationsTests {
         #expect(try AppDatabase.hasPendingMigrationWork(migrated) == true)
     }
 
+    /// A private defaults suite for the planner-statistics marker, so these probes
+    /// never read or write the app's own marker in `UserDefaults.standard`.
+    private static func makeMarkerDefaults() throws -> (defaults: UserDefaults, suiteName: String) {
+        let suiteName = "StartupMigrationsTests-\(UUID().uuidString)"
+        return (try #require(UserDefaults(suiteName: suiteName)), suiteName)
+    }
+
+    /// Records the marker as a whole-database `ANALYZE` completed at the database's
+    /// schema version now, as the upgrade step or the maintenance pass leaves it.
+    private static func markStatisticsCurrent(_ reader: some DatabaseReader, _ defaults: UserDefaults) throws {
+        let version = try reader.read { db in try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0 }
+        defaults.set(version, forKey: SyncEngine.plannerStatisticsSchemaVersionKey)
+    }
+
+    @Test("hasPendingUpgradeWork: fully migrated, resets done, current statistics, a deferred index missing IS pending")
+    func upgradePendingWhenADeferredIndexIsMissing() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        // The migration chain builds no deferred index, and the statistics are
+        // current, so only the index check can say yes.
+        let migrated = try TestDatabase.make()
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.hasPendingMigrationWork(migrated) == false)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == true)
+    }
+
+    @Test("hasPendingUpgradeWork: fully migrated, resets done, every deferred index present, current statistics is NOT pending (common launch)")
+    func upgradeNotPendingWhenEverythingIsDone() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == false)
+
+        // Any one deferred index missing makes it pending again. The drop moves
+        // `schema_version`, so the marker is set current again to leave the index
+        // check alone deciding.
+        let dropped = try #require(SyncEngine.deferredIndexes.last?.name)
+        try migrated.write { db in try db.execute(sql: "DROP INDEX \(dropped)") }
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == true)
+    }
+
+    @Test("hasPendingUpgradeWork: pending migration work is pending even with every deferred index present and current statistics")
+    func upgradePendingWhenMigrationWorkIsPending() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        UserDefaults.standard.set(false, forKey: "didCleanResetMessageData_v1")
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == true)
+    }
+
+    @Test("hasPendingUpgradeWork: statistics older than the schema, or none recorded, are pending; current ones are not")
+    func upgradePendingWhenStatisticsAreStale() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        // No migration work and every deferred index present: only the statistics
+        // check can say yes.
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        #expect(try AppDatabase.hasPendingMigrationWork(migrated) == false)
+        let key = SyncEngine.plannerStatisticsSchemaVersionKey
+        let live = try migrated.read { db in try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0 }
+
+        // Never analyzed.
+        #expect(marker.defaults.object(forKey: key) == nil)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == true)
+        // Analyzed at an older schema, as after a release whose only change is a migration.
+        marker.defaults.set(live - 1, forKey: key)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == true)
+        // Analyzed at this schema.
+        marker.defaults.set(live, forKey: key)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == false)
+    }
+
+    // MARK: - The upgrade launch: foreground x file existed before this launch x upgrade work
+
+    @Test("isUpgradeLaunch: a brand-new file is not an upgrade launch, though it reports upgrade work")
+    func brandNewFileIsNoUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        // As the launch does it: whether the file exists is read before the pool
+        // creates it.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("upgradelaunch_\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent("new.sqlite").path
+        let dbExisted = FileManager.default.fileExists(atPath: path)
+        let pool = try DatabasePool(path: path)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: directory) }
+
+        #expect(dbExisted == false)
+        #expect(try AppDatabase.hasPendingUpgradeWork(pool, defaults: marker.defaults) == true,
+                "a brand-new file reports upgrade work, or this case proves nothing")
+        #expect(try AppDatabase.isUpgradeLaunch(
+            pool, dbExisted: dbExisted, isForegroundLaunch: true, defaults: marker.defaults) == false)
+    }
+
+    @Test("isUpgradeLaunch: no existing file and no upgrade work is not an upgrade launch")
+    func noFileNoWorkIsNoUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == false)
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: false, isForegroundLaunch: true, defaults: marker.defaults) == false)
+    }
+
+    @Test("isUpgradeLaunch: a foreground launch on an existing file with upgrade work is an upgrade launch, each kind of work alone included")
+    func existingFileWithWorkIsAnUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        // Only a deferred index is missing: no migration work and current
+        // statistics, so only the index check can make it an upgrade launch.
+        let migrated = try TestDatabase.make()
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.hasPendingMigrationWork(migrated) == false)
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: true, defaults: marker.defaults) == true)
+
+        // Only the statistics are stale: every deferred index present, no
+        // migration work.
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        marker.defaults.removeObject(forKey: SyncEngine.plannerStatisticsSchemaVersionKey)
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: true, defaults: marker.defaults) == true)
+
+        // Only migration work: every deferred index present, current statistics.
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        UserDefaults.standard.set(false, forKey: "didCleanResetMessageData_v1")
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: true, defaults: marker.defaults) == true)
+    }
+
+    @Test("isUpgradeLaunch: an existing file with no upgrade work is not an upgrade launch (common launch)")
+    func existingFileWithoutWorkIsNoUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        let migrated = try TestDatabase.make()
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.hasPendingUpgradeWork(migrated, defaults: marker.defaults) == false)
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: true, defaults: marker.defaults) == false)
+    }
+
+    @Test("isUpgradeLaunch: a background launch is never an upgrade launch, whatever upgrade work the existing file has")
+    func backgroundLaunchIsNoUpgradeLaunch() throws {
+        let saved = Self.snapshotFlags()
+        defer { Self.restoreFlags(saved) }
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        let marker = try Self.makeMarkerDefaults()
+        defer { marker.defaults.removePersistentDomain(forName: marker.suiteName) }
+
+        // Every kind of upgrade work at once: a deferred index missing, no
+        // statistics recorded, and a reset still to run. The same file at a
+        // foreground launch is an upgrade launch, so only the launch kind differs.
+        let migrated = try TestDatabase.make()
+        UserDefaults.standard.set(false, forKey: "didCleanResetMessageData_v1")
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: true, defaults: marker.defaults) == true)
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: false, defaults: marker.defaults) == false)
+
+        // Each kind of work alone: still no upgrade launch in the background.
+        for key in Self.flagKeys { UserDefaults.standard.set(true, forKey: key) }
+        try Self.markStatisticsCurrent(migrated, marker.defaults)
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: false, defaults: marker.defaults) == false)
+        try migrated.write { db in try SyncEngine.createDeferredIndexes(db) }
+        marker.defaults.removeObject(forKey: SyncEngine.plannerStatisticsSchemaVersionKey)
+        #expect(try AppDatabase.isUpgradeLaunch(
+            migrated, dbExisted: true, isForegroundLaunch: false, defaults: marker.defaults) == false)
+    }
+
     // MARK: - Legacy per-subsystem log files (GitHub #83)
 
     /// The names `AppLogStore`'s header records as the files it replaced,
