@@ -191,6 +191,168 @@ struct NotificationCleanupServiceTests {
         #expect(NotificationCleanupService.identifiersToRemove([], now: now, passiveAllAges: true, lastNonReconnectPushAt: noPushHealth).isEmpty)
     }
 
+    // MARK: - Email banners (removed when the app is opened)
+
+    private func banner(
+        _ id: String,
+        category: String = "",
+        provider: String? = nil,
+        reminderHash: Bool = false
+    ) -> DeliveredNotificationSnapshot {
+        DeliveredNotificationSnapshot(
+            identifier: id,
+            date: now,
+            interruptionLevel: .passive,
+            providerTag: provider,
+            accountEmail: nil,
+            reconnectState: nil,
+            categoryIdentifier: category,
+            hasReminderHash: reminderHash
+        )
+    }
+
+    /// Opening the app removes every email banner, whoever delivered it, and keeps
+    /// reminders, nudges, account warnings and anything else.
+    @Test func emailBanners_removedAndEveryOtherNotificationKept() {
+        let snaps = [
+            // Email banners: filled by EmailNotificationBuilder (the extension keeps the
+            // push's system id; the app's own reply banner uses email-<account>-<message>).
+            banner("3F2A-system-id-1", category: "EMAIL", provider: "gmail"),
+            banner("3F2A-system-id-2", category: "EMAIL_TAG_ARCHIVE", provider: "outlook"),
+            banner("3F2A-system-id-3", category: "EMAIL_TAG_DELETE", provider: "imap_new_mail"),
+            banner("email-acc1-7", category: "EMAIL"),
+            // Email banners the extension delivered bare (no fill, no category).
+            banner("3F2A-system-id-4", provider: "imap_new_mail"),
+            banner("3F2A-system-id-5", provider: "gmail"),
+            banner("3F2A-system-id-6", provider: "outlook"),
+            // Kept: ProactiveNotifyService reminders and nudges (they carry `hash`),
+            // even a nudge filled as an email notification under an email id.
+            banner("due_abc", reminderHash: true),
+            banner("overdue_abc", reminderHash: true),
+            banner("email-acc1-9", category: "EMAIL", reminderHash: true),
+            banner("nudge_abc", category: "EMAIL", reminderHash: true),
+            // Kept: account warnings and anything else.
+            banner("3F2A-system-id-7", provider: "consent_error"),
+            banner("3F2A-system-id-8", provider: "imap_reconnect"),
+            banner("test_123"),
+            banner("other-category", category: "OTHER"),
+        ]
+        #expect(Set(NotificationCleanupService.emailBannerIdentifiers(snaps)) == Set([
+            "3F2A-system-id-1", "3F2A-system-id-2", "3F2A-system-id-3", "email-acc1-7",
+            "3F2A-system-id-4", "3F2A-system-id-5", "3F2A-system-id-6",
+        ]))
+    }
+
+    @Test func emailBanners_noneDelivered_removesNothing() {
+        #expect(NotificationCleanupService.emailBannerIdentifiers([]).isEmpty)
+        #expect(NotificationCleanupService.emailBannerIdentifiers([banner("due_abc", reminderHash: true)]).isEmpty)
+    }
+
+    /// Every action tag the app knows, no tag, and a tag it does not know.
+    private static let everyTag: [String?] = ActionTag.allCases.map { $0.rawValue as String? } + [nil, "unknown"]
+
+    /// Every category the email builder can set counts as an email banner, so a
+    /// filled banner is never missed whatever its action tag, and the set holds no
+    /// category the builder never sets.
+    @Test func emailBanners_everyBuilderCategoryCounts() {
+        var produced: Set<String> = []
+        for tag in Self.everyTag {
+            let category = EmailNotificationBuilder.categoryIdentifier(forActionTag: tag)
+            produced.insert(category)
+            #expect(NotificationCleanupService.isEmailBanner(banner("x", category: category)), "tag \(tag ?? "nil") -> \(category)")
+        }
+        #expect(produced == EmailNotificationBuilder.categoryIdentifiers)
+    }
+
+    // MARK: - Email banners, from the content the app's own builders make
+
+    private static let pushAccountEmail = "user@example.com"
+
+    /// The `userInfo` a visible push carries before the notification extension
+    /// fills it (the push worker's payload).
+    private static func pushUserInfo(provider: String) -> [AnyHashable: Any] {
+        ["provider": provider, "accountEmail": pushAccountEmail]
+    }
+
+    private static func filled(actionTag: String?, userInfo: [AnyHashable: Any] = [:]) -> UNMutableNotificationContent {
+        let content = UNMutableNotificationContent()
+        content.userInfo = userInfo
+        EmailNotificationBuilder.fill(
+            content,
+            signal: EmailNotificationBuilder.Signal(
+                senderName: "Sender", senderEmail: "sender@example.com", subject: "Subject",
+                summaryBlurb: "Summary", actionTag: actionTag),
+            accountId: "acc1", messageId: "42", observedUidValidity: nil)
+        return content
+    }
+
+    private func snapshot(_ identifier: String, _ content: UNNotificationContent) -> DeliveredNotificationSnapshot {
+        NotificationCleanupService.snapshot(identifier: identifier, date: now, content: content)
+    }
+
+    /// A new-mail banner the extension filled (on the push's own userInfo, under the
+    /// system identifier) and the reply banner the app posts itself (no push
+    /// userInfo, under `email-<account>-<message>`) are email banners for every tag,
+    /// and the snapshot carries the category `fill` set.
+    @Test func emailBanners_builderFilledContent_isEmail() {
+        for tag in Self.everyTag {
+            let category = EmailNotificationBuilder.categoryIdentifier(forActionTag: tag)
+            for provider in EmailNotificationBuilder.newMailPushProviders.sorted() {
+                let s = snapshot("3F2A-system-id", Self.filled(actionTag: tag, userInfo: Self.pushUserInfo(provider: provider)))
+                #expect(s.categoryIdentifier == category, "tag \(tag ?? "nil"), \(provider)")
+                #expect(!s.hasReminderHash)
+                #expect(NotificationCleanupService.isEmailBanner(s), "tag \(tag ?? "nil"), \(provider)")
+            }
+            let appPosted = snapshot(
+                EmailNotificationBuilder.identifier(accountId: "acc1", messageId: "42"), Self.filled(actionTag: tag))
+            #expect(appPosted.categoryIdentifier == category)
+            #expect(NotificationCleanupService.isEmailBanner(appPosted), "app-posted, tag \(tag ?? "nil")")
+        }
+    }
+
+    /// A new-mail push the extension delivered as it came (no fill, no category) is an
+    /// email banner; the account warnings delivered the same way are not.
+    @Test func emailBanners_barePush_byProvider() {
+        for provider in EmailNotificationBuilder.newMailPushProviders.sorted() {
+            let content = UNMutableNotificationContent()
+            content.userInfo = Self.pushUserInfo(provider: provider)
+            let s = snapshot("3F2A-system-id", content)
+            #expect(s.providerTag == provider)
+            #expect(s.categoryIdentifier.isEmpty)
+            #expect(NotificationCleanupService.isEmailBanner(s), "\(provider)")
+        }
+        for provider in ["consent_error", "imap_reconnect"] {
+            let content = UNMutableNotificationContent()
+            content.userInfo = Self.pushUserInfo(provider: provider)
+            #expect(!NotificationCleanupService.isEmailBanner(snapshot("3F2A-system-id", content)), "\(provider)")
+        }
+    }
+
+    /// `ProactiveNotifyService`'s nudge (built by `fill`, then its `hash` and `source`
+    /// added, under the email's own identifier) and its due and overdue reminders
+    /// (their own content with `hash`) are kept.
+    @Test func emailBanners_remindersAndNudges_kept() {
+        for tag in Self.everyTag {
+            let nudge = Self.filled(actionTag: tag)
+            var info = nudge.userInfo
+            info["hash"] = "reminder-hash"
+            info["source"] = "email"
+            nudge.userInfo = info
+            let s = snapshot(EmailNotificationBuilder.identifier(accountId: "acc1", messageId: "42"), nudge)
+            #expect(s.hasReminderHash)
+            #expect(!NotificationCleanupService.isEmailBanner(s), "nudge, tag \(tag ?? "nil")")
+        }
+        for identifier in ["due_reminder-hash", "overdue_reminder-hash"] {
+            let reminder = UNMutableNotificationContent()
+            reminder.title = "Reminder"
+            reminder.body = "Today: Reply to the invoice"
+            reminder.userInfo = ["hash": "reminder-hash", "messageId": "42", "source": "email"]
+            let s = snapshot(identifier, reminder)
+            #expect(s.hasReminderHash)
+            #expect(!NotificationCleanupService.isEmailBanner(s), "\(identifier)")
+        }
+    }
+
     @Test func futureDated_notRemoved() {
         // Defensive: clock skew → notification "in the future" must not sweep.
         let s = snap(id: "future", secondsAgo: -3600, level: .active, relativeTo: now)

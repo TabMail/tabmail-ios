@@ -174,7 +174,7 @@ final class AppDatabase: Sendable {
                 "Calendar crash recovery failed; residue preserved for the next launch.",
                 source: "AppDatabase")
         }
-        self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: pool)
+        self.inboxNotificationObserver = Self.makeInboxNotificationObserver(on: pool)
     }
 
     /// Test-only initializer: accepts an already-configured DatabasePool (e.g.
@@ -184,19 +184,15 @@ final class AppDatabase: Sendable {
         try self.init(pool: dbPool, runStartupResets: false)
     }
 
-    /// Wires production-flavored `InboxNotificationObserver` to the pool.
-    /// Atomic seed + register inside one write block — GRDB-documented idiomatic
-    /// pattern (`db.add(transactionObserver:)` from inside `pool.write`). Caller
-    /// MUST retain the returned observer; GRDB holds it weakly at
+    /// Wires production-flavored `InboxNotificationObserver` to the pool. It
+    /// starts with an empty map, so registering it reads nothing (#1385).
+    /// Caller MUST retain the returned observer; GRDB holds it weakly at
     /// `.observerLifetime`.
-    private static func makeInboxNotificationObserver(on pool: DatabasePool) throws -> InboxNotificationObserver {
+    private static func makeInboxNotificationObserver(on pool: DatabasePool) -> InboxNotificationObserver {
         let observer = InboxNotificationObserver(clear: { acct, mid in
             NSEDataBridge.clearNotification(accountId: acct, messageId: mid)
         })
-        try pool.write { db in
-            try observer.seed(db)
-            db.add(transactionObserver: observer)
-        }
+        pool.add(transactionObserver: observer)
         return observer
     }
 
@@ -395,9 +391,8 @@ final class AppDatabase: Sendable {
     /// provider-authoritative "already done" (`IOS-GRAPH-005`, #114).
     ///
     /// A THROW PROPAGATES OUT OF `init`, deliberately. `init` already throws on a
-    /// failed migration and on the observer-seeding write that follows, and
-    /// `AppStartup` turns that into the "couldn't open its local database"
-    /// failure WITHOUT publishing the pool. A database that cannot take this
+    /// failed migration, and `AppStartup` turns that into the "couldn't open its
+    /// local database" failure WITHOUT publishing the pool. A database that cannot take this
     /// write must not go on to release new claims into unreconciled state, so
     /// there is no `try?`, no retry ladder (migrations have none) and no
     /// swallow-and-log.

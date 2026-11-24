@@ -267,7 +267,8 @@ too. `reconcilePendingOperations` keeps its name and both callers and is now exa
 `drainPendingQueue()` + `reconcileOutbox()` + `reconcileCalendarQueue()`.
 
 **Failure semantics at the boundary: fail closed.** A throw PROPAGATES out of `init`, exactly as a
-failed migration or the observer-seeding write does; `AppStartup` renders "TabMail couldn't open its
+failed migration or the observer-seeding write does (2026-11-24 note: the observer-seeding write was
+later removed, #1385; the observer now starts empty); `AppStartup` renders "TabMail couldn't open its
 local database" and **does not publish the pool**. A database that cannot take the recovery write
 must not go on to release new claims into unreconciled state, so there is no `try?`, no retry ladder
 and no swallow-and-log. The previous site swallowed the failure (`try? await retryWrite`) and drained
