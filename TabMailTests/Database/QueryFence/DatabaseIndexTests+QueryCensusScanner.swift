@@ -49,6 +49,10 @@ extension DatabaseIndexTests {
             try db.execute(sql: "UPDATE messageHeader SET isRead = 1 " + "WHERE folderId = ?", arguments: [folderId])
             print("Found \(rows.select(where: folderId)) from cache")
         }
+
+        func evict(_ db: Database, afterEachPage: @Sendable () async -> Void = { await Pruner.pause() }) throws {
+            try db.execute(sql: "DELETE FROM messageBody WHERE fetchedAt < 0")
+        }
     }
     """###
 
@@ -116,6 +120,11 @@ extension DatabaseIndexTests {
             ScannedSite(31, "UnreadStore.touch", "sql", 0, "UPDATE messageHeader SET isRead = 1", sql: "UPDATE messageHeader SET isRead = 1 "),
             ScannedSite(32, "UnreadStore.touch", "call", 1, touchCall),
             ScannedSite(32, "UnreadStore.touch", "sql", 1, "UPDATE messageHeader SET isRead = 1", sql: "UPDATE messageHeader SET isRead = 1 "),
+            // A parameter's default closure opens no declaration: the body after the parameter
+            // list still names its function.
+            ScannedSite(37, "UnreadStore.evict", "call", 0, #"db.execute(sql: "DELETE FROM messageBody WHERE fetchedAt < 0")"#),
+            ScannedSite(37, "UnreadStore.evict", "sql", 0, "DELETE FROM messageBody WHERE fetchedAt < 0",
+                        sql: "DELETE FROM messageBody WHERE fetchedAt < 0"),
         ]
         #expect(found == expected)
     }
@@ -123,7 +132,7 @@ extension DatabaseIndexTests {
     @Test("A CRLF or CR source scans exactly as the LF one")
     func scannerReadsEveryLineEnding() {
         let lf = Self.scanned(Self.scannerFixture).map { ScannedSite($0) }
-        #expect(lf.count == 15)
+        #expect(lf.count == 17)
         for ending in ["\r\n", "\r"] {
             let other = Self.scanned(Self.scannerFixture.replacingOccurrences(of: "\n", with: ending)).map { ScannedSite($0) }
             #expect(other == lf, "line ending \(ending.debugDescription)")

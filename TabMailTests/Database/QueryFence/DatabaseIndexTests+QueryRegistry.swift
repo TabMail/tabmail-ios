@@ -26,6 +26,8 @@ import Testing
 /// - `SIM: <question>`: an index exists; whether the planner takes it is settled by the
 ///   plan check.
 /// - `SCAN #<issue>`: one of the statements a filed issue describes.
+/// - `STOPS: <Suite.test>`: a walk over a mail-sized set that stops once it has what it
+///   needs; the named `@Test` measures that its work does not grow with the set.
 /// - `EXEMPT: <reason>`, the reason one of: `wipe` (deletes everything by design: account
 ///   removal, sign-out, a Settings clear), `user rebuild` (the user asked to rebuild
 ///   everything), `debug/test scene` (`#if DEBUG` or a UI-test scene), `debug tool` (runs
@@ -153,7 +155,7 @@ extension DatabaseIndexTests {
     // MARK: - Verdicts are from the vocabulary
 
     static let verdictGrammar = QueryPlanRules.regex(
-        #"^(SEEK|NOT-A-QUERY|SCAN #[0-9]+|(BOUNDED|N\+1|SIM): \S.*|EXEMPT: (wipe|user rebuild|debug/test scene|debug tool|demo|test-only|search by method|shipped migration|(inherent|shipped one-shot): \S.*))$"#)
+        #"^(SEEK|NOT-A-QUERY|SCAN #[0-9]+|STOPS: [A-Za-z_]\w*\.[A-Za-z_]\w*|(BOUNDED|N\+1|SIM): \S.*|EXEMPT:(wipe|user rebuild|debug/test scene|debug tool|demo|test-only|search by method|shipped migration|(inherent|shipped one-shot): \S.*))$"#)
 
     static func isWellFormed(_ verdict: String) -> Bool { QueryPlanRules.matches(verdictGrammar, verdict) }
 
@@ -173,14 +175,83 @@ extension DatabaseIndexTests {
         for verdict in ["SEEK", "NOT-A-QUERY", "SCAN #1364", "BOUNDED: folders", "N+1: the page size",
                         "SIM: does the range seek", "EXEMPT: wipe", "EXEMPT: user rebuild", "EXEMPT: debug/test scene",
                         "EXEMPT: debug tool", "EXEMPT: demo", "EXEMPT: test-only", "EXEMPT: search by method",
-                        "EXEMPT: shipped migration", "EXEMPT: inherent: why", "EXEMPT: shipped one-shot: name"] {
+                        "EXEMPT: shipped migration", "EXEMPT: inherent: why", "EXEMPT: shipped one-shot: name",
+                        "STOPS: WalkTests.walkStops"] {
             #expect(Self.isWellFormed(verdict), "\(verdict) is part of the vocabulary")
         }
         for verdict in ["", "SEEK ", " SEEK", "SCAN", "SCAN #", "SCAN #12a", "SCAN-CANDIDATE: messageHeader", "BOUNDED:",
                         "BOUNDED: ", "EXEMPT: other", "EXEMPT: inherent:", "EXEMPT: wipe ", "seek", "SIM:question",
-                        "N+1 the page size"] {
+                        "N+1 the page size", "STOPS:", "STOPS: ", "STOPS: walkStops", "STOPS: WalkTests.",
+                        "STOPS: WalkTests.walkStops()", "STOPS: WalkTests.walkStops extra", "STOPS: A.b.c"] {
             #expect(!Self.isWellFormed(verdict), "\(verdict) is not part of the vocabulary")
         }
+    }
+
+    // MARK: - A STOPS verdict names its workload test
+
+    static let stopsVerdict = QueryPlanRules.regex(#"^STOPS: ([A-Za-z_]\w*)\.([A-Za-z_]\w*)$"#)
+
+    /// Whether `source` declares or extends `suite` and has a `@Test` function named `test`:
+    /// the nearest `@Test` before that `func` comes after every earlier `func`, so the
+    /// attribute is that function's. Both names are identifiers (the verdict grammar).
+    static func declaresTest(_ source: String, suite: String, test: String) -> Bool {
+        let suiteDeclaration = QueryPlanRules.regex(#"\b(?:struct|class|enum|actor|extension)\s+"# + suite + #"(?:\s*[:{<]|\s+where\b)"#)
+        guard QueryPlanRules.matches(suiteDeclaration, source) else { return false }
+        let text = source as NSString
+        for function in QueryPlanRules.allMatches(QueryPlanRules.regex(#"\bfunc\s+"# + test + #"\s*\("#), source) {
+            let before = text.substring(to: function.location) as NSString
+            let attribute = before.range(of: "@Test", options: .backwards).location
+            let earlierFunction = before.range(of: "func ", options: .backwards).location
+            if attribute != NSNotFound && (earlierFunction == NSNotFound || earlierFunction < attribute) { return true }
+        }
+        return false
+    }
+
+    /// The text of every Swift file under TabMailTests.
+    static func testSources() throws -> [String] {
+        let base = repositoryRoot.appendingPathComponent("TabMailTests")
+        guard let walker = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) else { return [] }
+        var sources: [String] = []
+        for case let url as URL in walker where url.pathExtension == "swift" {
+            sources.append(try String(contentsOf: url, encoding: .utf8))
+        }
+        return sources
+    }
+
+    @Test("Every STOPS verdict names a @Test function of its suite in TabMailTests")
+    func everyStopsVerdictNamesATest() throws {
+        let named = Set(try Self.registry().map(\.verdict).filter { QueryPlanRules.matches(Self.stopsVerdict, $0) })
+        let sources = try Self.testSources()
+        #expect(sources.count > 1)
+        let missing = named.sorted().filter { verdict in
+            guard let groups = QueryPlanRules.firstMatch(Self.stopsVerdict, verdict),
+                  let suite = groups[1], let test = groups[2] else { return true }
+            return !sources.contains { Self.declaresTest($0, suite: suite, test: test) }
+        }
+        #expect(missing.isEmpty, """
+            STOPS verdicts whose test is not a @Test function of that suite in TabMailTests (renamed or removed?):
+            \(missing.joined(separator: "\n"))
+            """)
+    }
+
+    /// Pins the lookup, so a lookup that found any name would not let every STOPS verdict through.
+    @Test("A STOPS test is found only as a @Test function in a file of its suite")
+    func stopsTestLookupIsExact() {
+        let source = """
+            @Suite(.serialized)
+            struct WalkTests {
+                @Test("The walk stops")
+                @MainActor
+                func walkStops() throws {}
+
+                func helper() {}
+            }
+            """
+        #expect(Self.declaresTest(source, suite: "WalkTests", test: "walkStops"))
+        #expect(!Self.declaresTest(source, suite: "WalkTests", test: "helper"), "a function with no @Test")
+        #expect(!Self.declaresTest(source, suite: "OtherTests", test: "walkStops"), "a file of another suite")
+        #expect(!Self.declaresTest(source, suite: "WalkTests", test: "walk"), "a prefix of a test name")
+        #expect(!Self.declaresTest(source, suite: "Walk", test: "walkStops"), "a prefix of a suite name")
     }
 
     // MARK: - The comparison on fixed registries

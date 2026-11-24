@@ -179,6 +179,8 @@ enum QueryCensusScanner {
         var out = Lexed()
         var depth = 0
         var stack: [(name: String, depth: Int)] = []
+        /// The pending code before each open brace that sits inside a parenthesis, with its depth.
+        var held: [(pending: String, depth: Int)] = []
         var pending = ""
         let patterns: Patterns
 
@@ -205,6 +207,15 @@ enum QueryCensusScanner {
             switch c {
             case "{":
                 depth += 1
+                // A brace inside an open parenthesis is a closure argument, or a parameter's
+                // default value (`after: () -> Void = { … }`): it opens no declaration, and
+                // the code before it stays pending, so the `{` after the parameter list still
+                // names its function.
+                if pending.filter({ $0 == "(" }).count > pending.filter({ $0 == ")" }).count {
+                    held.append((pending, depth))
+                    pending = ""
+                    return
+                }
                 if let name = declarationName(pending) {
                     stack.append((name, depth))
                     out.contexts.append((offset, context))
@@ -214,6 +225,12 @@ enum QueryCensusScanner {
                 let before = stack.count
                 while let top = stack.last, top.depth >= depth { stack.removeLast() }
                 if stack.count != before { out.contexts.append((offset, context)) }
+                if let outer = held.last, outer.depth == depth {
+                    held.removeLast()
+                    depth -= 1
+                    pending = outer.pending + "{}"
+                    return
+                }
                 depth -= 1
                 pending = ""
             case ";":
