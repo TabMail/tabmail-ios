@@ -36,12 +36,20 @@ the app runs one only after deleting all mail), so it suits a cursor that lives 
 stored. `INDEXED BY` is needed when another index gives the same order (`messageHeader_date` does), because a
 planner that took it would walk every folder to fill one page.
 
-Measure a page's cost with `sqlite3_stmt_status(statement.sqliteStatement, SQLITE_STMTSTATUS_VM_STEP, 0)` on a
-statement re-run from its `expandedDescription`, with the old shape as a control
+Measure a page's cost from the statement as it ran: SQLite's profile callback (`sqlite3_trace_v2` with
+`SQLITE_TRACE_PROFILE`) installed on every connection of the test pool reports each finished statement with its SQL and
+`sqlite3_stmt_status(statement, SQLITE_STMTSTATUS_VM_STEP, 1)`, so every read the code made is seen and costed on the
+connection that ran it, bound values and the reader's statistics included. Re-running a statement from its
+`expandedDescription` on another connection is weaker: bound values become literals, which can change the plan
+(IOS-PERF-004), and the other connection may hold other statistics; a filter on the expected statement text also
+misses an extra read the code makes. Keep the old shape as a control
 (`SyncEngineFTSBulkIndexTests.everyPageReadsOnlyItsOwnRows`).
 
 ## Where else the shape appears
 
 `InboxListReader.durableQuerySQL` pages the inbox by `(date, id)` too, and its display indexes
 (`messageHeader_inbox_display`, `messageHeader_triage_display`) do not hold `id` either; a page of 50 inside a large
-run of equal dates re-reads the run. Not measured as a user cost (IOS-SCROLL-004 owns that ordering).
+run of equal dates re-reads the run. Its cost is measured in `InboxListReader`'s comment on the `ORDER BY`: the sort
+is bounded by the `LIMIT` plus the tied-second block straddling it (`USE TEMP B-TREE FOR LAST TERM OF ORDER BY`, 0.24 ms
+at 100k on a Mac; triage sorts one whole tag bucket, 1.91 ms), so it is small for the inbox; IOS-SCROLL-004 owns that
+ordering.

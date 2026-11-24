@@ -382,6 +382,54 @@ struct SearchIndexCRUDTests {
         try await index.removeMessages(contentKeys: keys)
     }
 
+    @Test("documentCountForAccount gives the count of the LIKE read it replaced for account ids shaped like the app's")
+    func documentCountForAccountMatchesTheLikeCount() async throws {
+        try await index.initialize()
+        // Ids the app mints (UUIDs), and a fixed id with no colon like the demo account's.
+        let accounts = [UUID().uuidString, UUID().uuidString, UUID().uuidString, "demo-account-count"]
+        var headerIds: [String] = []
+        for (n, accountId) in accounts.enumerated() {
+            for m in 0...n {
+                headerIds.append("\(accountId):INBOX:\(m)")
+                headerIds.append("\(accountId):Archive/2026:\(m)")
+            }
+        }
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+        let records = headerIds.enumerated().map { offset, hid in
+            FTSHeaderRecord(contentKey: ContentKey(rawValue: hid), headerId: hid, messageId: "like\(offset)",
+                            subject: "S", from: "a@example.com", to: "b@example.com", dateMs: nowMs)
+        }
+        let keys = headerIds.map(ContentKey.init(rawValue:))
+        try await index.removeMessages(contentKeys: keys)
+        let inserted = try await index.indexHeaders(records)
+        #expect(inserted == headerIds.count)
+
+        // The oracle: the count the index ran before, on a read-only connection to
+        // the same database.
+        let appSupport = try #require(
+            FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first)
+        var config = Configuration()
+        config.readonly = true
+        let queue = try DatabaseQueue(
+            path: appSupport.appendingPathComponent("tabmail_fts/fts.db").path, configuration: config)
+        var counts: [(range: Int, like: Int, seeded: Int)] = []
+        for (n, accountId) in accounts.enumerated() {
+            let range = try await index.documentCountForAccount(accountId: accountId)
+            let like = try await queue.read { db in
+                try Int.fetchOne(
+                    db, sql: "SELECT COUNT(*) FROM message_ids WHERE headerId LIKE ?",
+                    arguments: [accountId + ":%"]) ?? 0
+            }
+            counts.append((range, like, 2 * (n + 1)))
+        }
+        try await index.removeMessages(contentKeys: keys)
+
+        for (accountId, count) in zip(accounts, counts) {
+            #expect(count.range == count.like, "\(accountId): \(count.range) by key range, \(count.like) by LIKE")
+            #expect(count.range == count.seeded, "\(accountId): \(count.range) counted, \(count.seeded) indexed")
+        }
+    }
+
     /// Statements a connection ran, with their bound values inlined so each can be
     /// planned afterwards (`expandedDescription`; see `SearchScopedPageTests.SQLTape`).
     private final class SQLTape: Sendable {
@@ -452,6 +500,29 @@ struct SearchIndexCRUDTests {
         #expect(seeksRange, "the account count no longer seeks its key range: \(plan)")
         #expect(!plan.contains("SCAN"), "the account count scans: \(plan)")
         #expect(probe.likePlan.contains("SCAN message_ids"), "the probe cannot see a scan: \(probe.likePlan)")
+    }
+
+    /// The probe above plans `accountDocumentCount` on its own connection, so this
+    /// pins that the actor's count runs that read and no other: one call to it and
+    /// no SQL of its own (a statement of the actor's own could scan unseen).
+    @Test("documentCountForAccount runs only the planned key-range read")
+    func documentCountForAccountRunsOnlyThePlannedRead() throws {
+        let sources = try DiagnosticPrintGateTests.appTargetSources()
+        let indexFile = sources.first { $0.relativePath == "TabMail/Services/Search/SearchIndex.swift" }
+        let indexText = try #require(indexFile?.source)
+        let lines = indexText.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+        let startIndex = lines.firstIndex { $0.contains("func documentCountForAccount(accountId: String)") }
+        let start = try #require(startIndex)
+        // The method ends at the first closing brace at its own indentation.
+        let endIndex = lines[start...].firstIndex { $0 == "    }" }
+        let end = try #require(endIndex)
+        let body = lines[(start + 1)..<end].joined(separator: "\n")
+
+        let reads = body.components(separatedBy: "Self.accountDocumentCount(db, accountId: accountId)").count - 1
+        #expect(reads == 1, "the count runs the planned read once: \(body)")
+        let ownSQL = ["sql", "fetch", "execute", "Statement", "message_ids"].filter { body.contains($0) }
+        #expect(ownSQL.isEmpty, "the count reads with SQL of its own (\(ownSQL)): \(body)")
     }
 
     @Test("removeMessagesForAccount removes all messages for given account")

@@ -780,13 +780,17 @@ extension SyncEngine {
     /// no marker or counter of its own, so each run checks the data itself.
     /// When the index is sparse, each folder is paged by key (`bulkIndexWalk`),
     /// so no message is materialized all at once.
-    func bulkIndexIfNeeded(account: Account) {
+    ///
+    /// Returns the run's task, or nil when a run for the account is under way.
+    /// Production callers discard it; it lets a test wait for the run to end.
+    @discardableResult
+    func bulkIndexIfNeeded(account: Account) -> Task<Void, Never>? {
         // Don't overlap per-account
-        guard bulkIndexTasks[account.id] == nil else { return }
+        guard bulkIndexTasks[account.id] == nil else { return nil }
 
         let accountId = account.id
         // QoS: `.medium` — see SyncEngineBackfill.swift for rationale.
-        bulkIndexTasks[accountId] = Task(priority: .medium) { [weak self] in
+        let task = Task(priority: .medium) { [weak self] in
             do {
                 let folderIds: [String] = try await self?.dbPool.read { db in
                     try String.fetchAll(db,
@@ -854,6 +858,8 @@ extension SyncEngine {
             }
             await self?.clearBulkIndexTask(accountId: accountId)
         }
+        bulkIndexTasks[accountId] = task
+        return task
     }
 
     /// Backfill folderId for existing FTS entries that were indexed before the folderId column existed.
