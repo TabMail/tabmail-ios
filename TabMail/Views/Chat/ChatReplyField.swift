@@ -114,9 +114,10 @@ struct ChatReplyField {
     }
 
     /// The line above the field while the agent works: the agent's own labels, except that
-    /// writing a reply reads "Writing your email".
+    /// writing a reply, or a new email's chat's email, reads "Writing your email".
     static func statusLine(_ label: String) -> String {
-        label == ToolRegistry.activityLabels["email_reply"] ? "Writing your email" : label
+        label == ToolRegistry.activityLabels["email_reply"] || label == ToolRegistry.activityLabels["email_compose"]
+            ? "Writing your email" : label
     }
 }
 
@@ -154,13 +155,30 @@ struct ChatNewEmailField {
     let sessionKey: String
     /// Each change of the field's words.
     let wordsChanged: (String) -> Void
-    /// Send with words in the field.
-    let send: (String) -> Void
+    /// Send with words in the field: the chat decides (`ChatNewDraft.send`). It returns the people
+    /// the email is written to, read at the tap, and the field's words go to the agent to write it,
+    /// as a reply's do; nil when the chat asked who it is to, and the words stay as they are.
+    let send: (String) -> [ChatThread.Person]?
     /// A choice in the paperclip's menu.
     let attach: (AttachSource) -> Void
 
     /// A new email's chat session key: a fresh one for each new email's chat.
-    static func newSessionKey() -> String { "new-email:\(UUID().uuidString)" }
+    static func newSessionKey() -> String { "\(sessionKeyPrefix)\(UUID().uuidString)" }
+
+    private static let sessionKeyPrefix = "new-email:"
+
+    /// Whether `key` is a new email's chat session key (`newSessionKey`).
+    static func isSessionKey(_ key: String) -> Bool { key.hasPrefix(sessionKeyPrefix) }
+
+    /// The agent's message for words sent in a new email's field: the words, with a nudge that
+    /// they are for a new email to `people`, so the agent writes it (`email_compose`, the words as
+    /// its request) unless the words ask something else. The sibling of
+    /// `ChatReplyField.agentMessage`.
+    static func agentMessage(to people: [ChatThread.Person], text: String) -> String {
+        let recipients = people.map { "\($0.name) <\($0.address)>" }.joined(separator: ", ")
+        return "New email to \(recipients) (typed in its field; unless I am asking something else, "
+            + "write this new email to them with email_compose, my words as the request): \(text)"
+    }
 }
 
 /// The chat input's words, which are all the reply field shows: the AI Suggestion never enters the
