@@ -294,7 +294,8 @@ struct ChatSwipeTests {
         // On the bubble itself, never on the whole row: actions on a view of several elements
         // reorder what VoiceOver reads in it (the bubble came between its own chips).
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
-        #expect(bubble.contains(".accessibilityAddTraits(.isButton) .accessibilityActions { ForEach(actions) { action in Button(action.title, action: action.action) } }"))
+        // A prefix: the bubble's own actions may follow (the avatar's "Copy Address", CopyAddressTests).
+        #expect(bubble.contains(".accessibilityAddTraits(.isButton) .accessibilityActions { ForEach(actions) { action in Button(action.title, action: action.action) }"))
         #expect(text.contains("allowsFullSwipe: false, open: swipeOpen)) .id(item.id)"), "control: the bubble's row, as the next check reads it")
         #expect(!text.contains("allowsFullSwipe: false, open: swipeOpen)) .accessibilityActions"), "no actions on the whole row")
         let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")

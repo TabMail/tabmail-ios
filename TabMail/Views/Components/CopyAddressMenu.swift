@@ -44,17 +44,11 @@ enum AddressCopy {
             }
     }
 
-    /// A message's sender: the name the email view shows and the sender's address. Nobody when the
-    /// message has no sender address.
-    static func sender(name: String, address: String) -> [Entry] {
-        guard !address.isEmpty else { return [] }
-        return [Entry(name: name.isEmpty ? address : name, address: address)]
-    }
-
     /// One person shown by `name`, whose address comes from an address field: the bare address the
     /// value names, read with the same parser as `entries(in:)`, so a value kept as written
-    /// (`support team <support@localhost>`) copies `support@localhost`. Shown by that address when
-    /// `name` is empty; nobody when the value names no address.
+    /// (`support team <support@localhost>`) copies `support@localhost`, and a stored sender address
+    /// holding more than the address (`ann@example.com (Ann Lee)`) copies `ann@example.com`. Shown by
+    /// that address when `name` is empty; nobody when the value names no address.
     static func named(_ name: String, address: String) -> [Entry] {
         guard let mailbox = entries(in: [address]).first else { return [] }
         return [Entry(name: name.isEmpty ? mailbox.address : name, address: mailbox.address)]
@@ -62,7 +56,8 @@ enum AddressCopy {
 
     /// A chat person (`ChatThread.Person`). Their address is usually bare, but the reply list keeps
     /// each entry it cannot send to as written (`RecipientEntry.leftovers`, through
-    /// `buildReplyAllRecipients`), so it is read through `named(_:address:)`.
+    /// `buildReplyAllRecipients`), so it is read through `named(_:address:)`. `ChatThread` keeps a
+    /// person's address lowercased, so that is the case a chat copy has.
     static func person(_ person: ChatThread.Person) -> [Entry] {
         named(person.name, address: person.address)
     }
@@ -70,7 +65,7 @@ enum AddressCopy {
     /// A compose recipient: the chip's address (a field holds addresses only, ADR-IOS-092) and the
     /// name the chip shows for it.
     static func recipient(_ token: String, displayNames: [String: String]) -> [Entry] {
-        sender(name: displayNames[token] ?? token, address: token)
+        named(displayNames[token] ?? "", address: token)
     }
 
     /// The menu's items. One person: one "Copy Address" item. Several (a To line): one item per

@@ -556,7 +556,7 @@ struct MessageCardView: View {
     /// The people a header line's "Copy Address" offers, each with the address it copies.
     static func copyEntries(_ line: HeaderLine, of message: MessageHeader) -> [AddressCopy.Entry] {
         switch line {
-        case .sender: AddressCopy.sender(name: message.from, address: message.fromAddress)
+        case .sender: AddressCopy.named(message.from, address: message.fromAddress)
         case .to: AddressCopy.entries(in: [message.to])
         case .cc: AddressCopy.entries(in: [message.cc])
         case .bcc: AddressCopy.entries(in: [message.bcc])

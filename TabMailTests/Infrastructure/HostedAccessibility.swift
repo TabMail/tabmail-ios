@@ -121,6 +121,26 @@ enum HostedAccessibility {
         guard let element = elements(under: view).first(where: { Self.identifier(of: $0) == identifier }),
               let custom = element.accessibilityCustomActions?.first(where: { $0.name == action })
         else { return false }
+        return run(custom)
+    }
+
+    /// The names of the actions every element under `view` offers VoiceOver, in element order.
+    static func actionNames(in view: UIView) -> [String] {
+        elements(under: view).flatMap { $0.accessibilityCustomActions ?? [] }.map(\.name)
+    }
+
+    /// Performs the named action of the first element under `view` that offers it, as VoiceOver's
+    /// actions rotor does. Returns whether an element offered it and the action ran.
+    static func perform(_ action: String, in view: UIView) -> Bool {
+        for element in elements(under: view) {
+            if let custom = element.accessibilityCustomActions?.first(where: { $0.name == action }) {
+                return run(custom)
+            }
+        }
+        return false
+    }
+
+    private static func run(_ custom: UIAccessibilityCustomAction) -> Bool {
         if let handler = custom.actionHandler { return handler(custom) }
         guard let target = custom.target as? NSObject, target.responds(to: custom.selector) else { return false }
         _ = target.perform(custom.selector, with: custom)

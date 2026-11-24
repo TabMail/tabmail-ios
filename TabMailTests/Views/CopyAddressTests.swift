@@ -197,6 +197,28 @@ struct CopyAddressTests {
         #expect(noAddressEntries.isEmpty)
     }
 
+    /// A Gmail sender is stored as its From text when that names no `<...>`, so the stored sender
+    /// address can hold a comment, or no address at all.
+    @Test("Email view: a stored sender address holding more than the address copies the address alone; one naming none offers nothing")
+    func emailViewSenderAsStored() {
+        var commented = Self.message()
+        commented.from = "ann@example.com (Ann Lee)"
+        commented.fromAddress = "ann@example.com (Ann Lee)"
+        var noAddress = Self.message()
+        noAddress.from = "Mailer Daemon"
+        noAddress.fromAddress = "Mailer Daemon"
+        let commentedCopy = AddressCopy.items(MessageCardView.copyEntries(.sender, of: commented)).map(\.address)
+        let noAddressEntries = MessageCardView.copyEntries(.sender, of: noAddress)
+        #expect(commentedCopy == ["ann@example.com"])
+        #expect(noAddressEntries.isEmpty)
+    }
+
+    @Test("A person whose name is empty is offered by their address")
+    func emptyName() {
+        let entries = AddressCopy.entries(in: [#""" <a@example.com>"#])
+        #expect(entries == [Entry(name: "a@example.com", address: "a@example.com")])
+    }
+
     @Test("Email view: the To, Cc and Bcc lines offer their own people")
     func emailViewRecipientLines() {
         let message = Self.message()
@@ -310,6 +332,13 @@ struct CopyAddressTests {
          ".copyAddressMenu(AddressCopy.person(person))", 0, 2, 2),
         ("TabMail/Views/Chat/ChatReplyToSheet.swift", "Button { pick(contact.email, name: contact.name) } label: {",
          ".copyAddressMenu(AddressCopy.named(contact.name, address: contact.email))", 0, 9, 1),
+        // The menu's preview keeps the avatar's circle and the chip's capsule.
+        ("TabMail/Views/Chat/ChatHeaderView.swift", ".copyAddressMenu(AddressCopy.person(person))",
+         ".contentShape(.contextMenuPreview, Circle())", 1, 0, 1),
+        ("TabMail/Views/Chat/ChatBubbleView.swift", ".copyAddressMenu(AddressCopy.person(item.sender))",
+         ".contentShape(.contextMenuPreview, Circle())", 1, 0, 1),
+        ("TabMail/Views/Compose/ComposeView.swift", ".copyAddressMenu(AddressCopy.recipient(token, displayNames: displayNames))",
+         ".contentShape(.contextMenuPreview, Capsule())", 1, 0, 1),
     ])
     func everyPlaceAttachesIt(_ place: (String, String, String, Int, Int, Int)) throws {
         let (path, anchor, menu, before, after, expected) = place
@@ -347,7 +376,7 @@ struct CopyAddressTests {
             "contextMenu { if !entries.isEmpty { CopyAddressMenuItems(entries: entries) } }",
             "if entries.isEmpty { label() } else { Menu { CopyAddressMenuItems(entries: entries) } label: {",
             "} primaryAction: { primaryAction() }",
-            #"SwiftUI.Section(heading) { ForEach(Array(items.enumerated()), id: \.offset) { _, item in Button { AddressCopy.copy(item) } label: {"#,
+            #"SwiftUI.Section(heading) { ForEach(Array(items.enumerated()), id: \.offset) { _, item in Button { AddressCopy.copy(item) } label: { Text(item.title) if let subtitle = item.subtitle { Text(subtitle) } }"#,
             "Button(item.title, systemImage: AddressCopy.systemImage) { AddressCopy.copy(item) }",
         ]
         let missing = wiring.filter { !text.contains($0) }

@@ -1491,3 +1491,11 @@ that person, and the bubble gives VoiceOver the avatar's action when it shows th
 for someone, the row menu as the label alone for nobody and with its tap, and every item copying its own
 item. `emailViewLinesKeepTheirTap` pins each card line's tap: the closed card's sender and recipient
 line open the card, the open card's lines show more or fewer details.
+`emailViewSenderAsStored`: a stored sender address holding a comment (`ann@example.com (Ann Lee)`, how a
+Gmail From without `<...>` is stored) copies `ann@example.com`, and one naming no address
+(`Mailer Daemon`) offers nothing; `emptyName`: `"" <a@example.com>` is offered by its address.
+`everyPlaceAttachesIt` also pins that the menu's preview keeps the avatars' circle and the compose chip's
+capsule, and `menuViewsWireTheCopy` the several-person item's title and address lines.
+`ChatBubbleActionTests.bubbleCopiesItsSendersAddress` opens a group chat in a window: each sender's
+bubble offers VoiceOver "Copy <name>'s Address", and performing it puts that sender's address on the
+general clipboard (the default pasteboard the menu writes).
