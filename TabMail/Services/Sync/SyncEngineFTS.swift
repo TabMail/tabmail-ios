@@ -790,6 +790,53 @@ extension SyncEngine {
         return true
     }
 
+    /// Writes one page of the bulk index walk: indexes `headers` into `searchIndex`,
+    /// then marks complete those not marked yet. Returns how many entries were new.
+    ///
+    /// The walk re-reads every header of the account, and most of them are indexed
+    /// and marked already: during a large account's first download a walk can start
+    /// on many sync passes. So an entry that already holds what the write would set
+    /// is left alone (`indexHeaders(_:skippingUnchanged:)`), and a header already
+    /// marked is not written again. Both end in the state a full rewrite leaves:
+    /// entries that differ are rewritten, and every header of the page is marked.
+    nonisolated static func bulkIndexWritePage(
+        _ headers: [MessageHeader], searchIndex: SearchIndex, headerDatabase: PrioritizedDatabase
+    ) async throws -> Int {
+        let records = bulkIndexRecords(headers)
+        let inserted = try await searchIndex.indexHeaders(records, skippingUnchanged: true)
+        // Mark headers as fully indexed. `[String]` is load-bearing:
+        // this binds `messageHeader.id` (F2).
+        let headerIds: [String] = records.map(\.headerId)
+        try? await headerDatabase.write { db in
+            for hid in headerIds {
+                try db.execute(
+                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ? AND headerComplete = 0",
+                    arguments: [hid]
+                )
+            }
+        }
+        return inserted
+    }
+
+    /// The search entries the bulk index writes for `headers`, one per header.
+    nonisolated static func bulkIndexRecords(_ headers: [MessageHeader]) -> [FTSHeaderRecord] {
+        headers.map { header in
+            FTSHeaderRecord(
+                // ⚠ STAGE E1: mint through `ContentKey.forHeader`.
+                contentKey: ContentKey(rawValue: header.id),
+                headerId: header.id,
+                messageId: header.messageId,
+                subject: header.subject,
+                from: "\(header.from) <\(header.fromAddress)>",
+                to: header.to,
+                cc: header.cc,
+                bcc: header.bcc,
+                dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
+                folderId: header.folderId
+            )
+        }
+    }
+
     /// Index existing messages into FTS if the index is sparse.
     ///
     /// Runs after every sync (step 3 of `sync(account:)`); the task guard below
@@ -835,35 +882,10 @@ extension SyncEngine {
                     let finished = try await SyncEngine.bulkIndexWalk(
                         folderIds: folderIds, dbPool: dbPool, limit: SyncConfig.ftsIndexBatchSize
                     ) { batch, batchNumber in
-                        let records = batch.map { header in
-                            FTSHeaderRecord(
-                                // ⚠ STAGE E1: mint through `ContentKey.forHeader`.
-                                contentKey: ContentKey(rawValue: header.id),
-                                headerId: header.id,
-                                messageId: header.messageId,
-                                subject: header.subject,
-                                from: "\(header.from) <\(header.fromAddress)>",
-                                to: header.to,
-                                cc: header.cc,
-                                bcc: header.bcc,
-                                dateMs: Int64(header.date.timeIntervalSince1970 * 1000),
-                                folderId: header.folderId
-                            )
-                        }
-                        let inserted = try await SearchIndex.shared.indexHeaders(records)
+                        let inserted = try await SyncEngine.bulkIndexWritePage(
+                            batch, searchIndex: SearchIndex.shared, headerDatabase: AppDatabase.backgroundPool)
                         if inserted > 0 {
                             BackgroundSyncLogger.logDebug("[FTS Bulk] Batch \(batchNumber): indexed \(inserted)")
-                        }
-                        // Mark headers as fully indexed. `[String]` is load-bearing:
-                        // this binds `messageHeader.id` (F2).
-                        let headerIds: [String] = records.map(\.headerId)
-                        try? await AppDatabase.backgroundPool.write { db in
-                            for hid in headerIds {
-                                try db.execute(
-                                    sql: "UPDATE messageHeader SET headerComplete = 1 WHERE id = ?",
-                                    arguments: [hid]
-                                )
-                            }
                         }
                     }
                     guard finished else { return }
