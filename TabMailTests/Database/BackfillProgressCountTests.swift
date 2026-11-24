@@ -386,6 +386,78 @@ struct BackfillProgressCountTests {
         try expectOrderedScan("large mailbox")
     }
 
+    /// Headers for the body admission plan test: thousands waiting for a body in each
+    /// queue's scope, far more than one window.
+    private static let bodyAdmissionPlanRows = 20_000
+
+    /// #1400: each body queue's refill runs its admission read, which stops at
+    /// `SyncConfig.bodyFetchRepopulateLimit`. The limit bounds the read only while the
+    /// plan walks `messageHeader_bodyRepopulateV2` in `date` order: a plan that sorts
+    /// reads every pending row before it returns the first. So in every statistics
+    /// state, and under a large mailbox's statistics, both reads seek that index on all
+    /// five equality columns with no sort, and return exactly one window. Red when a
+    /// read loses its limit: it then returns every pending row.
+    @Test("Each body queue's admission read seeks its index in date order, with no sort, and stops at one window")
+    func bodyAdmissionSeeksItsIndexAndStopsAtOneWindow() throws {
+        let queue = try Self.makeDatabase(accounts: ["acc-a", "acc-b"])
+        // Four of every five headers wait for a body; half of all headers are in the
+        // inbox (the active queue's scope), half elsewhere (the backfill queue's).
+        try Self.fill(queue, count: Self.bodyAdmissionPlanRows, templateAccount: "acc-a", Fill(
+            accountId: "'acc-' || char(97 + n % 2)",
+            headerComplete: "1",
+            bodyComplete: "(n % 5) = 0",
+            bodyEmptyConfirmed: "0",
+            bodyMetadataOversized: "0"))
+        try queue.write { conn in
+            try conn.execute(sql: "UPDATE messageHeader SET isInInbox = rowid % 2")
+        }
+        let seek = "SEARCH messageHeader USING INDEX messageHeader_bodyRepopulateV2 (isInInbox=? AND headerComplete=? AND bodyComplete=? AND bodyEmptyConfirmed=? AND bodyMetadataOversized=?)"
+        let reads = [("ActiveBodyQueue", ActiveBodyQueue.admissionSQL),
+                     ("BackfillBodyQueue", BackfillBodyQueue.admissionSQL)]
+
+        func expectWindowSeek(_ state: String) throws {
+            for (name, sql) in reads {
+                let (plan, rows) = try queue.read { conn in
+                    (try Row.fetchAll(conn, sql: "EXPLAIN QUERY PLAN " + sql)
+                        .compactMap { $0["detail"] as String? }
+                        .joined(separator: " | "),
+                     try Row.fetchAll(conn, sql: sql).count)
+                }
+                #expect(plan == seek,
+                        "\(state), \(name): the admission read must seek its index in date order, no sort: \(plan)")
+                #expect(rows == SyncConfig.bodyFetchRepopulateLimit,
+                        "\(state), \(name): the read returns one window, not every pending row: \(rows)")
+            }
+        }
+
+        for statistics in Statistics.allCases {
+            try Self.apply(statistics, to: queue)
+            if statistics == .fresh {
+                let statRows = try queue.read { conn in
+                    try Int.fetchOne(conn, sql: "SELECT COUNT(*) FROM main.sqlite_stat1 WHERE idx = 'messageHeader_bodyRepopulateV2'") ?? -1
+                }
+                #expect(statRows > 0, "setup: the fresh state is vacuous unless ANALYZE wrote the body index's row")
+            }
+            try expectWindowSeek(statistics.rawValue)
+        }
+        try Self.applyLargeMailboxStatistics(to: queue)
+        try expectWindowSeek("large mailbox")
+
+        // Control: without its index the same reads plan differently, so the exact plan
+        // checked above is not one every database yields.
+        try queue.write { conn in
+            try conn.execute(sql: "DROP INDEX messageHeader_bodyRepopulateV2")
+        }
+        for (name, sql) in reads {
+            let plan = try queue.read { conn in
+                try Row.fetchAll(conn, sql: "EXPLAIN QUERY PLAN " + sql)
+                    .compactMap { $0["detail"] as String? }
+                    .joined(separator: " | ")
+            }
+            #expect(plan != seek, "setup: \(name) plans differently without its index, or the plan check pins nothing: \(plan)")
+        }
+    }
+
     // MARK: - Same counts as the old statements
 
     @Test("Same counts as the old statements on an empty database and on one row in every flag combination")

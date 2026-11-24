@@ -526,7 +526,8 @@ struct AccountManagerQueueDrainTests {
     /// and DRAINED ANYWAY when the write failed; the new site calls
     /// `try Self.recoverPreviousSessionResidue(on: pool)` from
     /// `AppDatabase.init(pool:runStartupResets:)` and lets the throw out, exactly
-    /// as a failed migration or the observer-seeding write already does. Both
+    /// as a failed migration already does (the inbox observer's seeding write, which
+    /// also threw out of `init`, was removed in #1385). Both
     /// rewritten startup tests use writable pools and assert only the success
     /// path, so replacing that `try` with `try?` leaves every other expectation
     /// in this file green — a stricter contract with no witness.
