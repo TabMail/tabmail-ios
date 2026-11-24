@@ -72,6 +72,18 @@ final class UserLabelMenuModel {
         self.messageSnapshot = messageSnapshot
     }
 
+    // MARK: - Rows
+
+    /// The rows the sheet shows for `searchText` (#1386). With no search, `recent` is
+    /// `recentLabels` (its own section, above a separator) and `list` is every label
+    /// A to Z, the recent ones included; with no recent label, `recent` is empty and
+    /// the sheet is the A-to-Z list alone. While the user searches, `recent` is empty
+    /// and `list` is the A-to-Z labels whose name contains the search.
+    func rows(searchText: String) -> (recent: [UserLabel], list: [UserLabel]) {
+        guard !searchText.isEmpty else { return (recentLabels, sortedLabels) }
+        return ([], sortedLabels.filter { $0.name.localizedCaseInsensitiveContains(searchText) })
+    }
+
     // MARK: - Data Loading
 
     func loadLabels() {
@@ -411,18 +423,19 @@ struct UserLabelMenuView: View {
                     createRow
                 }
 
-                // Label list (sort order is stable — set once on appear). Without a
-                // search, the recently applied labels come first in their own section,
-                // then every label A to Z (#1386); with none recent, only the A-to-Z list.
-                if searchText.isEmpty && !model.recentLabels.isEmpty {
+                // Label list (sort order is stable — set once on appear). The model
+                // decides the rows (`UserLabelMenuModel.rows`, #1386): recent labels in
+                // their own section above every label A to Z, or the A-to-Z list alone.
+                let rows = model.rows(searchText: searchText)
+                if !rows.recent.isEmpty {
                     Section {
-                        ForEach(model.recentLabels) { label in labelRow(label) }
+                        ForEach(rows.recent) { label in labelRow(label) }
                     }
                     Section {
-                        ForEach(model.sortedLabels) { label in labelRow(label) }
+                        ForEach(rows.list) { label in labelRow(label) }
                     }
                 } else {
-                    ForEach(filteredLabels) { label in labelRow(label) }
+                    ForEach(rows.list) { label in labelRow(label) }
                 }
             }
             .searchable(text: $searchText, prompt: "Search or create label...")
@@ -492,11 +505,6 @@ struct UserLabelMenuView: View {
     }
 
     // MARK: - Filtering
-
-    private var filteredLabels: [UserLabel] {
-        guard !searchText.isEmpty else { return model.sortedLabels }
-        return model.sortedLabels.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-    }
 
     private var matchesExisting: Bool {
         model.sortedLabels.contains { $0.name.caseInsensitiveCompare(searchText) == .orderedSame }

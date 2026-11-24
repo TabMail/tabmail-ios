@@ -361,4 +361,44 @@ struct UserLabelMenuStampTests {
         let stamped = Array(try times(f).keys)
         #expect(stamped == ["\(f.accountId):Beta"], "stamped: \(stamped)")
     }
+
+    @Test("The sheet's rows: the A-to-Z list alone with no recent label, recent labels above every label, and only the matching A-to-Z rows while searching")
+    @MainActor
+    func sheetRows() async throws {
+        let f = try fixture(accountId: "labels-rows", provider: .outlook)
+        defer { restore(f) }
+        let header = try insertHeader(f, messageId: "graph-rows-1")
+        let labels = try insertLabels(f, ["Delta", "alpha", "Beta", "Gamma", "Echo"])
+        #expect(labels.count == 5)
+        guard labels.count == 5 else { return }
+
+        let fresh = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: header))
+        fresh.loadLabels()
+        let none = fresh.rows(searchText: "")
+        let noneList = none.list.map(\.name)
+        #expect(none.recent.isEmpty, "a recent section with no label used here")
+        #expect(noneList == ["alpha", "Beta", "Delta", "Echo", "Gamma"], "list: \(noneList)")
+
+        let deltaId = labels[0].id, alphaId = labels[1].id, gammaId = labels[3].id, echoId = labels[4].id
+        try await f.pool.write { db in
+            try UserLabelStore.recordUse(of: deltaId, at: hoursAgo(4), in: db)
+            try UserLabelStore.recordUse(of: echoId, at: hoursAgo(3), in: db)
+            try UserLabelStore.recordUse(of: alphaId, at: hoursAgo(2), in: db)
+            try UserLabelStore.recordUse(of: gammaId, at: hoursAgo(1), in: db)
+        }
+        let model = UserLabelMenuModel(messageSnapshot: MessageSnapshot(from: header))
+        model.loadLabels()
+
+        let open = model.rows(searchText: "")
+        let openRecent = open.recent.map(\.name)
+        let openList = open.list.map(\.name)
+        #expect(openRecent == ["Gamma", "alpha", "Echo"], "recent: \(openRecent)")
+        #expect(openList == ["alpha", "Beta", "Delta", "Echo", "Gamma"],
+                "every label A to Z, the recent ones included: \(openList)")
+
+        let searching = model.rows(searchText: "A")
+        let searchList = searching.list.map(\.name)
+        #expect(searching.recent.isEmpty, "the recent section showed while searching")
+        #expect(searchList == ["alpha", "Beta", "Delta", "Gamma"], "matching rows: \(searchList)")
+    }
 }

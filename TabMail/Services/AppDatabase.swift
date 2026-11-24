@@ -2664,6 +2664,11 @@ final class AppDatabase: Sendable {
         //     messageHeader` spelled twice (`v1`, then `v2`'s rebuild — both dropped
         //     by `v70`), and `v82`'s rebuild re-spelling the three label edges `v33`
         //     first declared. THE GREP COUNTS DEAD DDL; THE PRAGMA DOES NOT.
+        //     Re-derived 2026-11-24 over the chain through `v115` (#1386): the live
+        //     schema returns 11 foreign keys, all `CASCADE` — the 10 above plus
+        //     `userLabelLastUsed → userLabel` — and the source DDL is 17 declarations,
+        //     the same six of them dead. The counts above are the `271d13334`
+        //     measurement, kept as it was taken.
         //     ⚠️ `MIS-033` — this census read *"returns 19 lines, 3 of which are
         //     prose, leaving 16"* and the truth was 20 and 4. The uncounted fourth
         //     prose line was A LINE OF THIS BANNER: it quotes the search token, so
@@ -3189,14 +3194,17 @@ final class AppDatabase: Sendable {
         //    `TabMail/ Shared/ TabMailNotificationService/`:
         //      · `rg -c --pcre2 '^(?!\s*(///|//)).*references\("userLabel"'` → **2**,
         //        both in this file (`v33`'s create and step 4 below) and BOTH of them
-        //        `messageUserLabel`. (Naive: 3.)
+        //        `messageUserLabel`. (Naive: 3.) Since `v115` it returns 3: the third
+        //        is `userLabelLastUsed`, which `v115` creates long after this
+        //        migration has run, so it does not exist while v82 drops `userLabel`.
         //      · `rg -c --pcre2 '^(?!\s*(///|//)).*references\("messageUserLabel"'` →
         //        **no output, exit 1** — nothing can be cascaded into. (Naive: 1.)
         //      · `rg -i -c --pcre2 '^(?!\s*(///|//)).*CREATE TRIGGER'` → **4**,
         //        all later v85 direct-AI lifecycle triggers. None exists while v82
         //        runs, and SQLite's implicit `DROP TABLE` delete does not fire
         //        triggers in any case. (Before v85 this live census was zero.)
-        //    Non-vacuity for the predicates: the FIRST returns a non-empty 2 and the
+        //    Non-vacuity for the predicates: the FIRST returns a non-empty 2 (3 since
+        //    `v115`) and the
         //    trigger predicate returns 4, so the lookahead demonstrably does not
         //    swallow live code.
         //    The two `CREATE TABLE … AS SELECT` snapshots carry no constraints (SQLite
