@@ -46,8 +46,7 @@ struct InboxReadListingDifferentialTests {
     }
 
     static func listing(_ db: Database, pageIndex: Int, demoActive: Bool) throws -> Snapshot {
-        var cost = InboxReadTool.ReadCost()
-        let listing = try InboxReadTool.readListing(db, pageIndex: pageIndex, demoActive: demoActive, cost: &cost)
+        let listing = try InboxReadTool.readListing(db, pageIndex: pageIndex, demoActive: demoActive, meter: nil)
         return Snapshot(ids: listing.rows.map(\.id), totalCount: listing.totalCount, page: listing.page)
     }
 
@@ -270,8 +269,8 @@ struct InboxReadListingDifferentialTests {
                     }
                 }
                 for pageIndex in Set([1, pages]).sorted() {
-                    let old = try Self.pagesRead(url) { _ = try Self.oracle($0, pageIndex: pageIndex, demoActive: demoActive) }
-                    let new = try Self.pagesRead(url) { _ = try Self.listing($0, pageIndex: pageIndex, demoActive: demoActive) }
+                    let old = try Self.pagesRead(url) { try Self.oracle($0, pageIndex: pageIndex, demoActive: demoActive).ids.count }
+                    let new = try Self.pagesRead(url) { try Self.listing($0, pageIndex: pageIndex, demoActive: demoActive).ids.count }
                     let context = "\(name), demo \(demoActive), page_index \(pageIndex): old \(old), new \(new)"
                     if demoActive {
                         #expect(new <= old, "never more: \(context)")
@@ -329,7 +328,7 @@ struct InboxReadListingDifferentialTests {
         }
     }
 
-    private static func pagesRead(_ url: URL, _ body: @escaping @Sendable (Database) throws -> Void) throws -> Int {
+    private static func pagesRead(_ url: URL, _ body: @escaping @Sendable (Database) throws -> Int) throws -> Int {
         try DBProof.measure(DBProof.Variant(run: body), kind: .read, file: url).pagesRead
     }
 
@@ -350,8 +349,8 @@ struct InboxReadListingDifferentialTests {
             for demoActive in [false, true] {
                 let totalCount = try Self.read(url) { try Self.oracle($0, pageIndex: 1, demoActive: demoActive).totalCount }
                 for pageIndex in Set([1, InboxReadTool.totalPages(for: totalCount)]).sorted() {
-                    let old = try Self.pagesRead(url) { _ = try Self.oracle($0, pageIndex: pageIndex, demoActive: demoActive) }
-                    let new = try Self.pagesRead(url) { _ = try Self.listing($0, pageIndex: pageIndex, demoActive: demoActive) }
+                    let old = try Self.pagesRead(url) { try Self.oracle($0, pageIndex: pageIndex, demoActive: demoActive).ids.count }
+                    let new = try Self.pagesRead(url) { try Self.listing($0, pageIndex: pageIndex, demoActive: demoActive).ids.count }
                     #expect(new <= old, "\(fixture), \(statistics), demo \(demoActive), page_index \(pageIndex): old \(old), new \(new)")
                 }
             }
