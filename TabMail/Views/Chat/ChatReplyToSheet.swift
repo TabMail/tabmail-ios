@@ -94,6 +94,7 @@ struct ChatReplyToSheet: View {
                     ForEach(choice.people, id: \.address) { person in
                         Button { choice.toggle(person) } label: { row(person) }
                             .buttonStyle(.plain)
+                            .copyAddressMenu(AddressCopy.person(person))
                             .accessibilityAddTraits(choice.isTicked(person) ? .isSelected : [])
                             .accessibilityIdentifier(Self.personId)
                     }
@@ -115,6 +116,7 @@ struct ChatReplyToSheet: View {
                                 }
                             }
                         }
+                        .copyAddressMenu(AddressCopy.named(contact.name, address: contact.email))
                     }
                 }
                 // Someone recent who is not in the list yet: a tap adds them there, ticked, as a
@@ -125,6 +127,7 @@ struct ChatReplyToSheet: View {
                         ForEach(recentToAdd, id: \.address) { person in
                             Button { pick(person.address, name: person.name) } label: { row(person) }
                                 .buttonStyle(.plain)
+                                .copyAddressMenu(AddressCopy.person(person))
                                 .accessibilityIdentifier(Self.recentId)
                         }
                     }

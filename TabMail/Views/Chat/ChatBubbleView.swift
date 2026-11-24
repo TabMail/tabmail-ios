@@ -19,7 +19,11 @@ struct ChatBubbleView: View {
         VStack(alignment: item.isOwn ? .trailing : .leading, spacing: 4) {
             HStack(alignment: .bottom, spacing: 8) {
                 if item.isOwn { Spacer(minLength: 0) }
-                if showsSender { ChatAvatar(person: item.sender, size: ChatViewLayout.avatarSize) }
+                if showsSender {
+                    ChatAvatar(person: item.sender, size: ChatViewLayout.avatarSize)
+                        .contentShape(.contextMenuPreview, Circle())
+                        .copyAddressMenu(AddressCopy.person(item.sender))
+                }
                 VStack(alignment: item.isOwn ? .trailing : .leading, spacing: 4) {
                     if showsSender || item.repliedOnlyTo != nil {
                         nameLine
@@ -112,6 +116,10 @@ struct ChatBubbleView: View {
         .accessibilityActions {
             ForEach(actions) { action in
                 Button(action.title, action: action.action)
+            }
+            // The avatar's "Copy Address": VoiceOver does not reach the avatar.
+            if showsSender, let copy = AddressCopy.accessibilityAction(AddressCopy.person(item.sender)) {
+                Button(copy.title) { AddressCopy.copy(copy.item) }
             }
         }
     }

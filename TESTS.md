@@ -1465,3 +1465,29 @@ archive and Undo of the replacement are legitimate. `replyDraftShapedIdIsJudgedB
 `generationScopeAndReDrive` pin `FolderResetGeneration.refuses(headerId:accountId:)`: an id is judged
 by the folder it names through `MessageIdentity.headerIdBelongsToFolder`, never a hand split, so a
 reply-draft id with extra colons is refused only when its own folder was reset.
+
+## Copy Address — a long press on a person copies the bare address
+
+`CopyAddressTests` pins `AddressCopy`: `AddressCopy.entries(in:)` offers the bare address for a plain
+address, a `Name <name@example.com>` form, a quoted name holding a comma, a quoted name that looks like
+an address (the angle brackets' address is copied) and a person with white space around them; text
+naming no mailbox (junk, an empty group) offers nobody; a group offers its members; a person in two
+fields is offered once. One person's menu is one "Copy Address" item; several people get one item each,
+by name with the address under it, below a "Copy Address" heading. `copyWritesTheAddress` copies a
+one-person item and an item of several to a named pasteboard and reads back the address, not the title.
+`accessibilityAction` gives one person VoiceOver's "Copy <name>'s Address" with their item, and nobody
+or several people none. Each place offers the right person: the email view's sender lines
+(`MessageCardView.copyEntries(.sender)`, by address when unnamed, nothing without an address), its To,
+Cc and Bcc lines (a named To address copies the address alone) and the short recipient line, a compose
+chip (`AddressCopy.recipient`, under the chip's shown name), a chat person (`AddressCopy.person`, also
+one kept as written, `support team <support@localhost>`) and a contact the sheet's search finds
+(`AddressCopy.named`). `everyPlaceAttachesIt` reads the views' source: every `Text(message.from)`,
+`Text(message.fromAddress)`, To, Cc, Bcc and short recipient line of the card sits in a `CopyAddressMenu`
+with its own line's entries, every chat avatar in the header and beside a bubble, every person row of
+the "Reply to" / "Add recipient" sheet and each contact its search finds carries `.copyAddressMenu` with
+that person, and the bubble gives VoiceOver the avatar's action when it shows the sender.
+`composeChipAttachesIt` finds it once in each recipient chip and never on a rejected entry.
+`menuViewsWireTheCopy` reads `CopyAddressMenu.swift` with white space collapsed: the context menu only
+for someone, the row menu as the label alone for nobody and with its tap, and every item copying its own
+item. `emailViewLinesKeepTheirTap` pins each card line's tap: the closed card's sender and recipient
+line open the card, the open card's lines show more or fewer details.
