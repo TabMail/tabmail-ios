@@ -2,21 +2,26 @@ import Foundation
 
 /// Static census of every database query site in the production sources (`TabMail`,
 /// `TabMailNotificationService`, `Shared`), the input of the query-plan fence
-/// (`QueryRegistryFenceTests`). Pure Foundation, so the same file also runs on the
-/// host (`swiftc` with a small driver) to regenerate the registry skeleton.
+/// (`DatabaseIndexTests`, files in `QueryFence/`). Pure Foundation, so the same file also
+/// runs on the host (`swiftc` with a small driver) to regenerate the registry skeleton.
 ///
 /// Two kinds of site:
-/// - `sql`: a string literal whose text reads as SQL (the statement keywords below).
-///   Interpolations are kept as `\(…)`, whitespace runs collapse to one space.
-/// - `call`: a Swift statement that runs a query: one of its lines names a GRDB API
-///   (`fetchAll`, `execute`, …), calls a database handle (`db.x(…)`), or passes a
-///   handle as an argument (`record.insert(db)`, `helper(db: db)`). Handles are the
-///   names a file binds to a `Database` (a `: Database` parameter, or the parameter of
-///   a closure passed to `read`/`write`/…, `$0` included). The statement runs from the
-///   first line of its expression (a query-interface chain `Type\n.filter(…)\n.fetchAll(db)`
-///   is one statement) to its last argument line; the text is its code with comments
-///   removed, string literals blanked to `""` and multi-line closure bodies shown as `…`
-///   (each statement inside a closure body is a site of its own).
+/// - `sql`: a string literal whose text reads as SQL (the statement keywords below). Its
+///   text keeps each interpolation with its source (`\(folderId)`), whitespace runs
+///   collapsed to one space. `sql` is the statement as SQLite receives it: the escapes of
+///   the literal resolved, nothing else changed, interpolations as `\(…)`.
+/// - `call`: one call expression that runs a query: a GRDB API (`fetchAll(`, `execute(`,
+///   …) with its receiver chain, a member call on a database handle (`db.x(…)`), or a
+///   call that passes a handle as an argument (`record.insert(db)`, `helper(db: held.db)`).
+///   Handles are the names a file binds to a database: a parameter, property or tuple
+///   element typed `Database`, `DatabaseQueue`, `DatabasePool`, `DatabaseReader`,
+///   `DatabaseWriter` or `PrioritizedDatabase`; a `let`/`var` set to a new queue or pool;
+///   and the parameter of a closure passed to `read`/`write`/… (`$0` included). Every
+///   call is a site of its own, two calls on one line included. Its text runs from the
+///   start of its receiver chain to its closing bracket: comments removed, string
+///   literals with their contents, a closure body that spans lines shown as `{ … }` (each
+///   call inside it is a site of its own). A call on a local binding
+///   (`request.fetchAll(db)`) also carries the binding's initializer: ` ⟨request = …⟩`.
 ///
 /// A site is identified by file, enclosing declaration (`Type.function`), kind, text
 /// and an ordinal among identical sites in the same declaration, never by line, so
@@ -31,8 +36,7 @@ enum QueryCensusScanner {
         let ordinal: Int
         let line: Int
         let lastLine: Int
-        /// For a `sql` site, the statement as SQLite receives it: the literal with the
-        /// escapes of a non-raw string resolved, whitespace collapsed. Empty for `call`.
+        /// For a `sql` site, the statement as SQLite receives it. Empty for `call`.
         let sql: String
 
         /// Identity without the lines.
@@ -42,17 +46,50 @@ enum QueryCensusScanner {
         func hash(into hasher: inout Hasher) { hasher.combine(key) }
     }
 
+    enum ScanError: Error, CustomStringConvertible {
+        case missingDirectory(String)
+        case unreadable(String)
+        case walk([String])
+
+        var description: String {
+            switch self {
+            case .missingDirectory(let path): "source directory missing: \(path)"
+            case .unreadable(let path): "source directory cannot be listed: \(path)"
+            case .walk(let errors): "source walk failed:\n\(errors.joined(separator: "\n"))"
+            }
+        }
+    }
+
     static let sourceDirectories = ["TabMail", "TabMailNotificationService", "Shared"]
 
+    /// The errors a directory walk reports, collected from the enumerator's handler.
+    private final class WalkErrors: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [String] = []
+        func add(_ item: String) { lock.lock(); items.append(item); lock.unlock() }
+        var all: [String] { lock.lock(); defer { lock.unlock() }; return items }
+    }
+
     /// Every site of every production Swift file under `root`, in file then line order.
+    /// A missing source directory, or a file the walk cannot read, fails the scan.
     static func scan(root: URL) throws -> [Site] {
         var files: [String] = []
+        let rootPath = root.standardizedFileURL.path
         for dir in sourceDirectories {
             let base = root.appendingPathComponent(dir)
-            guard let walker = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) else { continue }
-            for case let url as URL in walker where url.pathExtension == "swift" {
-                files.append(String(url.standardizedFileURL.path.dropFirst(root.standardizedFileURL.path.count + 1)))
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: base.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw ScanError.missingDirectory(base.path)
             }
+            let errors = WalkErrors()
+            guard let walker = FileManager.default.enumerator(
+                at: base, includingPropertiesForKeys: nil, options: [],
+                errorHandler: { url, error in errors.add("\(url.path): \(error)"); return true }
+            ) else { throw ScanError.unreadable(base.path) }
+            for case let url as URL in walker where url.pathExtension == "swift" {
+                files.append(String(url.standardizedFileURL.path.dropFirst(rootPath.count + 1)))
+            }
+            if !errors.all.isEmpty { throw ScanError.walk(errors.all) }
         }
         files.sort()
         var sites: [Site] = []
@@ -76,6 +113,7 @@ enum QueryCensusScanner {
         let api: NSRegularExpression
         let declaration: NSRegularExpression
         let typedHandle: NSRegularExpression
+        let newHandle: NSRegularExpression
         let closureHandle: NSRegularExpression
         let shorthandHandle: NSRegularExpression
 
@@ -83,9 +121,10 @@ enum QueryCensusScanner {
             // Same statement keywords as the census that produced the registry.
             sql = Self.regex(#"(?is)\b(select\b.+\bfrom|update\s+\w+\s+set|delete\s+from|insert\s+(or\s+\w+\s+)?into|replace\s+into|create\s+(unique\s+)?index|drop\s+(index|table)|create\s+(virtual\s+)?table|alter\s+table|with\s+\w+\s+as|analyze|pragma\s+\w+|vacuum|\bmatch\b)"#)
             api = Self.regex(#"\.(fetchAll|fetchOne|fetchCount|fetchCursor|fetchSet|fetchSingle|deleteAll|deleteOne|updateAll|updateChanges|execute|makeStatement|cachedStatement|insertAndFetch|upsertAndFetch|isEmpty|exists)\s*\("#)
-            // `class func` / `class var` are members, not a type named `func`.
-            declaration = Self.regex(#"\b(?:(struct|class|enum|actor|extension|protocol)\s+(?!(?:func|var|let|subscript|init)\b)([A-Za-z_][\w.]*)|func\s+([^\s(<]+)|(init)[?!]?\s*[(<]|(deinit)\b|(subscript)\s*[(<])"#)
-            typedHandle = Self.regex(#"\b([A-Za-z_]\w*)\s*:\s*(?:GRDB\.)?Database\b(?!\w|\.)"#)
+            // `class func` / `class var` are members, not a type named `func`; `.init(` is a call.
+            declaration = Self.regex(#"\b(?:(struct|class|enum|actor|extension|protocol)\s+(?!(?:func|var|let|subscript|init)\b)([A-Za-z_][\w.]*)|func\s+([^\s(<]+)|(?<![.\w])(init)[?!]?\s*[(<]|(deinit)\b|(subscript)\s*[(<])"#)
+            typedHandle = Self.regex(#"\b([A-Za-z_]\w*)\s*:\s*(?:any\s+|some\s+)?(?:GRDB\.)?(?:Database|DatabaseQueue|DatabasePool|DatabaseReader|DatabaseWriter|PrioritizedDatabase)\b(?![\w.])"#)
+            newHandle = Self.regex(#"\b(?:let|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]*)?=\s*(?:try[?!]?\s+)?(?:GRDB\.)?(?:DatabaseQueue|DatabasePool)\s*\("#)
             closureHandle = Self.regex(#"\.(?:"# + Self.handleMethods + #")\b[^{\n]*\{\s*(?:\[[^\]]*\]\s*)?\(?\s*([A-Za-z_]\w*)\s*(?::\s*[\w.]+)?\s*\)?\s*(?:throws\s*)?(?:->\s*[^{}\n]*?)?\s+in\b"#)
             shorthandHandle = Self.regex(#"\.(?:"# + Self.handleMethods + #")\b[^{\n]*\{(?![^\n]*\bin\b)"#)
         }
@@ -100,50 +139,46 @@ enum QueryCensusScanner {
         }
 
         func matches(_ regex: NSRegularExpression, _ text: String) -> [NSTextCheckingResult] {
-            regex.matches(in: text, range: NSRange(text.startIndex..., in: text))
+            regex.matches(in: text, range: NSRange(location: 0, length: (text as NSString).length))
         }
 
         func first(_ regex: NSRegularExpression, _ text: String) -> Bool {
-            regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+            regex.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) != nil
         }
     }
 
     // MARK: - Lexing
 
-    /// One string literal: its first line, its text (interpolations as `\(…)`), the same
-    /// text with the escapes of a non-raw literal resolved (what SQLite receives), and the
-    /// declaration it sits in.
+    /// One string literal: its first line, its key text (interpolations with their
+    /// source), the text SQL detection reads (as written, interpolations `\(…)`, so an
+    /// interpolated expression's names never make a literal look like SQL), and the
+    /// statement SQLite receives (escapes resolved, interpolations `\(…)`).
     private struct Literal {
         let line: Int
         let text: String
+        let detect: String
         let resolved: String
         let context: String
     }
 
-    /// An open bracket: the character and the 0-based line it opened on.
-    private struct Open {
-        let char: Character
-        let line: Int
-    }
-
     private struct Lexed {
-        /// Code per line (index 0 = line 1), comments removed, literals blanked.
+        /// Code per line (index 0 = line 1), comments removed, each literal a `""` placeholder.
         var code: [String] = [""]
-        /// The declaration context in force at the start of each line's first code.
-        var lineContext: [String] = [""]
-        /// The brackets open at the start of each line, outermost first.
-        var startStack: [[Open]] = [[]]
         var literals: [Literal] = []
+        /// UTF-16 offset in the joined code of each placeholder's first quote -> literal index.
+        var placeholders: [Int: Int] = [:]
+        /// (UTF-16 offset, declaration context in force from there on), in offset order.
+        var contexts: [(offset: Int, context: String)] = [(0, "")]
     }
 
     private final class Lexer {
         let s: [Character]
         var i = 0
         var line = 1
+        var offset = 0
         var out = Lexed()
         var depth = 0
         var stack: [(name: String, depth: Int)] = []
-        var brackets: [Open] = []
         var pending = ""
         let patterns: Patterns
 
@@ -157,30 +192,28 @@ enum QueryCensusScanner {
         func peek(_ k: Int = 0) -> Character? { i + k < s.count ? s[i + k] : nil }
 
         func emitCode(_ c: Character) {
+            offset += c.utf16.count
             if c == "\n" {
                 line += 1
                 out.code.append("")
-                out.lineContext.append(context)
-                out.startStack.append(brackets)
+                // A line break separates words: `import GRDB` then `struct X {` must not
+                // read as `GRDBstruct X`, nor a property line then `init(` as `Intinit(`.
+                pending.append(" ")
                 return
             }
-            if out.code[line - 1].isEmpty { out.lineContext[line - 1] = context }
             out.code[line - 1].append(c)
             switch c {
-            case "(", "[":
-                brackets.append(Open(char: c, line: line - 1))
-                pending.append(c)
-            case ")", "]":
-                if !brackets.isEmpty { brackets.removeLast() }
-                pending.append(c)
             case "{":
-                brackets.append(Open(char: c, line: line - 1))
                 depth += 1
-                if let name = declarationName(pending) { stack.append((name, depth)) }
+                if let name = declarationName(pending) {
+                    stack.append((name, depth))
+                    out.contexts.append((offset, context))
+                }
                 pending = ""
             case "}":
-                if !brackets.isEmpty { brackets.removeLast() }
+                let before = stack.count
                 while let top = stack.last, top.depth >= depth { stack.removeLast() }
+                if stack.count != before { out.contexts.append((offset, context)) }
                 depth -= 1
                 pending = ""
             case ";":
@@ -230,7 +263,8 @@ enum QueryCensusScanner {
         }
 
         /// Lexes a string literal starting at `i` (optionally raw: `#…"`), records it,
-        /// and emits `""` into the code. Returns false when `i` is not a literal start.
+        /// and emits a `""` placeholder into the code. Returns false when `i` is not a
+        /// literal start.
         func lexString() -> Bool {
             var hashes = 0
             while peek(hashes) == "#" { hashes += 1 }
@@ -240,6 +274,7 @@ enum QueryCensusScanner {
             let multiline = peek(hashes + 1) == "\"" && peek(hashes + 2) == "\""
             i += hashes + (multiline ? 3 : 1)
             var text = ""
+            var detect = ""
             var resolved = ""
             var newlines = 0
             loop: while let c = peek() {
@@ -247,19 +282,21 @@ enum QueryCensusScanner {
                     let after = i + 1 + hashes
                     if after < s.count, s[after] == "(" {
                         i = after + 1
+                        let sourceStart = i
                         newlines += skipInterpolation()
-                        text += "\\(…)"
+                        let source = String(s[sourceStart..<max(sourceStart, i - 1)])
+                        text += "\\(" + QueryCensusScanner.normalize(source) + ")"
+                        detect += "\\(…)"
                         resolved += "\\(…)"
                         continue
                     }
-                    if hashes == 0 {
-                        if let n = peek(1) {
-                            text.append(c)
-                            text.append(n)
-                            if n == "\n" { newlines += 1 }
-                            resolved.append(Self.escaped(n))
-                        }
-                        i += 2
+                    if after < s.count {
+                        let (written, value, consumed) = escape(at: after)
+                        text += "\\" + String(repeating: "#", count: hashes) + written
+                        detect += "\\" + String(repeating: "#", count: hashes) + written
+                        resolved += value
+                        if written.contains("\n") { newlines += 1 }
+                        i = after + consumed
                         continue
                     }
                 }
@@ -279,23 +316,37 @@ enum QueryCensusScanner {
                     if !multiline { i += 1; break loop }
                 }
                 text.append(c)
+                detect.append(c)
                 resolved.append(c)
                 i += 1
             }
-            out.literals.append(Literal(line: startLine, text: text, resolved: resolved, context: startContext))
+            out.placeholders[offset] = out.literals.count
+            out.literals.append(Literal(line: startLine, text: text, detect: detect, resolved: resolved, context: startContext))
             emitCode("\"")
             emitCode("\"")
             for _ in 0..<newlines { emitCode("\n") }
             return true
         }
 
-        /// The character a Swift escape `\<n>` stands for. A line-continuation
-        /// backslash (`\` before a newline) and the whitespace escapes become a space;
-        /// `\u{…}` and `\0` keep their letter, which no SQL statement of ours uses.
-        static func escaped(_ n: Character) -> Character {
+        /// The escape whose letter is at `index` (after `\` and the raw hashes): its text
+        /// as written, the characters it stands for, and how many source characters it
+        /// spans from `index`. A backslash before a line break continues the line.
+        func escape(at index: Int) -> (written: String, value: String, consumed: Int) {
+            let n = s[index]
             switch n {
-            case "n", "t", "r", "\n": return " "
-            default: return n
+            case "n": return ("n", "\n", 1)
+            case "t": return ("t", "\t", 1)
+            case "r": return ("r", "\r", 1)
+            case "0": return ("0", "\0", 1)
+            case "\n": return ("\n", "", 1)
+            case "u":
+                guard index + 1 < s.count, s[index + 1] == "{" else { return ("u", "u", 1) }
+                var k = index + 2
+                var digits = ""
+                while k < s.count, s[k] != "}" { digits.append(s[k]); k += 1 }
+                let value = UInt32(digits, radix: 16).flatMap(Unicode.Scalar.init).map { String(Character($0)) } ?? ""
+                return ("u{" + digits + "}", value, k - index + 1)
+            default: return (String(n), String(n), 1)
             }
         }
 
@@ -336,7 +387,7 @@ enum QueryCensusScanner {
                 if c == "\\" && matchesHashes(at: i + 1, hashes) {
                     let after = i + 1 + hashes
                     if after < s.count, s[after] == "(" { i = after + 1; newlines += skipInterpolation(); continue }
-                    if hashes == 0 { if peek(1) == "\n" { newlines += 1 }; i += 2; continue }
+                    if after < s.count { if s[after] == "\n" { newlines += 1 }; i = after + 1; continue }
                 }
                 if c == "\"" {
                     if multiline {
@@ -353,6 +404,132 @@ enum QueryCensusScanner {
         }
     }
 
+    // MARK: - Code
+
+    /// The lexed code joined into one text, with its brackets paired.
+    private struct Code {
+        let text: String
+        let ns: NSString
+        let u: [UInt16]
+        let lineStarts: [Int]
+        /// The partner of every bracket, -1 when unpaired.
+        let partner: [Int]
+        /// The innermost bracket open at each offset (an opening bracket's own entry is
+        /// the bracket around it), -1 at the top level.
+        let enclosing: [Int]
+
+        static let space = UInt16(UInt8(ascii: " ")), tab = UInt16(UInt8(ascii: "\t")), newline = UInt16(UInt8(ascii: "\n"))
+        static let dot = UInt16(UInt8(ascii: ".")), question = UInt16(UInt8(ascii: "?")), bang = UInt16(UInt8(ascii: "!"))
+        static let lt = UInt16(UInt8(ascii: "<")), gt = UInt16(UInt8(ascii: ">")), comma = UInt16(UInt8(ascii: ","))
+        static let semicolon = UInt16(UInt8(ascii: ";")), equals = UInt16(UInt8(ascii: "="))
+        static let openParen = UInt16(UInt8(ascii: "(")), closeParen = UInt16(UInt8(ascii: ")"))
+        static let openBracket = UInt16(UInt8(ascii: "[")), closeBracket = UInt16(UInt8(ascii: "]"))
+        static let openBrace = UInt16(UInt8(ascii: "{")), closeBrace = UInt16(UInt8(ascii: "}"))
+        static let keywords: Set<String> = [
+            "return", "try", "await", "throw", "in", "else", "case", "if", "guard", "while", "let", "var",
+            "as", "is", "where", "switch", "defer", "do", "repeat", "for", "some", "any",
+        ]
+
+        init(_ lexed: Lexed) {
+            text = lexed.code.joined(separator: "\n")
+            ns = text as NSString
+            u = Array(text.utf16)
+            var starts = [0]
+            for (k, c) in u.enumerated() where c == Self.newline { starts.append(k + 1) }
+            lineStarts = starts
+            var partner = Array(repeating: -1, count: u.count)
+            var enclosing = Array(repeating: -1, count: u.count)
+            var stack: [Int] = []
+            for (k, c) in u.enumerated() {
+                enclosing[k] = stack.last ?? -1
+                switch c {
+                case Self.openParen, Self.openBracket, Self.openBrace:
+                    stack.append(k)
+                case Self.closeParen, Self.closeBracket, Self.closeBrace:
+                    let opener = c == Self.closeParen ? Self.openParen : c == Self.closeBracket ? Self.openBracket : Self.openBrace
+                    if let top = stack.last, u[top] == opener {
+                        stack.removeLast()
+                        partner[top] = k
+                        partner[k] = top
+                        enclosing[k] = stack.last ?? -1
+                    }
+                default:
+                    break
+                }
+            }
+            self.partner = partner
+            self.enclosing = enclosing
+        }
+
+        /// The 0-based line of an offset.
+        func line(of offset: Int) -> Int {
+            var lo = 0, hi = lineStarts.count - 1
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2
+                if lineStarts[mid] <= offset { lo = mid } else { hi = mid - 1 }
+            }
+            return lo
+        }
+
+        func isIdent(_ c: UInt16) -> Bool {
+            (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c == 36 || c > 127
+        }
+
+        func isSpace(_ c: UInt16) -> Bool { c == Self.space || c == Self.tab || c == Self.newline }
+
+        func substring(_ from: Int, _ to: Int) -> String {
+            to > from ? ns.substring(with: NSRange(location: from, length: to - from)) : ""
+        }
+
+        /// The start of the expression whose last part begins at `p`: back over member
+        /// dots, identifiers, postfix `?`/`!`, generic arguments and bracketed groups.
+        func calleeStart(_ p: Int) -> Int {
+            var start = p
+            while true {
+                var j = start - 1
+                while j >= 0, isSpace(u[j]) { j -= 1 }
+                guard j >= 0 else { return start }
+                let c = u[j]
+                let head = u[start]
+                let wantsOperand = head == Self.dot || head == Self.openParen || head == Self.openBracket
+                    || head == Self.question || head == Self.bang || head == Self.lt
+                if wantsOperand {
+                    if c == Self.closeParen || c == Self.closeBracket {
+                        guard partner[j] >= 0 else { return start }
+                        start = partner[j]
+                        continue
+                    }
+                    if c == Self.gt, let opener = genericOpen(closing: j) { start = opener; continue }
+                    if (c == Self.question || c == Self.bang) && head == Self.dot { start = j; continue }
+                    if isIdent(c) {
+                        var k = j
+                        while k > 0, isIdent(u[k - 1]) { k -= 1 }
+                        // A keyword is not an operand: `return .queue(q)`, `try (x)`.
+                        if Self.keywords.contains(substring(k, j + 1)) { return start }
+                        start = k
+                        continue
+                    }
+                    return start
+                }
+                if c == Self.dot { start = j; continue }
+                return start
+            }
+        }
+
+        /// The `<` of a generic argument list closed by the `>` at `closing`.
+        func genericOpen(closing: Int) -> Int? {
+            var level = 0
+            var k = closing
+            while k >= 0 {
+                let c = u[k]
+                if c == Self.gt { level += 1 } else if c == Self.lt { level -= 1; if level == 0 { return k } }
+                else if !(isIdent(c) || isSpace(c) || c == Self.dot || c == Self.comma || c == Self.question || c == Self.openBracket || c == Self.closeBracket) { return nil }
+                k -= 1
+            }
+            return nil
+        }
+    }
+
     // MARK: - Sites
 
     static func normalize(_ text: String) -> String {
@@ -361,141 +538,180 @@ enum QueryCensusScanner {
     }
 
     private static func scan(file: String, source: String, patterns: Patterns) -> [Site] {
-        let lexed = Lexer(source, patterns: patterns).run()
-        var raw: [(line: Int, lastLine: Int, context: String, kind: String, text: String, sql: String)] = []
+        let normalized = source.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        let lexed = Lexer(normalized, patterns: patterns).run()
+        let code = Code(lexed)
+        var raw: [(line: Int, lastLine: Int, start: Int, context: String, kind: String, text: String, sql: String)] = []
 
-        for literal in lexed.literals where patterns.first(patterns.sql, literal.text) {
-            raw.append((literal.line, literal.line, literal.context, "sql", normalize(literal.text), normalize(literal.resolved)))
+        for literal in lexed.literals where patterns.first(patterns.sql, literal.detect) {
+            raw.append((literal.line, literal.line, -1, literal.context, "sql", normalize(literal.text), literal.resolved))
         }
 
-        let allCode = lexed.code.joined(separator: "\n")
         var handles = Set<String>()
-        for m in patterns.matches(patterns.typedHandle, allCode) + patterns.matches(patterns.closureHandle, allCode) {
-            if let r = Range(m.range(at: 1), in: allCode) {
-                let name = String(allCode[r])
+        for regex in [patterns.typedHandle, patterns.newHandle, patterns.closureHandle] {
+            for m in patterns.matches(regex, code.text) {
+                let name = code.ns.substring(with: m.range(at: 1))
                 if name != "_" && name != "self" { handles.insert(name) }
             }
         }
-        let handleUse: NSRegularExpression? = handles.isEmpty ? nil : Self.useRegex(
-            handles.sorted().map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|"))
-        // `$0` is a handle only inside a shorthand closure of a database-access method.
-        let dollarUse = Self.useRegex(#"\$0"#)
-        let hasShorthand = patterns.first(patterns.shorthandHandle, allCode)
 
-        var starts = Set<Int>()
-        for (index, code) in lexed.code.enumerated() {
-            var isCall = patterns.first(patterns.api, code) || (handleUse.map { patterns.first($0, code) } ?? false)
-            if !isCall, hasShorthand, patterns.first(dollarUse, code) {
-                let closureLine = lexed.startStack[index].last(where: { $0.char == "{" })?.line
-                isCall = patterns.first(patterns.shorthandHandle, code)
-                    || closureLine.map { patterns.first(patterns.shorthandHandle, lexed.code[$0]) } == true
+        var calls: [(start: Int, end: Int)] = []
+        var seen = Set<Int>()
+        func add(_ start: Int, _ end: Int) {
+            guard end > start, seen.insert(start &* 1_000_003 &+ end).inserted else { return }
+            calls.append((start, end))
+        }
+        /// The call whose argument list holds `position`: its `(` and partner.
+        func argumentCall(_ position: Int) -> (open: Int, close: Int)? {
+            var b = code.enclosing[position]
+            while b >= 0 {
+                if code.u[b] == Code.openParen { return code.partner[b] >= 0 ? (b, code.partner[b]) : nil }
+                if code.u[b] == Code.openBrace { return nil }
+                b = code.enclosing[b]
             }
-            guard isCall else { continue }
-            let span = statementSpan(containing: index, lexed)
-            guard starts.insert(span.lowerBound).inserted else { continue }
-            raw.append((span.lowerBound + 1, span.upperBound + 1, lexed.lineContext[span.lowerBound], "call", render(span, lexed), ""))
+            return nil
         }
 
-        raw.sort { ($0.line, $0.kind) < ($1.line, $1.kind) }
-        var seen: [String: Int] = [:]
+        for m in patterns.matches(patterns.api, code.text) {
+            let open = m.range.location + m.range.length - 1
+            guard code.partner[open] >= 0 else { continue }
+            add(code.calleeStart(m.range.location), code.partner[open])
+        }
+
+        func addUses(_ names: String, where admits: (Int) -> Bool) {
+            for m in patterns.matches(Self.baseUse(names), code.text) where admits(m.range(at: 1).location) {
+                let opener = m.range.location + m.range.length - 1
+                guard code.partner[opener] >= 0 else { continue }
+                add(m.range(at: 1).location, code.partner[opener])
+            }
+            for m in patterns.matches(Self.argumentUse(names), code.text) where admits(m.range(at: 1).location) {
+                guard let call = argumentCall(m.range(at: 1).location) else { continue }
+                add(code.calleeStart(call.open), call.close)
+            }
+        }
+        if !handles.isEmpty {
+            addUses(handles.sorted().map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|"), where: { _ in true })
+        }
+        // `$0` is a handle only inside a shorthand closure of a database-access method.
+        addUses(#"\$0"#) { position in
+            var b = code.enclosing[position]
+            while b >= 0, code.u[b] != Code.openBrace { b = code.enclosing[b] }
+            guard b >= 0 else { return false }
+            let lineStart = code.lineStarts[code.line(of: b)]
+            let lineEnd = code.line(of: b) + 1 < code.lineStarts.count ? code.lineStarts[code.line(of: b) + 1] - 1 : code.u.count
+            let window = code.substring(lineStart, lineEnd)
+            guard let m = patterns.shorthandHandle.firstMatch(in: window, range: NSRange(location: 0, length: (window as NSString).length)) else { return false }
+            return lineStart + m.range.location + m.range.length - 1 == b
+        }
+
+        for call in calls {
+            let text = render(call.start, call.end, code, lexed) + bindingSuffix(call.start, code, lexed, handles, patterns)
+            raw.append((code.line(of: call.start) + 1, code.line(of: call.end) + 1, call.start,
+                        context(at: call.start, lexed), "call", text, ""))
+        }
+
+        raw.sort { ($0.line, $0.kind, $0.start) < ($1.line, $1.kind, $1.start) }
+        var ordinals: [String: Int] = [:]
         return raw.map { r in
             let identity = [r.context, r.kind, r.text].joined(separator: "\t")
-            let ordinal = seen[identity, default: 0]
-            seen[identity] = ordinal + 1
+            let ordinal = ordinals[identity, default: 0]
+            ordinals[identity] = ordinal + 1
             return Site(file: file, context: r.context, kind: r.kind, text: r.text, ordinal: ordinal,
                         line: r.line, lastLine: r.lastLine, sql: r.sql)
         }
     }
 
-    /// A use of one of `names` (an alternation) on a code line: the base of a call that is
-    /// not a database-access scope (`db.execute(`; not `db.write {`, not `ctx.db.read(`),
-    /// or a whole argument (`fetchAll(db)`, `helper(x, db: db)`, and an argument alone on
-    /// its line of a multi-line call).
-    private static func useRegex(_ names: String) -> NSRegularExpression {
-        Patterns.regex(
-            #"(?:(?<![.\w$])(?:"# + names + #")\s*\.\s*(?!(?:"# + Patterns.handleMethods + #")\b)\w+\s*[({]"#
-                + #"|(?:^|[(,])\s*(?:\w+\s*:\s*)?(?:"# + names + #")\s*(?:[),]|$))"#)
+    /// A member call on a handle that is not a database-access scope (`db.execute(`,
+    /// `held.db` excluded; not `db.write {`). Group 1 is the handle.
+    private static func baseUse(_ names: String) -> NSRegularExpression {
+        Patterns.regex(#"(?<![.\w$])("# + names + #")\s*\.\s*(?!(?:"# + Patterns.handleMethods + #")\b)\w+\s*[({]"#)
     }
 
-    // MARK: - Statements
-
-    /// Line starts that continue the statement above: a chained member, an infix operator.
-    private static let continuingStarts = [".", "?.", "&&", "||", "??", "?", ":", "+", "==", "!=", "..."]
-    /// Line ends that leave the statement open: an infix operator, an assignment, a list comma.
-    private static let continuingEnds = ["=", "&&", "||", "??", "+", ",", "."]
-
-    private static func trimmed(_ code: String) -> String {
-        code.trimmingCharacters(in: .whitespaces)
+    /// A handle passed as a whole argument (`fetchAll(db)`, `helper(x, db: held.db)`, an
+    /// argument alone on its line of a multi-line call). Group 1 is the handle.
+    private static func argumentUse(_ names: String) -> NSRegularExpression {
+        Patterns.regex(#"(?m)(?:^|[(,])[ \t]*(?:\w+[ \t]*:[ \t]*)?(?:[A-Za-z_]\w*[ \t]*\.[ \t]*)*("# + names + #")[ \t]*(?=[),]|$)"#)
     }
 
-    private static func previousCodeLine(before line: Int, _ lexed: Lexed) -> Int? {
-        var k = line - 1
-        while k >= 0 {
-            if !trimmed(lexed.code[k]).isEmpty { return k }
-            k -= 1
+    private static func context(at offset: Int, _ lexed: Lexed) -> String {
+        var lo = 0, hi = lexed.contexts.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if lexed.contexts[mid].offset <= offset { lo = mid } else { hi = mid - 1 }
         }
-        return nil
+        return lexed.contexts[lo].context
     }
 
-    private static func nextCodeLine(after line: Int, _ lexed: Lexed) -> Int? {
-        var k = line + 1
-        while k < lexed.code.count {
-            if !trimmed(lexed.code[k]).isEmpty { return k }
-            k += 1
-        }
-        return nil
-    }
-
-    private static func startsContinuing(_ line: Int, _ lexed: Lexed) -> Bool {
-        let t = trimmed(lexed.code[line])
-        return continuingStarts.contains { t.hasPrefix($0) }
-    }
-
-    private static func endsContinuing(_ line: Int, _ lexed: Lexed) -> Bool {
-        let t = trimmed(lexed.code[line])
-        return continuingEnds.contains { t.hasSuffix($0) } && !t.hasSuffix("...")
-    }
-
-    /// The 0-based first and last line of the statement that `line` belongs to. Inside an
-    /// open `(` or `[` the statement is the one that opened it; a line inside a closure body
-    /// (`{` innermost) starts a statement of its own.
-    private static func statementSpan(containing line: Int, _ lexed: Lexed) -> ClosedRange<Int> {
-        var start = line
-        while true {
-            let stack = lexed.startStack[start]
-            if let top = stack.last, top.char != "{" {
-                start = top.line
+    /// The code from `start` through `end` on one line: literals with their contents, a
+    /// closure body that spans lines as `{ … }`.
+    private static func render(_ start: Int, _ end: Int, _ code: Code, _ lexed: Lexed) -> String {
+        var out = ""
+        var p = start
+        var segment = start
+        while p <= end {
+            if let literal = lexed.placeholders[p] {
+                out += code.substring(segment, p) + "\"" + lexed.literals[literal].text + "\""
+                p += 2
+                segment = p
                 continue
             }
-            guard let prev = previousCodeLine(before: start, lexed),
-                  startsContinuing(start, lexed) || endsContinuing(prev, lexed) else { break }
-            let prevStack = lexed.startStack[prev]
-            // The line above sits inside a bracket opened after this statement's level
-            // (`})` closing an argument closure): continue from where that bracket opened.
-            start = prevStack.count > stack.count ? prevStack[stack.count].line : prev
-        }
-        let base = lexed.startStack[start].count
-        var end = start
-        while let next = nextCodeLine(after: end, lexed),
-              lexed.startStack[next].count > base || startsContinuing(next, lexed) || endsContinuing(end, lexed) {
-            end = next
-        }
-        return start...max(end, line)
-    }
-
-    /// The statement's code on one line; lines inside a closure body it opens are `…`.
-    private static func render(_ span: ClosedRange<Int>, _ lexed: Lexed) -> String {
-        let base = lexed.startStack[span.lowerBound].count
-        var parts: [String] = []
-        var skipping = false
-        for k in span {
-            if lexed.startStack[k].dropFirst(base).contains(where: { $0.char == "{" }) {
-                if !skipping { parts.append("…"); skipping = true }
+            if code.u[p] == Code.openBrace, code.partner[p] > p, code.partner[p] <= end,
+               code.line(of: code.partner[p]) > code.line(of: p) {
+                out += code.substring(segment, p) + "{ … }"
+                p = code.partner[p] + 1
+                segment = p
                 continue
             }
-            skipping = false
-            parts.append(lexed.code[k])
+            p += 1
         }
-        return normalize(parts.joined(separator: " "))
+        out += code.substring(segment, min(end + 1, code.u.count))
+        return normalize(out)
+    }
+
+    /// ` ⟨name = initializer⟩` when the call's receiver is a local binding, so an edit of
+    /// the request it was built from changes the key.
+    private static func bindingSuffix(_ start: Int, _ code: Code, _ lexed: Lexed, _ handles: Set<String>, _ patterns: Patterns) -> String {
+        var k = start
+        while k < code.u.count, code.isIdent(code.u[k]) { k += 1 }
+        let name = code.substring(start, k)
+        guard let first = name.unicodeScalars.first, CharacterSet.lowercaseLetters.contains(first) || first == "_",
+              !handles.contains(name), !["self", "try", "await", "return"].contains(name) else { return "" }
+        var j = k
+        while j < code.u.count, code.isSpace(code.u[j]) { j += 1 }
+        guard j < code.u.count, code.u[j] == Code.dot else { return "" }
+        let binding = Patterns.regex(#"(?<![.\w])(if\s+|guard\s+|while\s+)?(?:let|var)\s+"# + NSRegularExpression.escapedPattern(for: name) + #"\s*(?::[^=\n]*)?=(?!=)\s*"#)
+        guard let m = patterns.matches(binding, code.text).last(where: { $0.range.location < start }) else { return "" }
+        let conditional = m.range(at: 1).location != NSNotFound
+        let from = m.range.location + m.range.length
+        var q = from
+        scan: while q < code.u.count, q < start {
+            let c = code.u[q]
+            switch c {
+            case Code.openParen, Code.openBracket:
+                guard code.partner[q] > q, code.partner[q] < start else { break scan }
+                q = code.partner[q] + 1
+            case Code.openBrace:
+                guard !conditional, code.partner[q] > q, code.partner[q] < start else { break scan }
+                q = code.partner[q] + 1
+            case Code.newline:
+                var n = q + 1
+                while n < code.u.count, code.isSpace(code.u[n]) { n += 1 }
+                guard n < code.u.count, code.u[n] == Code.dot else { break scan }
+                q = n
+            case Code.semicolon, Code.comma, Code.closeParen, Code.closeBracket, Code.closeBrace:
+                break scan
+            default:
+                if code.isIdent(c), q == 0 || !code.isIdent(code.u[q - 1]) {
+                    var e = q
+                    while e < code.u.count, code.isIdent(code.u[e]) { e += 1 }
+                    if code.substring(q, e) == "else" { break scan }
+                    q = e
+                } else {
+                    q += 1
+                }
+            }
+        }
+        let initializer = render(from, max(from, q - 1), code, lexed)
+        return initializer.isEmpty ? "" : " ⟨\(name) = \(initializer)⟩"
     }
 }
