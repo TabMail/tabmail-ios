@@ -511,6 +511,61 @@ struct StoragePruneTargetTests {
                 "the files went from \(meter.reportedBytes) to \(reportedAfter) bytes")
     }
 
+    @Test("On a database in WAL mode, a VACUUM leaves the measure where the delete before it put it, before the full checkpoint that shrinks the file and after it")
+    func aVacuumLeavesTheMeasureWhereTheDeletePutIt() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pool = try DatabasePool(path: directory.appendingPathComponent("space.sqlite").path)
+        // Large enough that a row is mostly overflow pages of its own.
+        let rowBytes = 40_000
+        // As the app's email database: no automatic checkpoint.
+        try await pool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
+            try db.execute(sql: "CREATE TABLE blob (id INTEGER PRIMARY KEY, data BLOB)")
+        }
+        try await pool.write { db in
+            for _ in 0..<200 {
+                try db.execute(sql: "INSERT INTO blob (data) VALUES (zeroblob(?))", arguments: [rowBytes])
+            }
+        }
+        try await pool.writeWithoutTransaction { db in try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)") }
+        try await pool.write { db in try db.execute(sql: "DELETE FROM blob WHERE id % 2 = 0") }
+        let space = StorageEstimator.SpaceSource(
+            reportedBytes: { Int64(StorageEstimator.allocatedSizeMB(of: directory) * 1024 * 1024) },
+            databaseFileBytes: { StorageEstimator.databaseFileBytes(ofDatabaseAt: pool.path) },
+            pageTotals: { (try? await pool.read { db in try StorageEstimator.PageTotals.read(db) }) ?? nil })
+
+        // A run after the delete, then one after a VACUUM, which writes the whole
+        // database into the WAL and leaves the database file its old size.
+        let measuredAfterDelete = await StorageEstimator.SpaceMeter.start(space)
+        let meterAfterDelete = try #require(measuredAfterDelete)
+        let afterDelete = meterAfterDelete.startBytes
+        let fileBefore = allocatedBytes(pool.path)
+        try await pool.writeWithoutTransaction { db in try db.execute(sql: "VACUUM") }
+        try #require(allocatedBytes(pool.path) >= fileBefore,
+                     "setup: the database file shrank from \(fileBefore) to \(allocatedBytes(pool.path)) bytes before any checkpoint")
+        let measuredAfterVacuum = await StorageEstimator.SpaceMeter.start(space)
+        let meterAfterVacuum = try #require(measuredAfterVacuum)
+        let afterVacuum = meterAfterVacuum.startBytes
+
+        // Then a run after the full checkpoint that shrinks the file.
+        try await pool.writeWithoutTransaction { db in try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)") }
+        try #require(allocatedBytes(pool.path) < fileBefore,
+                     "setup: the checkpoint left the database file at \(allocatedBytes(pool.path)) bytes, from \(fileBefore)")
+        let measuredAfterCheckpoint = await StorageEstimator.SpaceMeter.start(space)
+        let meterAfterCheckpoint = try #require(measuredAfterCheckpoint)
+        let afterCheckpoint = meterAfterCheckpoint.startBytes
+
+        // The VACUUM only packs the half-empty pages the delete left: a few pages,
+        // where the 100 deleted rows freed about 100 times `rowBytes`.
+        let tolerance = Int64(rowBytes)
+        #expect(abs(afterVacuum - afterDelete) <= tolerance,
+                "\(afterDelete) bytes used after the delete, \(afterVacuum) after the VACUUM")
+        #expect(abs(afterCheckpoint - afterDelete) <= tolerance,
+                "\(afterDelete) bytes used after the delete, \(afterCheckpoint) after the VACUUM and its checkpoint")
+    }
+
     @Test("The measure is the space reported less the database files read at the run's start, plus the data the databases hold now: a delete lowers it, new pages raise it, a VACUUM leaves it")
     func theMeasureCountsTheDataTheDatabasesHold() async throws {
         let mb = Self.megabyte
