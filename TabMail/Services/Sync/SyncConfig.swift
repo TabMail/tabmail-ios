@@ -580,6 +580,17 @@ enum SyncConfig {
     /// (the embedding queue) from over-checkpointing while still bounding the WAL. SQLite
     /// autocheckpoint is disabled (see `AppDatabase.makePool`).
     static let walCheckpointMinIntervalSeconds: TimeInterval = 1.5
+    /// Entries of `bodyAssetPendingDelete` per batch of the pending-delete worker
+    /// (`BodyAssetMaintenance.processPendingDeletes`): one manifest read, one
+    /// main-database read and one main-database write per batch (#1376).
+    static let bodyAssetPendingDeleteBatchSize = 200
+    /// Wall-clock budget of one pending-delete pass; the rest of the list waits for
+    /// the next foreground maintenance pass.
+    static let bodyAssetPendingDeletePassBudgetSeconds: TimeInterval = 5
+    /// Manifest keys per page of the one-time orphan sweep
+    /// (`BodyAssetMaintenance.runOrphanSweepOnce`): one manifest read and one
+    /// main-database write per page.
+    static let bodyAssetOrphanSweepPageSize = 500
     /// Timeout for WiFi check (NWPathMonitor). Returns false if exceeded.
     static let wifiCheckTimeoutSeconds: TimeInterval = 5
     /// Timeout for per-account background delta sync (ensureConnected + delta).

@@ -127,17 +127,6 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
         }
     }
 
-    /// Served by the v64 `(folderId, messageId)` index.
-    func rows(folderId: String, after afterId: String?, limit: Int) async throws -> [CatchUpLocalRow] {
-        try await pool.read { db in
-            try Row.fetchAll(db, sql: """
-                SELECT \(Self.columns) FROM messageHeader
-                WHERE folderId = ? AND (? IS NULL OR messageId > ?)
-                ORDER BY messageId LIMIT ?
-                """, arguments: [folderId, afterId, afterId, limit]).map(Self.localRow)
-        }
-    }
-
     private static func datedRow(_ row: Row) -> CatchUpLocalRow {
         var local = localRow(row)
         local.orderDate = row["providerDate"]
@@ -156,16 +145,34 @@ struct SyncEngineCatchUpRowReader: CatchUpLocalRowReader {
         }
     }
 
-    /// Served by the same index, scanned backwards.
+    /// Served by the same index, read backwards from the bound. A listing calls this
+    /// once per range, each time with the previous range's oldest date, so the bounded
+    /// read must start at its bound: written as `(? IS NULL OR providerDate < ?)`, the
+    /// bound is no index range, and every call started at the folder's newest row and
+    /// stepped over every row newer than the bound.
     func newestRows(folderId: String, orderDatesBefore upper: Date?, limit: Int) async throws -> [CatchUpLocalRow] {
-        try await pool.read { db in
-            try Row.fetchAll(db, sql: """
-                SELECT \(Self.columns), providerDate FROM messageHeader
-                WHERE folderId = ? AND (? IS NULL OR providerDate < ?)
-                ORDER BY providerDate DESC, messageId DESC LIMIT ?
-                """, arguments: [folderId, upper, upper, limit]).map(Self.datedRow)
+        try await pool.read { db -> [CatchUpLocalRow] in
+            if let upper {
+                return try Row.fetchAll(db, sql: Self.newestRowsBeforeSQL, arguments: [folderId, upper, limit])
+                    .map(Self.datedRow)
+            }
+            return try Row.fetchAll(db, sql: Self.newestRowsSQL, arguments: [folderId, limit]).map(Self.datedRow)
         }
     }
+
+    /// The newest rows of a folder: the first range of a listing.
+    static let newestRowsSQL = """
+        SELECT \(columns), providerDate FROM messageHeader
+        WHERE folderId = ?
+        ORDER BY providerDate DESC, messageId DESC LIMIT ?
+        """
+
+    /// The newest rows of a folder before a date: every later range of a listing.
+    static let newestRowsBeforeSQL = """
+        SELECT \(columns), providerDate FROM messageHeader
+        WHERE folderId = ? AND providerDate < ?
+        ORDER BY providerDate DESC, messageId DESC LIMIT ?
+        """
 }
 
 extension SyncEngine {

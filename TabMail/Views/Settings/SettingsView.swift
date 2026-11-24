@@ -606,13 +606,14 @@ struct SettingsView: View {
             showSettingsError = true
         }
 
-        // 5b. Sweep BodyAssetStore — every bodyAsset row now references a
-        // deleted messageHeader, so the cross-DB sweep deletes them. The
-        // associated files (no row → orphan after the row delete) are then
-        // removed by the same sweep's filesystem walk. Inline / attachment
-        // assets are part of the "cached data" the user just opted to wipe.
-        await BodyAssetMaintenance.pruneOrphans()
-        BackgroundSyncLogger.logDebug("[NukeDB] Pruned BodyAssetStore orphans")
+        // 5b. Wipe BodyAssetStore — every bodyAsset row now references a deleted
+        // messageHeader. Inline / attachment assets are part of the "cached data"
+        // the user just opted to wipe, so both kinds go now (rows and files),
+        // instead of key by key through the pending-delete list (#1376). The
+        // entries the header delete queued there are now moot; the worker drops
+        // them without a manifest write (no rows remain under their keys).
+        await BodyAssetMaintenance.wipeAllAfterLocalIndexWipe()
+        BackgroundSyncLogger.logDebug("[NukeDB] Wiped BodyAssetStore")
 
         // 5. `defer` restarts sync — fresh backfill from top — on every exit.
         BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")

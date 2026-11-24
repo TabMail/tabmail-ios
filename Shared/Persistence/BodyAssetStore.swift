@@ -17,8 +17,8 @@ import Synchronization
 /// NSE-vs-main-app branch in this file.
 ///
 /// Operations that need to coordinate with the main app's `messageHeader` /
-/// `messageBody` tables (eviction's `bodyComplete=0` flip, cross-DB orphan
-/// sweep) live in `BodyAssetMaintenance` (main-app target only). NSE never
+/// `messageBody` tables (eviction's `messageBody` drop, the pending-delete
+/// worker) live in `BodyAssetMaintenance` (main-app target only). NSE never
 /// runs eviction inside its 30s budget anyway.
 ///
 /// **Storage layout:**
@@ -36,12 +36,19 @@ import Synchronization
 /// access (`evictionVictims`).
 ///
 /// **Write/delete idempotency** — a manifest-side preparation lease is
-/// persisted before file materialization, then publication replaces that lease
-/// with the live row. Physical deletion re-checks both live rows and preparation
-/// leases while holding the same cross-process manifest write transaction.
-/// A lease only protects a blob for `sweepMinAgeSeconds`; past that its writer
-/// is presumed dead (see `abandonedPreparationCutoffMs`) and the ordinary
-/// age-based sweep reclaims the blob exactly as it did before leases existed.
+/// persisted before file materialization, and `prepare` writes the bytes into
+/// `staging/<preparationId>`, never into the store. `publish` moves them into
+/// place inside the manifest write transaction that proves it still holds its
+/// lease and records the row, so a file in the store always has a row (#1376).
+/// Deletes unlink a row's file BEFORE deleting the row, in one manifest write
+/// transaction: a crash in between leaves a row whose file is gone, which a read
+/// notices (`BodyAssetSchemeHandler`'s missing-file report), never a file no row
+/// names. A lease only protects a write for `sweepMinAgeSeconds`; past that its
+/// writer is presumed dead (see `abandonedPreparationCutoffMs`), and
+/// `recoverAbandonedPreparations` reaps the lease and its staging file. A
+/// message's assets are deleted from the main database's `bodyAssetPendingDelete`
+/// list (`deletePendingContentKey`, driven by `BodyAssetMaintenance`); nothing
+/// sweeps the whole store.
 enum BodyAssetKind: Int, Sendable, Codable {
     case inlineImage = 0
     case attachment  = 1
@@ -64,6 +71,17 @@ enum BodyAssetStore {
     /// Top-level directory name inside the App Group container.
     private static let storeDirectoryName = "bodyAssets"
 
+    /// Directory inside the store where `prepare` writes a preparation's bytes,
+    /// named by its preparation id, until `publish` moves them into place
+    /// (#1376). Not `hashHexLength` characters long, so `pruneOrphanFiles`
+    /// never treats it as a header directory.
+    private static let stagingDirectoryName = "staging"
+
+    /// Rows per manifest write transaction in `deleteAllAssets(kind:)`, which
+    /// unlinks each row's file inside the transaction: bounds how long one wipe
+    /// holds the cross-process writer lock the notification extension also takes.
+    private static let wipeBatchSize = 200
+
     /// Manifest DB filename inside the App Group container.
     private static let manifestDBName = "bodyAssetIndex.sqlite"
 
@@ -80,6 +98,12 @@ enum BodyAssetStore {
     /// supplied queue and `storeDirectory()` returns the supplied URL,
     /// bypassing the App Group container entirely.
     private static let testOverride = Mutex<(containerURL: URL, queue: DatabaseQueue)?>(nil)
+
+    /// The main app's "does this content key still name a message?" check, which
+    /// `publish` asks while its lease is held (#1376). Nil in the notification
+    /// extension, which cannot read the main database: the merge queues its
+    /// staged keys for deletion instead (`NSEDataBridge.queueStagedAssetKey`).
+    private static let publishOwnerCheck = Mutex<(@Sendable (ContentKey) -> Bool)?>(nil)
 
     private static func invalidateUsedBytesCache() {
         usedBytesCache.withLock { $0 = nil }
@@ -135,6 +159,12 @@ enum BodyAssetStore {
     /// access in one seek of the index, without reading the message's rows. It replaces
     /// `idx_bodyAsset_header (headerId)`, which is its prefix and serves every other `headerId`
     /// lookup the same way, in the same build-then-drop order.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query, index, table
+    /// or column added here, and every query that reads them, must be as cheap as the data allows.
+    /// It must not add a new table or index scan unless no index or plainer query can avoid it;
+    /// then state why at the query. Prove a query or index change on a mail-sized database with the
+    /// DBProof harness (TabMailTests/Helpers/DBProofHarness.swift).
     static func migrateManifestSchema(_ db: Database) throws {
         try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS bodyAsset (
@@ -378,19 +408,47 @@ enum BodyAssetStore {
         storeDirectory()?.appendingPathComponent(headerHash(contentKey), isDirectory: true)
     }
 
-    /// Bytes already materialised on disk, awaiting manifest publication.
+    /// `<store>/staging/`, creating it if needed. Nil if the container is unavailable.
+    static func stagingDirectory() -> URL? {
+        guard let dir = storeDirectory() else { return nil }
+        let staging = dir.appendingPathComponent(stagingDirectoryName, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: staging.path) {
+            try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        }
+        return staging
+    }
+
+    /// Where `prepare` writes this preparation's bytes until `publish`.
+    static func stagingURL(for prepared: PreparedWrite) -> URL? {
+        stagingDirectory()?.appendingPathComponent(prepared.preparationId)
+    }
+
+    /// Installs (or, with nil, removes) the check `publish` asks before it records
+    /// a row. The main app installs it once at launch.
+    static func setPublishOwnerCheck(_ check: (@Sendable (ContentKey) -> Bool)?) {
+        publishOwnerCheck.withLock { $0 = check }
+    }
+
+    /// Bytes already materialised in `staging/<preparationId>`, awaiting manifest
+    /// publication.
     ///
     /// The blob id IS the logical slot id (`"<headerHash>/<assetHash(key)>"`) —
     /// the same address the published row's `id` carries, which is what keeps
     /// the `tabmail-asset://` URLs already baked into cached HTML resolvable and
     /// keeps "write the same (contentKey, key) twice" a single-slot overwrite.
-    /// Two consequences the lease has to carry:
+    /// Two consequences:
     ///   - `prepare` ALWAYS re-materialises the bytes (it cannot assume an
     ///     existing file holds the same content, because the address does not
     ///     name the content);
-    ///   - a failed publication cannot unlink the slot's bytes out from under a
-    ///     row that still references them — `removeBlobIfUnreferenced` refuses,
-    ///     because that live row names this very blob id.
+    ///   - the slot's file changes only inside `publish`'s manifest transaction,
+    ///     together with its row (#1376), so a publication refused before the
+    ///     `rename` (lease lost, owner check) leaves the slot, and any row that
+    ///     names it, exactly as they were. After the `rename` there are two
+    ///     exceptions: a transaction that fails removes the moved file, so an older
+    ///     row of the same slot names a missing file (a read notices and refetches);
+    ///     and a process killed between the `rename` and the COMMIT leaves a store
+    ///     file no row names, which only a UIDVALIDITY purge or the local index wipe
+    ///     reclaims (IOS-ASSET-004).
     struct PreparedWrite: Sendable {
         let preparationId: String
         let blobId: String
@@ -442,16 +500,18 @@ enum BodyAssetStore {
               contentType: contentType, data: data, identityStamp: identityStamp)
     }
 
-    /// Materialises bytes on disk WITHOUT publishing a manifest row, under a
-    /// persisted preparation lease that every physical deleter — in EITHER
-    /// process — must consult before it may unlink the blob.
+    /// Materialises bytes in `staging/<preparationId>` WITHOUT publishing a
+    /// manifest row, under a persisted preparation lease.
     ///
-    /// The lease is inserted BEFORE `createDirectory`/`data.write`, so the
-    /// protected window strictly contains the whole materialisation window.
-    /// A crash anywhere after this point leaves at worst an orphan file plus an
-    /// abandoned lease; both age out on `sweepMinAgeSeconds`
-    /// (`abandonedPreparationCutoffMs`) and are reclaimed by `pruneOrphanFiles`
-    /// exactly as an interrupted single-phase write was before leases existed.
+    /// The lease is inserted BEFORE the staging file is written, so a staging
+    /// file always has a lease until `publish` or a discard releases it. A crash
+    /// anywhere after this point leaves at worst a staging file plus an abandoned
+    /// lease; the lease ages out on `sweepMinAgeSeconds`
+    /// (`abandonedPreparationCutoffMs`) and `recoverAbandonedPreparations` deletes
+    /// both. The store itself is never touched until `publish` (#1376).
+    ///
+    /// The lease also tells the pending-delete worker that a write for this
+    /// content key is in progress (`deletePendingContentKey`).
     ///
     /// Not `private` only so the prepare→publish boundary is directly testable;
     /// production reaches it through `write`.
@@ -459,7 +519,7 @@ enum BodyAssetStore {
         contentKey: ContentKey, kind: BodyAssetKind, key: String,
         contentType: String, data: Data, identityStamp: String?
     ) -> PreparedWrite? {
-        guard let dir = storeDirectory(), let queue = manifestQueue() else { return nil }
+        guard let staging = stagingDirectory(), let queue = manifestQueue() else { return nil }
         let hHash = headerHash(contentKey)
         let aHash = assetHash(key)
         let blobId = "\(hHash)/\(aHash)"
@@ -505,15 +565,15 @@ enum BodyAssetStore {
             return nil
         }
 
-        // 2. File second. Always re-materialised: the blob id names the logical
-        // slot, not the bytes, so an existing file may hold DIFFERENT content.
-        let folderURL = dir.appendingPathComponent(hHash, isDirectory: true)
+        // 2. File second, into staging, named by the preparation id. Always
+        // re-materialised: the blob id names the logical slot, not the bytes, so
+        // an existing file may hold DIFFERENT content. Not `.atomic`: nothing
+        // reads a staging file before `publish` moves it, and a plain write leaves
+        // no temporary file beside it.
         do {
-            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
-            let fileURL = folderURL.appendingPathComponent(aHash)
-            try data.write(to: fileURL, options: .atomic)
+            try data.write(to: staging.appendingPathComponent(prepared.preparationId))
         } catch {
-            discardPreparedIfOrphaned(prepared)
+            discardPrepared(prepared)
             #if DEBUG
             print("[BodyAssetStore] file write failed for \(blobId): \(error)")
             #endif
@@ -523,25 +583,42 @@ enum BodyAssetStore {
         return prepared
     }
 
-    /// Publishes a prepared blob into the manifest. Refuses — recording NOTHING
-    /// — when this preparation no longer owns its lease, so a writer whose lease
-    /// was reaped can never leave a manifest row pointing at unlinked bytes.
+    /// Publishes a prepared blob: moves its staging file into the store and
+    /// records its row, in one manifest write transaction. Refuses — recording
+    /// and moving NOTHING — when this preparation no longer owns its lease, so a
+    /// writer whose lease was reaped can never put a file or a row into the store.
     /// Initial write does NOT bump LRU.
+    ///
+    /// #1376: it also refuses when the content key no longer names a message
+    /// (the main app's `publishOwnerCheck`). The check runs while the lease is
+    /// held, and the pending-delete worker never deletes a key's assets while a
+    /// lease under the key is live, so a write for a message deleted before or
+    /// during it either publishes before the worker deletes, or is refused here:
+    /// no row is left for a key nothing will delete.
     ///
     /// Not `private` only so the prepare→publish boundary is directly testable;
     /// production reaches it through `write`.
     static func publish(_ prepared: PreparedWrite) -> String? {
-        guard let queue = manifestQueue() else { return nil }
+        guard let queue = manifestQueue(), let dir = storeDirectory(),
+              let stagedURL = stagingURL(for: prepared) else { return nil }
+        if let ownerCheck = publishOwnerCheck.withLock({ $0 }), !ownerCheck(prepared.contentKey) {
+            #if DEBUG
+            print("[BodyAssetStore] publish refused for \(prepared.blobId): its content key names no message")
+            #endif
+            return nil
+        }
         let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
         let contentIdValue: String? = (prepared.kind == .inlineImage) ? prepared.key : nil
         let attachmentSectionValue: String? = (prepared.kind == .attachment) ? prepared.key : nil
+        let finalURL = dir.appendingPathComponent(prepared.blobId)
+        var movedIntoPlace = false
         let published: Bool
 
         do {
             published = try queue.write { db -> Bool in
                 // This no-op UPDATE proves that this preparation still owns its
                 // lease and acquires SQLite's cross-process writer lock before
-                // the manifest row is touched.
+                // the store or the manifest row is touched.
                 try db.execute(
                     sql: """
                         UPDATE bodyAssetPreparation
@@ -551,6 +628,19 @@ enum BodyAssetStore {
                     arguments: [prepared.preparationId, prepared.blobId]
                 )
                 guard db.changesCount == 1 else { return false }
+
+                // The file goes into place under the writer lock, so every deleter
+                // (each holds the same lock) sees the file and its row together.
+                // `rename` replaces an existing slot file atomically: a reader sees
+                // the old bytes or the new ones, never a missing file. The header
+                // directory cannot be removed under us: `removeHeaderDirectoryIfIdle`
+                // runs under the same lock and keeps a directory a live lease names.
+                try FileManager.default.createDirectory(
+                    at: finalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                guard rename(stagedURL.path, finalURL.path) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                movedIntoPlace = true
 
                 // ⚑ THE CONFLICT UPDATE MUST CARRY THE STAMP. `blobId` names the
                 // logical SLOT, not the bytes, and `prepare` ALWAYS re-materialises
@@ -586,6 +676,13 @@ enum BodyAssetStore {
                 return true
             }
         } catch {
+            // The transaction rolled back after the file went into place: take the
+            // file out again, so the store never holds a file its row does not
+            // describe. A row that named the slot before now has no file, which a
+            // read notices and refetches.
+            if movedIntoPlace {
+                try? FileManager.default.removeItem(at: finalURL)
+            }
             // ADR-IOS-046: a database-suspension abort (SQLITE_ABORT/INTERRUPT) is
             // expected + benign — the asset row re-writes on the next wake. Don't
             // log it as a failure. (Shared with the NSE target, so this uses GRDB's
@@ -618,7 +715,7 @@ enum BodyAssetStore {
         ) else { return nil }
         let result = publish(prepared)
         if result == nil {
-            discardPreparedIfOrphaned(prepared)
+            discardPrepared(prepared)
         }
         return result
     }
@@ -626,17 +723,15 @@ enum BodyAssetStore {
     /// Cutoff (epoch ms) at or before which a preparation lease is treated as
     /// ABANDONED — its writer died between the lease INSERT and publish/discard.
     ///
-    /// WHY THIS EXISTS. The lease stops a physical delete from unlinking a blob
-    /// that another writer just materialised. Without an expiry it also pins the
-    /// blob FOREVER when the writer never returns — very plausible for the NSE
-    /// inside its 30s budget. Every physical deleter (`pruneOrphanFiles`, both
-    /// `deleteAllAssets` overloads, `discardPreparedIfOrphaned`) routes through
-    /// `removeBlobIfUnreferenced` and refuses to unlink while any lease names the
-    /// blob, and `usedBytes` sums only `bodyAsset.sizeBytes`, so such a blob is
-    /// also invisible to the user's attachment cap. Before the lease table
-    /// existed the sweep reclaimed exactly this file after `sweepMinAgeSeconds`;
-    /// ageing the lease out on the SAME threshold restores that behaviour instead
-    /// of replacing it with an ownership test that fails open on crash.
+    /// WHY THIS EXISTS. A live lease tells the pending-delete worker that a write
+    /// for its key is in progress (`deletePendingContentKey` keeps the entry), and
+    /// keeps its header directory and staging file. Without an expiry it would do
+    /// so FOREVER when the writer never returns — very plausible for the NSE inside
+    /// its 30s budget: the worker would never finish the key, and the staging file
+    /// would never go (`usedBytes` sums only `bodyAsset.sizeBytes`, so it would also
+    /// be invisible to the user's attachment cap). Past `sweepMinAgeSeconds` the
+    /// lease is abandoned: `recoverAbandonedPreparations` reaps it with its staging
+    /// file, and the worker reaps it in the transaction that deletes its key.
     ///
     /// WHY EXPIRY IS SAFE. Reaping a lease can never publish bad state:
     /// `publish` re-proves ownership of its own lease row (`changesCount == 1`)
@@ -644,49 +739,90 @@ enum BodyAssetStore {
     /// publish rather than leaving a manifest row pointing at unlinked bytes.
     /// The worst case is a wasted fetch that self-heals on retry, and the caller
     /// sees the same `nil` it sees for any other write failure — never a row that
-    /// claims content we do not have. A YOUNG lease still protects its blob
-    /// unconditionally, and a PUBLISHED blob is protected by its manifest row
-    /// regardless of any lease.
+    /// claims content we do not have. A YOUNG lease is never reaped, and a
+    /// PUBLISHED blob is protected by its manifest row regardless of any lease.
     private static func abandonedPreparationCutoffMs() -> Int64 {
         Int64((Date().timeIntervalSince1970 - sweepMinAgeSeconds) * 1000)
     }
 
-    /// Releases this writer's preparation lease, then removes the blob only if
-    /// neither a live manifest row nor another writer's LIVE preparation lease
-    /// points at it. The check and unlink deliberately run inside one manifest
-    /// write transaction: prepare/publish/discard in the main app and NSE
-    /// therefore serialize through SQLite's cross-process writer lock.
-    static func discardPreparedIfOrphaned(_ prepared: PreparedWrite) {
-        removeBlobIfUnreferenced(
-            prepared.blobId,
-            releasingPreparationId: prepared.preparationId
-        )
+    /// Gives up a preparation: deletes its staging file, then releases its lease.
+    /// The store is never touched: a preparation's bytes enter it only inside
+    /// `publish`. The staging file is this preparation's alone (named by its id),
+    /// so it needs no check; if the process dies between the two steps, the lease
+    /// ages out and `recoverAbandonedPreparations` reaps it.
+    static func discardPrepared(_ prepared: PreparedWrite) {
+        if let stagedURL = stagingURL(for: prepared) {
+            try? FileManager.default.removeItem(at: stagedURL)
+        }
+        guard let queue = manifestQueue() else { return }
+        do {
+            try queue.write { db in
+                try db.execute(
+                    sql: "DELETE FROM bodyAssetPreparation WHERE preparationId = ?",
+                    arguments: [prepared.preparationId]
+                )
+            }
+        } catch {
+            #if DEBUG
+            if (error as? DatabaseError)?.isInterruptionError != true {
+                print("[BodyAssetStore] preparation release failed for \(prepared.blobId): \(error)")
+            }
+            #endif
+        }
+    }
+
+    /// #1376: crash recovery for writes, run by the main app's maintenance pass
+    /// (foreground only, ADR-IOS-046). Reaps every abandoned preparation lease, then
+    /// deletes each staging file whose lease is gone. It lists only `staging/`,
+    /// which holds only writes in progress, never the store.
+    ///
+    /// Exact: a lease is inserted before its staging file is written, and both run
+    /// in one manifest write transaction here, so a staging file whose lease this
+    /// transaction cannot see was published, discarded or abandoned, and its
+    /// preparation id is never leased again. A writer whose lease is reaped here
+    /// and that writes on later has its `publish` refused, and discards the file.
+    static func recoverAbandonedPreparations() {
+        guard let queue = manifestQueue(), let staging = stagingDirectory() else { return }
+        do {
+            try queue.write { db in
+                try db.execute(
+                    sql: "DELETE FROM bodyAssetPreparation WHERE createdAt <= ?",
+                    arguments: [abandonedPreparationCutoffMs()]
+                )
+                let leased = Set(try String.fetchAll(
+                    db, sql: "SELECT preparationId FROM bodyAssetPreparation"
+                ))
+                let files = (try? FileManager.default.contentsOfDirectory(
+                    at: staging, includingPropertiesForKeys: nil
+                )) ?? []
+                for file in files where !leased.contains(file.lastPathComponent) {
+                    try? FileManager.default.removeItem(at: file)
+                }
+            }
+        } catch {
+            #if DEBUG
+            if (error as? DatabaseError)?.isInterruptionError != true {
+                print("[BodyAssetStore] abandoned preparation recovery failed: \(error)")
+            }
+            #endif
+        }
     }
 
     /// Atomically guards a physical unlink with the manifest-side reachability
-    /// check. The DELETE is always the first statement — it releases this
-    /// writer's own lease AND reaps any abandoned lease on the same blob, and
-    /// it acquires the SQLite writer lock before the SELECT and the filesystem
-    /// action even when there is no lease of our own to release (the empty
-    /// preparation id cannot match a UUID).
-    private static func removeBlobIfUnreferenced(
-        _ blobId: String,
-        releasingPreparationId: String? = nil
-    ) {
+    /// check, for `pruneOrphanFiles`, which walks files it knows nothing about.
+    /// The DELETE is always the first statement — it reaps any abandoned lease on
+    /// the same blob, and it acquires the SQLite writer lock before the SELECT and
+    /// the filesystem action.
+    private static func removeBlobIfUnreferenced(_ blobId: String) {
         guard let queue = manifestQueue(), let dir = storeDirectory() else { return }
         do {
             try queue.write { db in
                 try db.execute(
                     sql: """
                         DELETE FROM bodyAssetPreparation
-                        WHERE blobId = ?
-                          AND (preparationId = ? OR createdAt <= ?)
+                        WHERE blobId = ? AND createdAt <= ?
                         """,
-                    arguments: [
-                        blobId,
-                        releasingPreparationId ?? "",
-                        abandonedPreparationCutoffMs(),
-                    ]
+                    arguments: [blobId, abandonedPreparationCutoffMs()]
                 )
                 // The DELETE above already removed every abandoned lease on this
                 // blob, so surviving `bodyAssetPreparation` rows are live ones.
@@ -711,9 +847,9 @@ enum BodyAssetStore {
                 )
             }
         } catch {
-            // Fail closed: an unavailable manifest leaves an orphan file behind,
-            // which the next sweep retries. Debug-gated because `Shared/` also
-            // compiles into the NSE, where `DebugModeManager` does not exist.
+            // Fail closed: an unavailable manifest leaves the file behind. Debug-gated
+            // because `Shared/` also compiles into the NSE, where `DebugModeManager`
+            // does not exist.
             #if DEBUG
             if (error as? DatabaseError)?.isInterruptionError != true {
                 print("[BodyAssetStore] unreferenced-blob check failed for \(blobId): \(error)")
@@ -742,19 +878,16 @@ enum BodyAssetStore {
     ///
     /// "Idle" is decided under the manifest's cross-process writer lock: no
     /// manifest row and no LIVE preparation lease names a blob under this hash,
-    /// and the directory is empty on disk. The lease is the PRECISE guard for
-    /// the only harmful race — a writer between `createDirectory` and
-    /// `data.write` — because `prepare` inserts its lease before both. That is
-    /// why the delete paths need no extra age gate; `pruneOrphanFiles`, which
-    /// walks directories it knows nothing about, additionally requires the
+    /// and the directory is empty on disk. `publish` creates the directory and
+    /// moves its file in under the same lock, so the two never interleave; the
+    /// lease check additionally keeps a directory a write in progress will use.
+    /// That is why the delete paths need no extra age gate; `pruneOrphanFiles`,
+    /// which walks directories it knows nothing about, additionally requires the
     /// directory's own mtime to be older than `sweepMinAgeSeconds`.
     ///
     /// Deliberately narrower than the previous single-phase sweep, which
     /// `removeItem`'d a header directory RECURSIVELY: bytes still on disk belong
-    /// to someone, so this only ever removes an EMPTY directory. Files left
-    /// under it by an interrupted write are reclaimed by the age-gated file loop
-    /// in `pruneOrphanFiles`, not by a recursive delete that cannot tell an
-    /// abandoned blob from one a concurrent writer is materialising right now.
+    /// to someone, so this only ever removes an EMPTY directory.
     private static func removeHeaderDirectoryIfIdle(hashName: String) {
         guard let queue = manifestQueue(), let dir = storeDirectory(),
               let hashUpperBound = prefixUpperBound(hashName) else { return }
@@ -1099,54 +1232,174 @@ enum BodyAssetStore {
     /// the row was written under. `headerId` is a mutable COLUMN — `rekeyContentKey`
     /// moves a moved message's assets to its new key without rewriting the files —
     /// so after a re-key `headerHash(contentKey)` names a directory that no longer
-    /// holds anything, the removal misses, and every one of that message's files
-    /// leaks until `pruneOrphanFiles()` reclaims it 60s later. Deriving the
-    /// directories from `substr(id, 1, hashHexLength)` of the rows actually being
-    /// deleted is correct in both worlds, and byte-identical at HEAD where no
+    /// holds anything, and a removal derived from the key would miss every one of
+    /// that message's files. Deriving the files and directories from the rows
+    /// actually being deleted is correct in both worlds, and byte-identical where no
     /// re-key has happened (the only distinct prefix IS `headerHash(contentKey)`).
     @discardableResult
     static func deleteAllAssets(forContentKey contentKey: ContentKey) -> Int64 {
-        guard let queue = manifestQueue() else { return 0 }
+        deleteAllAssetsResult(forContentKey: contentKey) ?? 0
+    }
+
+    /// `deleteAllAssets(forContentKey:)`, reporting a manifest failure as nil.
+    private static func deleteAllAssetsResult(forContentKey contentKey: ContentKey) -> Int64? {
+        guard let queue = manifestQueue(), let dir = storeDirectory() else { return nil }
         let deletion: (bytes: Int64, blobIds: [String])
         do {
-            deletion = try queue.write { db -> (bytes: Int64, blobIds: [String]) in
-                let blobIds = try String.fetchAll(
-                    db,
-                    sql: "SELECT id FROM bodyAsset WHERE headerId = ?",
-                    arguments: [contentKey]
-                )
-                let total = try Int64.fetchOne(
-                    db,
-                    sql: "SELECT COALESCE(SUM(sizeBytes), 0) FROM bodyAsset WHERE headerId = ?",
-                    arguments: [contentKey]
-                ) ?? 0
-                try db.execute(
-                    sql: "DELETE FROM bodyAsset WHERE headerId = ?",
-                    arguments: [contentKey]
-                )
-                return (total, blobIds)
+            deletion = try queue.write { db in
+                try deleteRowsAndFiles(forContentKey: contentKey, in: dir, db: db)
             }
         } catch {
             #if DEBUG
             print("[BodyAssetStore] deleteAllAssets manifest failed for \(contentKey): \(error)")
             #endif
-            return 0
+            return nil
         }
-        for blobId in deletion.blobIds {
-            removeBlobIfUnreferenced(blobId)
+        finishDeletion(of: contentKey, blobIds: deletion.blobIds)
+        return deletion.bytes
+    }
+
+    /// Inside a manifest write transaction: unlinks every file `contentKey`'s rows
+    /// name, THEN deletes the rows (#1376: the file first, then its record). A crash
+    /// in between leaves rows whose files are gone, which a read notices
+    /// (`BodyAssetSchemeHandler`'s missing-file report, the attachment list's cache
+    /// miss) and the next delete of the key finishes; never a file no row names,
+    /// which nothing would ever find. Each row's id is its own blob (the primary
+    /// key), and a write in progress keeps its bytes in staging until `publish`
+    /// moves them in under this same lock, so no other writer's file is unlinked.
+    private static func deleteRowsAndFiles(
+        forContentKey contentKey: ContentKey, in dir: URL, db: Database
+    ) throws -> (bytes: Int64, blobIds: [String]) {
+        let rows = try Row.fetchAll(
+            db,
+            sql: "SELECT id, sizeBytes FROM bodyAsset WHERE headerId = ?",
+            arguments: [contentKey]
+        )
+        let blobIds = rows.map { $0["id"] as String }
+        let bytes = rows.reduce(Int64(0)) { $0 + ($1["sizeBytes"] as Int64) }
+        for blobId in blobIds {
+            try? FileManager.default.removeItem(at: dir.appendingPathComponent(blobId))
         }
-        // No rows: fall back to the key's own hash so a manifest-less directory left
-        // by an interrupted write is still reclaimed — the pre-existing behaviour,
-        // now narrowed to an EMPTY, unleased directory so it cannot take a
-        // concurrent writer's in-flight bytes with it.
-        let headerHashes: Set<String> = deletion.blobIds.isEmpty
+        try db.execute(
+            sql: "DELETE FROM bodyAsset WHERE headerId = ?",
+            arguments: [contentKey]
+        )
+        return (bytes, blobIds)
+    }
+
+    /// After a key's rows and files are deleted: reclaims the header directories
+    /// they lived in, once idle, and invalidates the byte count. With no rows it
+    /// tries the key's own hash, so a directory left empty by an interrupted write
+    /// is still reclaimed (only an EMPTY, unleased one).
+    private static func finishDeletion(of contentKey: ContentKey, blobIds: [String]) {
+        let headerHashes: Set<String> = blobIds.isEmpty
             ? [headerHash(contentKey)]
-            : Set(deletion.blobIds.map { String($0.prefix(hashHexLength)) })
+            : Set(blobIds.map { String($0.prefix(hashHexLength)) })
         for hash in headerHashes {
             removeHeaderDirectoryIfIdle(hashName: hash)
         }
         invalidateUsedBytesCache()
-        return deletion.bytes
+    }
+
+    /// What `deletePendingContentKey` did.
+    enum PendingDeleteOutcome: Sendable, Equatable {
+        /// The key's rows and files are gone (none is fine); `bytes` reclaimed.
+        case deleted(bytes: Int64)
+        /// A live preparation lease under the key's header hash: a write for the
+        /// key is in progress, so nothing was deleted. Retry later.
+        case writeInProgress
+        /// The manifest could not be read or written. Retry later.
+        case failed
+    }
+
+    /// #1376: deletes the assets of a key from the main database's
+    /// `bodyAssetPendingDelete` list, for the pending-delete worker
+    /// (`BodyAssetMaintenance.processPendingDeletes`), in ONE manifest write
+    /// transaction:
+    /// 1. reaps the abandoned leases under the key's header hash (its writes
+    ///    write under that hash);
+    /// 2. if a live lease remains there, a write for the key is in progress:
+    ///    nothing is deleted (`.writeInProgress`), so the worker keeps the entry
+    ///    and the write's rows are deleted on a later pass;
+    /// 3. otherwise unlinks the files the key's rows name, then deletes the rows
+    ///    (`deleteRowsAndFiles`).
+    ///
+    /// A writer whose lease step 1 reaps has its `publish` refused, so it never
+    /// records a row after this transaction.
+    static func deletePendingContentKey(_ contentKey: ContentKey) -> PendingDeleteOutcome {
+        guard let queue = manifestQueue(), let dir = storeDirectory() else { return .failed }
+        let hash = headerHash(contentKey)
+        guard let hashUpperBound = prefixUpperBound(hash) else { return .failed }
+        let result: (bytes: Int64, blobIds: [String])?
+        do {
+            result = try queue.write { db -> (bytes: Int64, blobIds: [String])? in
+                try db.execute(
+                    sql: """
+                        DELETE FROM bodyAssetPreparation
+                        WHERE blobId >= ? AND blobId < ? AND createdAt <= ?
+                        """,
+                    arguments: [hash, hashUpperBound, abandonedPreparationCutoffMs()]
+                )
+                // A FROM-less scalar select always yields one row; nil fails closed.
+                let leased = try Bool.fetchOne(
+                    db,
+                    sql: """
+                        SELECT EXISTS(
+                            SELECT 1 FROM bodyAssetPreparation
+                            WHERE blobId >= ? AND blobId < ?
+                        )
+                        """,
+                    arguments: [hash, hashUpperBound]
+                ) ?? true
+                guard !leased else { return nil }
+                return try deleteRowsAndFiles(forContentKey: contentKey, in: dir, db: db)
+            }
+        } catch {
+            #if DEBUG
+            if (error as? DatabaseError)?.isInterruptionError != true {
+                print("[BodyAssetStore] pending delete failed for \(contentKey): \(error)")
+            }
+            #endif
+            return .failed
+        }
+        guard let result else { return .writeInProgress }
+        finishDeletion(of: contentKey, blobIds: result.blobIds)
+        return .deleted(bytes: result.bytes)
+    }
+
+    /// #1376: which of `contentKeys` have assets for the pending-delete worker to
+    /// settle: a manifest row under the key, or a preparation lease under its header
+    /// hash (a write in progress). One manifest read; nil if it failed. A key with
+    /// neither has nothing to delete, so its entry needs no manifest write.
+    ///
+    /// The rows are found by an index seek per key (`headerId IN (…)` on an index led
+    /// by `headerId`); the lease table holds only writes in progress, so it is read
+    /// whole.
+    static func contentKeysWithAssets(among contentKeys: [ContentKey]) -> Set<ContentKey>? {
+        guard !contentKeys.isEmpty else { return [] }
+        guard let queue = manifestQueue() else { return nil }
+        do {
+            return try queue.read { db in
+                let placeholders = Array(repeating: "?", count: contentKeys.count).joined(separator: ",")
+                var withAssets = Set(try ContentKey.fetchAll(
+                    db,
+                    sql: "SELECT DISTINCT headerId FROM bodyAsset WHERE headerId IN (\(placeholders))",
+                    arguments: StatementArguments(contentKeys)
+                ))
+                let leasedHashes = Set(try String.fetchAll(
+                    db, sql: "SELECT blobId FROM bodyAssetPreparation"
+                ).map { String($0.prefix(hashHexLength)) })
+                for key in contentKeys where leasedHashes.contains(headerHash(key)) {
+                    withAssets.insert(key)
+                }
+                return withAssets
+            }
+        } catch {
+            #if DEBUG
+            print("[BodyAssetStore] contentKeysWithAssets failed: \(error)")
+            #endif
+            return nil
+        }
     }
 
     /// Re-point every manifest row of `oldKey` at `newKey`, preserving the bytes on
@@ -1165,7 +1418,14 @@ enum BodyAssetStore {
     /// are authoritative and the old key's rows + files are deleted instead.
     @discardableResult
     static func rekeyContentKey(from oldKey: ContentKey, to newKey: ContentKey) -> Int {
-        guard oldKey != newKey, let queue = manifestQueue() else { return 0 }
+        rekeyContentKeyResult(from: oldKey, to: newKey) ?? 0
+    }
+
+    /// `rekeyContentKey(from:to:)`, reporting a manifest failure as nil, so the
+    /// pending-delete worker keeps an entry whose re-key did not happen (#1376).
+    static func rekeyContentKeyResult(from oldKey: ContentKey, to newKey: ContentKey) -> Int? {
+        guard oldKey != newKey else { return 0 }
+        guard let queue = manifestQueue() else { return nil }
         let moved: Int
         do {
             moved = try queue.write { db -> Int in
@@ -1185,11 +1445,10 @@ enum BodyAssetStore {
             #if DEBUG
             print("[BodyAssetStore] rekeyContentKey failed for \(oldKey): \(error)")
             #endif
-            return 0
+            return nil
         }
         if moved < 0 {
-            _ = deleteAllAssets(forContentKey: oldKey)
-            return 0
+            return deleteAllAssetsResult(forContentKey: oldKey) == nil ? nil : 0
         }
         return moved
     }
@@ -1197,54 +1456,80 @@ enum BodyAssetStore {
     /// Delete all manifest rows + files for a kind. Returns the set of content keys
     /// affected (so the maintenance layer can do its main-DB cleanup for kind=0).
     /// Idempotent. Does NOT touch main DB.
+    ///
+    /// In batches of `wipeBatchSize` rows, walking the primary key, each batch one
+    /// manifest write transaction that unlinks its rows' files and then deletes the
+    /// rows (#1376: the file first, then its record, as in `deleteRowsAndFiles`).
     @discardableResult
     static func deleteAllAssets(kind: BodyAssetKind) -> Set<ContentKey> {
-        guard let queue = manifestQueue() else { return [] }
-        let snapshot: [(id: String, contentKey: ContentKey)]
-        do {
-            snapshot = try queue.read { db in
-                let rows = try Row.fetchAll(
-                    db,
-                    sql: "SELECT id, headerId FROM bodyAsset WHERE kind = ?",
-                    arguments: [kind.rawValue]
-                )
-                return rows.map { (id: $0["id"], contentKey: $0["headerId"]) }
+        guard let queue = manifestQueue(), let dir = storeDirectory() else { return [] }
+        var contentKeys = Set<ContentKey>()
+        var headerHashes = Set<String>()
+        var after = ""
+        while true {
+            let batch: [(id: String, contentKey: ContentKey)]
+            do {
+                batch = try queue.write { db in
+                    let rows = try Row.fetchAll(
+                        db,
+                        sql: "SELECT id, headerId FROM bodyAsset WHERE kind = ? AND id > ? ORDER BY id LIMIT ?",
+                        arguments: [kind.rawValue, after, wipeBatchSize]
+                    ).map { (id: $0["id"] as String, contentKey: $0["headerId"] as ContentKey) }
+                    guard !rows.isEmpty else { return rows }
+                    for row in rows {
+                        try? FileManager.default.removeItem(at: dir.appendingPathComponent(row.id))
+                    }
+                    let placeholders = Array(repeating: "?", count: rows.count).joined(separator: ",")
+                    try db.execute(
+                        sql: "DELETE FROM bodyAsset WHERE id IN (\(placeholders))",
+                        arguments: StatementArguments(rows.map(\.id))
+                    )
+                    return rows
+                }
+            } catch {
+                #if DEBUG
+                print("[BodyAssetStore] deleteAllAssets(kind:) batch failed: \(error)")
+                #endif
+                break
             }
-        } catch {
-            #if DEBUG
-            print("[BodyAssetStore] deleteAllAssets(kind:) snapshot failed: \(error)")
-            #endif
-            return []
-        }
-        guard !snapshot.isEmpty else { return [] }
-        let contentKeys = Set(snapshot.map(\.contentKey))
-        do {
-            try queue.write { db in
-                try db.execute(
-                    sql: "DELETE FROM bodyAsset WHERE kind = ?",
-                    arguments: [kind.rawValue]
-                )
-            }
-        } catch {
-            #if DEBUG
-            print("[BodyAssetStore] deleteAllAssets(kind:) manifest delete failed: \(error)")
-            #endif
-        }
-        for entry in snapshot {
-            removeBlobIfUnreferenced(entry.id)
+            guard let last = batch.last else { break }
+            after = last.id
+            contentKeys.formUnion(batch.map(\.contentKey))
+            headerHashes.formUnion(batch.map { String($0.id.prefix(hashHexLength)) })
         }
         // Only rmdir if now empty (other kind's files may remain) and unleased.
         // Directories come from the ROWS, same as `deleteAllAssets(forContentKey:)`
         // — re-hashing the key names the wrong directory after a `rekeyContentKey`.
-        for hashName in Set(snapshot.map { String($0.id.prefix(hashHexLength)) }) {
+        for hashName in headerHashes {
             removeHeaderDirectoryIfIdle(hashName: hashName)
         }
         invalidateUsedBytesCache()
         return contentKeys
     }
 
-    /// Returns the set of distinct content keys present in the manifest.
-    /// Used by `BodyAssetMaintenance.pruneOrphans` for the cross-DB sweep.
+    /// One page of the manifest's distinct content keys after `after`, in key
+    /// order, for the one-time orphan sweep (`BodyAssetMaintenance.runOrphanSweepOnce`).
+    /// Walks an index led by `headerId`. Nil if the read failed.
+    static func manifestContentKeys(after: ContentKey?, limit: Int) -> [ContentKey]? {
+        guard let queue = manifestQueue() else { return nil }
+        do {
+            return try queue.read { db in
+                try ContentKey.fetchAll(
+                    db,
+                    sql: "SELECT DISTINCT headerId FROM bodyAsset WHERE headerId > ? ORDER BY headerId LIMIT ?",
+                    arguments: [after?.rawValue ?? "", limit]
+                )
+            }
+        } catch {
+            #if DEBUG
+            print("[BodyAssetStore] manifestContentKeys failed: \(error)")
+            #endif
+            return nil
+        }
+    }
+
+    /// Returns the set of distinct content keys present in the manifest. Used by
+    /// the UIDVALIDITY reset's per-folder purge (`purgeBodyAssetsForFolder`).
     static func allManifestContentKeys() -> Set<ContentKey> {
         guard let queue = manifestQueue() else { return [] }
         do {
@@ -1287,15 +1572,18 @@ enum BodyAssetStore {
     /// preparation-lease recheck, and reclaims header directories that are empty
     /// and have been idle for at least the same threshold. Does NOT cross to the
     /// main DB. Safe to run from any target.
+    ///
+    /// It walks the whole store, so it is never periodic (#1376): it runs once
+    /// after the update that removed the periodic sweep, for files orphaned before
+    /// it (`BodyAssetMaintenance.runOrphanSweepOnce`), and after a UIDVALIDITY
+    /// reset's folder purge. `staging/` is not a header directory (its name is not
+    /// `hashHexLength` long), so it is skipped.
     static func pruneOrphanFiles() {
         guard let dir = storeDirectory(), let queue = manifestQueue() else { return }
 
-        // Table-wide reap of abandoned leases. `removeBlobIfUnreferenced` reaps
-        // per-blob, but a writer that died before its bytes ever hit disk leaves
-        // a lease no file-driven sweep would ever visit. This is the only
-        // periodic entry point, so it owns the table-wide pass. Deleting a lease
-        // NEVER deletes bytes — it only stops an abandoned lease from vetoing
-        // the age-gated file sweep below.
+        // Table-wide reap of abandoned leases, as `recoverAbandonedPreparations`
+        // does. Deleting a lease NEVER deletes bytes — it only stops an abandoned
+        // lease from vetoing the age-gated file sweep below.
         do {
             try queue.write { db in
                 try db.execute(
@@ -1362,8 +1650,8 @@ enum BodyAssetStore {
                 // argument and its negative case). `substr(id, 1, n) = ?` wraps the
                 // indexed column in a function, so `sqlite_autoindex_bodyAsset_1`
                 // cannot seek it and this is a full SCAN. It runs once per known
-                // header directory inside the 60s foreground sweep, i.e. O(D×N) over
-                // the manifest; as a range each iteration is
+                // header directory, i.e. O(D×N) over the manifest; as a range each
+                // iteration is
                 // `SEARCH … USING COVERING INDEX (id>? AND id<?)`.
                 //
                 // `name` is exactly `hashHexLength` characters (guarded above), which
@@ -1425,9 +1713,12 @@ enum BodyAssetStore {
 
     // MARK: - Test helpers
 
+    /// A test environment starts with no publish owner check (the app installs
+    /// one at launch); a test that needs one sets it with `setPublishOwnerCheck`.
     static func _setTestEnvironment(containerURL: URL, queue: DatabaseQueue) {
         testOverride.withLock { $0 = (containerURL, queue) }
         usedBytesCache.withLock { $0 = nil }
+        publishOwnerCheck.withLock { $0 = nil }
     }
 
     static func _makeTestQueue() throws -> DatabaseQueue {
@@ -1440,5 +1731,6 @@ enum BodyAssetStore {
         testOverride.withLock { $0 = nil }
         queueCache.withLock { $0 = nil }
         usedBytesCache.withLock { $0 = nil }
+        publishOwnerCheck.withLock { $0 = nil }
     }
 }

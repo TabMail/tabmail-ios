@@ -182,15 +182,10 @@ struct BackfillBodyRepopulateOnDrainTests {
 @Suite("BackfillEmbeddingQueue.repopulateOnDrain — query correctness")
 struct BackfillEmbeddingRepopulateOnDrainTests {
 
-    /// Runs the exact SQL from `BackfillEmbeddingQueue.repopulateOnDrain`.
+    /// Runs the production statement `BackfillEmbeddingQueue.repopulateOnDrain` runs.
     private func queryRepopulateOnDrain(_ db: DatabaseQueue) throws -> [String] {
         try db.read { dbConn in
-            try String.fetchAll(dbConn, sql: """
-                SELECT id FROM messageHeader
-                WHERE bodyComplete = 1 AND embeddingComplete = 0 AND bodyEmptyConfirmed = 0
-                ORDER BY isInInbox DESC, date DESC
-                LIMIT 500
-                """)
+            try String.fetchAll(dbConn, sql: BackfillEmbeddingQueue.repopulateSQL(limit: 500))
         }
     }
 

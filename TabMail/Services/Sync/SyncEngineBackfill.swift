@@ -416,24 +416,7 @@ extension SyncEngine {
 
         // GRDB is sole authority for body status flags
         let (grdbTotal, grdbIndexed, pendingBody) = (try? await dbPool.read { db -> (Int, Int, Int) in
-            let total = try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
-            // Both predicates live on `MessageHeader` as named requests rather than
-            // inline `filter(…)` chains — see `bodySettledRequest` /
-            // `pendingBodyRequest` for what they contain and why they are named. A
-            // chain here is invisible to every SQL-text census and unreachable from
-            // the test tree, and both properties cost real defects before.
-            //
-            // `bodyMetadataOversized` counts as SETTLED, not pending: those bodies
-            // are unfetchable by this build, and leaving them in work-remaining
-            // means `pendingBodyCount` never reaches 0, `isFullyComplete` is false
-            // forever, and the sync banner never clears. Owner decision 2026-09-01.
-            // If a future fix makes these bodies fetchable again, the two requests
-            // and the body-queue admission queries drop the flag together.
-            let indexed = try MessageHeader.bodySettledRequest(accountId: accountId).fetchCount(db)
-            // Completion gates on this reaching 0, not on an exact count match
-            // against a server-reported total.
-            let pending = try MessageHeader.pendingBodyRequest(accountId: accountId).fetchCount(db)
-            return (total, indexed, pending)
+            try Self.backfillProgressCounts(db, accountId: accountId)
         }) ?? (0, 0, 1)   // pending=1 on read failure → never false-complete
 
         // Gmail/Exchange: uidTotal is 0 (no IMAP UIDs). Use the server-reported
@@ -459,6 +442,37 @@ extension SyncEngine {
                 uidTotal: uidTotal, uidWalked: uidWalked,
                 pendingBodyCount: pendingBody
             )
+    }
+
+    /// The three counts the backfill progress publishes for `accountId`, in one read:
+    /// every stored header, the settled ones and the ones still owing a body.
+    ///
+    /// All three read index entries only, never a header row (#1401): the total
+    /// through an `accountId`-led index, and both body counts through the deferred
+    /// `messageHeader_backfillProgress`, which holds every column either predicate
+    /// tests. Until that index is built they read the rows as before, with the same
+    /// results. `BackfillProgressCountTests` pins the plans and the counts.
+    nonisolated static func backfillProgressCounts(
+        _ db: Database, accountId: String
+    ) throws -> (total: Int, settled: Int, pending: Int) {
+        let total = try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
+        // Both predicates live on `MessageHeader` as named requests rather than
+        // inline `filter(…)` chains — see `bodySettledRequest` /
+        // `pendingBodyRequest` for what they contain and why they are named. A
+        // chain here is invisible to every SQL-text census and unreachable from
+        // the test tree, and both properties cost real defects before.
+        //
+        // `bodyMetadataOversized` counts as SETTLED, not pending: those bodies
+        // are unfetchable by this build, and leaving them in work-remaining
+        // means `pendingBodyCount` never reaches 0, `isFullyComplete` is false
+        // forever, and the sync banner never clears. Owner decision 2026-09-01.
+        // If a future fix makes these bodies fetchable again, the two requests
+        // and the body-queue admission queries drop the flag together.
+        let indexed = try MessageHeader.bodySettledRequest(accountId: accountId).fetchCount(db)
+        // Completion gates on this reaching 0, not on an exact count match
+        // against a server-reported total.
+        let pending = try MessageHeader.pendingBodyRequest(accountId: accountId).fetchCount(db)
+        return (total, indexed, pending)
     }
 
     /// UID walk progress: per folder, the scope is UIDNEXT-1 (from the provider's

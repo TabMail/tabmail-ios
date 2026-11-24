@@ -67,3 +67,102 @@
 **Rule 1 applied.** `messageBody_staleEvict` on `messageBody(fetchedAt)` serves the stale-body evict step's keyset page (`SyncEngine.staleBodyPageSQL`: the next `pruneChunkSize` bodies older than the cache cutoff after a `(fetchedAt, rowid)` cursor, in index order). `EXPLAIN QUERY PLAN` before: `SCAN messageBody` (the old page, `LIMIT … OFFSET …`, walked the table from its start inside its write, through the overflow pages of every kept body, since `fetchedAt` is stored after the HTML). After: `SEARCH messageBody USING INDEX messageBody_staleEvict ((fetchedAt,rowid)>(?,?) AND fetchedAt<?)`, no scan, no temp B-tree; the first page is `(fetchedAt<?)`. Before it, `messageBody` had only its primary-key autoindex, and nothing else records when a body was cached, so no existing index could carry the predicate. A full index, not a partial one (rule 2): the stale set does not drain to empty (the rules keep inbox and recent bodies) and its bound moves with the clock. No index is dropped (rules 3 and 4). Only the evict step filters or orders on `fetchedAt`. Every other `messageBody` statement selects rows by `id` (one key, an `id` list or subquery, or an `id` prefix or range), reads `MAX(rowid)` by a right-edge rowid lookup (the v70 migration's diagnostic and `MigrationTimingLedger.measureChainScale`), or works on the whole table (wipes, a migration's copy), so no other plan can move to the new index.
 
 **Built deferred, rule 5 by the amended timing.** The index is in `SyncEngine.deferredIndexes` (IOS-PERF-005), not a migration, because building it reads every cached body once. The build is DDL, so it moves `schema_version`, and the same maintenance pass's `runRefreshPlannerStatisticsIfStale` (which runs after it) refreshes the statistics when it completes; it is single-flight and gives up while the database is suspended, and a pass where it does not complete leaves its marker stale, so a later pass refreshes them. The evict step runs only once the index exists (`runEvictStaleBodiesIfIndexed`), so its page never runs unindexed. Detail: IOS-PERF-002 amendment of the same date.
+
+---
+
+## Amendment 2026-11-24: a deferred index and the statistics refresh commit in one write
+
+**Rule 5's timing, refined.** The amended rule 5 (statistics refreshed by the background pass, once per schema change, whole-database) is unchanged. What changes is where a deferred index is built: no longer in a write of its own before the refresh, but inside the refresh's write. `SyncEngine.runRefreshPlannerStatisticsIfStale` builds every missing deferred index (`SyncEngine.deferredIndexes`), runs `ANALYZE`, and reads `schema_version` for its marker in one write; when no deferred index is missing it is the same statistics refresh as before. It checks for missing deferred indexes before its marker, so a deferred index added later is built even where the statistics are already fresh.
+
+**Why.** `CREATE INDEX` moves `schema_version` and `ANALYZE` does not (once `sqlite_stat1` exists), and a connection reloads its schema and statistics only when `schema_version` has moved. Built in a write of its own, the index was visible for a moment with no statistics, and a connection that read in that moment kept planning from the new index beside the other indexes' old statistics after the refresh committed, until it was closed. A census of 14 statements over five statistics regimes and two index shapes found such connections planning differently from a fresh one; in one write they all converge (IOS-PERF-005, amendment of the same date, pinned by `DeferredIndexStatisticsTests`).
+
+**Negative case.** This does not narrow the refresh to the new index: `ANALYZE <index>` in the build's write was exact only when the other statistics were current, and NEGATIVE CASE 2 above still holds. Nor does it move any build onto the launch path: the write runs only in the background maintenance pass, at `.background`, and rolls back whole if cancelled or failing.
+
+---
+
+## Amendment 2026-11-24 (#1401): `messageHeader_backfillProgress`
+
+**Rule 1 applied.** `messageHeader_backfillProgress` on `messageHeader(accountId, bodyComplete, bodyEmptyConfirmed, bodyMetadataOversized, headerComplete)` serves the three counts the backfill progress publishes for one account on every update (`SyncEngine.backfillProgressCounts`, called by `updateBackfillProgressForAccount`). It holds every column `MessageHeader.bodySettledRequest` and `MessageHeader.pendingBodyRequest` test, so both counts read its entries and never a header row: the pending count seeks all five columns, the settled count seeks the account and tests its `OR` in each entry. Before it, the settled count planned `SEARCH messageHeader USING INDEX messageHeader_accountId_messageId (accountId=?)` and read every header row of the account, and the pending count planned `SEARCH messageHeader USING INDEX idx_messageHeader_bodyStatus (headerComplete=? AND bodyComplete=? AND bodyEmptyConfirmed=?)` and read every pending row of every account. No existing index has `accountId` together with `bodyEmptyConfirmed` and `bodyMetadataOversized`, so none could carry either predicate. The total keeps its `accountId`-led covering index. The two predicates and their documented `headerComplete` asymmetry are unchanged; each update still counts the whole set.
+
+**A full index, not a partial one (rule 2).** The settled set grows to the whole account, so it does not drain to empty. A partial index on the unsettled rows would also not be chosen for these counts: GRDB binds `== true` and `== false` as parameters, and SQLite matches a partial index's `WHERE` against literal terms, not against parameters bound after the statement is prepared.
+
+**Nothing dropped (rules 3, 4 and 6).** The index extends v40's `messageHeader_accountId_bodyComplete` and keeps its prefix, so it serves every plan that one serves; v40's stays, as v40's `messageHeader_bodyRepopulate` stayed beside `messageHeader_bodyRepopulateV2`.
+
+**Built deferred, rule 5 by the amended timing.** It is in `SyncEngine.deferredIndexes` (IOS-PERF-005): building it reads every header once, and its absence changes no result, only how much the counts read; nothing names it in an `INDEXED BY`. It is built inside the statistics refresh's write with the other deferred indexes (amendment above), so the index and its statistics commit together. `BackfillProgressCountTests` pins the plans in three statistics states (the migration chain's, none, a fresh `ANALYZE`), with a control that drops the index and reproduces both row-reading plans, and compares the counts against the same read without the index on an empty database, one row in each flag combination, tied index keys, several accounts with one empty, and 100,000 rows.
+
+**Measured (#1401, iOS simulator, `BackfillProgressIndexProofTests` on `DBProof.Shape.large`: 105,000 headers in four accounts, the app's own SQLite).**
+
+Size, after a vacuum. Of the 43,180-page database:
+
+| Index | Pages | Size | Per header | Share of the database |
+|---|---|---|---|---|
+| `messageHeader_backfillProgress` | 1,258 | 5.15 MB | 49.1 bytes | 2.91% |
+| v40's `messageHeader_accountId_bodyComplete` | 1,188 | 4.87 MB | 46.3 bytes | 2.75% |
+
+Write cost, as median wall time old -> new, new/old ratio. "No statistics" is no `sqlite_stat1`; "analyzed" is after the app's `ANALYZE`. These are the figures of the final proof run, on the head that ships.
+
+| Write | No statistics | Analyzed | Pages written |
+|---|---|---|---|
+| 100 new headers | 37.8 -> 45.0 ms (1.19) | 37.3 -> 42.5 ms (1.14) | 232 -> 241 |
+| `headerComplete = 1` on 200 headers | 59.5 -> 64.4 ms (1.08) | 53.5 -> 54.7 ms (1.02) | 754 -> 777 |
+| `bodyComplete = 1` on 50 bodies | 44.4 -> 59.6 ms (1.34) | 42.7 -> 65.2 ms (1.53, marked slower) | 339 -> 511 |
+
+The harness marks every ratio within noise except the analyzed `bodyComplete` flip. That flip writes 51% more pages because the index holds that column, so each completed body moves one entry. In time this is about 15 to 22 ms more per 50-body batch write, or 0.30 to 0.45 ms per body. An earlier run of the same proof measured about 0.15 ms per body with the same page counts. The accepted figure is this run's, and the page count is the stable measure. The cost is accepted against the reads it saves (below): each progress update reads 102 pending pages instead of 5,178 to 7,986, and 716 settled pages instead of 6,467. A body download's network time is far above half a millisecond.
+
+Census of the hot reads, with the index present and without it, in four statistics states:
+- the migration chain's;
+- none;
+- a fresh `ANALYZE` with the index present;
+- an `ANALYZE` taken before the index was built.
+
+Pages read, with the index / without it:
+
+| Read | Migration chain's | None | Fresh `ANALYZE` | `ANALYZE` before the index |
+|---|---|---|---|---|
+| Settled count | 716 / 6,467 | 716 / 6,467 | 716 / 6,467 | 716 / 6,467 |
+| Pending count | 102 / 7,986 | 102 / 7,986 | 102 / 5,178 | 102 / 5,178 |
+| Total count | 677 / 677 | 677 / 677 | 677 / 677 | 716 / 677 |
+| Embedding repopulate (`repopulateSQL`) | 511 / 511 | 511 / 511 | 511 / 511 | 511 / 511 |
+
+Every other hot read (the body download queues, the inbox member seed, the label-filter page) reads within 0.3% of the same pages in every state.
+
+What changed:
+- The pending count reads 102 pages instead of 7,986 (the migration chain's and no statistics) or 5,178 (fresh and stale).
+- The settled count reads 716 pages instead of 6,467, in every state.
+
+Two reads cost more:
+- **The embedding repopulate read.** Its statement is now `BackfillEmbeddingQueue.repopulateSQL`, which both queues' repopulate reads run.
+  - **What happened:** with this index present and a fresh `ANALYZE`, SQLite planned it as `SEARCH messageHeader USING INDEX messageHeader_backfillProgress (ANY(accountId) AND bodyComplete=? AND bodyEmptyConfirmed=?) | USE TEMP B-TREE FOR ORDER BY`. That is a skip-scan by account plus a sort of the whole backlog: 10,831 pages instead of 511, and 915,829 VM steps instead of 2,509.
+  - **The fix:** the statement names `messageHeader_embeddingIncomplete` with `INDEXED BY`. That index is migration-built (v50) and never deferred, so it always exists, and the read keeps its ordered scan in every state.
+  - **Pinned by:** `BackfillProgressCountTests.embeddingRepopulateKeepsItsIndex`. It checks the plan in every statistics state and under the `sqlite_stat1` rows of a full `ANALYZE` of the proof database (taken with the Mac's sqlite3 and identical to the simulator's `ANALYZE` of it; a plain `ANALYZE` with no analysis limit, as the app runs, counts exactly, so the app's writes the same rows on that data), and it is red without the name under those rows. Setup checks compare the rows with the table's index list and require that under them the read without the name plans the skip-scan, so rows from another database fail the test instead of passing it. A fresh `ANALYZE` of the test's own 20,000 headers does not reproduce the skip-scan on the simulator's SQLite (the Mac's SQLite plans it from 5,000 headers), so the test carries the large mailbox's statistics. The planner reads nothing else about the table: the app's SQLite keeps no `sqlite_stat4`. The proof's census probe runs the production statement.
+- **The total count, in the stale state only.** It moves to this index: 716 pages instead of 677 (+6%), because v40's index is the smaller covering index for that count.
+  - **Accepted:** the pass no longer leaves this state. The deferred build runs inside the statistics refresh's write (amendment above), so no connection sees the index without its statistics. The census keeps the state as the worst case: before that change, a connection that loaded the schema between the build and the `ANALYZE` held it until it was closed.
+  - **Why v40 stays:** in every other state the total still reads v40's `messageHeader_accountId_bodyComplete`, and it is the cheaper index there.
+
+---
+
+## Amendment 2026-11-24 (#1397): `messageHeader_completeByDate`
+
+**Rule 1 applied.** `messageHeader_completeByDate` on `messageHeader(date, id) WHERE headerComplete = 1 AND bodyComplete = 1` serves the start-up search self-check's candidate read (`SyncEngine.ftsBodyMembershipCandidateSQL`, the newest 2,000 complete headers of every account), which runs at every launch and every return to the foreground.
+- **Before:** `EXPLAIN QUERY PLAN` showed `SEARCH messageHeader USING INDEX idx_messageHeader_bodyStatus (headerComplete=? AND bodyComplete=?)` and `USE TEMP B-TREE FOR ORDER BY`. The read read and sorted every complete header before it returned the first.
+- **After:** `SCAN messageHeader USING COVERING INDEX messageHeader_completeByDate`. The read walks the index newest first, stops at the 2,000th entry, and reads no table page.
+- **No existing index could do this.** None orders the complete headers by `date`, so none could return them in date order.
+
+**A partial index, for its scope.** The complete set does not drain to empty: it is most of the table, so rule 2's reason does not apply. The index is partial so that only a statement whose WHERE implies `headerComplete = 1 AND bodyComplete = 1` can use it.
+- **The full-index version failed.** A first version was a full index on `(headerComplete, bodyComplete, date, id)`. The planner also chose it for the start-up recovery read (`headerComplete = 0`, `LIMIT 500`), which then read 40 to 97 percent more pages than through `idx_messageHeader_bodyStatus` (simulator proof at 105,000 and 525,000 headers). A partial index cannot serve that read.
+- **Only two statements can use it.** In the app, only the candidate read and the page of the one-time sweep `healAllFTSBodyMembership` have a WHERE that implies the index's. The candidate statement keeps its two literals: SQLite matches a partial index's WHERE against literal terms, not against parameters bound after the statement is prepared.
+- **Fewer writes.** A header enters the index only once both flags are 1. Inserting a header that has no body, or marking a header complete before its body arrives, does not write to the index.
+
+**Statistics states.**
+- **Statistics taken after the sync:** the candidate read uses the index; the recovery read and the sweep page keep their plans.
+- **`sqlite_stat1` emptied:** all three reads keep the plans they had without the index, with no gain and no loss.
+- **Statistics taken on an empty mailbox** (a fresh install whose first maintenance pass runs before its first sync): the candidate read uses the index, and the sweep page may too. That sweep runs once per device, seconds after the first launch's sync starts, when such a mailbox is still nearly empty. Before this index, the sweep page already sorted every complete header in that state.
+
+**Nothing dropped (rules 3, 4 and 6).** `idx_messageHeader_bodyStatus` still serves the recovery read, and serves the sweep page when no statistics exist.
+
+**Built deferred, rule 5 by the amended timing.** The index is in `SyncEngine.deferredIndexes` (IOS-PERF-005) for three reasons: building it reads every header once; without it no result changes, only the read's cost; and the statement names no index. It is built inside the statistics refresh's write with the other deferred indexes (amendment of 2026-11-24 above), so the index and its statistics commit together.
+
+**Pinned by:**
+- `FTSSelfHealCandidateReadTests` compares the read with the index against the replaced read, without the index, on these mailboxes: empty, one row, only incomplete headers, a window that cuts a run of equal dates, several accounts, and 100,000 rows both dense and sparse. It runs each comparison in the three statistics states, pins the plans in each state, and checks that the recovery read and the sweep page do not move to the index.
+- `FTSSelfHealCandidateProofTests` measures, on the proof databases: the read, the two other reads, the sync pass's header writes, and the index's size.
+- The query registry gives the read the verdict `STOPS: FTSSelfHealCandidateReadTests.candidateReadStopsAtTheWindow`, not `SEEK`: the plan check runs without statistics too, and there the planner does not choose a partial index.

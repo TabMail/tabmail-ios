@@ -57,4 +57,29 @@ has the requested shape and completion mix, the statistics states differ only as
 reaches only its own file, the counters tell a scan from a seek, a write leaves the prepared file alone, and
 an empty comparison is refused.
 
+## Plan tests that pin a plan (found 2026-11-24)
+
+A unit test that pins a statement's plan (`EXPLAIN QUERY PLAN`) on a small fixture often adds a
+"large mailbox" state by writing `sqlite_stat1` rows into the fixture. Two rules make that state prove
+something:
+
+1. **Take the rows from the database the claim is about.** Run a full `ANALYZE` of the proof base
+   (`proof-base.sqlite` of the unit's own proof dir, not another copy) and copy its rows. The Mac's
+   `sqlite3` and the simulator plan alike on identical `sqlite_stat1` rows when no `sqlite_stat4` is
+   present, so the Mac's rows serve once they are compared with the simulator's. Rows from another
+   database can describe a table on which the planner never picks the bad plan. #1401's test passed with
+   the pin removed twice for that reason.
+2. **Add a positive control under the injected rows.** At setup, plan the statement WITHOUT its pin
+   (for example without its `INDEXED BY`) and assert it plans the exact bad plan the pin exists to
+   prevent. If it does not, the state pins nothing and the test must fail, not pass. Also check that the
+   injected rows name every index of the table and no other, so a new index cannot silently fall
+   outside them.
+
+A plan check also pins **every loop** of a join, not only the plan's first line: the label-walk hand-off
+statement fixed its outer loop but left the inner `messageHeader` access to the planner, which with no
+`sqlite_stat1` range-scanned a folder index once per outer row (about 24M VM steps), while the gate
+checked only the first line.
+
 **Related.** The startup budget a launch query must fit: [042](042-syncstartup-budget-discipline-v50-v51-lesson.md).
+
+**Where it is asked for.** A query-cost note at every schema and migration entry point (the main database's migrations, the notification staging database, the body-asset manifest, the badge table, the search and memory indexes, the deferred indexes) asks every new query, index, table or column to add no new scan unless no index or plainer query can avoid it, and points here. `QueryCostNoteFenceTests` keeps the note in place, word for word, and requires it in any new source file that defines schema.

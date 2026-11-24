@@ -29,10 +29,151 @@ extension SyncEngine {
     /// non-numeric `messageId` in an IMAP folder would read as 0 and so sort
     /// first, pruned before every UID; no IMAP path writes one.
     nonisolated static func pruneOrderSQL(_ mode: StaleWindowMode) -> String {
+        "\(pruneKeySQL(mode)) ASC"
+    }
+
+    /// The prune order's key, as its index stores it: `messageHeader_folderId_uidInt`
+    /// for `.uid`, `messageHeader_folderId_date` for `.date`. Rows that share a key
+    /// come out of either index in `rowid` order.
+    nonisolated static func pruneKeySQL(_ mode: StaleWindowMode) -> String {
         switch mode {
-        case .uid: return "CAST(messageId AS INTEGER) ASC"
-        case .date: return "date ASC"
+        case .uid: return "CAST(messageId AS INTEGER)"
+        case .date: return "date"
         }
+    }
+
+    /// The last row a body-pass page returned: its prune key as stored (compared
+    /// in the column's own representation, never re-encoded) and its `rowid`.
+    struct PruneCursor: Sendable {
+        let key: DatabaseValue
+        let rowId: Int64
+    }
+
+    /// The rows after the cursor in (prune key, `rowid`) order. On `date` it is the
+    /// row value `(date, rowid) > (?, ?)`, which the index seeks in full, so rows
+    /// that share a date are never read twice. SQLite does not match a row value
+    /// against an indexed expression: `(CAST(messageId AS INTEGER), rowid) > (?, ?)`
+    /// seeks only `folderId` and walks the folder from its start. So on `.uid` it is
+    /// a range on the key, which the index seeks, plus a test of the `rowid` among
+    /// the rows that share the cursor's key: one row in an IMAP folder, whose UIDs
+    /// are unique.
+    private nonisolated static func pruneCursorPredicate(_ mode: StaleWindowMode, afterCursor: Bool) -> String {
+        guard afterCursor else { return "" }
+        switch mode {
+        case .uid:
+            let key = pruneKeySQL(mode)
+            return " AND \(key) >= ? AND (\(key) > ? OR rowid > ?)"
+        case .date:
+            return " AND (date, rowid) > (?, ?)"
+        }
+    }
+
+    /// One body-pass page: the next `limit` rows of a folder after the cursor, in
+    /// the prune order with ties in `rowid` order, as a seek on the order's index
+    /// (#1402). Arguments: `pruneArguments`.
+    nonisolated static func prunePageSQL(_ mode: StaleWindowMode, afterCursor: Bool) -> String {
+        let key = pruneKeySQL(mode)
+        return """
+            SELECT rowid AS pruneRowId, id, \(key) AS pruneKey FROM messageHeader
+            WHERE folderId = ?\(pruneCursorPredicate(mode, afterCursor: afterCursor))
+            ORDER BY \(key), rowid LIMIT ?
+            """
+    }
+
+    /// How many of a folder's rows lie after the cursor (all of them without one),
+    /// counted up to `limit` only: it reads at most `limit` index entries, whatever
+    /// the folder's size (#1402). Arguments: `pruneArguments`.
+    nonisolated static func pruneRemainderSQL(_ mode: StaleWindowMode, afterCursor: Bool) -> String {
+        let key = pruneKeySQL(mode)
+        return """
+            SELECT count(*) FROM (SELECT 1 FROM messageHeader
+            WHERE folderId = ?\(pruneCursorPredicate(mode, afterCursor: afterCursor))
+            ORDER BY \(key), rowid LIMIT ?)
+            """
+    }
+
+    /// `[folderId, limit]` without a cursor; after one, `[folderId, key, key, rowid,
+    /// limit]` on `.uid` and `[folderId, key, rowid, limit]` on `.date`.
+    nonisolated static func pruneArguments(
+        _ mode: StaleWindowMode, folderId: String, cursor: PruneCursor?, limit: Int
+    ) -> StatementArguments {
+        guard let cursor else { return [folderId, limit] }
+        switch mode {
+        case .uid: return [folderId, cursor.key, cursor.key, cursor.rowId, limit]
+        case .date: return [folderId, cursor.key, cursor.rowId, limit]
+        }
+    }
+
+    /// Whether more than `floor` of the folder's rows lie after the cursor (all of
+    /// them without one). It reads at most `floor + 1` index entries. Until #1402
+    /// the prune counted the whole folder for this: once per folder in the body
+    /// pass, and before every chunk of the header pass.
+    nonisolated static func pruneRowsBeyondFloor(
+        _ db: Database, folderId: String, mode: StaleWindowMode, after cursor: PruneCursor?, floor: Int
+    ) throws -> Bool {
+        let counted = try Int.fetchOne(
+            db, sql: pruneRemainderSQL(mode, afterCursor: cursor != nil),
+            arguments: pruneArguments(mode, folderId: folderId, cursor: cursor, limit: floor + 1)) ?? 0
+        return counted > floor
+    }
+
+    /// One folder's body pass: deletes the cached bodies of its rows oldest first
+    /// in the prune order, a page of `chunkSize` rows at a time, while more than
+    /// `floor` rows lie after the last page (`pruneRowsBeyondFloor`) and, asked
+    /// after that, `isOverBudget()` holds. Returns how many bodies it deleted.
+    /// `isOverBudget` is `StorageEstimator.isOverBudget` in the pass; a test passes
+    /// its own to stop after a given number of pages.
+    ///
+    /// A page is the next `chunkSize` rows after a cursor (`prunePageSQL`), a seek
+    /// on the order's index, so it costs the same wherever it lies in the folder,
+    /// and a pass reads each row once (#1402). Until #1402 the page was
+    /// `LIMIT chunkSize OFFSET n` after a full count of the folder: each page
+    /// stepped over every row before it, so a folder of n rows read about
+    /// n² / (2 · chunkSize) index entries. In a folder no other writer changes during
+    /// the pass, the pages, their order and the stops are the same: the rows after
+    /// the cursor are the folder's count less the offset, so "more than `floor` of
+    /// them" is exactly the former `offset < count - floor`, and rows that share a
+    /// key come in `rowid` order, as the index returned them. When sync writes the
+    /// folder meanwhile, the check counts the rows after the cursor as they are then,
+    /// where the former walk kept its start-of-pass count and offset: a row deleted
+    /// before the cursor no longer makes the walk skip rows or run into the floor, a
+    /// row deleted after it stops the pass earlier, a row inserted before it is no
+    /// longer re-read, and a row inserted after it can let the pass prune up to that
+    /// many more older bodies, rounded to pages, each outside the floor when checked.
+    /// A row deleted between a check and its page can still put that page inside the
+    /// floor, as the last page may be; the former walk had the whole pass for that.
+    /// As before, the last page is a whole page even when fewer rows are left above
+    /// the floor, so it can delete the bodies of rows inside the floor.
+    ///
+    /// A read that fails ends the folder's pass, as a failed count or page did.
+    nonisolated static func pruneFolderBodies(
+        dbPool: PrioritizedDatabase, folderId: String, mode: StaleWindowMode,
+        floor: Int, chunkSize: Int, isOverBudget: () -> Bool
+    ) -> Int {
+        var removed = 0
+        var cursor: PruneCursor?
+        while (try? dbPool.read({ db in
+            try pruneRowsBeyondFloor(db, folderId: folderId, mode: mode, after: cursor, floor: floor)
+        })) ?? false, isOverBudget() {
+            let page: [(id: String, cursor: PruneCursor)] = (try? dbPool.read { db in
+                try Row.fetchAll(
+                    db, sql: prunePageSQL(mode, afterCursor: cursor != nil),
+                    arguments: pruneArguments(mode, folderId: folderId, cursor: cursor, limit: chunkSize)
+                ).map { row -> (id: String, cursor: PruneCursor) in
+                    let key: DatabaseValue = row["pruneKey"]
+                    let rowId: Int64 = row["pruneRowId"]
+                    return (id: row["id"], cursor: PruneCursor(key: key, rowId: rowId))
+                }
+            }) ?? []
+            guard let last = page.last else { break }
+            let headerIds = page.map(\.id)
+            let deleted = (try? dbPool.write { db in
+                try MessageBody.filter(headerIds.contains(Column("id"))).deleteAll(db)
+            }) ?? 0
+            removed += deleted
+            cursor = last.cursor
+        }
+        return removed
     }
 
     /// Nonisolated prune — runs entirely off the main thread. `pruneOrder` is each
@@ -68,34 +209,13 @@ extension SyncEngine {
             // An account with no registered provider (it failed to register,
             // e.g. missing credentials) is still pruned, oldest date first as
             // before #1062: no catch-up of it runs to reload what is pruned.
-            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
+            let mode = pruneOrder[account.id] ?? .date
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
-                let totalInFolder = (try? dbPool.read { db in
-                    try MessageHeader.filter(Column("folderId") == folder.id).fetchCount(db)
-                }) ?? 0
-                guard totalInFolder > floor else { continue }
-                let pruneCount = totalInFolder - floor
-
-                var offset = 0
-                while offset < pruneCount, StorageEstimator.isOverBudget() {
-                    let headerIds: [String] = (try? dbPool.read { db in
-                        try String.fetchAll(db,
-                            MessageHeader
-                                .select(Column("id"))
-                                .filter(Column("folderId") == folder.id)
-                                .order(sql: orderSQL)
-                                .limit(pruneChunkSize, offset: offset)
-                        )
-                    }) ?? []
-                    guard !headerIds.isEmpty else { break }
-                    let deleted = (try? dbPool.write { db in
-                        try MessageBody.filter(headerIds.contains(Column("id"))).deleteAll(db)
-                    }) ?? 0
-                    bodiesRemoved += deleted
-                    offset += headerIds.count
-                }
+                bodiesRemoved += pruneFolderBodies(
+                    dbPool: dbPool, folderId: folder.id, mode: mode,
+                    floor: floor, chunkSize: pruneChunkSize, isOverBudget: StorageEstimator.isOverBudget)
             }
         }
         if bodiesRemoved > 0 {
@@ -107,15 +227,19 @@ extension SyncEngine {
             // An account with no registered provider (it failed to register,
             // e.g. missing credentials) is still pruned, oldest date first as
             // before #1062: no catch-up of it runs to reload what is pruned.
-            let orderSQL = pruneOrderSQL(pruneOrder[account.id] ?? .date)
+            let mode = pruneOrder[account.id] ?? .date
+            let orderSQL = pruneOrderSQL(mode)
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
                 guard StorageEstimator.isOverBudget() else { break }
                 while StorageEstimator.isOverBudget() {
-                    let currentCount = (try? dbPool.read { db in
-                        try MessageHeader.filter(Column("folderId") == folder.id).fetchCount(db)
-                    }) ?? 0
-                    guard currentCount > floor else { break }
+                    // At most `floor + 1` index entries, not a count of the whole
+                    // folder before every chunk (#1402). A failed read stops the
+                    // folder, as the count's `?? 0` did.
+                    let beyondFloor = (try? dbPool.read { db in
+                        try pruneRowsBeyondFloor(db, folderId: folder.id, mode: mode, after: nil, floor: floor)
+                    }) ?? false
+                    guard beyondFloor else { break }
                     let batch: [MessageHeader] = (try? dbPool.read { db in
                         try MessageHeader
                             .filter(Column("folderId") == folder.id)
@@ -224,7 +348,7 @@ extension SyncEngine {
     ///
     /// Without the index every page would scan and sort the whole table inside its
     /// write, the #1354 hold made worse. The index is deferred, built later in the
-    /// same pass (`runBuildDeferredIndexesIfMissing`), so the first pass after an
+    /// same pass (`runRefreshPlannerStatisticsIfStale`), so the first pass after an
     /// upgrade skips the step and the next one evicts; stale bodies stay cached one
     /// pass longer, which changes nothing but disk use. A schema that cannot be read
     /// counts as missing (retried next pass).
@@ -649,7 +773,7 @@ extension SyncEngine {
                 // is a best-effort background sweep, the rows it failed to remove
                 // are inert (`status == failed` is outside `drainCalendarQueue`'s
                 // filter), and the next pass retries. Its two siblings in this
-                // file — `runBuildDeferredIndexesIfMissing`'s success and
+                // file — `runRefreshPlannerStatisticsIfStale`'s success and
                 // abandoned arms — are gated the same way, including the error arm.
                 if DebugModeManager.isLoggingEnabled() {
                     BackgroundSyncLogger.logDebug("[CalendarQueue] Retired-op reclaim failed: \(error)")
@@ -672,24 +796,25 @@ extension SyncEngine {
     ///
     /// Gmail duplicate-label safety: if the same rfc822MessageId still
     /// exists in inbox, the tag is legitimate (Gmail shows the same
-    /// message in both Inbox and All Mail) and we skip it.
-    func sweepStaleActionTags(account: Account, provider _: any EmailProvider) async {
+    /// message in both Inbox and All Mail) and we skip it. Each candidate
+    /// (a tagged non-inbox row past the TTL with a Message-ID) is checked on
+    /// its own with `inboxCopySQL`, a seek on the Message-ID index; a sweep
+    /// with no candidate reads no inbox row at all (#1404). A check that
+    /// fails keeps that tag; the next full sync's sweep checks it again.
+    ///
+    /// `inboxCopyExists` replaces that check (tests); nil reads `inboxCopySQL`.
+    func sweepStaleActionTags(
+        account: Account,
+        provider _: any EmailProvider,
+        inboxCopyExists: (@Sendable (_ rfc822MessageId: String, _ accountId: String) async throws -> Bool)? = nil
+    ) async {
         let maxPerSweep = SyncConfig.pruneChunkSize
-
-        // Collect inbox rfc822MessageIds for the duplicate-label guard.
-        let inboxRfc822Ids: Set<String> = (try? await dbPool.read { db in
-            let inboxHeaders = try MessageHeader
-                .filter(Column("accountId") == account.id && Column("isInInbox") == true)
-                .limit(SyncConfig.maxLoadedMessages)
-                .fetchAll(db)
-            var ids = Set<String>()
-            for msg in inboxHeaders {
-                if let rfc = msg.rfc822MessageId, !rfc.isEmpty {
-                    ids.insert(rfc)
-                }
+        let pool = dbPool
+        let inboxCopyExists = inboxCopyExists ?? { rfc822MessageId, accountId in
+            try await pool.read { db in
+                try Self.inboxCopyExists(db, rfc822MessageId: rfc822MessageId, accountId: accountId)
             }
-            return ids
-        }) ?? []
+        }
 
         let folders = (try? await dbPool.read { db in
             try Folder.filter(Column("accountId") == account.id && Column("role") != FolderRole.inbox.rawValue).fetchAll(db)
@@ -714,11 +839,6 @@ extension SyncEngine {
             for msg in msgs where msg.actionTag != nil {
                 guard cleared < maxPerSweep else { break }
 
-                // Gmail safety: if this rfc822MessageId is still in inbox, skip.
-                if let rfc = msg.rfc822MessageId, !rfc.isEmpty, inboxRfc822Ids.contains(rfc) {
-                    continue
-                }
-
                 // TTL guard: only reclaim once the tag is older than
                 // SyncConfig.actionTagTTLSeconds. A NULL `actionTagSetAt`
                 // (legacy pre-migration row, or a writer that failed to stamp
@@ -729,6 +849,15 @@ extension SyncEngine {
                 // timestamp is likewise treated as expired (ADR-IOS-008).
                 if let setAt = msg.actionTagSetAt, setAt > cutoff {
                     continue
+                }
+
+                // Gmail safety: if this rfc822MessageId is still in inbox, skip.
+                // Checked after the TTL so a young tag costs no read; a failed
+                // check keeps the tag (fail closed).
+                if let rfc = msg.rfc822MessageId, !rfc.isEmpty {
+                    guard let inInbox = try? await inboxCopyExists(rfc, account.id), !inInbox else {
+                        continue
+                    }
                 }
 
                 // Clear local state — action tags are local-only (ADR-IOS-036),
@@ -752,6 +881,27 @@ extension SyncEngine {
         if cleared > 0 {
             BackgroundSyncLogger.logDebug("[StaleTagSweep] Swept \(cleared) stale tags for \(account.emailAddress)")
         }
+    }
+
+    /// Whether `accountId` has an inbox row with this Message-ID: the stale-tag
+    /// sweep's Gmail duplicate guard, read once per candidate.
+    ///
+    /// It names its index, as `aiCacheInInboxSQL` does, so it always seeks the
+    /// Message-ID (the few copies of one message) whatever the planner statistics
+    /// hold. Left to the planner, the read walks `messageHeader_isInInbox_date`
+    /// (every inbox row of every account) with no statistics, and scans the whole
+    /// table with statistics recorded while `messageHeader` held a row or two (a
+    /// fresh install's first maintenance pass); nothing re-analyzes the table
+    /// while its schema is unchanged. `messageHeader_rfc822MessageId` is built by
+    /// the migrations, never deferred.
+    nonisolated static let inboxCopySQL = """
+        SELECT 1 FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND accountId = ? AND isInInbox = 1
+        LIMIT 1
+        """
+
+    nonisolated static func inboxCopyExists(_ db: Database, rfc822MessageId: String, accountId: String) throws -> Bool {
+        try Int.fetchOne(db, sql: inboxCopySQL, arguments: [rfc822MessageId, accountId]) != nil
     }
 
     // MARK: - Chat Session Eviction
@@ -851,19 +1001,6 @@ extension SyncEngine {
         let sql: String
     }
 
-    /// What one call to `runBuildDeferredIndexesIfMissing` did. Returned so the
-    /// invariant — *a deferred index is built exactly once and the pass converges* —
-    /// is observable without reaching into `sqlite_master` from the caller.
-    enum DeferredIndexBuild: Equatable, Sendable {
-        /// Every deferred index already exists. Nothing was written.
-        case alreadyPresent
-        /// At least one was missing and the whole set has now been created.
-        case built
-        /// The probe could not read the schema, or the create failed / was cancelled
-        /// / hit a suspension. NOTHING is recorded, so the next pass retries.
-        case abandoned
-    }
-
     /// Indexes moved OFF the blocking migration path (ADR-IOS-029, 2026-08-05
     /// amendment; owner directive *"startup migrations should really have only
     /// things that are absolutely necessary and blocking. Other things should happen
@@ -922,6 +1059,13 @@ extension SyncEngine {
     /// because `CREATE INDEX IF NOT EXISTS` is a no-op on the first and a build on
     /// the second, and this pass runs from both the foreground poll and the
     /// BGProcessing drain. Registered as `IOS-PERF-005`.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     nonisolated static let deferredIndexes: [DeferredIndex] = [
         DeferredIndex(
             name: "messageHeader_unreadSweep",
@@ -959,26 +1103,70 @@ extension SyncEngine {
             sql: """
                 CREATE INDEX IF NOT EXISTS messageBody_staleEvict
                 ON messageBody(fetchedAt)
+                """),
+        // #1401: the backfill progress counts (`backfillProgressCounts`) count
+        // `MessageHeader.bodySettledRequest` and `.pendingBodyRequest` for one account
+        // on every progress update. This index holds every column either predicate
+        // tests, so both counts read its entries and never a header row: the pending
+        // count seeks all five columns, the settled count reads the account's entries
+        // and tests its OR in each. No other index has `accountId` with
+        // `bodyEmptyConfirmed` and `bodyMetadataOversized`. It extends v40's
+        // `messageHeader_accountId_bodyComplete` and keeps its prefix, so it serves
+        // every plan that one does; v40's stays (ADR-IOS-029 rules 3 and 4). Deferred:
+        // the build reads every header once, and its absence changes no result, only
+        // how much the counts read.
+        DeferredIndex(
+            name: "messageHeader_backfillProgress",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_backfillProgress
+                ON messageHeader(accountId, bodyComplete, bodyEmptyConfirmed,
+                                 bodyMetadataOversized, headerComplete)
+                """),
+        // Serves `SyncEngine.ftsBodyMembershipCandidateSQL`, the start-up search
+        // self-check's newest 2,000 complete headers (#1397). With it that read walks
+        // this index newest first, takes `id` from it (covering: no table page is read)
+        // and stops at the 2,000th entry; without it the read seeks
+        // `idx_messageHeader_bodyStatus` and sorts every complete header of every
+        // account before returning the first. Deferred because its absence degrades
+        // performance and nothing else: the statement names no index and picks the same
+        // headers either way, so until the first maintenance pass builds it the read
+        // costs what it cost before.
+        //
+        // PARTIAL, on purpose. It holds only complete headers, so SQLite can use it only
+        // for a statement whose WHERE implies `headerComplete = 1 AND bodyComplete = 1`.
+        // A full index led by `headerComplete` was also taken by the start-up recovery
+        // read (`headerComplete = 0`), which then read more pages than through
+        // `idx_messageHeader_bodyStatus`. Only a header whose two flags are both 1 is
+        // written to it: inserting a header with no body, or marking a header complete
+        // before its body, leaves it alone.
+        DeferredIndex(
+            name: "messageHeader_completeByDate",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_completeByDate
+                ON messageHeader(date, id)
+                WHERE headerComplete = 1 AND bodyComplete = 1
                 """)
     ]
 
     /// The index the stale-body evict step seeks (`deferredIndexes`).
     nonisolated static let staleBodyIndexName = "messageBody_staleEvict"
 
-    /// Creates every deferred index that does not already exist, inside the caller's
-    /// transaction.
+    /// Creates every index in `indexes` (the deferred set unless a test names another)
+    /// that does not already exist, inside the caller's transaction.
     ///
     /// Separate from the `async` pass below so a test can reach the PRODUCTION DDL
     /// through a plain `Database` instead of re-typing the `CREATE INDEX` — a
     /// re-typed copy is a test that passes against a statement the app does not run.
-    nonisolated static func createDeferredIndexes(_ db: Database) throws {
-        for index in deferredIndexes {
+    nonisolated static func createDeferredIndexes(
+        _ db: Database, _ indexes: [DeferredIndex] = SyncEngine.deferredIndexes
+    ) throws {
+        for index in indexes {
             try db.execute(sql: index.sql)
         }
     }
 
-    /// The deferred indexes `sqlite_master` does not have, or `nil` if the schema
-    /// could not be read at all (which is *unknown*, not *present*).
+    /// The indexes of `indexes` that `sqlite_master` does not have, or `nil` if the
+    /// schema could not be read at all (which is *unknown*, not *present*).
     ///
     /// ⚠️ NOT `async`, for the same reason as `plannerStatisticsSchemaVersion` below:
     /// Swift binds the ASYNC overload from an async context, and
@@ -986,9 +1174,11 @@ extension SyncEngine {
     /// staging merge before it reads. Inlining this into the async caller silently
     /// drags a multi-second durable merge into a probe that exists to decide whether
     /// to do any work at all.
-    private static func missingDeferredIndexes(_ dbPool: PrioritizedDatabase) -> [String]? {
+    private static func missingDeferredIndexes(
+        _ dbPool: PrioritizedDatabase, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
+    ) -> [String]? {
         try? dbPool.read { db in
-            try deferredIndexes.filter { index in
+            try indexes.filter { index in
                 try Row.fetchOne(
                     db,
                     sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
@@ -997,98 +1187,73 @@ extension SyncEngine {
         }
     }
 
-    /// Builds any missing deferred index. Runs from the background WAL maintenance
-    /// pass, BEFORE the `ANALYZE` step.
-    ///
-    /// 🚨 THE ORDER IS LOAD-BEARING AND IT IS THE ONE THING TO PRESERVE HERE.
-    /// `CREATE INDEX` is DDL, so it bumps SQLite's `schema_version`, which is exactly
-    /// the marker `runRefreshPlannerStatisticsIfStale` latches on. Building the index
-    /// FIRST means the `ANALYZE` that follows in the same pass reads the
-    /// POST-index version and records it, so **one pass converges**: index built,
-    /// statistics computed over it, marker settled. Moving this AFTER the `ANALYZE`
-    /// would have the analysis record version N, the index bump it to N+1, and the
-    /// NEXT pass pay a second whole-database `ANALYZE` for nothing.
-    ///
-    /// ⚠️ NO SINGLE-FLIGHT LATCH, deliberately, and this is where it differs from its
-    /// `ANALYZE` sibling. The two maintenance callers (the foreground poll and the
-    /// BGProcessing drain) really can overlap, but `CREATE INDEX IF NOT EXISTS` is
-    /// idempotent and SQLite serializes writers, so the loser of the race waits for
-    /// the writer and then executes a no-op. The sibling needs a latch because
-    /// `ANALYZE` is NOT a no-op the second time — it re-pays up to 8.5 s. Adding a
-    /// latch here would buy nothing and add a failure mode.
-    ///
-    /// FAILS SAFE. If this is skipped, cancelled or aborted, `markAllAsRead` sorts
-    /// through a temp B-tree — slow, and correct in the sense that matters (identical
-    /// rows, identical order) — and the stale-body evict step waits for its index
-    /// (`runEvictStaleBodiesIfIndexed`), so stale bodies stay cached a pass longer
-    /// (#1354). Nothing is recorded on failure, so the next pass retries. Recovery is
-    /// automatic and needs no user gesture (THE MANTRA: recoverable ⇒ fail closed).
-    ///
-    /// 🚨 IT IS **NOT** "THE ALREADY-SHIPPED BEHAVIOUR UP TO `v83`", WHICH IS WHAT
-    /// THIS SENTENCE SAID UNTIL R16-4 (corrected 2026-08-06) — and the wording
-    /// mattered, because that clause was the entire licence for deferring the build.
-    /// Shipped `markAllAsRead` (`07a4bb703:TabMail/ViewModels/InboxViewModel.swift`,
-    /// an immutable tag) fetched `.filter(folderId == fid && isRead == false)
-    /// .limit(batchSize)` with **no `ORDER BY`**, so it never sorted at all. The
-    /// ordered keyset sweep arrived IN-RANGE with `a790dd61d` (2026-08-03), which
-    /// `git merge-base --is-ancestor a790dd61d 07a4bb703` reports is NOT an ancestor
-    /// of the shipped tag (exit 1). Measured at 357,400 rows / 100,000 unread /
-    /// fresh-install `sqlite_stat1`: shipped **7,889 ms**, current with the index
-    /// **4,610 ms**, current WITHOUT it **43,296 ms** — **5.5× worse than shipped**.
-    /// The deferral is accepted because the window is TRANSIENT and SELF-HEALING,
-    /// never because it equals a shipped baseline. Full argument: `IOS-PERF-005`.
-    ///
-    /// ⚠️ Contrast the sibling below: `runRefreshPlannerStatisticsIfStale`'s
-    /// "ALREADY-SHIPPED regime" claim about stale statistics is TRUE and stays —
-    /// `ANALYZE` really has only ever run inside migration bodies. Two adjacent
-    /// functions, the same argument shape, opposite truth values; that is why each
-    /// one has to be checked against the tag rather than against its neighbour.
-    ///
-    /// COST WHILE IT RUNS: one write transaction; for `messageHeader_unreadSweep`
-    /// 119 ms measured at 360k rows, 5,050 ms on a real 5-account device — which
-    /// is the whole point of it being here rather than on the launch path.
-    /// `messageBody_staleEvict` (#1354) reads every cached body once, since
-    /// `fetchedAt` is stored after the HTML, so its build costs more than those
-    /// figures on a large body cache.
-    @discardableResult
-    nonisolated static func runBuildDeferredIndexesIfMissing(
-        dbPool: PrioritizedDatabase
-    ) async -> DeferredIndexBuild {
-        guard let missing = missingDeferredIndexes(dbPool) else {
-            // Could not read the schema ⇒ nothing is determined. Retry next pass.
-            return .abandoned
-        }
-        guard !missing.isEmpty else { return .alreadyPresent }
-
-        let t0 = CFAbsoluteTimeGetCurrent()
-        // Same cancellation shape as `runRefreshPlannerStatisticsIfStale`: the flag is
-        // a `Mutex` rather than `Task.isCancelled` because GRDB dispatches the write
-        // closure onto its own writer queue, where `Task.isCancelled` always reads
-        // `false`. Abandoning drops no user intention — this write carries none.
-        let cancelledWhileQueued = Mutex<Bool>(false)
-        do {
-            try await withTaskCancellationHandler {
-                try await dbPool.write(label: "BuildDeferredIndexes") { db in
-                    guard !cancelledWhileQueued.withLock({ $0 }),
-                          !DatabaseSuspension.isSuspended else {
-                        throw CancellationError()
-                    }
-                    try createDeferredIndexes(db)
-                }
-            } onCancel: {
-                cancelledWhileQueued.withLock { $0 = true }
-            }
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] built deferred index(es) \(missing.joined(separator: ", ")) in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms")
-            }
-            return .built
-        } catch {
-            if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] deferred index build abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — retrying next pass: \(error)")
-            }
-            return .abandoned
-        }
-    }
+    // MARK: Building a deferred index (inside the statistics write below)
+    //
+    // A missing deferred index is built by `runRefreshPlannerStatisticsIfStale`, in
+    // the SAME write transaction as the whole-database `ANALYZE` and before it, and
+    // the marker is then settled on the schema version read after that `ANALYZE`
+    // (2026-11-24). Until then the build was its own write, run just
+    // before the statistics step, and that left a window: a connection that read
+    // between the two writes loaded the new index with no statistics row beside
+    // current ones for every other index, and SQLite keeps what a connection loads
+    // until the next schema change, because `ANALYZE` alone does not bump
+    // `schema_version`. With the new index looking far more selective than it is,
+    // such a connection planned the unread inbox page and the pending-body count
+    // through it (measured on a 100k-header test database: 71 to 367 pages read for the
+    // unread page), and kept doing so until GRDB closed it at the next background
+    // entry. One write means no connection can load a schema that has a new index
+    // but not its statistics, whatever statistics the database had before. Two
+    // narrower fixes do not hold: an `ANALYZE` of only the new index in the build's write, which is exact
+    // only when every other index's statistics are current (with older or missing
+    // ones the new index looks UNselective, so its own read keeps the old plan and
+    // another read can flip), and an `ANALYZE` of its table there, which is exact but
+    // pays a second statistics run when the whole-database one follows.
+    //
+    // The rest of this note is the build's own history, kept from when it was a
+    // separate step.
+    //
+    // ORDER. `CREATE INDEX` is DDL, so it bumps SQLite's `schema_version`, which is
+    // exactly the marker the statistics step latches on. Building FIRST means the
+    // `ANALYZE` reads the POST-index version and records it, so **one pass
+    // converges**: index built, statistics computed over it, marker settled.
+    // Building after would have the analysis record version N, the index bump it to
+    // N+1, and the NEXT pass pay a second whole-database `ANALYZE` for nothing. Inside
+    // one write the order is the statement order, and the marker is read last.
+    //
+    // FAILS SAFE. If the write is skipped, cancelled or aborted it rolls back whole
+    // (index and statistics), `markAllAsRead` sorts through a temp B-tree — slow, and
+    // correct in the sense that matters (identical rows, identical order) — and the
+    // stale-body evict step waits for its index (`runEvictStaleBodiesIfIndexed`), so
+    // stale bodies stay cached a pass longer (#1354). Nothing is recorded on failure,
+    // so the next pass retries. Recovery is automatic and needs no user gesture (THE
+    // MANTRA: recoverable ⇒ fail closed).
+    //
+    // 🚨 IT IS **NOT** "THE ALREADY-SHIPPED BEHAVIOUR UP TO `v83`", WHICH IS WHAT
+    // THIS SENTENCE SAID UNTIL R16-4 (corrected 2026-08-06) — and the wording
+    // mattered, because that clause was the entire licence for deferring the build.
+    // Shipped `markAllAsRead` (`07a4bb703:TabMail/ViewModels/InboxViewModel.swift`,
+    // an immutable tag) fetched `.filter(folderId == fid && isRead == false)
+    // .limit(batchSize)` with **no `ORDER BY`**, so it never sorted at all. The
+    // ordered keyset sweep arrived IN-RANGE with `a790dd61d` (2026-08-03), which
+    // `git merge-base --is-ancestor a790dd61d 07a4bb703` reports is NOT an ancestor
+    // of the shipped tag (exit 1). Measured at 357,400 rows / 100,000 unread /
+    // fresh-install `sqlite_stat1`: shipped **7,889 ms**, current with the index
+    // **4,610 ms**, current WITHOUT it **43,296 ms** — **5.5× worse than shipped**.
+    // The deferral is accepted because the window is TRANSIENT and SELF-HEALING,
+    // never because it equals a shipped baseline. Full argument: `IOS-PERF-005`.
+    //
+    // ⚠️ Contrast `runRefreshPlannerStatisticsIfStale`'s own doc below: its
+    // "ALREADY-SHIPPED regime" claim about stale statistics is TRUE and stays —
+    // `ANALYZE` really has only ever run inside migration bodies. Two adjacent
+    // functions, the same argument shape, opposite truth values; that is why each
+    // one has to be checked against the tag rather than against its neighbour.
+    //
+    // COST OF A BUILD: inside the statistics write; for `messageHeader_unreadSweep`
+    // 119 ms measured at 360k rows, 5,050 ms on a real 5-account device — which
+    // is the whole point of it being here rather than on the launch path.
+    // `messageBody_staleEvict` (#1354) reads every cached body once, since
+    // `fetchedAt` is stored after the HTML, so its build costs more than those
+    // figures on a large body cache.
 
     // MARK: - Query-planner statistics (ADR-IOS-029 rule 5, deferred timing)
 
@@ -1097,12 +1262,15 @@ extension SyncEngine {
     /// otherwise, and an aborted pass does not consume the obligation* — is
     /// observable without reaching into the marker or into SQLite internals.
     enum PlannerStatisticsRefresh: Equatable, Sendable {
-        /// The schema has not changed since the last completed `ANALYZE`.
+        /// Every deferred index exists and the schema has not changed since the last
+        /// completed `ANALYZE`.
         case alreadyFresh
-        /// `ANALYZE` completed and the marker advanced to the settled schema version.
+        /// `ANALYZE` completed, after building every missing deferred index in the
+        /// same write, and the marker advanced to the settled schema version.
         case refreshed
-        /// The pass could not read the schema version, or `ANALYZE` failed / was
-        /// aborted. The marker is UNCHANGED, so the next pass retries.
+        /// The pass could not read the schema or its version, or the write failed /
+        /// was aborted, which rolls back any index it built with its statistics. The
+        /// marker is UNCHANGED, so the next pass retries.
         case abandoned
         /// Another caller already holds the single-flight latch. This pass did
         /// nothing and consumed no obligation — the in-flight one will advance the
@@ -1184,7 +1352,19 @@ extension SyncEngine {
     /// between an upgrade launch and the first maintenance pass is no worse than
     /// every shipped release, and strictly better once the pass runs.
     ///
-    /// COST WHILE IT RUNS: one write transaction, up to ~8.5 s at 500k headers.
+    /// IT ALSO BUILDS EVERY MISSING DEFERRED INDEX, IN THE SAME WRITE. When an index
+    /// of `indexes` (`deferredIndexes` in the app) is missing, the write creates it
+    /// and then runs the `ANALYZE`, whatever the marker says, so the index and its
+    /// statistics commit together and the marker settles on the post-index schema
+    /// version: no connection can load a schema that has the new index but not its
+    /// statistics (see "Building a deferred index" above). With every deferred index
+    /// present this is the stale-marker `ANALYZE` alone, as before. `indexes` is a
+    /// parameter only so a test can add an index the app does not build yet; the app
+    /// always passes the default.
+    ///
+    /// COST WHILE IT RUNS: one write transaction, up to ~8.5 s at 500k headers, plus,
+    /// on the pass that builds a deferred index, that build (see "COST OF A BUILD"
+    /// above).
     ///
     /// ⚠️ THIS FUNCTION IS `async` FOR ONE REASON, AND THE PREVIOUS VERSION OF THIS
     /// PARAGRAPH WAS WRONG. It used to claim the cost lands *"on the caller's pool
@@ -1209,7 +1389,8 @@ extension SyncEngine {
     nonisolated static func runRefreshPlannerStatisticsIfStale(
         dbPool: PrioritizedDatabase,
         defaults: UserDefaults = .standard,
-        markerKey: String = plannerStatisticsSchemaVersionKey
+        markerKey: String = plannerStatisticsSchemaVersionKey,
+        indexes: [DeferredIndex] = SyncEngine.deferredIndexes
     ) async -> PlannerStatisticsRefresh {
         // SINGLE-FLIGHT. Taken BEFORE the marker read, because the race is two
         // callers both reading the marker stale — taking it after the read would
@@ -1222,6 +1403,11 @@ extension SyncEngine {
         guard acquired else { return .alreadyRunning }
         defer { plannerStatisticsRefreshInFlight.withLock { $0 = false } }
 
+        // Under the latch, so two overlapping callers cannot both build and analyze.
+        guard let missing = missingDeferredIndexes(dbPool, among: indexes) else {
+            // Could not read the schema ⇒ nothing is determined. Retry next pass.
+            return .abandoned
+        }
         guard let currentVersion = plannerStatisticsSchemaVersion(dbPool) else {
             // Could not read the schema version ⇒ nothing is determined. Leave the
             // marker alone and retry next pass.
@@ -1230,7 +1416,8 @@ extension SyncEngine {
         // `object(forKey:)` rather than `integer(forKey:)`: a never-analyzed database
         // has NO stored value, and `integer(forKey:)` cannot tell that apart from a
         // stored 0 — which is a legal `schema_version`.
-        if let analyzed = defaults.object(forKey: markerKey) as? Int,
+        if missing.isEmpty,
+           let analyzed = defaults.object(forKey: markerKey) as? Int,
            analyzed == currentVersion {
             return .alreadyFresh
         }
@@ -1256,7 +1443,8 @@ extension SyncEngine {
         // cancelled … never-drop-user-intention: a half-decided DB write must not be
         // abandoned mid-flight"*). That contract protects writes that CARRY a user
         // intention. `ANALYZE` carries none — it rewrites planner statistics only —
-        // and abandoning it drops nothing: the marker is left where it was, so the
+        // and neither does a deferred index build, so abandoning the write drops
+        // nothing: it rolls back whole, the marker is left where it was, so the
         // obligation stays outstanding and the next pass redoes it. The deviation is
         // confined to this one write for exactly that reason.
         let cancelledWhileQueued = Mutex<Bool>(false)
@@ -1266,6 +1454,11 @@ extension SyncEngine {
                     guard !cancelledWhileQueued.withLock({ $0 }),
                           !DatabaseSuspension.isSuspended else {
                         throw CancellationError()
+                    }
+                    // The missing deferred indexes first, then the statistics over
+                    // them, in this one transaction (see "Building a deferred index").
+                    if !missing.isEmpty {
+                        try createDeferredIndexes(db, indexes)
                     }
                     try db.execute(sql: "ANALYZE")
                     // Read AFTER, inside the same transaction. The FIRST `ANALYZE` on a
@@ -1280,12 +1473,14 @@ extension SyncEngine {
             }
             defaults.set(settled, forKey: markerKey)
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE refreshed query-planner statistics in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
+                let built = missing.isEmpty ? "" : "built deferred index(es) \(missing.joined(separator: ", ")) and "
+                BackgroundSyncLogger.logDebug("[Maintenance] \(built)ANALYZE refreshed query-planner statistics in one write in \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms (schema_version \(settled))")
             }
             return .refreshed
         } catch {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms — statistics stay stale, retrying next pass: \(error)")
+                let built = missing.isEmpty ? "" : " (with the build of \(missing.joined(separator: ", ")), rolled back)"
+                BackgroundSyncLogger.logDebug("[Maintenance] ANALYZE abandoned after \(Int((CFAbsoluteTimeGetCurrent() - t0) * 1000))ms\(built) — statistics stay stale, retrying next pass: \(error)")
             }
             return .abandoned
         }
