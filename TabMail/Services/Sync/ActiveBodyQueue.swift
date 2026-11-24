@@ -37,8 +37,8 @@ actor ActiveBodyQueue {
         let isInInbox: Bool
     }
 
-    /// The SOLE admission query for this queue: every row that still needs a body
-    /// fetch, in the order the queue wants them. Hoisted into ONE symbol because it
+    /// The SOLE admission query for this queue: the rows that still need a body
+    /// fetch, in the order the queue wants them (a window of them; see below). Hoisted into ONE symbol because it
     /// has three consumers that must never diverge — `repopulateFromDatabase`
     /// (launch / foreground / sync recovery), `repopulateOnDrain` (the drain-time
     /// safety net), and the tests that assert what the queue will and will not admit.
@@ -49,12 +49,20 @@ actor ActiveBodyQueue {
     ///
     /// `bodyMetadataOversized = 0` is the quarantine gate — see
     /// `MessageHeader.bodyMetadataOversized` for the full CLEARED enumeration.
+    ///
+    /// A refill admits a WINDOW: the newest `SyncConfig.bodyFetchRepopulateLimit`
+    /// pending inbox rows, read through `messageHeader_bodyRepopulateV2` in `date` order
+    /// with no sort, stopping at the limit. A row leaves the predicate once its body is
+    /// stored, confirmed empty or quarantined, so the drain-time refill after a window
+    /// completes admits the next newest window. The window's cost is accepted as
+    /// `IOS-BODY-007`, stated on `BackfillBodyQueue.admissionSQL`.
     nonisolated static let admissionSQL = """
         SELECT id, accountId, folderPath, messageId, isInInbox
         FROM messageHeader
         WHERE headerComplete = 1 AND bodyComplete = 0 AND bodyEmptyConfirmed = 0 AND isInInbox = 1
           AND bodyMetadataOversized = 0
         ORDER BY date DESC
+        LIMIT \(SyncConfig.bodyFetchRepopulateLimit)
         """
 
     /// Runs `admissionSQL` and maps it to queue items. Synchronous — the caller owns
