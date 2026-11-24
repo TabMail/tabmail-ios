@@ -946,7 +946,7 @@ extension SyncEngine {
     /// drags a multi-second durable merge into a probe that exists to decide whether
     /// to do any work at all.
     private static func missingDeferredIndexes(
-        _ dbPool: PrioritizedDatabase, among indexes: [DeferredIndex]
+        _ dbPool: PrioritizedDatabase, among indexes: [DeferredIndex] = SyncEngine.deferredIndexes
     ) -> [String]? {
         try? dbPool.read { db in
             try indexes.filter { index in
