@@ -478,7 +478,7 @@ actor SyncEngine {
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runPurgeExpiredAICache(dbPool: dbPool)
+            await runPurgeExpiredAICache(dbPool: dbPool)
         }
         let t3 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {

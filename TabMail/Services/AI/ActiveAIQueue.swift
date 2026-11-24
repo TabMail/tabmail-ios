@@ -834,7 +834,7 @@ actor ActiveAIQueue {
                 // Expire the AI cache once all AI work is done. The purge keeps an
                 // expired entry whose message is in an inbox (ADR-IOS-078).
                 Task.detached {
-                    SyncEngine.runPurgeExpiredAICache(dbPool: AppDatabase.backgroundPool)
+                    await SyncEngine.runPurgeExpiredAICache(dbPool: AppDatabase.backgroundPool)
                 }
             }
         }

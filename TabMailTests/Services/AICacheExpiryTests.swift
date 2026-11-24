@@ -138,6 +138,13 @@ struct AICacheExpiryTests {
         }
     }
 
+    /// How many cache-changing commits had happened at each WAL checkpoint call.
+    private final class CheckpointLog: Sendable {
+        private let calls = Mutex<[Int]>([])
+        func record(_ committed: Int) { calls.withLock { $0.append(committed) } }
+        var all: [Int] { calls.withLock { $0 } }
+    }
+
     private struct Env {
         let pool: DatabasePool
         let directory: URL
@@ -218,8 +225,11 @@ struct AICacheExpiryTests {
         PrioritizedDatabase(pool: env.pool, priority: .background)
     }
 
-    private func purge(_ env: Env) {
-        SyncEngine.runPurgeExpiredAICache(dbPool: pool(env))
+    /// One run of the expiry. Its WAL checkpoint is a no-op here: the real one acts on
+    /// the app's own database, not on this test's (`eachBatchIsFollowedByACheckpoint`
+    /// checks where the run calls it).
+    private func purge(_ env: Env) async {
+        await SyncEngine.runPurgeExpiredAICache(dbPool: pool(env), checkpointWAL: {})
     }
 
     /// Every entry left, key to `updatedAt`.
@@ -239,7 +249,7 @@ struct AICacheExpiryTests {
     // MARK: - What expires
 
     @Test("An archived message's expired entry is deleted though its key names the inbox; an inbox message's stays")
-    func expiryFollowsTheMessageNotTheKey() throws {
+    func expiryFollowsTheMessageNotTheKey() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let fresh = Date().addingTimeInterval(-3_600)
@@ -253,7 +263,7 @@ struct AICacheExpiryTests {
         let recentKey = try insertEntry(env, rfc: "recent@example.com", updatedAt: fresh)
         let start = Date()
 
-        purge(env)
+        await purge(env)
 
         let after = try entries(env)
         #expect(after[archivedKey] == nil, "an archived message's entry outlived the TTL")
@@ -268,7 +278,7 @@ struct AICacheExpiryTests {
     }
 
     @Test("The inbox check reads every copy of the message, however many there are")
-    func inboxCheckReadsEveryCopy() throws {
+    func inboxCheckReadsEveryCopy() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let rfc = "many-copies@example.com"
@@ -282,14 +292,14 @@ struct AICacheExpiryTests {
         try insert(env, copies: copies)
         let key = try insertEntry(env, rfc: rfc, updatedAt: expired)
 
-        purge(env)
+        await purge(env)
 
         let after = try entries(env)
         #expect(after[key] != nil, "the entry of a message that is in the inbox was deleted")
     }
 
     @Test("A copy in another account's inbox keeps the entry")
-    func inboxCopyInAnotherAccountKeepsTheEntry() throws {
+    func inboxCopyInAnotherAccountKeepsTheEntry() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let rfc = "shared@example.com"
@@ -299,26 +309,26 @@ struct AICacheExpiryTests {
         ])
         let key = try insertEntry(env, rfc: rfc, updatedAt: expired)
 
-        purge(env)
+        await purge(env)
 
         let after = try entries(env)
         #expect(after[key] != nil, "the entry was deleted though another account's inbox holds the message")
     }
 
     @Test("An expired entry with no Message-ID is deleted", arguments: [nil, ""] as [String?])
-    func entryWithoutMessageIdIsDeleted(rfc: String?) throws {
+    func entryWithoutMessageIdIsDeleted(rfc: String?) async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let key = try insertEntry(env, rfc: rfc, key: "\(Self.accountId):INBOX:no-id", updatedAt: expired)
 
-        purge(env)
+        await purge(env)
 
         let after = try entries(env)
         #expect(after[key] == nil)
     }
 
     @Test("A write-through gives an entry without a Message-ID the one it is keyed by, and the expiry then keeps it")
-    func writeThroughFillsAMissingMessageId() throws {
+    func writeThroughFillsAMissingMessageId() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let rfc = "legacy@example.com"
@@ -333,7 +343,7 @@ struct AICacheExpiryTests {
             // Age it again, so only the Message-ID can keep it.
             try db.execute(sql: "UPDATE messageAICache SET updatedAt = ? WHERE key = ?", arguments: [expired, key])
         }
-        purge(env)
+        await purge(env)
 
         let after = try env.pool.read { try MessageAICache.fetchOne($0, key: key) }
         #expect(after?.rfc822MessageId == rfc, "the write-through left the entry without a Message-ID")
@@ -341,7 +351,7 @@ struct AICacheExpiryTests {
     }
 
     @Test("The TTL ends exactly SyncConfig.aiCacheTTLDays calendar days back")
-    func ttlBoundary() throws {
+    func ttlBoundary() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let now = Date()
@@ -355,7 +365,7 @@ struct AICacheExpiryTests {
         let insideKey = try insertEntry(env, rfc: "inside@example.com", updatedAt: inside)
         let outsideKey = try insertEntry(env, rfc: "outside@example.com", updatedAt: outside)
 
-        purge(env)
+        await purge(env)
 
         let after = try entries(env)
         #expect(after[insideKey] != nil, "an entry an hour inside the TTL was deleted")
@@ -363,7 +373,7 @@ struct AICacheExpiryTests {
     }
 
     @Test("One run handles every expired entry, across batches, with kept entries among them")
-    func oneRunHandlesEveryExpiredEntry() throws {
+    func oneRunHandlesEveryExpiredEntry() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let total = SyncConfig.pruneChunkSize * 2 + 10
@@ -384,7 +394,7 @@ struct AICacheExpiryTests {
         let counter = CacheWritesPerCommit()
         try env.pool.write { $0.add(transactionObserver: counter, extent: .databaseLifetime) }
 
-        purge(env)
+        await purge(env)
 
         let after = try entries(env)
         let stillExpired = after.values.filter { $0 < limit }.count
@@ -401,7 +411,7 @@ struct AICacheExpiryTests {
     }
 
     @Test("An AI result written between two batches of a run is kept")
-    func writeBetweenBatchesIsKept() throws {
+    func writeBetweenBatchesIsKept() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let total = SyncConfig.pruneChunkSize * 2 + 10
@@ -419,7 +429,7 @@ struct AICacheExpiryTests {
         let writer = WriteAfterFirstBatch(pool: env.pool, candidates: archived, limit: cutoff)
         try env.pool.write { $0.add(transactionObserver: writer, extent: .databaseLifetime) }
 
-        purge(env)
+        await purge(env)
 
         let outcome = writer.outcome
         #expect(outcome.failure == nil, "the write between batches failed: \(outcome.failure ?? "")")
@@ -437,7 +447,7 @@ struct AICacheExpiryTests {
     /// deletes or keeps its entries: a read before that transaction leaves a moment in
     /// which an AI result can be written and then deleted by a decision made without it.
     @Test("Each batch is read in the write transaction that deletes or keeps its entries")
-    func eachBatchIsReadInTheWriteThatHandlesIt() throws {
+    func eachBatchIsReadInTheWriteThatHandlesIt() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let total = SyncConfig.pruneChunkSize + 10
@@ -451,7 +461,7 @@ struct AICacheExpiryTests {
         }
         _ = env.tape.drain()
 
-        purge(env)
+        await purge(env)
 
         let statements = env.tape.drainWithConnection()
         let batchReads = statements.filter { $0.sql.contains("SELECT key, rfc822MessageId FROM messageAICache") }
@@ -487,8 +497,39 @@ struct AICacheExpiryTests {
         }
     }
 
+    /// SQLite's own checkpoint is off in the app, so a batch writer bounds the WAL itself:
+    /// the run checkpoints after every batch, once that batch's write has committed.
+    @Test("Each batch is followed by a WAL checkpoint, after its write commits")
+    func eachBatchIsFollowedByACheckpoint() async throws {
+        let env = try makeEnv()
+        defer { finish(env) }
+        let total = SyncConfig.pruneChunkSize * 2 + 10
+        var copies: [Copy] = []
+        for i in 0..<total {
+            copies.append(Copy(uid: "\(i + 1)", folderPath: i % 2 == 0 ? "INBOX" : "Archive", rfc: "c\(i)@example.com"))
+        }
+        try insert(env, copies: copies)
+        for (i, copy) in copies.enumerated() {
+            try insertEntry(env, rfc: copy.rfc, updatedAt: expired.addingTimeInterval(-Double(i)))
+        }
+        let counter = CacheWritesPerCommit()
+        try env.pool.write { $0.add(transactionObserver: counter, extent: .databaseLifetime) }
+        let log = CheckpointLog()
+
+        await SyncEngine.runPurgeExpiredAICache(dbPool: pool(env), checkpointWAL: {
+            log.record(counter.commits.count)
+        })
+
+        let commits = counter.commits
+        let seen = log.all
+        // Two full batches, then the last ten entries; the empty read that ends the run
+        // writes nothing and needs no checkpoint.
+        #expect(commits.count == 3, "batches that changed the cache: \(commits)")
+        #expect(seen == [1, 2, 3], "cache-changing commits seen at each checkpoint: \(seen)")
+    }
+
     @Test("A batch that fails is undone whole, and the next run finishes the expiry")
-    func failedBatchIsFinishedByTheNextRun() throws {
+    func failedBatchIsFinishedByTheNextRun() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         let copies = (0..<10).map { i in
@@ -511,14 +552,14 @@ struct AICacheExpiryTests {
                 """)
         }
 
-        purge(env)
+        await purge(env)
 
         let afterFailure = try entries(env)
         #expect(Set(afterFailure.keys) == Set(keys), "the failed batch deleted entries")
         #expect(afterFailure.values.allSatisfy { $0 < limit }, "the failed batch restarted clocks")
 
         try env.pool.write { try $0.execute(sql: "DROP TRIGGER temp.failExpiry") }
-        purge(env)
+        await purge(env)
 
         let after = try entries(env)
         for (i, key) in keys.enumerated() {
@@ -532,7 +573,7 @@ struct AICacheExpiryTests {
     }
 
     @Test("An entry whose stored results no longer decode is expired, and so are the others")
-    func undecodableEntryDoesNotStopExpiry() throws {
+    func undecodableEntryDoesNotStopExpiry() async throws {
         let env = try makeEnv()
         defer { finish(env) }
         try insert(env, copies: [
@@ -550,14 +591,17 @@ struct AICacheExpiryTests {
         }
         let plainKey = try insertEntry(env, rfc: "plain@example.com", updatedAt: expired)
 
-        purge(env)
+        await purge(env)
 
         let left = try env.pool.read { try String.fetchAll($0, sql: "SELECT key FROM messageAICache") }
         #expect(!left.contains(brokenKey), "the undecodable entry outlived the TTL")
         #expect(!left.contains(plainKey), "an undecodable entry stopped the expiry of the others")
     }
 
-    @Test("A maintenance pass expires the cache")
+    /// The pass runs the expiry with its real WAL checkpoint, which acts on
+    /// `AppDatabase.backgroundPool`; `.processGlobalState` makes sure that database
+    /// exists and that no other suite swaps it while the checkpoint runs.
+    @Test("A maintenance pass expires the cache", .processGlobalState)
     func maintenancePassExpires() async throws {
         let env = try makeEnv()
         defer { finish(env) }
@@ -594,7 +638,7 @@ struct AICacheExpiryTests {
     }
 
     @Test("Every statement the purge runs reads through the index it names", arguments: AICacheExpiryStatistics.allCases)
-    func everyStatementReadsThroughAnIndex(statistics: AICacheExpiryStatistics) throws {
+    func everyStatementReadsThroughAnIndex(statistics: AICacheExpiryStatistics) async throws {
         let env = try makeEnv()
         defer { finish(env) }
         try insert(env, copies: [Copy(uid: "1", folderPath: "Archive", rfc: "archived@example.com")])
@@ -621,7 +665,7 @@ struct AICacheExpiryTests {
         }
         _ = env.tape.drain()
 
-        purge(env)
+        await purge(env)
 
         let statements = env.tape.drain().filter(Self.touchesMailTables)
         let planned = try env.pool.read { db in

@@ -373,7 +373,15 @@ extension SyncEngine {
     /// shrinks with every batch and the loop ends. A batch reads each entry's key
     /// and Message-ID only, so an entry whose stored results no longer decode is
     /// expired like any other instead of failing the batch on every run.
-    nonisolated static func runPurgeExpiredAICache(dbPool: PrioritizedDatabase) {
+    ///
+    /// SQLite's own checkpoint is off (`AppDatabase.makePool`), so the WAL grows
+    /// until something checkpoints it: after every batch, once its write has
+    /// committed, the run calls `checkpointWAL` (the throttled
+    /// `checkpointWALThrottled`, as the other batch writers do).
+    nonisolated static func runPurgeExpiredAICache(
+        dbPool: PrioritizedDatabase,
+        checkpointWAL: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }
+    ) async {
         let now = Date()
         let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: now) ?? Date.distantPast
         let chunkSize = SyncConfig.pruneChunkSize
@@ -414,6 +422,7 @@ extension SyncEngine {
                 BackgroundSyncLogger.logDebug("[AICache] Purge failed: \(error)")
                 break
             }
+            await checkpointWAL()
         }
         if purged > 0 || rescued > 0 {
             BackgroundSyncLogger.logDebug("[AICache] Purged \(purged) expired entries, rescued \(rescued) still-in-inbox (TTL=\(SyncConfig.aiCacheTTLDays)d)")

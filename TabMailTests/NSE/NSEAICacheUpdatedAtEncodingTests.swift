@@ -119,8 +119,8 @@ struct NSEAICacheUpdatedAtEncodingTests {
         }
     }
 
-    private func purge(_ pool: DatabasePool) {
-        SyncEngine.runPurgeExpiredAICache(dbPool: PrioritizedDatabase(pool: pool))
+    private func purge(_ pool: DatabasePool) async {
+        await SyncEngine.runPurgeExpiredAICache(dbPool: PrioritizedDatabase(pool: pool))
     }
 
     private func entryExists(_ pool: DatabasePool) async throws -> Bool {
@@ -154,7 +154,7 @@ struct NSEAICacheUpdatedAtEncodingTests {
         try await pool.write { db in
             try db.execute(sql: "DELETE FROM messageHeader WHERE accountId = ?", arguments: [Self.accountId])
         }
-        purge(pool)
+        await purge(pool)
         return try await entryExists(pool)
     }
 
@@ -230,7 +230,7 @@ extension NSEAICacheUpdatedAtEncodingTests {
         #expect(merged?.rfc822MessageId == Self.rfc822, "\(branch): the merge did not store the Message-ID it made the key from")
         let start = Date()
 
-        purge(pool)
+        await purge(pool)
 
         let after = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
         #expect(after?.summaryBlurb == "A short summary", "\(branch): the entry of a message in the inbox was purged")
@@ -264,7 +264,7 @@ extension NSEAICacheUpdatedAtEncodingTests {
         #expect(try await q.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nse_processed_message") } == 0)
 
         try await pool.write { try $0.execute(sql: "DELETE FROM messageHeader") }
-        purge(pool)
+        await purge(pool)
         #expect(try await entryExists(pool) == fresh)
     }
 
