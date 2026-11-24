@@ -9,7 +9,7 @@ import Synchronization
 @testable import TabMail
 
 /// The statements a connection ran, expanded. `trace` fires on the database's own queue, hence the `Mutex`.
-private final class BackfillCountTape: Sendable {
+final class BackfillCountTape: Sendable {
     private let statements = Mutex<[String]>([])
     func record(_ sql: String) { statements.withLock { $0.append(sql) } }
     var all: [String] { statements.withLock { $0 } }
