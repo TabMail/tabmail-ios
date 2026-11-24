@@ -34,8 +34,9 @@ enum AICacheExpiryStatistics: String, CaseIterable, Sendable {
 ///   next run;
 /// - the AI queue runs it once its work is done, and no other cache upkeep;
 /// - an entry whose stored results no longer decode is expired like any other;
-/// - it checkpoints the app's WAL after each batch it commits, and the TRUNCATE the
-///   maintenance pass asks for right after a run still empties the WAL file;
+/// - it checkpoints the app's WAL between two batches, once the earlier one has
+///   committed, and never after its last batch, so the TRUNCATE the maintenance pass
+///   asks for right after a run of one batch still empties the WAL file;
 /// - every statement it runs reads through an index, whatever the statistics (ADR-IOS-029).
 @Suite("AI cache expiry")
 struct AICacheExpiryTests {
@@ -228,9 +229,10 @@ struct AICacheExpiryTests {
     }
 
     /// One run of the expiry. Its WAL checkpoint is a no-op here: the real one acts on
-    /// the app's own database, not on this test's (`eachBatchIsFollowedByACheckpoint`
-    /// checks where the run calls it, `expiryCheckpointsTheAppDatabase` runs the real one
-    /// with a test database installed as the app's).
+    /// the app's own database, not on this test's (`checkpointsRunBetweenBatchesOnly`
+    /// checks where the run calls it; `expiryCheckpointsTheAppDatabase` and
+    /// `oneBatchExpiryLeavesTheTruncateItsTurn` run the real one with a test database
+    /// installed as the app's).
     private func purge(_ env: Env) async {
         await SyncEngine.runPurgeExpiredAICache(dbPool: pool(env), checkpointWAL: {})
     }
@@ -501,12 +503,15 @@ struct AICacheExpiryTests {
     }
 
     /// SQLite's own checkpoint is off in the app, so a batch writer bounds the WAL itself:
-    /// the run checkpoints after every batch, once that batch's write has committed.
-    @Test("Each batch is followed by a WAL checkpoint, after its write commits")
-    func eachBatchIsFollowedByACheckpoint() async throws {
+    /// the run checkpoints between two batches, once the earlier one's write has
+    /// committed. It never checkpoints after its last batch, which leaves the TRUNCATE
+    /// the maintenance pass asks for right after the run its turn in the throttle; so a
+    /// run of one batch, a full one included, takes no checkpoint.
+    @Test("A WAL checkpoint runs between two batches, after the earlier one commits, and never after the last",
+          arguments: [10, SyncConfig.pruneChunkSize, SyncConfig.pruneChunkSize + 1, SyncConfig.pruneChunkSize * 2 + 10])
+    func checkpointsRunBetweenBatchesOnly(total: Int) async throws {
         let env = try makeEnv()
         defer { finish(env) }
-        let total = SyncConfig.pruneChunkSize * 2 + 10
         var copies: [Copy] = []
         for i in 0..<total {
             copies.append(Copy(uid: "\(i + 1)", folderPath: i % 2 == 0 ? "INBOX" : "Archive", rfc: "c\(i)@example.com"))
@@ -525,10 +530,12 @@ struct AICacheExpiryTests {
 
         let commits = counter.commits
         let seen = log.all
-        // Two full batches, then the last ten entries; the empty read that ends the run
-        // writes nothing and needs no checkpoint.
-        #expect(commits.count == 3, "batches that changed the cache: \(commits)")
-        #expect(seen == [1, 2, 3], "cache-changing commits seen at each checkpoint: \(seen)")
+        // Every batch changes the cache. A checkpoint follows each batch but the last,
+        // before the next batch commits.
+        let batches = (total + SyncConfig.pruneChunkSize - 1) / SyncConfig.pruneChunkSize
+        let between = Array(1..<batches)
+        #expect(commits.count == batches, "[\(total) entries] batches that changed the cache: \(commits)")
+        #expect(seen == between, "[\(total) entries] cache-changing commits seen at each checkpoint: \(seen)")
     }
 
     @Test("A batch that fails is undone whole, and the next run finishes the expiry")
@@ -632,30 +639,44 @@ struct AICacheExpiryTests {
         return (attributes[.size] as? NSNumber)?.intValue ?? -1
     }
 
-    /// The expiry's real WAL checkpoint, end to end, on a database configured as the
-    /// app's (SQLite's own checkpoint off) and installed as the app's database. A run
-    /// checkpoints that database after a batch it committed, and the TRUNCATE the
-    /// foreground maintenance pass asks for right after the run still empties the WAL
-    /// file, although the run's last PASSIVE checkpoint was a moment before it.
-    @Test("The expiry checkpoints the app's database, and the maintenance pass's TRUNCATE right after it still runs", .processGlobalState)
-    func expiryCheckpointsTheAppDatabase() async throws {
+    /// A test database configured as the app's (SQLite's own checkpoint off), with
+    /// `total` expired entries, half of them for inbox messages.
+    private func makeAppConfiguredEnv(total: Int, rfcPrefix: String) throws -> Env {
         let env = try makeEnv(configuration: AppDatabase.makeConfiguration())
-        defer { finish(env) }
-        let total = SyncConfig.pruneChunkSize * 2 + 10
         var copies: [Copy] = []
         for i in 0..<total {
-            copies.append(Copy(uid: "\(i + 1)", folderPath: i % 2 == 0 ? "INBOX" : "Archive", rfc: "k\(i)@example.com"))
+            copies.append(Copy(uid: "\(i + 1)", folderPath: i % 2 == 0 ? "INBOX" : "Archive", rfc: "\(rfcPrefix)\(i)@example.com"))
         }
         try insert(env, copies: copies)
         for (i, copy) in copies.enumerated() {
             try insertEntry(env, rfc: copy.rfc, updatedAt: expired.addingTimeInterval(-Double(i)))
         }
+        return env
+    }
+
+    /// Installs `env`'s database as the app's; returns the one it replaced, to put back.
+    private func installAsAppDatabase(_ env: Env) throws -> AppDatabase? {
         let appDatabase = try AppDatabase(dbPool: env.pool)
-        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+        return AppDatabase.shared.withLock { current -> AppDatabase? in
             let prev = current
             current = appDatabase
             return prev
         }
+    }
+
+    /// Whether a statement keeps or deletes an AI cache entry.
+    private static func changesAnEntry(_ sql: String) -> Bool {
+        sql.hasPrefix("UPDATE messageAICache") || sql.hasPrefix("DELETE FROM messageAICache")
+    }
+
+    /// The expiry's real WAL checkpoint, end to end, on a database configured as the
+    /// app's and installed as the app's database: a run of several batches checkpoints
+    /// that database after a batch it committed.
+    @Test("The expiry checkpoints the app's database between its batches", .processGlobalState)
+    func expiryCheckpointsTheAppDatabase() async throws {
+        let env = try makeAppConfiguredEnv(total: SyncConfig.pruneChunkSize * 2 + 10, rfcPrefix: "k")
+        defer { finish(env) }
+        let previous = try installAsAppDatabase(env)
         defer { AppDatabase.shared.withLock { $0 = previous } }
         // A checkpoint another test took a moment ago would hold the throttle's window.
         try await Task.sleep(for: .seconds(SyncConfig.walCheckpointMinIntervalSeconds))
@@ -664,13 +685,35 @@ struct AICacheExpiryTests {
         await SyncEngine.runPurgeExpiredAICache(dbPool: AppDatabase.backgroundPool)
 
         let writer = env.tape.drainWithConnection().filter { $0.onWriter }.map { $0.sql }
-        let firstChange = writer.firstIndex {
-            $0.hasPrefix("UPDATE messageAICache") || $0.hasPrefix("DELETE FROM messageAICache")
-        }
+        let firstChange = writer.firstIndex(where: Self.changesAnEntry)
         let change = try #require(firstChange, "the run changed no entry")
         let checkpointed = writer[change...].contains { $0.contains("wal_checkpoint(PASSIVE)") }
         let checkpoints = writer.filter { $0.contains("wal_checkpoint") }
         #expect(checkpointed, "no checkpoint of the app's database after a batch: \(checkpoints)")
+    }
+
+    /// The common run is one batch, and the foreground maintenance pass asks for a
+    /// TRUNCATE checkpoint right after it. The checkpoint throttle lets one checkpoint
+    /// through per window, so a checkpoint the run took a moment before would make it
+    /// skip that TRUNCATE and leave the WAL file at its full size. A run of one batch
+    /// takes none, and the TRUNCATE empties the file.
+    @Test("After an expiry of one batch, the maintenance pass's TRUNCATE empties the WAL file", .processGlobalState)
+    func oneBatchExpiryLeavesTheTruncateItsTurn() async throws {
+        let env = try makeAppConfiguredEnv(total: 10, rfcPrefix: "o")
+        defer { finish(env) }
+        let previous = try installAsAppDatabase(env)
+        defer { AppDatabase.shared.withLock { $0 = previous } }
+        // A checkpoint another test took a moment ago would hold the throttle's window.
+        try await Task.sleep(for: .seconds(SyncConfig.walCheckpointMinIntervalSeconds))
+        _ = env.tape.drain()
+
+        await SyncEngine.runPurgeExpiredAICache(dbPool: AppDatabase.backgroundPool)
+
+        let writer = env.tape.drainWithConnection().filter { $0.onWriter }.map { $0.sql }
+        let changed = writer.contains(where: Self.changesAnEntry)
+        let checkpoints = writer.filter { $0.contains("wal_checkpoint") }
+        #expect(changed, "the run changed no entry")
+        #expect(checkpoints.isEmpty, "a run of one batch checkpointed: \(checkpoints)")
         let walPath = env.pool.path + "-wal"
         let walBefore = try fileSize(walPath)
         #expect(walBefore > 0, "the WAL file was already empty, so the TRUNCATE below proves nothing")
@@ -678,7 +721,7 @@ struct AICacheExpiryTests {
         await SyncEngine.checkpointWALThrottled(truncate: true)
 
         let walAfter = try fileSize(walPath)
-        #expect(walAfter == 0, "the TRUNCATE right after the run left the WAL file at \(walAfter) bytes")
+        #expect(walAfter == 0, "the TRUNCATE right after a run of one batch left the WAL file at \(walAfter) bytes")
     }
 
     // MARK: - How it reads
@@ -740,14 +783,15 @@ struct AICacheExpiryTests {
         let inboxChecks = reads("FROM messageHeader INDEXED BY")
         let updates = planned.filter { $0.sql.hasPrefix("UPDATE messageAICache") }
         let deletes = planned.filter { $0.sql.hasPrefix("DELETE FROM messageAICache") }
-        // The gate, one batch with both expired entries, the empty batch that ends the
-        // run; one inbox check per expired entry; one entry kept, one deleted.
+        // The gate, then one batch with both expired entries, which reads one entry more
+        // than it handles and so finds it is the last; one inbox check per expired entry;
+        // one entry kept, one deleted.
         #expect(counts.count == 1)
-        #expect(batches.count == 2)
+        #expect(batches.count == 1)
         #expect(inboxChecks.count == 2)
         #expect(updates.count == 1)
         #expect(deletes.count == 1)
-        #expect(planned.count == 7, "a statement on a mail table this test does not know: \(planned.map(\.sql))")
+        #expect(planned.count == 6, "a statement on a mail table this test does not know: \(planned.map(\.sql))")
         for read in counts + batches {
             #expect(read.plan.contains("messageAICache_expiry (updatedAt<?)"), "\(read.sql): \(read.plan)")
         }

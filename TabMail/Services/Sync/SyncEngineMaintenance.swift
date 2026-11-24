@@ -375,9 +375,14 @@ extension SyncEngine {
     /// expired like any other instead of failing the batch on every run.
     ///
     /// SQLite's own checkpoint is off (`AppDatabase.makePool`), so the WAL grows
-    /// until something checkpoints it: after every batch, once its write has
-    /// committed, the run calls `checkpointWAL` (the throttled
-    /// `checkpointWALThrottled`, as the other batch writers do).
+    /// until something checkpoints it: between two batches, once the earlier one's
+    /// write has committed, the run calls `checkpointWAL` (the throttled
+    /// `checkpointWALThrottled`, as the other batch writers do). It never checkpoints
+    /// after its last batch. The maintenance pass asks for a TRUNCATE checkpoint right
+    /// after the run, and the throttle would skip that TRUNCATE inside the window a
+    /// checkpoint moments before had opened; so a run of one batch, the common case,
+    /// adds no checkpoint at all. To know inside its own transaction whether another
+    /// batch follows, a batch reads one expired entry more than it handles.
     nonisolated static func runPurgeExpiredAICache(
         dbPool: PrioritizedDatabase,
         checkpointWAL: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }
@@ -394,9 +399,9 @@ extension SyncEngine {
         while true {
             do {
                 let batchResult = try expireAICacheBatch(dbPool: dbPool, now: now, cutoff: cutoff, chunkSize: chunkSize)
-                if batchResult.batchEmpty { break }
                 purged += batchResult.purged
                 rescued += batchResult.rescued
+                if !batchResult.more { break }
             } catch {
                 BackgroundSyncLogger.logDebug("[AICache] Purge failed: \(error)")
                 break
@@ -423,17 +428,17 @@ extension SyncEngine {
 
     /// One batch of the purge, read and handled in one write transaction: up to
     /// `chunkSize` expired entries, each deleted or, when its message is in an inbox,
-    /// kept with `updatedAt = now`. `batchEmpty` when no expired entry was left.
+    /// kept with `updatedAt = now`. It reads one entry more than it handles: `more`
+    /// when that entry exists, so another batch follows.
     private nonisolated static func expireAICacheBatch(
         dbPool: PrioritizedDatabase, now: Date, cutoff: Date, chunkSize: Int
-    ) throws -> (purged: Int, rescued: Int, batchEmpty: Bool) {
-        return try dbPool.write { db -> (purged: Int, rescued: Int, batchEmpty: Bool) in
-            let batch = try Row.fetchAll(db, sql: aiCacheExpiredBatchSQL, arguments: [cutoff, chunkSize])
-            guard !batch.isEmpty else { return (0, 0, true) }
+    ) throws -> (purged: Int, rescued: Int, more: Bool) {
+        return try dbPool.write { db -> (purged: Int, rescued: Int, more: Bool) in
+            let rows = try Row.fetchAll(db, sql: aiCacheExpiredBatchSQL, arguments: [cutoff, chunkSize + 1])
 
             var batchPurged = 0
             var batchRescued = 0
-            for row in batch {
+            for row in rows.prefix(chunkSize) {
                 let key: String = row["key"]
                 let rfc822MessageId: String? = row["rfc822MessageId"]
                 if let msgId = rfc822MessageId.map({ EmailFilter.normalizeMessageId($0) }), !msgId.isEmpty,
@@ -445,7 +450,7 @@ extension SyncEngine {
                 try db.execute(sql: "DELETE FROM messageAICache WHERE key = ?", arguments: [key])
                 batchPurged += 1
             }
-            return (batchPurged, batchRescued, false)
+            return (batchPurged, batchRescued, rows.count > chunkSize)
         }
     }
 

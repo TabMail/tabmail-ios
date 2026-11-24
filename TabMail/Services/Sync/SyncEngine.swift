@@ -545,16 +545,10 @@ actor SyncEngine {
     /// merge / a user action can't inherit a checkpoint stall (the ~1-2s "tic"). Hanging it
     /// off the constantly-running backfill — not just the sparse per-poll maintenance, which
     /// ran 0x in a 44-min capture — is what bounds the WAL reliably.
-    ///
-    /// A TRUNCATE is never throttled. Its one caller, the end of the foreground poll's
-    /// maintenance pass, asks for it once per pass, and the batch writers checkpoint
-    /// PASSIVE all the time: the AI cache expiry in that same pass checkpoints after
-    /// every batch, moments before. Throttled, the TRUNCATE would lose its turn to that
-    /// PASSIVE checkpoint, and the WAL file would keep its full size until a later pass.
     nonisolated static func checkpointWALThrottled(truncate: Bool = false) async {
         let now = CFAbsoluteTimeGetCurrent()
         let go = walCheckpointState.withLock { last -> Bool in
-            guard truncate || now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
+            guard now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
             last = now
             return true
         }
