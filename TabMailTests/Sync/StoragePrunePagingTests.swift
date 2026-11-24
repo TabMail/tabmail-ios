@@ -24,7 +24,11 @@ import Testing
 ///   states a device can hold;
 /// - what a read costs, as pages fetched (pager cache hits plus misses, which is
 ///   deterministic): a page costs the same at the end of a large folder as at its
-///   start, and the check costs the same in a large folder as in a small one.
+///   start, and the check costs the same in a large folder as in a small one. Each
+///   cost test first shows the meter sees the former statement's cost grow.
+///
+/// The pass itself, `SyncEngine.runPruneIfOverBudget`, is pinned on its reads by
+/// `StoragePrunePassReadTests`.
 @Suite("Storage prune paging: the former pages and stops, each read bounded", .timeLimit(.minutes(2)))
 struct StoragePrunePagingTests {
     private typealias Hold = StaleBodyEvictWriterHoldTests
@@ -41,6 +45,11 @@ struct StoragePrunePagingTests {
     /// straddle one more leaf). The former walk's last page in `largeFolder` rows
     /// stepped over about a hundred index pages more than its first.
     static let pageSlack = 10
+
+    /// How much more a read that grows with the folder must cost in `largeFolder`
+    /// rows (at the folder's end, or against a folder of 200 rows) for the meter to
+    /// count as seeing the growth: three times the slack the bounded reads get.
+    static let growthMargin = 3 * pageSlack
 
     /// The index each order seeks.
     static func indexName(_ mode: StaleWindowMode) -> String {
@@ -59,6 +68,8 @@ struct StoragePrunePagingTests {
     final class ReaderStatementMeter: Sendable {
         struct StatementPages: Sendable {
             let sql: String
+            /// The statement with its arguments bound, to tell which folder it read.
+            let expandedSQL: String
             let pages: Int
 
             /// A read of `messageHeader`: a page or a check (the pass's only reads).
@@ -84,10 +95,13 @@ struct StoragePrunePagingTests {
                       let handle = OpaquePointer(bitPattern: bits) else { return }
                 let now = Hold.pagesSoFar(handle)
                 let sql = statement.sql
+                let expandedSQL = statement.expandedSQL
                 state.withLock { state in
                     let pages = now - (state.pagesAtLastStatement[bits] ?? now)
                     state.pagesAtLastStatement[bits] = now
-                    if state.recording { state.recorded.append(StatementPages(sql: sql, pages: pages)) }
+                    if state.recording {
+                        state.recorded.append(StatementPages(sql: sql, expandedSQL: expandedSQL, pages: pages))
+                    }
                 }
             }
         }
@@ -503,6 +517,27 @@ struct StoragePrunePagingTests {
         let smallCheck = try small()
         let smallCheckPages = smallCheck.reads.map(\.pages).reduce(0, +)
 
+        // Non-vacuity: the meter sees a read that grows with the folder. The page
+        // the pass read before #1402 (`LIMIT ? OFFSET ?`) costs more at the
+        // folder's end than at its start, because it steps over every row before it.
+        func formerPage(offset: Int) throws -> Int {
+            try fixture.meter.headerReads {
+                try fixture.pool.read { db in
+                    try String.fetchAll(db,
+                        MessageHeader
+                            .select(Column("id"))
+                            .filter(Column("folderId") == fixture.folderId("Archive"))
+                            .order(sql: SyncEngine.pruneOrderSQL(mode))
+                            .limit(Self.chunk, offset: offset)
+                    )
+                }
+            }.reads.map(\.pages).reduce(0, +)
+        }
+        let formerFirst = try formerPage(offset: 0)
+        let formerLast = try formerPage(offset: Self.largeFolder - Self.chunk)
+        #expect(formerLast - formerFirst > Self.growthMargin,
+                "setup: the meter does not see the former page grow: \(formerFirst) pages at the folder's start, \(formerLast) at its end")
+
         let run = fixture.meter.headerReads {
             SyncEngine.pruneFolderBodies(
                 dbPool: fixture.database, folderId: fixture.folderId("Archive"), mode: mode,
@@ -525,7 +560,10 @@ struct StoragePrunePagingTests {
                 "a check fetched up to \(costliestCheck) pages; in a folder of 200 rows it fetches \(smallCheckPages)")
     }
 
-    @Test("The check before each header chunk costs the same in a large folder as in a small one",
+    /// The check alone. That the header pass asks it before each chunk, and reads
+    /// nothing else that grows, is pinned on the pass itself by
+    /// `StoragePrunePassReadTests`.
+    @Test("The remainder check costs the same in a large folder as in a small one",
           arguments: [StaleWindowMode.uid, .date])
     func theCheckCostsTheSameWhateverTheFolderSize(_ mode: StaleWindowMode) throws {
         let fixture = try Self.makeFixture()
@@ -545,6 +583,20 @@ struct StoragePrunePagingTests {
         _ = try check("INBOX")
         let small = try check("INBOX")
         let large = try check("Archive")
+
+        // Non-vacuity: the meter sees a read that grows with the folder. The count
+        // the pass made before #1402 reads every entry of the folder.
+        func formerCount(_ path: String) throws -> Int {
+            try fixture.meter.headerReads {
+                try fixture.pool.read { db in
+                    try MessageHeader.filter(Column("folderId") == fixture.folderId(path)).fetchCount(db)
+                }
+            }.reads.map(\.pages).reduce(0, +)
+        }
+        let formerSmall = try formerCount("INBOX")
+        let formerLarge = try formerCount("Archive")
+        #expect(formerLarge - formerSmall > Self.growthMargin,
+                "setup: the meter does not see the former count grow: \(formerLarge) pages in \(Self.largeFolder) rows, \(formerSmall) in 200")
 
         #expect(small.answer && large.answer && small.reads == 1 && large.reads == 1,
                 "setup: small \(small), large \(large)")

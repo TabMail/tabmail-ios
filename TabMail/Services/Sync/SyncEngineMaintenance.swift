@@ -129,10 +129,19 @@ extension SyncEngine {
     /// and a pass reads each row once (#1402). Until #1402 the page was
     /// `LIMIT chunkSize OFFSET n` after a full count of the folder: each page
     /// stepped over every row before it, so a folder of n rows read about
-    /// n² / (2 · chunkSize) index entries. The pages, their order and the stops are
-    /// the same: the rows after the cursor are the folder's count less the offset,
-    /// so "more than `floor` of them" is exactly the former `offset < count - floor`,
-    /// and rows that share a key come in `rowid` order, as the index returned them.
+    /// n² / (2 · chunkSize) index entries. In a folder no other writer changes during
+    /// the pass, the pages, their order and the stops are the same: the rows after
+    /// the cursor are the folder's count less the offset, so "more than `floor` of
+    /// them" is exactly the former `offset < count - floor`, and rows that share a
+    /// key come in `rowid` order, as the index returned them. When sync writes the
+    /// folder meanwhile, the check counts the rows after the cursor as they are then,
+    /// where the former walk kept its start-of-pass count and offset: a row deleted
+    /// before the cursor no longer makes the walk skip rows or run into the floor, a
+    /// row deleted after it stops the pass earlier, a row inserted before it is no
+    /// longer re-read, and a row inserted after it can let the pass prune up to that
+    /// many more older bodies, rounded to pages, each outside the floor when checked.
+    /// A row deleted between a check and its page can still put that page inside the
+    /// floor, as the last page may be; the former walk had the whole pass for that.
     /// As before, the last page is a whole page even when fewer rows are left above
     /// the floor, so it can delete the bodies of rows inside the floor.
     ///
