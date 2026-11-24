@@ -77,3 +77,41 @@
 **Nothing dropped (rules 3, 4 and 6).** The index extends v40's `messageHeader_accountId_bodyComplete` and keeps its prefix, so it serves every plan that one serves; v40's stays, as v40's `messageHeader_bodyRepopulate` stayed beside `messageHeader_bodyRepopulateV2`.
 
 **Built deferred, rule 5 by the amended timing.** It is in `SyncEngine.deferredIndexes` (IOS-PERF-005): building it reads every header once, and its absence changes no result, only how much the counts read; nothing names it in an `INDEXED BY`. The build moves `schema_version`, so the statistics refresh that follows it in the same pass re-arms. `BackfillProgressCountTests` pins the plans in three statistics states (the migration chain's, none, a fresh `ANALYZE`), with a control that drops the index and reproduces both row-reading plans, and compares the counts against the same read without the index on an empty database, one row in each flag combination, tied index keys, several accounts with one empty, and 100,000 rows.
+
+**Measured (#1401, iOS simulator, `BackfillProgressIndexProofTests` on `DBProof.Shape.large`: 105,000 headers in four accounts, the app's own SQLite).**
+
+Size, after a vacuum. Of the 43,180-page database:
+
+| Index | Pages | Size | Per header | Share of the database |
+|---|---|---|---|---|
+| `messageHeader_backfillProgress` | 1,258 | 5.15 MB | 49.1 bytes | 2.91% |
+| v40's `messageHeader_accountId_bodyComplete` | 1,188 | 4.87 MB | 46.3 bytes | 2.75% |
+
+Write cost, as median wall time old -> new, new/old ratio. "No statistics" is no `sqlite_stat1`; "analyzed" is after the app's `ANALYZE`. The harness marks every ratio within noise.
+
+| Write | No statistics | Analyzed | Pages written |
+|---|---|---|---|
+| 100 new headers | 37.8 -> 40.2 ms (1.06) | 38.6 -> 38.1 ms (0.99) | 232 -> 241 |
+| `headerComplete = 1` on 200 headers | 59.7 -> 57.5 ms (0.96) | 54.0 -> 52.6 ms (0.98) | 754 -> 777 |
+| `bodyComplete = 1` on 50 bodies | 44.0 -> 58.7 ms (1.33) | 47.8 -> 55.4 ms (1.16) | 339 -> 511 |
+
+The `bodyComplete` flip writes 51% more pages because the index holds that column, so each completed body moves one entry, about 0.15 ms per body. That cost is accepted against the reads it saves.
+
+Census of the hot reads, with the index present and without it, in four statistics states:
+- the migration chain's;
+- none;
+- a fresh `ANALYZE` with the index present;
+- an `ANALYZE` taken before the index was built.
+
+What changed:
+- The pending count reads 102 pages instead of 7,986 (the migration chain's and no statistics) or 5,178 (fresh and stale).
+- The settled count reads 716 pages instead of 6,467, in every state.
+
+Two reads cost more:
+- **The embedding repopulate read.** Its statement is now `BackfillEmbeddingQueue.repopulateSQL`, which both queues' repopulate reads run.
+  - **What happened:** with this index present and a fresh `ANALYZE`, SQLite planned it as `SEARCH messageHeader USING INDEX messageHeader_backfillProgress (ANY(accountId) AND bodyComplete=? AND bodyEmptyConfirmed=?) | USE TEMP B-TREE FOR ORDER BY`. That is a skip-scan by account plus a sort of the whole backlog: 10,831 pages instead of 511, and 915,829 VM steps instead of 2,509.
+  - **The fix:** the statement names `messageHeader_embeddingIncomplete` with `INDEXED BY`. That index is migration-built (v50) and never deferred, so it always exists, and the read keeps its ordered scan in every state.
+  - **Pinned by:** `BackfillProgressCountTests.embeddingRepopulateKeepsItsIndex`. It is red without the name. The proof's census probe runs the production statement.
+- **The total count, in the stale state only.** It moves to this index: 716 pages instead of 677 (+6%), because v40's index is the smaller covering index for that count.
+  - **Accepted:** the stale state lasts only until the next statistics refresh, and a deferred build that analyzes the new index in its own write does not leave it at all.
+  - **Why v40 stays:** in every other state the total still reads v40's `messageHeader_accountId_bodyComplete`, and it is the cheaper index there.

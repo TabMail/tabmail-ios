@@ -259,6 +259,50 @@ struct BackfillProgressCountTests {
         }
     }
 
+    /// Headers for the embedding plan test: enough that, with the app's `ANALYZE`, the
+    /// planner prefers a skip-scan of this index to the embedding read's own index when
+    /// the read does not name it (it does not at 1,000 rows; it does at 5,000).
+    private static let embeddingPlanRows = 20_000
+
+    /// #1401: with this index present and the app's `ANALYZE` run, SQLite planned the
+    /// embedding repopulate read as a skip-scan of this index by account plus a sort of
+    /// the whole backlog: 10,831 pages instead of 511 on 105,000 headers. The read names
+    /// `messageHeader_embeddingIncomplete`, so in every statistics state it stays one
+    /// ordered scan of that index, with no sort, stopping at its limit. Red when the
+    /// statement does not name the index: the fresh state then plans the skip-scan.
+    @Test("With this index present, the embedding repopulate read keeps its ordered scan of its own index")
+    func embeddingRepopulateKeepsItsIndex() throws {
+        let accounts = ["acc-a", "acc-b", "acc-c", "acc-d"]
+        let queue = try Self.makeDatabase(accounts: accounts)
+        // Four accounts; four of every five headers have a body and no embedding, so
+        // they are in the embedding read's partial index.
+        try Self.fill(queue, count: Self.embeddingPlanRows, templateAccount: "acc-a", Fill(
+            accountId: "'acc-' || char(97 + n % 4)",
+            headerComplete: "1",
+            bodyComplete: "(n % 5) <> 0",
+            bodyEmptyConfirmed: "0",
+            bodyMetadataOversized: "0"))
+        let sql = BackfillEmbeddingQueue.repopulateSQL(limit: SyncConfig.embeddingRepopulateChunk)
+
+        for statistics in Statistics.allCases {
+            try Self.apply(statistics, to: queue)
+            if statistics == .fresh {
+                let statRows = try Self.indexStatRows(queue)
+                #expect(statRows > 0, "setup: the fresh state is vacuous unless ANALYZE wrote this index's row")
+            }
+            let (plan, rows) = try queue.read { conn in
+                (try Row.fetchAll(conn, sql: "EXPLAIN QUERY PLAN " + sql)
+                    .compactMap { $0["detail"] as String? }
+                    .joined(separator: " | "),
+                 try String.fetchAll(conn, sql: sql).count)
+            }
+            #expect(plan == "SCAN messageHeader USING INDEX messageHeader_embeddingIncomplete",
+                    "\(statistics.rawValue): the embedding read must scan its own index in order, no sort: \(plan)")
+            #expect(rows == SyncConfig.embeddingRepopulateChunk,
+                    "\(statistics.rawValue): setup: the read returns a full chunk: \(rows)")
+        }
+    }
+
     // MARK: - Same counts as the old statements
 
     @Test("Same counts as the old statements on an empty database and on one row in every flag combination")

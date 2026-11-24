@@ -315,10 +315,7 @@ struct BackfillProgressIndexProofTests {
                 SELECT rowid, id FROM messageHeader WHERE rowid > ? AND bodyComplete = 1 AND headerComplete = 1 \
                 ORDER BY rowid LIMIT 500
                 """, arguments: [0]),
-            Probe(name: "embedding repopulate", hot: false, sql: """
-                SELECT id FROM messageHeader WHERE bodyComplete = 1 AND embeddingComplete = 0 AND bodyEmptyConfirmed = 0 \
-                ORDER BY isInInbox DESC, date DESC LIMIT 500
-                """, arguments: []),
+            Probe(name: "embedding repopulate", hot: false, sql: BackfillEmbeddingQueue.repopulateSQL(limit: 500), arguments: []),
             Probe(name: "recover incomplete headers", hot: false, sql: """
                 SELECT * FROM messageHeader WHERE headerComplete = 0 LIMIT 500
                 """, arguments: []),
