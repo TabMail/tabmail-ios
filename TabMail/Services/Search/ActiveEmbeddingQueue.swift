@@ -244,12 +244,8 @@ actor ActiveEmbeddingQueue {
                 // over a large account = GBs of re-read: the read "burst" seen in profiling).
                 // Matching the index makes it a top-500 index seek; bonus: inbox embeds
                 // first, which the index's leading `isInInbox DESC` always intended.
-                try String.fetchAll(db, sql: """
-                    SELECT id FROM messageHeader
-                    WHERE bodyComplete = 1 AND embeddingComplete = 0 AND bodyEmptyConfirmed = 0
-                    ORDER BY isInInbox DESC, date DESC
-                    LIMIT 500
-                    """)
+                // The statement also names the index (`repopulateSQL`, #1401).
+                try String.fetchAll(db, sql: BackfillEmbeddingQueue.repopulateSQL(limit: 500))
             }
             guard !ids.isEmpty else { return }
             let items = ids.map { Item(headerId: $0) }
