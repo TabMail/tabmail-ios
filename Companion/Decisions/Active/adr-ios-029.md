@@ -87,21 +87,32 @@ Size, after a vacuum. Of the 43,180-page database:
 | `messageHeader_backfillProgress` | 1,258 | 5.15 MB | 49.1 bytes | 2.91% |
 | v40's `messageHeader_accountId_bodyComplete` | 1,188 | 4.87 MB | 46.3 bytes | 2.75% |
 
-Write cost, as median wall time old -> new, new/old ratio. "No statistics" is no `sqlite_stat1`; "analyzed" is after the app's `ANALYZE`. The harness marks every ratio within noise.
+Write cost, as median wall time old -> new, new/old ratio. "No statistics" is no `sqlite_stat1`; "analyzed" is after the app's `ANALYZE`. These are the figures of the final proof run, on the head that ships.
 
 | Write | No statistics | Analyzed | Pages written |
 |---|---|---|---|
-| 100 new headers | 37.8 -> 40.2 ms (1.06) | 38.6 -> 38.1 ms (0.99) | 232 -> 241 |
-| `headerComplete = 1` on 200 headers | 59.7 -> 57.5 ms (0.96) | 54.0 -> 52.6 ms (0.98) | 754 -> 777 |
-| `bodyComplete = 1` on 50 bodies | 44.0 -> 58.7 ms (1.33) | 47.8 -> 55.4 ms (1.16) | 339 -> 511 |
+| 100 new headers | 37.8 -> 45.0 ms (1.19) | 37.3 -> 42.5 ms (1.14) | 232 -> 241 |
+| `headerComplete = 1` on 200 headers | 59.5 -> 64.4 ms (1.08) | 53.5 -> 54.7 ms (1.02) | 754 -> 777 |
+| `bodyComplete = 1` on 50 bodies | 44.4 -> 59.6 ms (1.34) | 42.7 -> 65.2 ms (1.53, marked slower) | 339 -> 511 |
 
-The `bodyComplete` flip writes 51% more pages because the index holds that column, so each completed body moves one entry, about 0.15 ms per body. That cost is accepted against the reads it saves.
+The harness marks every ratio within noise except the analyzed `bodyComplete` flip. That flip writes 51% more pages because the index holds that column, so each completed body moves one entry. In time this is about 15 to 22 ms more per 50-body batch write, or 0.30 to 0.45 ms per body. An earlier run of the same proof measured about 0.15 ms per body with the same page counts. The accepted figure is this run's, and the page count is the stable measure. The cost is accepted against the reads it saves (below): each progress update reads 102 pending pages instead of 5,178 to 7,986, and 716 settled pages instead of 6,467. A body download's network time is far above half a millisecond.
 
 Census of the hot reads, with the index present and without it, in four statistics states:
 - the migration chain's;
 - none;
 - a fresh `ANALYZE` with the index present;
 - an `ANALYZE` taken before the index was built.
+
+Pages read, with the index / without it:
+
+| Read | Migration chain's | None | Fresh `ANALYZE` | `ANALYZE` before the index |
+|---|---|---|---|---|
+| Settled count | 716 / 6,467 | 716 / 6,467 | 716 / 6,467 | 716 / 6,467 |
+| Pending count | 102 / 7,986 | 102 / 7,986 | 102 / 5,178 | 102 / 5,178 |
+| Total count | 677 / 677 | 677 / 677 | 677 / 677 | 716 / 677 |
+| Embedding repopulate (`repopulateSQL`) | 511 / 511 | 511 / 511 | 511 / 511 | 511 / 511 |
+
+Every other hot read (the body download queues, the inbox member seed, the label-filter page) reads within 0.3% of the same pages in every state.
 
 What changed:
 - The pending count reads 102 pages instead of 7,986 (the migration chain's and no statistics) or 5,178 (fresh and stale).
