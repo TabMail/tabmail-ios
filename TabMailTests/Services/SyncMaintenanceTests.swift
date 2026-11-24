@@ -1327,6 +1327,34 @@ struct PlannerStatisticsRefreshTests {
     /// production tree, never listed by hand, so a third caller added in a new file is
     /// caught rather than silently uncovered (`MIS-007` — a hand-written census stops
     /// being complete the day the thing it counts grows).
+    /// Which storage prune each caller runs (#1437): the background processing
+    /// job's maintenance the overnight one (from 90% of the limit), the foreground
+    /// poll's the foreground one (from 95%), and the maintenance pass runs the one it
+    /// is handed first. The tests that call the prune pass their gate, so only the
+    /// source shows which gate production runs. Every production line that names
+    /// a gate, forwards one or calls the prune is discovered by walking the tree.
+    @Test("The background job's maintenance runs the overnight prune, the foreground poll's the foreground prune, and the pass runs the gate it is handed")
+    func eachMaintenanceCallerRunsItsPruneGate() {
+        let uses = SyncEngineMaintenanceTests.productionCodeLines()
+            .filter { line in
+                ["prune: .", "prune: prune", "prune: StorageEstimator", "if let prune", "runPruneIfOverBudget("]
+                    .contains { line.code.contains($0) }
+            }
+            .map { "\($0.file): \($0.code)" }
+            .sorted()
+        let expected = [
+            "SyncEngine.swift: await runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder, gate: prune)",
+            "SyncEngine.swift: dbPool: pool, prune: prune,",
+            "SyncEngine.swift: func scheduleMaintenanceInBackground(prune: StorageEstimator.PruneGate?) {",
+            "SyncEngine.swift: if let prune, shouldRun() {",
+            "SyncEngine.swift: prune: StorageEstimator.PruneGate?,",
+            "SyncEngineMaintenance.swift: nonisolated static func runPruneIfOverBudget(",
+            "SyncScheduler.swift: await manager.syncEngine.scheduleMaintenanceInBackground(prune: .foreground)",
+            "SyncScheduler.swift: dbPool: AppDatabase.backgroundPool, prune: .overnight,",
+        ].sorted()
+        #expect(uses == expected, "the prune's gates as production passes them: \(uses)")
+    }
+
     @Test("No production caller runs WAL maintenance above .background")
     func everyWALMaintenanceCallSitePassesABackgroundPool() throws {
         // …/tabmail-ios/TabMailTests/Services/<this file>

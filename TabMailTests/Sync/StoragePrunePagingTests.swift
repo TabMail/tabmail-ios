@@ -374,7 +374,8 @@ struct StoragePrunePagingTests {
             let budget = ScriptedBudget(allowed: allowed)
             let removed = await SyncEngine.pruneFolderBodies(
                 dbPool: fixture.database, folderId: folderId, mode: shape.mode,
-                floor: Self.floor, chunkSize: Self.chunk, aboveTarget: { budget.isOverBudget() })
+                floor: Self.floor, chunkSize: Self.chunk, aboveTarget: { budget.isOverBudget() },
+                afterEachBatch: {})
             let after = try Self.bodyIds(fixture)
 
             #expect(budget.calls == formerBudget.calls,
@@ -559,7 +560,7 @@ struct StoragePrunePagingTests {
         let run = await fixture.meter.asyncHeaderReads {
             await SyncEngine.pruneFolderBodies(
                 dbPool: fixture.database, folderId: fixture.folderId("Archive"), mode: mode,
-                floor: Self.floor, chunkSize: Self.chunk, aboveTarget: { true })
+                floor: Self.floor, chunkSize: Self.chunk, aboveTarget: { true }, afterEachBatch: {})
         }
         let pages = run.reads.filter { !$0.isCount }.map(\.pages)
         let checks = run.reads.filter(\.isCount).map(\.pages)

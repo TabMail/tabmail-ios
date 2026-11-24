@@ -121,6 +121,8 @@ extension SyncEngine {
     /// in the prune order, a page of `chunkSize` rows at a time, while more than
     /// `floor` rows lie after the last page (`pruneRowsBeyondFloor`) and, asked
     /// after that, `aboveTarget()` holds. Returns how many bodies it deleted.
+    /// After each page's write, outside it, it calls `afterEachBatch` (the run's
+    /// checkpoint, `runPruneIfOverBudget`'s).
     /// `aboveTarget` is the pass's storage check (`runPruneIfOverBudget`); a test
     /// passes its own to stop after a given number of pages. Until #1437 it was
     /// `StorageEstimator.isOverBudget`, the size of the files in Application
@@ -150,7 +152,8 @@ extension SyncEngine {
     /// A read that fails ends the folder's pass, as a failed count or page did.
     nonisolated static func pruneFolderBodies(
         dbPool: PrioritizedDatabase, folderId: String, mode: StaleWindowMode,
-        floor: Int, chunkSize: Int, aboveTarget: () async -> Bool
+        floor: Int, chunkSize: Int, aboveTarget: () async -> Bool,
+        afterEachBatch: () async -> Void
     ) async -> Int {
         var removed = 0
         var cursor: PruneCursor?
@@ -174,6 +177,7 @@ extension SyncEngine {
             }) ?? 0
             removed += deleted
             cursor = last.cursor
+            await afterEachBatch()
         }
         return removed
     }
@@ -187,16 +191,19 @@ extension SyncEngine {
     /// decorrelated, ADR-IOS-042) that every catch-up listing downloaded again.
     ///
     /// It runs only under an Email Index Limit, and only once the space the limit
-    /// counts (`StorageEstimator.SpaceMeter`: the space Settings reports, less the
-    /// WAL files and empty pages of the email and search databases) reaches the gate's start
-    /// percentage of the limit; it then deletes until that space is at or below
+    /// counts (`StorageEstimator.SpaceMeter`: the space Settings reports, with the
+    /// email and search databases counted by the data they hold) reaches the gate's
+    /// start percentage of the limit; it then deletes until that space is at or below
     /// `SyncConfig.storagePruneTargetPercent` of it, or every folder is at its floor.
     /// The limit is read once, as its first step: a limit changed while it runs
     /// applies to the next prune. The storage folder is walked once, at the start,
     /// outside any write; each later check re-reads only the databases' page totals.
     /// Each header batch waits for its search entries and bodies to be released
-    /// before the next check, so that check sees what the batch freed. `space`
-    /// replaces the app's measure (`SpaceSource.app`) in tests.
+    /// before the next check, so that check sees what the batch freed. After each
+    /// batch's write (a page of bodies or a batch of headers), outside it, the run
+    /// calls `afterEachBatch`: the throttled `PASSIVE` checkpoint, so the WAL does not
+    /// grow through the whole run (autocheckpoint is off). `space` replaces the app's
+    /// measure (`SpaceSource.app`) and `afterEachBatch` the checkpoint in tests.
     ///
     /// *Superseded (#1437):* it ran while `StorageEstimator.isOverBudget`, the
     /// allocated size of the files in Application Support, reached the limit, walked
@@ -207,7 +214,8 @@ extension SyncEngine {
     /// not awaited.
     nonisolated static func runPruneIfOverBudget(
         dbPool: PrioritizedDatabase, pruneOrder: [String: StaleWindowMode],
-        gate: StorageEstimator.PruneGate, space: StorageEstimator.SpaceSource? = nil
+        gate: StorageEstimator.PruneGate, space: StorageEstimator.SpaceSource? = nil,
+        afterEachBatch: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }
     ) async {
         let budgetMB = StorageEstimator.budgetMB
         guard let startBytes = StorageEstimator.limitBytes(percent: gate.startPercent, ofBudgetMB: budgetMB),
@@ -218,7 +226,7 @@ extension SyncEngine {
         let measureMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
         let startUsed = meter.startBytes
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Prune] Used \(Self.megabytes(startUsed))MB of \(budgetMB)MB (reported \(Self.megabytes(meter.reportedBytes))MB, WAL \(Self.megabytes(meter.walBytes))MB, measured in \(measureMs)ms), gate \(gate)")
+            BackgroundSyncLogger.logDebug("[Prune] Used \(Self.megabytes(startUsed))MB of \(budgetMB)MB (reported \(Self.megabytes(meter.reportedBytes))MB, database files \(Self.megabytes(meter.databaseFileBytes))MB, measured in \(measureMs)ms), gate \(gate)")
         }
         guard Double(startUsed) >= startBytes else { return }
         // Whether the prune goes on: the run is still wanted (`runWALMaintenance`'s
@@ -254,7 +262,8 @@ extension SyncEngine {
                 guard await aboveTarget() else { break }
                 bodiesRemoved += await pruneFolderBodies(
                     dbPool: dbPool, folderId: folder.id, mode: mode,
-                    floor: floor, chunkSize: pruneChunkSize, aboveTarget: aboveTarget)
+                    floor: floor, chunkSize: pruneChunkSize, aboveTarget: aboveTarget,
+                    afterEachBatch: afterEachBatch)
             }
         }
         if bodiesRemoved > 0 {
@@ -373,6 +382,8 @@ extension SyncEngine {
                                 keys, stores: [.searchIndex, .body], pool: dbPool)
                         }.value
                     }
+                    // After the batch's write and its release, outside both.
+                    await afterEachBatch()
                 }
             }
         }

@@ -72,7 +72,7 @@ struct StoragePrunePassReadTests {
         let run = await fixture.meter.asyncHeaderReads {
             await SyncEngine.runPruneIfOverBudget(
                 dbPool: fixture.database, pruneOrder: [fixture.accountId: mode],
-                gate: .foreground, space: .constant(Int64.max))
+                gate: .foreground, space: .constant(Int64.max), afterEachBatch: {})
         }
 
         // Each statement's costliest run in each folder, told apart by the folder id it binds.

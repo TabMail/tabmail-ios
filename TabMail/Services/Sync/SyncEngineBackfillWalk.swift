@@ -1113,7 +1113,10 @@ extension SyncEngine {
     /// IMAP: header fetch then body fetch in the same iteration (protocol limitation).
     /// After walking all folders, runs a cleanup pass for any remaining empty bodies.
     /// Returns true if any work was done.
-    func runBackfillWalk(account: Account, deadline: Date? = nil) async -> Bool {
+    ///
+    /// `space` is where the storage target is measured (#1437); nil measures
+    /// the app's own databases and storage folder. Tests pass their own.
+    func runBackfillWalk(account: Account, deadline: Date? = nil, space: StorageEstimator.SpaceSource? = nil) async -> Bool {
         runningBackfillWalks += 1
         defer { runningBackfillWalks -= 1 }
         #if DEBUG
@@ -1214,7 +1217,7 @@ extension SyncEngine {
         // (`StorageEstimator.WalkCheck`, #1437): one walk of the storage folder for
         // this run, here, and each folder pick below re-reads only the databases'
         // page totals. nil with no limit set.
-        let storageCheck = await StorageEstimator.WalkCheck.start(.app(pool: dbPool))
+        let storageCheck = await StorageEstimator.WalkCheck.start(space ?? .app(pool: dbPool))
         while true {
             guard !Task.isCancelled else { return didWork }
             guard !isPastDeadline() else { break }

@@ -2828,20 +2828,21 @@ actor SearchIndex {
     }
 
     /// The search database's pages and empty pages (`StorageEstimator.PageTotals`),
-    /// whose empty pages the Email Index Limit's measure subtracts together with the
-    /// email database's (#1437). nil when the database cannot be opened or read.
+    /// whose data the Email Index Limit's measure counts together with the email
+    /// database's (#1437). nil when the database cannot be opened or read.
     func pageTotals() -> StorageEstimator.PageTotals? {
         ensureReady()
         guard let dbPool else { return nil }
         return (try? dbPool.read { db in try StorageEstimator.PageTotals.read(db) }) ?? nil
     }
 
-    /// The allocated size of the search database's WAL file, in bytes (#1437): the
-    /// storage measure leaves it out, as it leaves out the email database's.
-    func walFileBytes() -> Int64 {
+    /// The allocated size of the search database file and its WAL file, in bytes
+    /// (#1437): the storage measure counts the database's data instead
+    /// (`StorageEstimator.SpaceMeter`), as it does the email database's.
+    func databaseFileBytes() -> Int64 {
         ensureReady()
         guard let dbPool else { return 0 }
-        return StorageEstimator.walFileBytes(ofDatabaseAt: dbPool.path)
+        return StorageEstimator.databaseFileBytes(ofDatabaseAt: dbPool.path)
     }
 
 
