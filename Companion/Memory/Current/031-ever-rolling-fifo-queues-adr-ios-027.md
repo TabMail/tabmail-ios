@@ -6,6 +6,8 @@
 > **Accepted, per ADR-IOS-078's residual invariant:** for an out-of-window row, exempt AI work can fail to be scheduled or be discarded before it runs — never silently wrong, never durable, always repairable by one ordinary gesture (reopen/Retry re-enters the exempt direct path). ⛔ Do **NOT** widen `repopulationCandidates` to "fix" it, and do **NOT** re-gate an exempt producer to "restore" a global bound — the AI window is the install-flood door. Fuller version of this note sits on the routed ADR-IOS-027 fragment; canonical statements are ADR-IOS-078 (§ Pathway regating) and the `IOS-AI-004` amendment.
 >
 > *Note (2026-11-20, #1064):* `BackfillBodyQueue` holds older-mail body downloads under the walk's network and power gates (Wi-Fi-only, low battery, Low Power Mode; ADR-IOS-005 amendment). That hold is a network and power rule, not a pause mechanism: items stay pending, no retry is spent, and a gate watcher re-dispatches when it lifts.
+>
+> *Correction (2026-11-24, #1400):* "`ActiveBodyQueue`'s sweep is Inbox-wide and **unbounded**" above describes the body queues before #1400. Both body queues' refills (`ActiveBodyQueue` and `BackfillBodyQueue`, full and drain-time) now read one window of the newest `SyncConfig.bodyFetchRepopulateLimit` waiting rows; successive refills still reach every waiting row, with one accepted exception, `IOS-BODY-007`. The AI window stays load-bearing (ADR-IOS-027's current note).
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Ever-Rolling FIFO Queues (ADR-IOS-027)
