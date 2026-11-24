@@ -120,9 +120,11 @@ extension SyncEngine {
     /// One folder's body pass: deletes the cached bodies of its rows oldest first
     /// in the prune order, a page of `chunkSize` rows at a time, while more than
     /// `floor` rows lie after the last page (`pruneRowsBeyondFloor`) and, asked
-    /// after that, `isOverBudget()` holds. Returns how many bodies it deleted.
-    /// `isOverBudget` is `StorageEstimator.isOverBudget` in the pass; a test passes
-    /// its own to stop after a given number of pages.
+    /// after that, `aboveTarget()` holds. Returns how many bodies it deleted.
+    /// `aboveTarget` is the pass's storage check (`runPruneIfOverBudget`); a test
+    /// passes its own to stop after a given number of pages. Until #1437 it was
+    /// `StorageEstimator.isOverBudget`, the size of the files in Application
+    /// Support, which a delete never shrinks.
     ///
     /// A page is the next `chunkSize` rows after a cursor (`prunePageSQL`), a seek
     /// on the order's index, so it costs the same wherever it lies in the folder,
@@ -148,14 +150,14 @@ extension SyncEngine {
     /// A read that fails ends the folder's pass, as a failed count or page did.
     nonisolated static func pruneFolderBodies(
         dbPool: PrioritizedDatabase, folderId: String, mode: StaleWindowMode,
-        floor: Int, chunkSize: Int, isOverBudget: () -> Bool
-    ) -> Int {
+        floor: Int, chunkSize: Int, aboveTarget: () async -> Bool
+    ) async -> Int {
         var removed = 0
         var cursor: PruneCursor?
-        while (try? dbPool.read({ db in
+        while (try? passThroughRead(dbPool, { db in
             try pruneRowsBeyondFloor(db, folderId: folderId, mode: mode, after: cursor, floor: floor)
-        })) ?? false, isOverBudget() {
-            let page: [(id: String, cursor: PruneCursor)] = (try? dbPool.read { db in
+        })) ?? false, await aboveTarget() {
+            let page: [(id: String, cursor: PruneCursor)] = (try? passThroughRead(dbPool) { db in
                 try Row.fetchAll(
                     db, sql: prunePageSQL(mode, afterCursor: cursor != nil),
                     arguments: pruneArguments(mode, folderId: folderId, cursor: cursor, limit: chunkSize)
@@ -167,7 +169,7 @@ extension SyncEngine {
             }) ?? []
             guard let last = page.last else { break }
             let headerIds = page.map(\.id)
-            let deleted = (try? dbPool.write { db in
+            let deleted = (try? passThroughWrite(dbPool) { db in
                 try MessageBody.filter(headerIds.contains(Column("id"))).deleteAll(db)
             }) ?? 0
             removed += deleted
@@ -183,23 +185,60 @@ extension SyncEngine {
     /// *Superseded (#1062):* every folder was pruned oldest DATE first, which on
     /// IMAP left pruned holes throughout the UID range (UID and date are
     /// decorrelated, ADR-IOS-042) that every catch-up listing downloaded again.
-    nonisolated static func runPruneIfOverBudget(dbPool: PrioritizedDatabase, pruneOrder: [String: StaleWindowMode]) {
-        guard StorageEstimator.isOverBudget() else { return }
-
+    ///
+    /// It runs only under an Email Index Limit, and only once the space the limit
+    /// counts (`StorageEstimator.SpaceMeter`: the space Settings reports, less the
+    /// WAL files and empty pages of the email and search databases) reaches the gate's start
+    /// percentage of the limit; it then deletes until that space is at or below
+    /// `SyncConfig.storagePruneTargetPercent` of it, or every folder is at its floor.
+    /// The limit is read once, as its first step: a limit changed while it runs
+    /// applies to the next prune. The storage folder is walked once, at the start,
+    /// outside any write; each later check re-reads only the databases' page totals.
+    /// Each header batch waits for its search entries and bodies to be released
+    /// before the next check, so that check sees what the batch freed. `space`
+    /// replaces the app's measure (`SpaceSource.app`) in tests.
+    ///
+    /// *Superseded (#1437):* it ran while `StorageEstimator.isOverBudget`, the
+    /// allocated size of the files in Application Support, reached the limit, walked
+    /// again before every folder, every page and every deleted row (that check ran
+    /// inside the batch's write). A delete never shrinks a SQLite file (the pages it
+    /// frees go to the freelist, and auto_vacuum is off), so that size never fell and
+    /// every run trimmed every folder to its floor. The release after each batch was
+    /// not awaited.
+    nonisolated static func runPruneIfOverBudget(
+        dbPool: PrioritizedDatabase, pruneOrder: [String: StaleWindowMode],
+        gate: StorageEstimator.PruneGate, space: StorageEstimator.SpaceSource? = nil
+    ) async {
         let budgetMB = StorageEstimator.budgetMB
-        let floor = StorageEstimator.floorPerFolder
+        guard let startBytes = StorageEstimator.limitBytes(percent: gate.startPercent, ofBudgetMB: budgetMB),
+              let targetBytes = StorageEstimator.limitBytes(
+                percent: SyncConfig.storagePruneTargetPercent, ofBudgetMB: budgetMB) else { return }
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let meter = await StorageEstimator.SpaceMeter.start(space ?? .app(pool: dbPool)) else { return }
+        let measureMs = Int((CFAbsoluteTimeGetCurrent() - t0) * 1000)
+        let startUsed = meter.startBytes
         if DebugModeManager.isLoggingEnabled() {
-            let totalMB = StorageEstimator.totalSizeMB()
-            BackgroundSyncLogger.logDebug("[Prune] Over budget (\(String(format: "%.1f", totalMB))MB / \(budgetMB)MB)")
+            BackgroundSyncLogger.logDebug("[Prune] Used \(Self.megabytes(startUsed))MB of \(budgetMB)MB (reported \(Self.megabytes(meter.reportedBytes))MB, WAL \(Self.megabytes(meter.walBytes))MB, measured in \(measureMs)ms), gate \(gate)")
+        }
+        guard Double(startUsed) >= startBytes else { return }
+        // Whether the prune goes on: the run is still wanted (`runWALMaintenance`'s
+        // `shouldRun`) and the space used is still above the target. A measure that
+        // fails stops it, as a failed read stops a folder.
+        let aboveTarget: () async -> Bool = {
+            guard !Task.isCancelled, !DatabaseSuspension.isSuspended,
+                  let used = await meter.usedBytes() else { return false }
+            return Double(used) > targetBytes
         }
 
-        let accounts = (try? dbPool.read { db in try Account.fetchAll(db) }) ?? []
+        let floor = StorageEstimator.floorPerFolder
+
+        let accounts = (try? passThroughRead(dbPool) { db in try Account.fetchAll(db) }) ?? []
         let pruneChunkSize = SyncConfig.pruneChunkSize
 
         // Fetch all folders once — reused for both body and header pruning
         var foldersByAccount: [String: [Folder]] = [:]
         for account in accounts {
-            foldersByAccount[account.id] = (try? dbPool.read { db in
+            foldersByAccount[account.id] = (try? passThroughRead(dbPool) { db in
                 try Folder.filter(Column("accountId") == account.id).fetchAll(db)
             }) ?? []
         }
@@ -212,10 +251,10 @@ extension SyncEngine {
             let mode = pruneOrder[account.id] ?? .date
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
-                guard StorageEstimator.isOverBudget() else { break }
-                bodiesRemoved += pruneFolderBodies(
+                guard await aboveTarget() else { break }
+                bodiesRemoved += await pruneFolderBodies(
                     dbPool: dbPool, folderId: folder.id, mode: mode,
-                    floor: floor, chunkSize: pruneChunkSize, isOverBudget: StorageEstimator.isOverBudget)
+                    floor: floor, chunkSize: pruneChunkSize, aboveTarget: aboveTarget)
             }
         }
         if bodiesRemoved > 0 {
@@ -231,16 +270,16 @@ extension SyncEngine {
             let orderSQL = pruneOrderSQL(mode)
             let folders = foldersByAccount[account.id] ?? []
             for folder in folders {
-                guard StorageEstimator.isOverBudget() else { break }
-                while StorageEstimator.isOverBudget() {
+                guard await aboveTarget() else { break }
+                while await aboveTarget() {
                     // At most `floor + 1` index entries, not a count of the whole
                     // folder before every chunk (#1402). A failed read stops the
                     // folder, as the count's `?? 0` did.
-                    let beyondFloor = (try? dbPool.read { db in
+                    let beyondFloor = (try? passThroughRead(dbPool) { db in
                         try pruneRowsBeyondFloor(db, folderId: folder.id, mode: mode, after: nil, floor: floor)
                     }) ?? false
                     guard beyondFloor else { break }
-                    let batch: [MessageHeader] = (try? dbPool.read { db in
+                    let batch: [MessageHeader] = (try? passThroughRead(dbPool) { db in
                         try MessageHeader
                             .filter(Column("folderId") == folder.id)
                             .order(sql: orderSQL)
@@ -249,9 +288,17 @@ extension SyncEngine {
                     }) ?? []
                     guard !batch.isEmpty else { break }
 
-                    var chunkIds: [String] = []
+                    // The batch's ids, once its transaction commits. A failed write
+                    // rolls the whole batch back and stops the folder: the same batch
+                    // would be selected again, and a write that keeps failing would
+                    // repeat it for as long as the space used stays above the target. Until
+                    // #1437 a failed write kept the ids collected before it failed and
+                    // released them, and the write checked
+                    // `StorageEstimator.isOverBudget` (a walk of the files) before
+                    // every row; nothing is measured inside the write now.
+                    let chunkIds: [String]
                     do {
-                        try dbPool.write { db in
+                        chunkIds = try passThroughWrite(dbPool) { db -> [String] in
                             // A folder pruned lowest UID first records where the
                             // prune reached, with the folder's epoch, in this same
                             // transaction (`CatchUpPruneCutoff`, #1062): under a
@@ -273,13 +320,12 @@ extension SyncEngine {
                                     arguments: [folder.id]))
                             }
                             var highestPrunedUid: Int?
+                            var ids: [String] = []
                             for msg in batch {
-                                guard StorageEstimator.isOverBudget() else { break }
-                                chunkIds.append(msg.id)
+                                ids.append(msg.id)
                                 var current: MessageHeader?
                                 if cutoffEpoch != nil { current = try MessageHeader.fetchOne(db, key: msg.id) }
                                 let deleted = try msg.delete(db)
-                                headersRemoved += 1
                                 if deleted, let cutoffEpoch, let current,
                                    current.folderId == folder.id, current.messageId == msg.messageId,
                                    current.observedUidValidity == cutoffEpoch, msg.observedUidValidity == cutoffEpoch,
@@ -291,14 +337,20 @@ extension SyncEngine {
                                 try Self.recordCatchUpPruneCutoff(
                                     folderId: folder.id, highest: highestPrunedUid, epoch: cutoffEpoch, db: db)
                             }
+                            return ids
                         }
                     } catch {
                         BackgroundSyncLogger.logDebug("[Prune] Delete failed: \(error)")
+                        break
                     }
+                    headersRemoved += chunkIds.count
                     if !chunkIds.isEmpty {
                         // Routed through `MessageContentStore`. The headers were
                         // deleted in the write transaction just above, so this
-                        // detached release counts owners in the post-delete world.
+                        // release counts owners in the post-delete world. Awaited
+                        // (#1437): the next storage check has to see the search
+                        // entries and bodies this batch freed, or the prune would
+                        // delete more headers for space already on its way back.
                         //
                         // `.body` joins `.searchIndex` from Stage D and MATTERS MOST
                         // here: this whole function exists to reclaim disk when the
@@ -316,10 +368,10 @@ extension SyncEngine {
                         // is the only change; the work, its ordering and its failure
                         // handling are untouched.
                         let keys = chunkIds.map(ContentKey.init(rawValue:))
-                        Task.detached(priority: .medium) {
+                        await Task.detached(priority: .medium) {
                             await MessageContentStore.releaseUnowned(
                                 keys, stores: [.searchIndex, .body], pool: dbPool)
-                        }
+                        }.value
                     }
                 }
             }
@@ -327,7 +379,15 @@ extension SyncEngine {
         if headersRemoved > 0 {
             BackgroundSyncLogger.logDebug("[Prune] Removed \(headersRemoved) message headers")
         }
-        BackgroundSyncLogger.logDebug("[Prune] Done — now \(String(format: "%.1f", StorageEstimator.totalSizeMB()))MB")
+        if DebugModeManager.isLoggingEnabled() {
+            let used = await meter.usedBytes().map(Self.megabytes) ?? "unknown"
+            BackgroundSyncLogger.logDebug("[Prune] Done — used now \(used)MB")
+        }
+    }
+
+    /// Bytes as megabytes with one decimal, for the prune's debug lines.
+    private nonisolated static func megabytes(_ bytes: Int64) -> String {
+        String(format: "%.1f", Double(bytes) / (1024 * 1024))
     }
 
     /// The stale-body evict step's page: the next `limit` bodies older than the
@@ -374,6 +434,16 @@ extension SyncEngine {
         _ dbPool: PrioritizedDatabase, _ updates: (Database) throws -> T
     ) throws -> T {
         try dbPool.write(updates)
+    }
+
+    /// `PrioritizedDatabase.read`'s synchronous overload, for an async caller, for
+    /// the same reason as `passThroughWrite`: the storage prune's reads stay the
+    /// synchronous reads they were before it became async (#1437), with no
+    /// `Sendable` result required.
+    private nonisolated static func passThroughRead<T>(
+        _ dbPool: PrioritizedDatabase, _ value: (Database) throws -> T
+    ) throws -> T {
+        try dbPool.read(value)
     }
 
     /// Nonisolated evict — runs entirely off the main thread.

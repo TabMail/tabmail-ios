@@ -18,6 +18,7 @@
 
 ### Progressive Backfill & Storage Budget (ADR-IOS-005, ADR-IOS-006)
 
+> **Current note (2026-11-24, #1437):** "Storage pruning" and "StorageEstimator" below are superseded by ADR-IOS-006's current note of 2026-11-24. The prune (`SyncEngine.runPruneIfOverBudget`, `async`, `gate:` `.overnight` from the background processing job, `.foreground` from the poll) and the older-mail walk measure the space Settings reports less the WAL files and empty pages of both databases (`StorageEstimator.SpaceMeter`, one folder walk per run, then header reads only); the prune runs from 90%/95% of the limit down to 80%, the walk stops at 80%. Tests: `StoragePruneTargetTests`.
 > **Current note (2026-11-20, #1062):** the date-based self-heal (`SyncEngineSelfHeal`, `selfHealRecentMessages`) is deleted. Missing IMAP mail is now found and loaded by UID by the catch-up (ADR-IOS-107, amendment of 2026-11-20), which feeds the same insert funnel; every self-heal mention below is history.
 > **Current note (2026-11-20, #1062):** the prune now deletes each folder oldest-first in its sync order: lowest UID first on IMAP, oldest date first on Gmail/Exchange (ADR-IOS-006 current note). "Oldest-first" below meant by date for every provider.
 - **No age cutoff** — backfill always walks to completion: IMAP walks UID range from UIDNEXT-1 to UID 1, Gmail/Exchange exhausts all page tokens. Storage budget is the only gate.

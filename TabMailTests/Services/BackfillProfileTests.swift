@@ -182,8 +182,9 @@ struct StorageEstimatorConstantsTests {
         #expect(size >= 0)
     }
 
-    @Test("isOverBudget returns false with unlimited budget")
-    func notOverBudgetWithUnlimited() {
-        #expect(StorageEstimator.isOverBudget() == false)
+    @Test("The older-mail walk's storage check is off with unlimited budget")
+    func noWalkCheckWithUnlimited() async {
+        let check = await StorageEstimator.WalkCheck.start(.constant(Int64.max))
+        #expect(check == nil)
     }
 }

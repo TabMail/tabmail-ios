@@ -1,6 +1,31 @@
 
 ## ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 
+> **Current note (2026-11-24, #1437): what the limit counts, and where the prune starts and stops.**
+> The space the Email Index Limit counts is the space Settings reports (`StorageEstimator.totalSizeMB`,
+> a walk of Application Support) less the WAL files of the email and search databases and less their
+> empty pages (`freelist_count x page_size` of each, from the database header): a row delete moves the
+> pages it frees to the freelist and writes to the WAL, and neither shrinks a file (auto_vacuum is NONE;
+> the app ran VACUUM only after "Delete All Email Index Data"; the app's truncating checkpoint is
+> throttled), so the walk alone never fell and every prune trimmed every folder to its 50-message floor.
+> A run (a prune, or one run of the older-mail walk) walks the folder and reads the WAL files' size once,
+> at its start and outside any write, then re-reads only the page totals: used = reported at the start -
+> WAL files at the start - empty pages now + pages the databases gained since the start
+> (`StorageEstimator.SpaceMeter`; the growth term keeps the reported number current without a second
+> walk). Pages the WAL adds past the end of a database file are left out until a checkpoint copies them
+> in, so the measure can be low by their size: a prune then deletes less, never more. The prune starts at 90% of the limit in the background
+> processing job and at 95% in the foreground maintenance task, and deletes until the space used is at or
+> below 80% (`SyncConfig.storagePrune*Percent`); the order is unchanged (cached HTML beyond each folder's
+> newest 50 first, then headers in batches of 50 in each account's prune order, 50 per folder kept). Each
+> header batch waits for its search entries and bodies to be released before the next check. The limit
+> is read once, at the prune's start. The older-mail walk stops at the same 80% (`StorageEstimator.WalkCheck`;
+> a measure that cannot be read stops it for the run). Settings still shows the whole `totalSizeMB`. No limit set:
+> the prune and the walk measure nothing and change nothing. *Superseded in place:* decision 3's "Storage
+> budget gates whether backfill proceeds" was a walk of the folder against 100% of the limit before every
+> folder pick (`StorageEstimator.isOverBudget`, deleted); decision 4's measurement is now the reported half
+> of the measure, not the whole of it. Returning the empty pages to the file system (an
+> overnight VACUUM of both databases, for every user) is separate work.
+>
 > **Current note (2026-11-21, #1062): what was pruned is recorded, not inferred.** The lowest held UID
 > is no evidence of what was pruned: an infinite-scroll page caches rows below the pruned UIDs, and a
 > window UID whose header could not be read sits below the first local one. The IMAP prune now records

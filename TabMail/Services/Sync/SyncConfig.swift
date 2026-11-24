@@ -285,6 +285,18 @@ enum SyncConfig {
     static let backgroundBackfillDeadlineSeconds: TimeInterval = 5 * 60
     /// Pruning batch size — how many messages to process per iteration when over budget.
     static let pruneChunkSize = 50
+    /// The storage prune under an Email Index Limit (`SyncEngine.runPruneIfOverBudget`)
+    /// compares the space it counts (`StorageEstimator.SpaceMeter`: the space
+    /// Settings reports, less the WAL files and empty pages of the email and search databases)
+    /// with these percentages of the limit. In the background processing job it
+    /// starts once that space reaches `storagePruneOvernightStartPercent`; in the
+    /// foreground maintenance task, once it reaches
+    /// `storagePruneForegroundStartPercent`. Either way it deletes until the space is
+    /// at or below `storagePruneTargetPercent`, which leaves room for new mail; the
+    /// older-mail walk stops there too (`StorageEstimator.WalkCheck`).
+    static let storagePruneOvernightStartPercent = 90
+    static let storagePruneForegroundStartPercent = 95
+    static let storagePruneTargetPercent = 80
     /// FTS bulk-index batch size — headers indexed per folder page.
     static let ftsIndexBatchSize = 200
     /// Yield interval during FTS body backfill — sleep briefly every N updates.

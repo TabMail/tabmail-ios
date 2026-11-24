@@ -316,7 +316,9 @@ extension IMAPMissingByUIDTests {
             }
 
             // Over the limit whatever this store's size: a padding file larger
-            // than the limit, so the prune runs to its floor in every folder.
+            // than the limit (the walk of the files, which the older-mail walk's
+            // gate reads), and a measure of the space used above every level of it (#1437),
+            // so the prune runs to its floor in every folder.
             let savedBudget = UserDefaults.standard.object(forKey: StorageEstimator.storageBudgetKey)
             defer { UserDefaults.standard.set(savedBudget, forKey: StorageEstimator.storageBudgetKey) }
             StorageEstimator.budgetMB = 1
@@ -325,12 +327,15 @@ extension IMAPMissingByUIDTests {
             let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
             try Data(count: 2 * 1024 * 1024).write(to: padding)
             defer { try? FileManager.default.removeItem(at: padding) }
-            try #require(StorageEstimator.isOverBudget(), "setup: the store is over the limit, so the prune runs to its floor")
+            let walkCheck = await StorageEstimator.WalkCheck.start(.app(pool: AppDatabase.backgroundPool))
+            let walkStopped = await walkCheck?.reached() == true
+            try #require(walkStopped, "setup: the files are over the limit, so the older-mail walk loads nothing")
 
             // The prune, in each account's order as the engine resolves it.
             let order = await w.engine.pruneOrderByAccount()
             #expect(order[w.accountId] == .uid && order[gmailId] == .date, "setup: each account's order comes from its provider")
-            SyncEngine.runPruneIfOverBudget(dbPool: AppDatabase.backgroundPool, pruneOrder: order)
+            await SyncEngine.runPruneIfOverBudget(
+                dbPool: AppDatabase.backgroundPool, pruneOrder: order, gate: .foreground, space: .constant(Int64.max))
 
             let floor = StorageEstimator.floorPerFolder
             let newestDated = server.sorted {
@@ -433,7 +438,9 @@ extension IMAPMissingByUIDTests {
         try await Self.withWorld("prune-scroll", server: server, local: server) { w in
             #expect(try w.folder().backfillComplete, "setup: the older-mail walk is complete")
             // Over the limit whatever this store's size: a padding file larger
-            // than the limit, so the prune runs to its floor.
+            // than the limit (the walk of the files, which the older-mail walk's
+            // gate reads), and a measure of the space used above every level of it (#1437),
+            // so the prune runs to its floor.
             let savedBudget = UserDefaults.standard.object(forKey: StorageEstimator.storageBudgetKey)
             defer { UserDefaults.standard.set(savedBudget, forKey: StorageEstimator.storageBudgetKey) }
             StorageEstimator.budgetMB = 1
@@ -442,8 +449,12 @@ extension IMAPMissingByUIDTests {
             let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
             try Data(count: 2 * 1024 * 1024).write(to: padding)
             defer { try? FileManager.default.removeItem(at: padding) }
-            try #require(StorageEstimator.isOverBudget(), "setup: the store is over the limit, so the prune runs")
-            SyncEngine.runPruneIfOverBudget(dbPool: AppDatabase.backgroundPool, pruneOrder: await w.engine.pruneOrderByAccount())
+            let walkCheck = await StorageEstimator.WalkCheck.start(.app(pool: AppDatabase.backgroundPool))
+            let walkStopped = await walkCheck?.reached() == true
+            try #require(walkStopped, "setup: the files are over the limit, so the older-mail walk loads nothing")
+            await SyncEngine.runPruneIfOverBudget(
+                dbPool: AppDatabase.backgroundPool, pruneOrder: await w.engine.pruneOrderByAccount(),
+                gate: .foreground, space: .constant(Int64.max))
 
             let kept = try w.held()
             try #require(!kept.isEmpty && kept.count < count && kept == Array(kept[0]...count),
@@ -586,8 +597,12 @@ extension IMAPMissingByUIDTests {
             let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
             try Data(count: 2 * 1024 * 1024).write(to: padding)
             defer { try? FileManager.default.removeItem(at: padding) }
-            try #require(StorageEstimator.isOverBudget(), "setup: the store is over the limit, so the prune runs")
-            SyncEngine.runPruneIfOverBudget(dbPool: AppDatabase.backgroundPool, pruneOrder: [w.accountId: uidOrder ? .uid : .date])
+            let walkCheck = await StorageEstimator.WalkCheck.start(.app(pool: AppDatabase.backgroundPool))
+            let walkStopped = await walkCheck?.reached() == true
+            try #require(walkStopped, "setup: the files are over the limit, so the older-mail walk loads nothing")
+            await SyncEngine.runPruneIfOverBudget(
+                dbPool: AppDatabase.backgroundPool, pruneOrder: [w.accountId: uidOrder ? .uid : .date],
+                gate: .foreground, space: .constant(Int64.max))
             let held = try w.held()
             try #require(held.count < count, "setup: the prune deleted rows: \(held.count) of \(count) kept")
             let cutoff = CatchUpPruneCutoff.read(try w.folder().catchUpState, epoch: Self.epoch)
@@ -797,8 +812,12 @@ extension IMAPMissingByUIDTests {
             let padding = appSupport.appendingPathComponent("prune-test-padding-\(UUID().uuidString)")
             try Data(count: 2 * 1024 * 1024).write(to: padding)
             defer { try? FileManager.default.removeItem(at: padding) }
-            try #require(StorageEstimator.isOverBudget(), "setup: the store is over the limit, so the prune runs")
-            SyncEngine.runPruneIfOverBudget(dbPool: AppDatabase.backgroundPool, pruneOrder: [w.accountId: .uid])
+            let walkCheck = await StorageEstimator.WalkCheck.start(.app(pool: AppDatabase.backgroundPool))
+            let walkStopped = await walkCheck?.reached() == true
+            try #require(walkStopped, "setup: the files are over the limit, so the older-mail walk loads nothing")
+            await SyncEngine.runPruneIfOverBudget(
+                dbPool: AppDatabase.backgroundPool, pruneOrder: [w.accountId: .uid],
+                gate: .foreground, space: .constant(Int64.max))
             try #require(try w.held().count < count, "setup: the prune deleted rows")
             let state = try w.folder().catchUpState
             #expect(!(state ?? "").contains(CatchUpPruneCutoff.key),

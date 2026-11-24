@@ -1209,6 +1209,12 @@ extension SyncEngine {
         // recent (shallowest crawl depth), fetches older messages via UID/page-token walk.
         // IMAP: walks from UIDNEXT-1 backward to UID 1.
         // Gmail/Exchange: page-token walk from newest to oldest.
+        //
+        // Under an Email Index Limit the walk stops where the storage prune stops
+        // (`StorageEstimator.WalkCheck`, #1437): one walk of the storage folder for
+        // this run, here, and each folder pick below re-reads only the databases'
+        // page totals. nil with no limit set.
+        let storageCheck = await StorageEstimator.WalkCheck.start(.app(pool: dbPool))
         while true {
             guard !Task.isCancelled else { return didWork }
             guard !isPastDeadline() else { break }
@@ -1240,12 +1246,15 @@ extension SyncEngine {
                 }
             }
             let isExpensiveNetwork = NetworkMonitor.checkExpensive()
+            // Until #1437 the walk stopped at the whole limit, a walk of the storage
+            // folder for every folder checked here.
+            let atStorageTarget = await storageCheck?.reached() ?? false
             let folder = remaining
                 .filter { f in
                     if epochDeclinedFolderIds.contains(f.id) { return false }
                     if pageWalkSkippedFolderIds.contains(f.id) { return false }
                     if !fastSync && isExpensiveNetwork && !primaryRoles.contains(f.role) { return false }
-                    if StorageEstimator.isOverBudget() { return false }
+                    if atStorageTarget { return false }
                     return true
                 }
                 .sorted { a, b in

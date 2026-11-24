@@ -31,13 +31,14 @@ struct StorageEstimatorTests {
         #expect(!StorageEstimator.storageBudgetKey.isEmpty)
     }
 
-    @Test("isOverBudget returns false when budget is unlimited")
-    func notOverBudgetWhenUnlimited() {
-        // With default budget (Int.max), should never be over budget
+    @Test("The older-mail walk's storage check is off when budget is unlimited")
+    func noWalkCheckWhenUnlimited() async {
+        // With default budget (Int.max), the walk never stops for storage
         let savedBudget = UserDefaults.standard.integer(forKey: StorageEstimator.storageBudgetKey)
         defer { UserDefaults.standard.set(savedBudget, forKey: StorageEstimator.storageBudgetKey) }
 
         UserDefaults.standard.removeObject(forKey: StorageEstimator.storageBudgetKey)
-        #expect(StorageEstimator.isOverBudget() == false)
+        let check = await StorageEstimator.WalkCheck.start(.constant(Int64.max))
+        #expect(check == nil)
     }
 }
