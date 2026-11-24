@@ -656,7 +656,7 @@ struct DeferredIndexBuildTests {
 
         #expect(await SyncEngine.runRefreshPlannerStatisticsIfStale(
             dbPool: dbPool, defaults: defaults, markerKey: key) == .refreshed)
-        let liveVersion = try fixture.pool.read { db in
+        let liveVersion = try await fixture.pool.read { db in
             try Int.fetchOne(db, sql: "PRAGMA schema_version")
         }
         let marker = defaults.object(forKey: key) as? Int
