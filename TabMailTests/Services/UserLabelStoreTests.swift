@@ -297,49 +297,6 @@ struct UserLabelStoreTests {
         #expect(labels[0].name == "Work")
     }
 
-    // MARK: - Menu Sorting
-
-    @Test("labelsSortedForMenu sorts applied first, then by frequency, then alphabetical")
-    func menuSorting() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let msg1 = try TestDatabase.insertMessageHeader(db, messageId: "100")
-        let msg2 = try TestDatabase.insertMessageHeader(db, messageId: "200")
-        let msg3 = try TestDatabase.insertMessageHeader(db, messageId: "300")
-        try db.write { db in
-            try UserLabel(accountId: "acc1", providerLabelId: "L1", name: "Work", isSystem: false).insert(db)
-            try UserLabel(accountId: "acc1", providerLabelId: "L2", name: "Personal", isSystem: false).insert(db)
-            try UserLabel(accountId: "acc1", providerLabelId: "L3", name: "Rare", isSystem: false).insert(db)
-            // msg1 has "Work" (applied to target message)
-            try MessageUserLabel(messageId: msg1.id, userLabelId: "acc1:L1").insert(db)
-            // "Personal" appears on 2 inbox messages (higher frequency)
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "acc1:L2").insert(db)
-            try MessageUserLabel(messageId: msg3.id, userLabelId: "acc1:L2").insert(db)
-            // "Rare" appears on 1 inbox message
-            try MessageUserLabel(messageId: msg2.id, userLabelId: "acc1:L3").insert(db)
-        }
-        let inboxFolderId = "acc1:INBOX"
-        let sorted = try db.read { db in
-            try UserLabelStore.labelsSortedForMenu(
-                accountId: "acc1",
-                messageId: msg1.id,
-                inboxFolderIds: [inboxFolderId],
-                in: db
-            )
-        }
-        #expect(sorted.count == 3)
-        // First: applied label "Work" (checkmarked)
-        #expect(sorted[0].label.name == "Work")
-        #expect(sorted[0].isApplied == true)
-        // Second: "Personal" (frequency 2, higher than "Rare")
-        #expect(sorted[1].label.name == "Personal")
-        #expect(sorted[1].isApplied == false)
-        // Third: "Rare" (frequency 1)
-        #expect(sorted[2].label.name == "Rare")
-        #expect(sorted[2].isApplied == false)
-    }
-
     // MARK: - Migration v31
 
     @Test("Migration v31 creates userLabel and messageUserLabel tables")

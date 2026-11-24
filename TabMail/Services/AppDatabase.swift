@@ -4519,6 +4519,34 @@ final class AppDatabase: Sendable {
                 END
                 """)
         }
+
+        // #1386 (ADR-IOS-118): the label menu lists the labels the user applied most
+        // recently in this app above the A-to-Z list, instead of ranking every label by
+        // how many inbox messages carry it (which read every inbox message and its label
+        // rows each time the menu opened). No existing column records when a label was
+        // applied: `messageUserLabel` holds only the pair, `userLabel` only the label,
+        // and the queued `pendingOperation` row is deleted once it has run. So this is
+        // its own small table:
+        // - One row per label, keyed by the label's surrogate id (`userLabel.id`, which
+        //   carries the account), removed with the label and so with its account.
+        // - Written only by the label menu's apply, in the transaction that writes the
+        //   label's join row (`UserLabelStore.recordUse`); read only by the menu.
+        // - Starts empty, with nothing backfilled: a label has no time until the user
+        //   applies it here, and until then the menu is the A-to-Z list alone.
+        // - No index beyond the primary key: it holds one row per label the user has
+        //   applied here, so the menu reads all of it, a small read; the primary key
+        //   also serves the cascade's lookup when a label is deleted.
+        // - A later migration that rebuilds `userLabel` (as v82 did) cascades these rows
+        //   away unless it carries them across.
+        migrator.registerTimedMigration(
+            "v115_addUserLabelLastUsed", foreignKeyChecks: .immediate
+        ) { db in
+            try db.create(table: "userLabelLastUsed") { t in
+                t.primaryKey("userLabelId", .text)
+                    .references("userLabel", onDelete: .cascade)
+                t.column("lastUsedAt", .datetime).notNull()
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
