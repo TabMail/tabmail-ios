@@ -452,6 +452,10 @@ enum SyncConfig {
     /// in a large inbox trigger a suggestion to archive.
     /// Matches TB's inboxManagement.archiveAgeDays.
     static let archiveAgeDays = 14
+    /// Rows per read of the Settings "Archive old messages" sweep
+    /// (`SettingsView.oldInboxPage`): each read is one bounded statement over
+    /// one inbox folder's old messages, instead of one statement over all of them.
+    static let archiveOldReadPageSize = 500
 
     // MARK: - Polling & Background Intervals (seconds)
 
