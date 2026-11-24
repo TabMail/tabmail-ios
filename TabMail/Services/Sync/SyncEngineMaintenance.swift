@@ -1016,11 +1016,16 @@ extension SyncEngine {
         // the column and its triggers only), so the index is built once from the
         // filled column and commits with it. Deferred like the others, and for one
         // more reason: built in a migration, it would have no statistics row until
-        // this write's `ANALYZE` (#1401). Its absence changes no result: the evict
-        // waits for it (`runEvictStaleBodiesIfIndexed`), and until the fill commits
-        // the bodies cached before v116 read as not cached (`HTMLCachePair`, "Before
-        // the first upgrade step"). The fill reads every cached body once, as
-        // `messageBody_staleEvict`'s build did.
+        // this write's `ANALYZE` (#1401). The evict waits for it
+        // (`runEvictStaleBodiesIfIndexed`). Its fill is a data repair readers rely on,
+        // deferred as a named exception to ADR-IOS-029 NEGATIVE CASE 3: until it
+        // commits, a body cached before v116 reads as not cached, so it may be fetched
+        // or merged again; nothing is deleted and no message is shown another's content
+        // (`HTMLCachePair`, "Before the deferred index step"). The fill reads every
+        // cached body once, as `messageBody_staleEvict`'s build did, and also rewrites
+        // one header row per cached body, and the index covers every header, all in
+        // the one write, so this build costs more than that one did
+        // (`StaleBodyEvictPairProofTests` reports it).
         DeferredIndex(
             name: HTMLCachePair.indexName,
             sql: HTMLCachePair.indexSQL,
@@ -1242,23 +1247,6 @@ extension SyncEngine {
         try? dbPool.read { db in try Int.fetchOne(db, sql: "PRAGMA schema_version") ?? 0 }
     }
 
-    /// A `PASSIVE` WAL checkpoint of `dbPool`, the pool a statistics write that built a
-    /// deferred index has just committed to: the frames that write added move into the
-    /// database file, and the next write starts the WAL over. Never waits on a reader.
-    /// Skipped while the database is suspended; a failure changes nothing (the next
-    /// throttled checkpoint does the same work).
-    ///
-    /// It checkpoints the pool it is given, never `AppDatabase.backgroundPool` (which
-    /// `checkpointWALThrottled` uses): that one is reached through `AppDatabase.shared`,
-    /// which does not exist yet when the step runs before the database is published.
-    /// Unthrottled, because it follows at most one write per schema change.
-    nonisolated static func checkpointWALAfterBuild(_ dbPool: PrioritizedDatabase) async {
-        guard !DatabaseSuspension.isSuspended else { return }
-        _ = try? await dbPool.writeWithoutTransaction { db in
-            try db.execute(sql: "PRAGMA wal_checkpoint(PASSIVE)")
-        }
-    }
-
     /// `UserDefaults` key holding the SQLite `schema_version` in force when the last
     /// whole-database `ANALYZE` COMPLETED. `StartupMigrations` is the precedent for
     /// using `UserDefaults` as a durable one-shot latch here.
@@ -1319,9 +1307,11 @@ extension SyncEngine {
     /// THE WAL AFTER A BUILD. A write that built an index (and ran a fill for one)
     /// wrote many pages in one transaction, and autocheckpoint is off, so after it
     /// commits this calls `checkpointWAL` with the pool it wrote to
-    /// (`checkpointWALAfterBuild` in the app), outside the write, as every batch writer
-    /// checkpoints after its batch. A refresh that built nothing writes only
-    /// `sqlite_stat1` and adds no checkpoint.
+    /// (`checkpointWALThrottled(pool:)` in the app), outside the write, as every batch
+    /// writer checkpoints after its batch. It is the one checkpoint helper, throttle
+    /// included: a checkpoint run less than `walCheckpointMinIntervalSeconds` earlier
+    /// skips this one, and the next batch writer's checkpoint takes those frames. A
+    /// refresh that built nothing writes only `sqlite_stat1` and adds no checkpoint.
     ///
     /// ⚠️ THIS FUNCTION IS `async` FOR ONE REASON, AND THE PREVIOUS VERSION OF THIS
     /// PARAGRAPH WAS WRONG. It used to claim the cost lands *"on the caller's pool
@@ -1348,7 +1338,7 @@ extension SyncEngine {
         defaults: UserDefaults = .standard,
         markerKey: String = plannerStatisticsSchemaVersionKey,
         indexes: [DeferredIndex] = SyncEngine.deferredIndexes,
-        checkpointWAL: @Sendable (PrioritizedDatabase) async -> Void = { await SyncEngine.checkpointWALAfterBuild($0) }
+        checkpointWAL: @Sendable (PrioritizedDatabase) async -> Void = { await SyncEngine.checkpointWALThrottled(pool: $0) }
     ) async -> PlannerStatisticsRefresh {
         // SINGLE-FLIGHT. Taken BEFORE the marker read, because the race is two
         // callers both reading the marker stale — taking it after the read would

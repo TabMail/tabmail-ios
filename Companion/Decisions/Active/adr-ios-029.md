@@ -176,8 +176,13 @@ fills the column from `messageBody` (`HTMLCachePair.fillSQL`, run by `createDefe
 while the index is missing), then builds the index, then runs `ANALYZE`, so no connection ever loads
 it without a statistics row (#1401). The index existing is the proof the fill ran. The fill reads
 every cached body once (`fetchedAt` is stored after the HTML), as `messageBody_staleEvict`'s build
-did, so the step costs what it cost before; `StaleBodyEvictPairProofTests` reports v116's time and the
-step's (whole, its three statements apart, and per MB of body pages) at 105k and 525k headers, and
+did, and it also rewrites one header row per cached body, and the index covers every header, all in
+the one write, so the step costs more than that build did. It runs where that build ran: in the
+first background maintenance pass after the upgrade (`runWALMaintenance`, `.background`), never on
+the launch path; a `.priority` write issued while it holds the writer (a Send) waits for it once.
+After it commits, the step calls `checkpointWALThrottled` with the pool it wrote to, as every batch
+writer does. `StaleBodyEvictPairProofTests` reports v116's time and the step's (whole, its three
+statements apart, and per MB of body pages) and the WAL size after it, at 105k and 525k headers, and
 the step again at 105k with bodies of 24 to 40 KB. Rule 1: it serves exactly the evict's keyset page
 (`isInInbox = 0 AND htmlCachedAt < ?` in `(htmlCachedAt, rowid)` order) and "no cached HTML"
 (`htmlCachedAt IS NULL` under one `isInInbox` value); `SyncEngineMaintenanceTests.staleBodyPageSeeksItsIndex`
@@ -191,8 +196,15 @@ the index after v116 with no `ANALYZE`, the state a migration-built index would 
 at least one `isInInbox = 1` read onto it, so the census is shown to see such a change.
 
 **The evict waits for it** (`runEvictStaleBodiesIfIndexed`, as it waited for `messageBody_staleEvict`).
-Until the step commits, the bodies cached before v116 read as not cached and nothing is deleted
-(ADR-IOS-119 decision 7).
+
+**A named exception to NEGATIVE CASE 3.** The fill is a data repair that `HTMLCachePair.isCached`
+readers rely on, the kind NEGATIVE CASE 3 keeps blocking. It is deferred only because of what its
+absence does: until the step commits, a body cached before v116 reads as not cached, so it may be
+fetched or merged again (`fetchBody` and the thread view fetch it again, the notification merge
+re-merges a staged row, the AI diagnostic reports no body); nothing is deleted and no message is
+shown another's content (ADR-IOS-119 decision 7). A repair whose absence would delete data, show a
+message another's content or change what a user reads stays blocking: this exception covers this
+fill only.
 
 **`messageBody_staleEvict` (#1354) leaves `SyncEngine.deferredIndexes`.** Nothing reads it since the
 evict reads its candidates from the header. As of 2026-11-24 no released or TestFlight build ran the

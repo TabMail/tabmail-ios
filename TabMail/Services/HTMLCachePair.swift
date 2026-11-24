@@ -11,16 +11,16 @@ import GRDB
 /// code probes `messageBody` for existence or writes the column
 /// (`HTMLCachePairFenceTests`). Reading the HTML itself still reads `messageBody`.
 ///
-/// ## Before the first upgrade step
+/// ## Before the deferred index step
 ///
 /// v116 adds the column empty and its triggers; the bodies cached before it are
 /// recorded by the fill (`fillSQL`), which runs in the deferred index step
-/// (`SyncEngine.deferredIndexes`), in the same write that builds `indexName` and
-/// analyzes it. Until that write commits, a message whose HTML was cached before v116
+/// (`SyncEngine.deferredIndexes`) of the first background maintenance pass after the
+/// upgrade, in the same write that builds `indexName` and analyzes it. Until that
+/// write commits, a message whose HTML was cached before v116
 /// and not written since reads as not cached here. That is the only difference:
 ///
-/// - `AccountManager.fetchBody` and the thread bubble's load fetch its body again
-///   (the user's first open runs the step first);
+/// - `AccountManager.fetchBody` and the thread bubble's load fetch its body again;
 /// - the notification merge re-merges a staged row whose body predates v116, because
 ///   its body insert is ignored and leaves the pair empty;
 /// - the AI queue's diagnostic line says `hasMessageBody=false`.

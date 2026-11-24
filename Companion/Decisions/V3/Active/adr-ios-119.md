@@ -67,14 +67,24 @@ inbox instead reads about 85k rows at 105k.
    existence is the proof the fill ran: both commit together, and no app-kept marker records it.
    Two reasons: the fill reads every cached body once (`fetchedAt` is stored after the HTML), which
    is upgrade work for the deferred step, not the blocking migration chain; and an index built in
-   a migration would have no planner statistics until the next `ANALYZE` (#1401). It costs what
-   `messageBody_staleEvict`'s build cost, which read every cached body the same way.
+   a migration would have no planner statistics until the next `ANALYZE` (#1401). It reads every
+   cached body as `messageBody_staleEvict`'s build did, and it also rewrites one header row per
+   cached body, and the index covers every header, all in the one write, so it costs more than
+   that build. It runs in the first background maintenance pass after the upgrade
+   (`runWALMaintenance`, `.background`), never on the launch path; a `.priority` write issued
+   while it holds the writer (a Send) waits for it once. After it commits, the step calls
+   `SyncEngine.checkpointWALThrottled` with the pool it wrote to, the one checkpoint helper, so a
+   checkpoint run moments earlier in the same pass can skip this one and leave its frames to the
+   next batch writer's checkpoint (the proof reports the WAL size after the step).
    **Before the step,** a message whose HTML was cached before v116 and not written since reads
    as not cached: `fetchBody` and the thread view fetch its body again; the notification merge
    re-merges a staged row whose body predates v116 (its body insert is ignored, so the pair stays
    empty); the AI queue's diagnostic says it has no body. Nothing is deleted (the evict waits for
    the index) and no message is given another's content. A pair that is set is exact from v116 on,
-   because the triggers run from then.
+   because the triggers run from then. The fill is a data repair readers rely on, so deferring it
+   is a named exception to ADR-IOS-029 NEGATIVE CASE 3 (recorded there and in IOS-PERF-005), and
+   it rests on this paragraph: what its absence changes is a repeat fetch or merge, never a
+   deletion or another message's content.
 
 **Proof of need (why a column, triggers and an index):** no existing field says whether a header's
 HTML is cached or when. `bodyComplete` is the search-text pair (ADR-IOS-050) and is set for messages

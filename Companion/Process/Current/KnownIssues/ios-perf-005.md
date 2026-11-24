@@ -71,11 +71,17 @@ reads `messageBody_staleEvict` any more and it is out of `SyncEngine.deferredInd
 `messageHeader_htmlCachedAt` takes its place there, with a fill: migration v116 adds only the column
 `messageHeader.htmlCachedAt` and its triggers, and the deferred step's one write fills the column from
 `messageBody` (`HTMLCachePair.fillSQL`, only while the index is missing), builds the index and runs
-`ANALYZE`. The fill reads every cached body once, as `messageBody_staleEvict`'s build did, so the
-step's cost is unchanged in kind; this row's points apply to it as they did to that build. Its absence
-changes no result: the evict waits for it (`runEvictStaleBodiesIfIndexed`, now pointed at
-`messageHeader_htmlCachedAt`), and until the step commits the bodies cached before v116 read as not
-cached, nothing is deleted, and no message is given another's content (ADR-IOS-119 decision 7). As of
+`ANALYZE`. The fill reads every cached body once, as `messageBody_staleEvict`'s build did, and also
+rewrites one header row per cached body, and the index covers every header, all in the one write, so
+the step costs more than that build did (`StaleBodyEvictPairProofTests` reports it at 105k and 525k
+headers, with the WAL size after it). This row's points apply to it as they did to that build: it runs
+in the first background maintenance pass after the upgrade, never on the launch path, and a
+`.priority` write issued during it (a Send) waits for it once. The evict waits for it
+(`runEvictStaleBodiesIfIndexed`, now pointed at `messageHeader_htmlCachedAt`). **A named exception to
+this row's negative case** (and ADR-IOS-029 NEGATIVE CASE 3): the fill is a data repair a reader
+assumes, deferred only because until the step commits a body cached before v116 reads as not cached,
+so it may be fetched or merged again; nothing is deleted and no message is given another's content
+(ADR-IOS-119 decision 7). It licenses no other deferred repair. As of
 2026-11-24 no released or TestFlight build ran the step with `messageBody_staleEvict` in the list, so
 no user's database holds it. The 2026-11-23 amendment above describes the state from #1354 to #1433
 and stays as history.

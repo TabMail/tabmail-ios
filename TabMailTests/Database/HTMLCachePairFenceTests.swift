@@ -70,7 +70,7 @@ struct HTMLCachePairFenceTests {
         "TabMail/Services/Sync/SyncEngineMaintenance.swift\tSyncEngine.runEvictStaleBodies":
             Allowed(count: 1, reason: "the evict: deletes each candidate's body; candidates come from HTMLCachePair"),
         "TabMail/Services/Sync/SyncEngineFTS.swift\tSyncEngine.oneTimeBodyCompleteRestore":
-            Allowed(count: 2, reason: "runs once at startup, possibly before the deferred fill records the bodies cached before v116, so it asks messageBody itself (HTMLCachePair, \"Before the first upgrade step\")"),
+            Allowed(count: 2, reason: "runs once at startup, possibly before the deferred fill records the bodies cached before v116, so it asks messageBody itself (HTMLCachePair, \"Before the deferred index step\")"),
         "TabMail/Services/Sync/SyncEngineSettingsReset.swift\tSyncEngine": Allowed(count: 1, reason: "settings reset statement list: " + deletesHTML),
         "TabMail/Services/Sync/SyncEngineSettingsReset.swift\tSyncEngine.resetMessageDataTxn": Allowed(count: 2, reason: deletesHTML),
         "TabMail/ViewModels/InboxViewModel.swift\tInboxViewModel.deleteDraftMessage": Allowed(count: 1, reason: deletesHTML),
