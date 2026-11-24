@@ -265,12 +265,15 @@ struct BackfillProgressCountTests {
     /// the large mailbox's statistics below do.
     private static let embeddingPlanRows = 20_000
 
-    /// `sqlite_stat1` for `messageHeader` as a whole-database `ANALYZE` wrote it, with this
-    /// index present, on the 105,000-header proof database (four accounts, 84,951 headers
-    /// owing an embedding). Under these statistics the proof saw the read without its
-    /// index name skip-scan this index. The app's SQLite keeps no `sqlite_stat4`, so these
-    /// rows are all the planner knows about the table: written over the test's rows, they
-    /// give it a large mailbox's estimates.
+    /// `sqlite_stat1` for `messageHeader` from a full `ANALYZE` of the 105,000-header proof
+    /// database with this index present (four accounts, 84,951 headers owing an embedding),
+    /// taken with the Mac's sqlite3. That is the database on which the proof saw the read
+    /// without its index name skip-scan this index. A plain `ANALYZE` with no analysis
+    /// limit, which is what the app runs, counts the rows of every key prefix exactly, so
+    /// these are the rows the app's own `ANALYZE` writes on that data. The app's SQLite
+    /// keeps no `sqlite_stat4`, so they are all the planner knows about the table: written
+    /// over the test's rows, they give it a large mailbox's estimates. The test checks at
+    /// setup that they name every index of the table and no other.
     private static let largeMailboxStatistics: [String: String] = [
         "idx_messageHeader_bodyStatus": "105000 52500 35000 35000 17500",
         "messageHeader_accountId_bodyComplete": "105000 26250 13125",
