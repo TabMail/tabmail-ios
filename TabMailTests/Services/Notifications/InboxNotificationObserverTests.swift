@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Testing
+import Foundation
 import GRDB
 import Synchronization
 @testable import TabMail
@@ -19,8 +20,15 @@ struct InboxNotificationObserverTests {
         func record(_ acct: String, _ mid: String) { lock.withLock { $0.append((acct, mid)) } }
     }
 
-    /// Make a migrated in-memory queue with the observer pre-seeded + wired in
-    /// against a default account/inbox folder.
+    /// Every statement a pool runs, from GRDB's statement trace.
+    private final class StatementTape: Sendable {
+        private let statements = Mutex<[String]>([])
+        func record(_ sql: String) { statements.withLock { $0.append(sql) } }
+        var all: [String] { statements.withLock { $0 } }
+    }
+
+    /// Make a migrated in-memory queue with the observer registered (its map
+    /// starts empty, as in production) against a default account/inbox folder.
     /// Returns the observer too — caller MUST bind it (e.g. `let (q, rec, _obs) = …`).
     /// GRDB holds observers weakly at `.observerLifetime`; if the observer's only
     /// strong ref goes out of scope, events stop firing silently.
@@ -30,10 +38,7 @@ struct InboxNotificationObserverTests {
         try TestDatabase.insertFolder(queue, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         let rec = ClearRecorder()
         let observer = InboxNotificationObserver(clear: { acct, mid in rec.record(acct, mid) })
-        try queue.write { db in
-            try observer.seed(db)
-            db.add(transactionObserver: observer)
-        }
+        queue.add(transactionObserver: observer)
         return (queue, rec, observer)
     }
 
@@ -138,37 +143,105 @@ struct InboxNotificationObserverTests {
         #expect(rec.calls[0].0 == "acc1")
     }
 
-    @Test func seedPicksUpExistingInboxRows_observerFiresOnTheirExit() async throws {
-        // Insert BEFORE wiring observer — simulates app launch with pre-existing inbox state.
+    // MARK: - Launch: the map starts empty
+
+    /// An email that arrives after launch and then leaves the inbox has its banner
+    /// cleared: the observer learns it from the insert.
+    @Test func arrivesAfterRegistrationThenLeaves_firesClear() async throws {
+        let (q, rec, _observer) = try Self.makeWired()
+        _ = _observer  // observer's lifetime is load-bearing — notifications stop if it deinits
+        try TestDatabase.insertMessageHeader(q, messageId: "7", isInInbox: true)
+        try await q.write { db in try db.execute(sql: "UPDATE messageHeader SET isInInbox = 0 WHERE messageId = '7'") }
+        #expect(rec.calls.count == 1)
+        guard rec.calls.count == 1 else { return }
+        #expect(rec.calls[0].0 == "acc1")
+        #expect(rec.calls[0].1 == "7")
+    }
+
+    /// Registering reads nothing, so an inbox row written before registration and
+    /// never touched since is not tracked; its banner, if any, was removed when the
+    /// user opened the app (`EmailBannerOpenClear`).
+    @Test func inInboxBeforeRegistrationAndUntouched_isNotTracked() async throws {
         let q = try TestDatabase.make()
         try TestDatabase.insertAccount(q, id: "acc1")
         try TestDatabase.insertFolder(q, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
         try TestDatabase.insertMessageHeader(q, messageId: "1", isInInbox: true)
         let rec = ClearRecorder()
         let observer = InboxNotificationObserver(clear: { acct, mid in rec.record(acct, mid) })
-        try await q.write { db in
-            try observer.seed(db)
-            db.add(transactionObserver: observer)
-        }
+        q.add(transactionObserver: observer)
         try await q.write { db in try db.execute(sql: "UPDATE messageHeader SET isInInbox = 0 WHERE messageId = '1'") }
-        #expect(rec.calls.count == 1)
+        #expect(rec.calls.isEmpty)
+        withExtendedLifetime(observer) {}
     }
 
-    @Test func emptySeed_doesNotCrash() async throws {
-        // Map starts empty when no rows have isInInbox=1.
+    /// An inbox row written before registration is tracked from its first write
+    /// after it (here a read mark), so its later exit clears its banner.
+    @Test func inInboxBeforeRegistrationThenTouched_isTracked() async throws {
+        let q = try TestDatabase.make()
+        try TestDatabase.insertAccount(q, id: "acc1")
+        try TestDatabase.insertFolder(q, name: "INBOX", path: "INBOX", role: .inbox, accountId: "acc1")
+        try TestDatabase.insertMessageHeader(q, messageId: "1", isInInbox: true)
+        let rec = ClearRecorder()
+        let observer = InboxNotificationObserver(clear: { acct, mid in rec.record(acct, mid) })
+        q.add(transactionObserver: observer)
+        try await q.write { db in try db.execute(sql: "UPDATE messageHeader SET isRead = 1 WHERE messageId = '1'") }
+        #expect(rec.calls.isEmpty)
+        try await q.write { db in try db.execute(sql: "UPDATE messageHeader SET isInInbox = 0 WHERE messageId = '1'") }
+        #expect(rec.calls.count == 1)
+        withExtendedLifetime(observer) {}
+    }
+
+    @Test func emptyDatabase_registrationAndDelete_doNotFire() async throws {
         let q = try TestDatabase.make()
         try TestDatabase.insertAccount(q, id: "acc1")
         try TestDatabase.insertFolder(q, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
         let rec = ClearRecorder()
         let observer = InboxNotificationObserver(clear: { acct, mid in rec.record(acct, mid) })
-        try await q.write { db in
-            try observer.seed(db)
-            db.add(transactionObserver: observer)
-        }
+        q.add(transactionObserver: observer)
         try TestDatabase.insertMessageHeader(q, messageId: "1", folderId: "acc1:Archive",
                                              folderPath: "Archive", isInInbox: false)
         try await q.write { db in try db.execute(sql: "DELETE FROM messageHeader WHERE messageId = '1'") }
         #expect(rec.calls.isEmpty)
+        withExtendedLifetime(observer) {}
+    }
+
+    /// Opening the database (the launch path that registers the production observer)
+    /// reads no inbox rows: the whole-inbox read that used to run inside the launch
+    /// write is gone. The database is migrated by a first open, then opened again
+    /// with every statement traced, as a relaunch does.
+    @MainActor
+    @Test func openingTheDatabase_readsNoInboxRows() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("tabmail.sqlite").path
+        var plain = Configuration()
+        plain.foreignKeysEnabled = true
+        let first = try DatabasePool(path: path, configuration: plain)
+        let tape = StatementTape()
+        var traced = Configuration()
+        traced.foreignKeysEnabled = true
+        traced.prepareDatabase { db in
+            db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
+        }
+        var second: DatabasePool?
+        defer { TestDatabaseTeardown.retire(pools: [first] + (second.map { [$0] } ?? []), directory: dir) }
+
+        let firstDB = try AppDatabase(dbPool: first)
+        withExtendedLifetime(firstDB) {}
+
+        let relaunch = try DatabasePool(path: path, configuration: traced)
+        second = relaunch
+        let reopened = try AppDatabase(dbPool: relaunch)
+        let statements = tape.all
+        // A read of messageHeader rows by inbox membership (DDL and triggers that
+        // merely name the column are not reads).
+        let inboxReads = statements.filter { sql in
+            let flat = sql.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            return flat.contains("SELECT") && flat.contains("FROM messageHeader") && flat.contains("isInInbox")
+        }
+        #expect(!statements.isEmpty, "the trace saw no statement, so the check below would pass vacuously")
+        #expect(inboxReads.isEmpty, "opening the database read inbox rows: \(inboxReads)")
+        withExtendedLifetime(reopened) {}
     }
 
     @Test func updateChangingMessageIdOnInboxRow_clearsWithOriginalId() async throws {

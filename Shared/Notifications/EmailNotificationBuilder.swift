@@ -129,6 +129,16 @@ enum EmailNotificationBuilder {
         }
     }
 
+    /// Every category `categoryIdentifier(forActionTag:)` returns, so every
+    /// notification `fill` built carries one of them.
+    static let categoryIdentifiers: Set<String> = ["EMAIL", "EMAIL_TAG_ARCHIVE", "EMAIL_TAG_DELETE"]
+
+    /// The push payload's `provider` values of a new-mail push (the push
+    /// worker's `sendVisiblePush`): Gmail, Outlook, and IMAP/iCloud as
+    /// `imap_new_mail`. The other visible pushes are `consent_error` and
+    /// `imap_reconnect`.
+    static let newMailPushProviders: Set<String> = ["gmail", "outlook", "imap_new_mail"]
+
     /// Fill an email notification with unified layout used by every
     /// new-email ping path (NSE, main-app silent push, BGAppRefresh merge).
     ///
