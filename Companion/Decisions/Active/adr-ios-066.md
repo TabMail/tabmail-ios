@@ -47,6 +47,15 @@ Standing rules that came out of it:
    legacy-tolerant; attachments are keyed by a mutable address, so a legacy token is a strict miss.
 5. Orphan reclamation is **by age**, reusing `sweepMinAgeSeconds` — the mechanism the shipped
    release already had. Restoring it beat inventing a fourth one (rule 2c).
+   **Amendment (2026-11-24, #1376):** the age threshold now governs write LEASES and their staged
+   files, not files in the store. A write's bytes live in `staging/<preparationId>` until `publish`
+   moves them in with their row, so the store never holds a file a write in progress owns. An
+   abandoned lease ages out on `sweepMinAgeSeconds` and `recoverAbandonedPreparations` deletes it and
+   its staged file; a writer whose lease was reaped is refused at `publish` (rule 3 still holds: the
+   lease proof and the move run in one manifest transaction). Assets whose message was deleted are
+   reclaimed by the pending-delete worker from the keys the main database queued, not by age;
+   `pruneOrphanFiles` (age-gated) runs only once after the update and after a UIDVALIDITY reset's
+   folder purge. See ADR-IOS-046's 2026-11-24 amendment.
 
 **Accepted residual:** in a folder that has ever had a UIDVALIDITY reset, rfc-less attachments stay
 unopenable. `MessageHeader` carries no epoch and a retained view holds a stale snapshot, so a
