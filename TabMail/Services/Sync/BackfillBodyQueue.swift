@@ -877,7 +877,7 @@ actor BackfillBodyQueue {
     /// (#1400). `pacingDelay` is the delay's source; tests pass their own.
     private func finishBatch(
         capKey: FolderCapKey,
-        pacingDelay: @Sendable () async -> TimeInterval = { await BackfillProfile.current().interCycleActiveDelay }
+        pacingDelay: @Sendable () async -> TimeInterval = { BackfillProfile.current().interCycleActiveDelay }
     ) async {
         if storage.isEmpty && activeBatchCount == 1 {
             // Boot-log mirror: queue went IDLE — if the user-felt "sharp
