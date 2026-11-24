@@ -279,6 +279,45 @@ struct SyncEngineMaintenanceTests {
                 "the archive body past the newest \(recent) is evicted, and only it")
     }
 
+    /// A refresh that builds a deferred index wrote many pages in one transaction (the
+    /// HTML-cache pair's fill rewrites a header per cached body), and autocheckpoint is
+    /// off: it checkpoints the WAL once, after the write. A refresh that builds nothing
+    /// writes only the statistics and adds none; neither does one that finds the
+    /// statistics fresh.
+    /// `.processGlobalState`: the refresh carries a process-wide single-flight latch and
+    /// gives up while `DatabaseSuspension.isSuspended`.
+    @Test("A refresh that builds a deferred index checkpoints the WAL after it; one that builds nothing does not",
+          .processGlobalState)
+    func refreshCheckpointsTheWALAfterABuild() async throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        _ = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: SyncConfig.bodyCacheRecentPerFolder + 1)
+        let markerKey = "analyzeMarker-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removeObject(forKey: markerKey) }
+        let checkpoints = CheckpointCount()
+        let count: @Sendable (PrioritizedDatabase) async -> Void = { _ in await checkpoints.record() }
+
+        let build = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterBuild = await checkpoints.calls
+        // Every index present and the marker stale: the ANALYZE alone.
+        UserDefaults.standard.removeObject(forKey: markerKey)
+        let analyzeOnly = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterAnalyzeOnly = await checkpoints.calls
+        let fresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterFresh = await checkpoints.calls
+
+        #expect(build == .refreshed)
+        #expect(afterBuild == 1, "one checkpoint after the write that built the deferred indexes")
+        #expect(analyzeOnly == .refreshed)
+        #expect(afterAnalyzeOnly == 1, "a refresh that built nothing checkpointed")
+        #expect(fresh == .alreadyFresh)
+        #expect(afterFresh == 1, "a refresh that found the statistics fresh checkpointed")
+    }
+
     /// The gate waits for the evict step's own index and no other: with that index
     /// built and every other deferred index still missing, the step runs.
     /// `.processGlobalState`: the gate runs production's checkpoint between pages,
@@ -447,4 +486,10 @@ struct SyncEngineMaintenanceTests {
         #expect(firstChunk[0].messageId == "1")
         #expect(secondChunk[0].messageId == "4")
     }
+}
+
+/// Counts the WAL checkpoints a refresh asks for (`refreshCheckpointsTheWALAfterABuild`).
+private actor CheckpointCount {
+    private(set) var calls = 0
+    func record() { calls += 1 }
 }

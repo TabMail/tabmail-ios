@@ -240,6 +240,10 @@ struct StaleBodyEvictPairProofTests {
         var wallMs: [Double] = []
         /// The maintenance pass's deferred step, whole, through the production function.
         var stepWallMs: [Double] = []
+        /// The WAL file's size right after that step, before this proof truncates it:
+        /// what the step's one transaction wrote to the WAL (the step's own checkpoint
+        /// is PASSIVE, which leaves the file at that size).
+        var stepWalBytes: [Int] = []
         /// The step's three statements apart, each run on its own fresh copy.
         var fillMs: [Double] = []
         var indexMs: [Double] = []
@@ -278,8 +282,11 @@ struct StaleBodyEvictPairProofTests {
 
     /// Runs the maintenance pass's deferred step on `url` as the app runs it after the
     /// upgrade (`SyncEngine.runRefreshPlannerStatisticsIfStale`, with a marker of its
-    /// own so the app's is untouched). Returns its wall time and result.
-    static func runDeferredStep(_ url: URL) async throws -> (wallMs: Double, result: SyncEngine.PlannerStatisticsRefresh) {
+    /// own so the app's is untouched). Returns its wall time, its result and the WAL
+    /// file's size after it, read before the truncate below.
+    static func runDeferredStep(_ url: URL) async throws -> (
+        wallMs: Double, result: SyncEngine.PlannerStatisticsRefresh, walBytes: Int
+    ) {
         let suiteName = "StaleBodyEvictPairProof.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -289,9 +296,18 @@ struct StaleBodyEvictPairProofTests {
             dbPool: PrioritizedDatabase(pool: pool, priority: .background),
             defaults: defaults, markerKey: "plannerStatisticsSchemaVersion")
         let elapsed = DispatchTime.now().uptimeNanoseconds - start
+        let walBytes = try Self.walFileBytes(url)
         try await pool.writeWithoutTransaction { db in _ = try db.checkpoint(.truncate) }
         try pool.close()
-        return (Double(elapsed) / 1_000_000, result)
+        return (Double(elapsed) / 1_000_000, result, walBytes)
+    }
+
+    /// The size of `url`'s WAL file, 0 when there is none.
+    static func walFileBytes(_ url: URL) throws -> Int {
+        let wal = url.path + "-wal"
+        guard FileManager.default.fileExists(atPath: wal) else { return 0 }
+        let attributes = try FileManager.default.attributesOfItem(atPath: wal)
+        return (attributes[.size] as? NSNumber)?.intValue ?? 0
     }
 
     /// The step's statements apart, in one transaction on a migrated copy: the fill,
@@ -336,6 +352,53 @@ struct StaleBodyEvictPairProofTests {
         try freedPages(url, "DROP INDEX \(name)")
     }
 
+    // The censuses below are synchronous on purpose: inside an `async` function GRDB's
+    // `read` and `write` bind their `async` overloads (the synchronous ones are
+    // disfavored), so the measuring functions call these instead.
+
+    /// The file's pages and page size.
+    static func fileSize(_ url: URL) throws -> (pages: Int, pageSize: Int) {
+        let queue = try DatabaseQueue(path: url.path)
+        defer { try? queue.close() }
+        return try queue.read { db in
+            (try Self.pageCount(db), try Int.fetchOne(db, sql: "PRAGMA page_size") ?? 0)
+        }
+    }
+
+    /// Right after v116, before the step: the file's pages, the headers with a
+    /// cached-at time, and whether the pair's index exists (1) or not (0).
+    static func migratedCensus(_ url: URL) throws -> (pages: Int, filled: Int, indexed: Int) {
+        let queue = try DatabaseQueue(path: url.path)
+        defer { try? queue.close() }
+        return try queue.read { db in
+            let pages = try Self.pageCount(db)
+            let filled = try Int.fetchOne(
+                db, sql: "SELECT count(*) FROM messageHeader WHERE htmlCachedAt IS NOT NULL") ?? -1
+            let indexed = try Int.fetchOne(
+                db, sql: "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                arguments: [HTMLCachePair.indexName]) ?? -1
+            return (pages, filled, indexed)
+        }
+    }
+
+    /// After the step, on the kept pair file: its pages, the filled headers and the
+    /// pair's mismatches; then it drops the old index, as a phone's file has it, and
+    /// gives the free pages that leaves.
+    static func steppedCensus(_ url: URL) throws -> (pages: Int, filled: Int, mismatches: Int, freePages: Int) {
+        let queue = try DatabaseQueue(path: url.path)
+        defer { try? queue.close() }
+        return try queue.writeWithoutTransaction { db in
+            let pages = try Self.pageCount(db)
+            let filled = try Int.fetchOne(
+                db, sql: "SELECT count(*) FROM messageHeader WHERE htmlCachedAt IS NOT NULL") ?? 0
+            let mismatches = try HTMLCachePairTests.mismatches(db).count
+            try db.execute(sql: "DROP INDEX \(Config.oldIndexName)")
+            let freePages = try Int.fetchOne(db, sql: "PRAGMA freelist_count") ?? 0
+            _ = try db.checkpoint(.truncate)
+            return (pages, filled, mismatches, freePages)
+        }
+    }
+
     /// Times the migration and the deferred step `DBProof.repeats` times each, every
     /// run on a fresh copy of `oldBase`, keeps the first copy as `pairBase`, drops the
     /// old index from it (its pages go to the free list, as on a phone), and measures
@@ -348,28 +411,22 @@ struct StaleBodyEvictPairProofTests {
         // The body table and its primary key, without the old step's index on it.
         cost.bodyPages = try Self.freedPages(
             oldBase, setup: ["DROP INDEX \(Config.oldIndexName)"], "DROP TABLE messageBody")
-        let oldQueue = try DatabaseQueue(path: oldBase.path)
-        cost.oldPages = try oldQueue.read { try Self.pageCount($0) }
-        cost.pageSize = try oldQueue.read { try Int.fetchOne($0, sql: "PRAGMA page_size") ?? 0 }
-        try oldQueue.close()
+        let oldSize = try Self.fileSize(oldBase)
+        cost.oldPages = oldSize.pages
+        cost.pageSize = oldSize.pageSize
 
         for run in 0..<DBProof.repeats {
             let file = run == 0 ? pairBase : scratch
             cost.wallMs.append(try Self.migrate(base: oldBase, to: file))
             if run == 0 {
-                let queue = try DatabaseQueue(path: file.path)
-                try queue.read { db in
-                    cost.migratedPages = try Self.pageCount(db)
-                    cost.filledByMigration = try Int.fetchOne(
-                        db, sql: "SELECT count(*) FROM messageHeader WHERE htmlCachedAt IS NOT NULL") ?? -1
-                    cost.indexedByMigration = try Int.fetchOne(
-                        db, sql: "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
-                        arguments: [HTMLCachePair.indexName]) ?? -1
-                }
-                try queue.close()
+                let migrated = try Self.migratedCensus(file)
+                cost.migratedPages = migrated.pages
+                cost.filledByMigration = migrated.filled
+                cost.indexedByMigration = migrated.indexed
             }
             let step = try await Self.runDeferredStep(file)
             cost.stepWallMs.append(step.wallMs)
+            cost.stepWalBytes.append(step.walBytes)
             cost.stepResults.append(step.result)
             if run != 0 { try DBProof.removeDatabaseFiles(at: scratch) }
         }
@@ -383,17 +440,11 @@ struct StaleBodyEvictPairProofTests {
         }
 
         cost.pairIndexPages = try Self.indexPages(pairBase, Config.pairIndexName)
-        let queue = try DatabaseQueue(path: pairBase.path)
-        try queue.writeWithoutTransaction { db in
-            cost.steppedPages = try Self.pageCount(db)
-            cost.headersFilled = try Int.fetchOne(
-                db, sql: "SELECT count(*) FROM messageHeader WHERE htmlCachedAt IS NOT NULL") ?? 0
-            cost.mismatches = try HTMLCachePairTests.mismatches(db).count
-            try db.execute(sql: "DROP INDEX \(Config.oldIndexName)")
-            cost.pairFreePages = try Int.fetchOne(db, sql: "PRAGMA freelist_count") ?? 0
-            _ = try db.checkpoint(.truncate)
-        }
-        try queue.close()
+        let stepped = try Self.steppedCensus(pairBase)
+        cost.steppedPages = stepped.pages
+        cost.headersFilled = stepped.filled
+        cost.mismatches = stepped.mismatches
+        cost.pairFreePages = stepped.freePages
         return cost
     }
 
@@ -473,6 +524,25 @@ struct StaleBodyEvictPairProofTests {
         }
     }
 
+    /// A whole-database `ANALYZE` on `url`, as the census's `before` state has it.
+    static func analyze(_ url: URL) throws {
+        let queue = try DatabaseQueue(path: url.path)
+        defer { try? queue.close() }
+        try queue.writeWithoutTransaction { db in try DBProof.apply(.analyzed, to: db) }
+    }
+
+    /// The control's schema on `url`: the migration chain, then the pair's fill and
+    /// index with no `ANALYZE` after them.
+    static func buildPairWithoutStatistics(_ url: URL) throws {
+        let pool = try DatabasePool(path: url.path, configuration: AppDatabase.makeConfiguration())
+        defer { try? pool.close() }
+        try AppDatabase.runMigrations(on: pool)
+        try pool.write { db in
+            try db.execute(sql: HTMLCachePair.fillSQL)
+            try db.execute(sql: HTMLCachePair.indexSQL)
+        }
+    }
+
     /// Plans every census read in each state, each on its own copy of `oldBase`.
     static func planCensus(oldBase: URL, scratch: URL) async throws -> [PlanCensusLine] {
         let reads = try Self.censusReads(oldBase)
@@ -486,17 +556,9 @@ struct StaleBodyEvictPairProofTests {
             case .before, .indexWithoutStatistics:
                 try DBProof.removeDatabaseFiles(at: scratch)
                 try FileManager.default.copyItem(at: oldBase, to: scratch)
-                let queue = try DatabaseQueue(path: scratch.path)
-                try queue.writeWithoutTransaction { db in try DBProof.apply(.analyzed, to: db) }
-                try queue.close()
+                try Self.analyze(scratch)
                 if state == .indexWithoutStatistics {
-                    let pool = try DatabasePool(path: scratch.path, configuration: AppDatabase.makeConfiguration())
-                    try AppDatabase.runMigrations(on: pool)
-                    try pool.write { db in
-                        try db.execute(sql: HTMLCachePair.fillSQL)
-                        try db.execute(sql: HTMLCachePair.indexSQL)
-                    }
-                    try pool.close()
+                    try Self.buildPairWithoutStatistics(scratch)
                 }
             }
             plans[state] = try Self.readPlans(scratch, reads)
@@ -1073,6 +1135,7 @@ struct StaleBodyEvictPairProofTests {
             lines.append("migration v116 (column and triggers) on the old file, \(migration.wallMs.count) runs: median \(ms(migrationWall.median)) ms, p10 \(ms(migrationWall.p10)), p90 \(ms(migrationWall.p90)), max \(ms(migrationWall.sorted.last ?? 0))")
             lines.append("  old file \(pagesText(migration.oldPages)); after v116 \(pagesText(migration.migratedPages)) (+\(migration.migratedPages - migration.oldPages)); headers with a cached-at time after v116: \(migration.filledByMigration); \(HTMLCachePair.indexName) after v116: \(migration.indexedByMigration)")
             lines.append("deferred step (fill, index and ANALYZE in one write, runRefreshPlannerStatisticsIfStale), \(migration.stepWallMs.count) runs: median \(ms(stepWall.median)) ms, p10 \(ms(stepWall.p10)), p90 \(ms(stepWall.p90)), max \(ms(stepWall.sorted.last ?? 0)); results \(Set(migration.stepResults.map { "\($0)" }).sorted())")
+            lines.append("  WAL file after the step (before the truncate): \(Self.walText(migration.stepWalBytes))")
             lines.append("  its statements apart, \(migration.fillMs.count) runs each: fill median \(ms(fill.median)) ms (p90 \(ms(fill.p90))); index median \(ms(index.median)) (p90 \(ms(index.p90))); ANALYZE median \(ms(analyze.median)) (p90 \(ms(analyze.p90)))")
             lines.append("  body pages (messageBody and its primary key): \(pagesText(migration.bodyPages)); per MB of them: fill \(perMB(fill.median)) ms, step \(perMB(stepWall.median)) ms")
             lines.append("  after the step \(pagesText(migration.steppedPages)) (+\(migration.steppedPages - migration.migratedPages) over v116); free after dropping messageBody_staleEvict \(pagesText(migration.pairFreePages))")
@@ -1164,6 +1227,7 @@ struct StaleBodyEvictPairProofTests {
             "cached bodies: \(larger.census.total) (inbox \(larger.census.inbox), folder newest \(larger.census.folderNewest), fresh \(larger.census.fresh)); the old step's settle pass evicted \(larger.settled)",
             "migration v116, \(migration.wallMs.count) runs: median \(ms(migrationWall.median)) ms, p90 \(ms(migrationWall.p90))",
             "deferred step, \(migration.stepWallMs.count) runs: median \(ms(stepWall.median)) ms, p10 \(ms(stepWall.p10)), p90 \(ms(stepWall.p90)), max \(ms(stepWall.sorted.last ?? 0)); results \(Set(migration.stepResults.map { "\($0)" }).sorted())",
+            "  WAL file after the step (before the truncate): \(Self.walText(migration.stepWalBytes))",
             "  headers filled: \(migration.headersFilled); pair mismatches after the fill: \(migration.mismatches)",
             "-- against the main run at the same size",
             line("HTML \(larger.htmlBytes.lowerBound)-\(larger.htmlBytes.upperBound) bytes", migration),
@@ -1176,4 +1240,12 @@ struct StaleBodyEvictPairProofTests {
     }
 
     private static func ms(_ value: Double) -> String { String(format: "%.3f", value) }
+
+    /// The step's WAL sizes in MB: median and max over the runs.
+    private static func walText(_ bytes: [Int]) -> String {
+        let sorted = bytes.sorted()
+        guard let largest = sorted.last else { return "n/a" }
+        func mb(_ value: Int) -> String { String(format: "%.1f", Double(value) / 1_048_576) }
+        return "median \(mb(sorted[sorted.count / 2])) MB, max \(mb(largest)) MB over \(sorted.count) runs"
+    }
 }

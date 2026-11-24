@@ -224,6 +224,32 @@ struct HTMLCachePairTests {
         #expect(!refilled, "the fill ran again though its index was there")
     }
 
+    /// The fill writes one row per header that has a body and no other. A fill of every
+    /// header would leave the same values (a header with no body stays NULL) but
+    /// rewrite every header row in the step's one write: about 525,000 instead of the
+    /// about 104,000 cached ones on the large proof database.
+    @Test("The fill writes one header per cached body and no other")
+    func theFillWritesOnlyCachedHeaders() throws {
+        let db = try Self.seeded()
+        let cached = try (1...3).map { try Self.header(db, "\($0)", folderPath: "Archive").id }
+        let bare = try (4...8).map { try Self.header(db, "\($0)").id }
+        try db.write { conn in
+            for (offset, id) in cached.enumerated() {
+                try Self.body(id, fetchedAt: Self.hoursAgo(offset + 1)).insert(conn)
+            }
+            // The state v116 leaves: the column empty for bodies cached before it.
+            try conn.execute(sql: "UPDATE messageHeader SET htmlCachedAt = NULL")
+        }
+        let written = try db.write { conn -> Int in
+            try conn.execute(sql: HTMLCachePair.fillSQL)
+            return conn.changesCount
+        }
+        let bad = try db.read { try Self.mismatches($0) }
+        #expect(written == cached.count,
+                "the fill wrote \(written) header rows; \(cached.count) have a body and \(bare.count) do not")
+        #expect(bad.isEmpty, "headers out of step with their bodies after the fill: \(bad)")
+    }
+
     /// The pair's writes touch only `htmlCachedAt`, which the chat pill's reminder
     /// count does not read, so its observation does not re-run on a body save or
     /// delete, or on the fill. Observed through GRDB's own region tracking of the
@@ -282,6 +308,31 @@ struct HTMLCachePairTests {
         }
     }
 
+    /// A body write that keeps its `fetchedAt` writes no header. A record update names
+    /// every column, `fetchedAt` included, so the update trigger is considered on
+    /// every one; it writes the header only when the id or the cached-at time moves.
+    /// An update with a new time is the control.
+    @Test("A body record update that keeps fetchedAt writes no header")
+    func aBodyUpdateKeepingFetchedAtWritesNoHeader() throws {
+        let db = try Self.seeded()
+        let id = try Self.header(db, "1", folderPath: "Archive").id
+        var body = Self.body(id, fetchedAt: Self.hoursAgo(3))
+        try db.write { [body] conn in try body.insert(conn) }
+        let counter = HeaderUpdateCounter()
+        db.add(transactionObserver: counter)
+        body.htmlContent = "<p>edited</p>"
+        try db.write { [body] conn in try body.update(conn) }
+        let afterKeep = counter.count
+        body.fetchedAt = Self.hoursAgo(1)
+        try db.write { [body] conn in try body.update(conn) }
+        let afterNewTime = counter.count
+        db.remove(transactionObserver: counter)
+        let bad = try db.read { try Self.mismatches($0) }
+        #expect(afterKeep == 0, "an update that kept fetchedAt wrote \(afterKeep) header rows")
+        #expect(afterNewTime == 1, "control: an update with a new fetchedAt writes its header once: \(afterNewTime)")
+        #expect(bad.isEmpty, "headers out of step with their bodies: \(bad)")
+    }
+
     @Test("Bulk body deletes keep the pair: an IN list, a folder prefix, the whole table")
     func bulkBodyDeletesKeepThePair() throws {
         let db = try Self.seeded()
@@ -330,6 +381,26 @@ struct HTMLCachePairTests {
         func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
             guard case let .update(tableName, columnNames) = eventKind else { return false }
             return tableName == MessageHeader.databaseTableName && columnNames.contains(HTMLCachePair.column)
+        }
+
+        func databaseDidChange(with event: DatabaseEvent) {
+            guard event.kind == .update, event.tableName == MessageHeader.databaseTableName else { return }
+            value.withLock { $0 += 1 }
+        }
+
+        func databaseDidCommit(_ db: Database) {}
+        func databaseDidRollback(_ db: Database) {}
+    }
+
+    /// Counts every `messageHeader` row update, whatever columns it writes, the
+    /// triggers' writes included.
+    final class HeaderUpdateCounter: TransactionObserver, Sendable {
+        private let value = Mutex(0)
+        var count: Int { value.withLock { $0 } }
+
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
+            guard case let .update(tableName, _) = eventKind else { return false }
+            return tableName == MessageHeader.databaseTableName
         }
 
         func databaseDidChange(with event: DatabaseEvent) {

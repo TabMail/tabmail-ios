@@ -634,8 +634,8 @@ struct StaleBodyEvictWriterHoldTests {
 
         // The property: such a run reads no more as the table grows (a count of
         // the table, even through a compact index, adds more than the slack).
-        #expect(many - few <= Self.runGrowthSlackPages,
-                "a run read \(few) then \(many) pages with 10x the bodies; the slack is \(Self.runGrowthSlackPages)")
+        #expect(many.pagesRead - few.pagesRead <= Self.runGrowthSlackPages,
+                "a run read \(few.pagesRead) then \(many.pagesRead) pages with 10x the bodies; the slack is \(Self.runGrowthSlackPages)")
     }
 
     /// #1433: the step reads only its candidates, messages outside every inbox. Before,

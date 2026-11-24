@@ -1740,8 +1740,9 @@ final class AppDatabase: Sendable {
             try db.create(index: "messageHeader_accountId_bodyComplete",
                           on: "messageHeader", columns: ["accountId", "bodyComplete"])
 
-            // P0: Reminder count — ChatPillState ValueObservation re-runs on EVERY
-            // messageHeader write. Without this index, each re-run does a full 250K scan.
+            // P0: Reminder count — ChatPillState ValueObservation re-runs on every
+            // messageHeader insert or delete and every update of a column it reads.
+            // Without this index, each re-run does a full 250K scan.
             // Also used by ReminderBuilder.collectMessageReminders().
             // Partial index: only rows with reminderContent (typically <100 rows).
             try db.execute(sql: """
