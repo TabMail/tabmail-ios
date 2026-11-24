@@ -120,8 +120,9 @@ struct EmailBannerOpenClearWiringTests {
     @Test("The shared instance removes the email banners")
     func sharedInstanceRemovesEmailBanners() throws {
         let text = try Self.source("TabMail/Services/Notifications/EmailBannerOpenClear.swift")
+        #expect(text.contains("static let shared = EmailBannerOpenClear(remove: removeEmailBanners)"))
         #expect(text.contains(
-            "static let shared = EmailBannerOpenClear(remove: { Task { await NotificationCleanupService.removeEmailBanners() } })"))
+            "private static func removeEmailBanners() { Task { await NotificationCleanupService.removeEmailBanners() } }"))
     }
 
     @Test("The removal removes only the identifiers emailBannerIdentifiers picks")

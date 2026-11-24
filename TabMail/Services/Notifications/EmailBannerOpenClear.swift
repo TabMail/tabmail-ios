@@ -28,9 +28,14 @@ import UIKit
 @MainActor
 final class EmailBannerOpenClear {
 
-    static let shared = EmailBannerOpenClear(remove: {
+    // A method reference, not a closure literal: Swift 6 rejects a closure in this
+    // initializer ("default argument cannot be both main actor-isolated and
+    // @concurrent").
+    static let shared = EmailBannerOpenClear(remove: removeEmailBanners)
+
+    private static func removeEmailBanners() {
         Task { await NotificationCleanupService.removeEmailBanners() }
-    })
+    }
 
     private let remove: @MainActor () -> Void
     private var hasRemoved = false
