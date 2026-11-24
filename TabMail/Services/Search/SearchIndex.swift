@@ -122,6 +122,20 @@ actor SearchIndex {
     private var dbPool: DatabasePool?
     private var isInitialized = false
 
+    init() {}
+
+    #if DEBUG
+    /// Test seam: the folder this index opens its database in instead of Application Support, and a
+    /// receiver for the SQL of every statement its connections run. Both nil outside tests.
+    private var directoryForTesting: URL?
+    private var statementTraceForTesting: (@Sendable (String) -> Void)?
+
+    init(directoryForTesting: URL, statementTraceForTesting: @escaping @Sendable (String) -> Void) {
+        self.directoryForTesting = directoryForTesting
+        self.statementTraceForTesting = statementTraceForTesting
+    }
+    #endif
+
     /// Close the database pool for nuke operation. Must reinitialize after.
     func closeForNuke() {
         dbPool = nil
@@ -203,7 +217,12 @@ actor SearchIndex {
         guard !isInitialized else { return }
 
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        #if DEBUG
+        let ftsDir = directoryForTesting ?? appSupport.appendingPathComponent("tabmail_fts", isDirectory: true)
+        let statementTrace = statementTraceForTesting
+        #else
         let ftsDir = appSupport.appendingPathComponent("tabmail_fts", isDirectory: true)
+        #endif
         try FileManager.default.createDirectory(at: ftsDir, withIntermediateDirectories: true)
 
         let dbPath = ftsDir.appendingPathComponent("fts.db").path
@@ -219,6 +238,11 @@ actor SearchIndex {
         // (PRAGMA WAL set below), so reads stay available while suspended.
         config.observesSuspensionNotifications = true
         config.prepareDatabase { db in
+            #if DEBUG
+            if let statementTrace {
+                db.trace(options: .statement) { event in statementTrace(event.expandedDescription) }
+            }
+            #endif
             // Register sqlite-vec vec0 module on this connection (belt-and-suspenders
             // alongside sqlite3_auto_extension — ensures vec0 is available on every
             // GRDB reader/writer connection regardless of auto_extension behavior).
@@ -247,10 +271,10 @@ actor SearchIndex {
         try dbPool!.read { db in try loadKnownYears(db: db) }
         isInitialized = true
 
-        let count = try documentCount()
+        // No document count here: counting reads one index entry per indexed email, on every open.
         if DebugModeManager.isLoggingEnabled() {
             let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
-            BackgroundSyncLogger.logDebug("[SearchIndex] Initialized with \(count) documents, shards: [\(shardList)]")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Initialized, shards: [\(shardList)]")
         }
 
         // Tokenizer migration: rebuild shards created with an outdated tokenize=
@@ -788,13 +812,6 @@ actor SearchIndex {
     }
 
     // MARK: - Document Count
-
-    func documentCount() throws -> Int {
-        guard let dbPool else { return 0 }
-        return try dbPool.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM message_meta") ?? 0
-        }
-    }
 
     /// Count FTS documents belonging to a specific account.
     /// Header IDs use format "accountId:folderPath:messageId" so LIKE prefix matches.

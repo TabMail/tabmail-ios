@@ -502,15 +502,24 @@ struct BackfillUIDWalkRaceTests {
             cursor: Self.resumedCursor, localUIDs: [Self.aboveCursor], pool: pool)
         defer { Self.tearDown(walk) }
 
+        // Every write of the walk position moves the folder's version, even one
+        // that rewrites the same cursor. The cursor itself is no proof: the
+        // walk's parallel workers can confirm a lower range first, so its first
+        // progress write still records the resumed cursor, and the writes after
+        // it fall inside the progress throttle.
+        let versionBefore = try walk.row().backfillVersion
+        let progressVersion = Locked<Int?>(nil)
         let progressCursor = Locked<Int?>(nil)
         F.atCheckpoint(1, .afterWorkersJoinedBeforeFinalBookkeeping(folderId: walk.folderId)) {
-            progressCursor.set(try? walk.row().backfillUidCursor)
+            let row = try? walk.row()
+            progressVersion.set(row?.backfillVersion)
+            progressCursor.set(row?.backfillUidCursor)
             await reset.run(on: walk, missingLocally: [Self.aboveCursor])
         }
         let didWork = await walk.call()
 
-        #expect(progressCursor.get().map { $0 < Self.resumedCursor } == true,
-                "\(reset): precondition: the walk's own progress write landed before the reset (cursor \(String(describing: progressCursor.get())))")
+        #expect(progressVersion.get().map { $0 > versionBefore } == true,
+                "\(reset): precondition: the walk's own progress write landed before the reset (version \(versionBefore) then \(String(describing: progressVersion.get())), cursor \(String(describing: progressCursor.get())))")
         let row = try walk.row()
         #expect(!row.backfillComplete, "\(reset): the stale walker completed the reset folder")
         let claim = try walk.claim()

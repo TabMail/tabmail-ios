@@ -548,7 +548,10 @@ struct DatabaseIndexTests {
 ///
 /// `.serialized` because `runRefreshPlannerStatisticsIfStale` carries a
 /// process-wide single-flight latch, and the ordering test drives it.
-@Suite("Deferred index builds — v83 moved off the launch path", .serialized)
+/// `.processGlobalState` for the same latch across suites (the maintenance pass
+/// test in `StaleBodyEvictRunTests` drives it too), and because the build gives up
+/// while `DatabaseSuspension.isSuspended`, which `DatabaseSuspensionTests` holds.
+@Suite("Deferred index builds — v83 moved off the launch path", .serialized, .processGlobalState)
 struct DeferredIndexBuildTests {
 
     private struct Fixture {

@@ -460,9 +460,11 @@ actor SyncEngine {
     /// its last step is"* while `ANALYZE` was the only deferred step;
     /// `runBuildDeferredIndexesIfMissing` joined it on 2026-08-06.) The AI cache
     /// expiry is async as well, only so it can await a WAL checkpoint between its
-    /// batches; its reads and writes stay synchronous. Every other step here is
-    /// unchanged and still synchronous. Both callers already run inside detached
-    /// tasks, so this adds no new concurrency.
+    /// batches; its reads and writes stay synchronous. The stale-body evict awaits
+    /// the throttled WAL checkpoint between its pages (#1354); its page writes stay
+    /// the pass-through write. Every other step here is unchanged and still
+    /// synchronous. Both callers already run inside detached tasks, so this adds no
+    /// new concurrency.
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
         includePrune: Bool,
@@ -476,7 +478,7 @@ actor SyncEngine {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+            await runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
