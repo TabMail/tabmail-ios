@@ -26,23 +26,37 @@ request's identifier and posts no local notifications). Only the banners the mai
 reply banner in `AccountManagerAI`, `ProactiveNotifyService` nudges) use
 `EmailNotificationBuilder.identifier` (`email-<accountId>-<messageId>`). So clearing by that identifier
 (`InboxNotificationObserver`, `NSEDataBridge.clearNotification` on read) misses extension-delivered banners;
-that gap is a separate issue and not part of this rule.
+that gap is #1453 (P3) and not part of this rule.
 
 **The observer starts empty.** `InboxNotificationObserver` no longer seeds its rowid map with a whole-inbox
 read inside the launch write (the removed `seed(_:)`, `SELECT rowid, accountId, messageId FROM messageHeader
 WHERE isInInbox = 1`, which held the writer for one index entry plus one table row per inbox message on
 every database open). `AppDatabase.makeInboxNotificationObserver` only registers it
 (`pool.add(transactionObserver:)`). It learns a row from any insert or update after registration, so an
-email that arrives or is touched after launch and then leaves the inbox still has its banner cleared.
-Memory 078's "Startup populate via `WHERE isInInbox = 1` once during `AppDatabase.init`" describes the
-earlier design.
+email that arrives or is touched after launch and then leaves the inbox still has its app-posted banner
+(`email-<accountId>-<messageId>`) cleared. Memory 078's "Startup populate via `WHERE isInInbox = 1` once
+during `AppDatabase.init`" describes the earlier design.
 
-**Accepted edge.** A banner shown before a background launch, for an email that leaves the inbox while the
-app stays in the background, stays until the app is opened or the 24-hour `NotificationCleanupService`
-sweep removes it. Nothing is lost.
+**Accepted edges.** Nothing is lost in either.
+
+- A banner shown before a background launch, for an email that leaves the inbox while the app stays in the
+  background, stays until the app is opened or the 24-hour `NotificationCleanupService` sweep removes it.
+- A reply nudge (`ProactiveNotifyService`, identifier `email-<accountId>-<messageId>`, with `hash`) is kept
+  on open. When its email later leaves the inbox in a process started after the nudge was posted, the
+  observer has not seen that row (its map starts empty), so the nudge stays until the 24-hour sweep. The
+  removed launch seed used to clear it.
+
+**Supersedes in memory 078** (left unchanged there, its text is hash-pinned): the observer's "Startup
+populate via `WHERE isInInbox = 1` once during `AppDatabase.init`", and "Survives FG" for active
+notifications, which no longer holds for email banners at the first activation of a process.
 
 **Tests.** `NotificationCleanupServiceTests` (the predicate: email banners removed, reminders, nudges,
-`consent_error`, `imap_reconnect` and unknown notifications kept), `EmailBannerOpenClearTests` (first
-activation removes once, a background launch removes nothing, a later activation removes nothing),
+`consent_error`, `imap_reconnect` and unknown notifications kept; the same through
+`NotificationCleanupService.snapshot(identifier:date:content:)` on content the real
+`EmailNotificationBuilder.fill` built, on a bare push, and on the nudge and due/overdue reminder shapes),
+`EmailBannerOpenClearTests` (first activation removes once, a background launch removes nothing, a later
+activation removes nothing, a second `start` installs no second observer; source fences for the launch
+install, the shared instance's removal, `removeEmailBanners` removing only `emailBannerIdentifiers`, the
+`hash` key on every `ProactiveNotifyService` notification, and every email category registered),
 `InboxNotificationObserverTests` (post-launch arrive-then-leave clears; a row present before registration
-and never touched is not tracked).
+and never touched is not tracked; opening the database reads no inbox rows).

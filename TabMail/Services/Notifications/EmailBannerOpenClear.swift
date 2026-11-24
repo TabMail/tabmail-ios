@@ -16,7 +16,9 @@ import UIKit
 /// the app, so it removes nothing: it often comes right after a new-mail banner
 /// the user has not seen yet. Later activations of the same process remove
 /// nothing either; while the process lives, `InboxNotificationObserver` clears
-/// a banner when its email leaves the inbox.
+/// the app's own banner for an email (`EmailNotificationBuilder.identifier`) when
+/// the email leaves the inbox. A banner the notification extension delivered keeps
+/// the push's system identifier, which that clear does not name.
 ///
 /// This replaces the observer's launch seed, which read every inbox row inside
 /// the launch write only so it could clear such banners. Accepted edge: a banner

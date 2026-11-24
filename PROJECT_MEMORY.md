@@ -102,7 +102,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Cron Reminders (ScheduledItem Architecture) | [read in full](Companion/Memory/Current/075-cron-reminders-scheduleditem-architecture.md) |
 | Banner Flash Prevention (MailNavigationView) | [read in full](Companion/Memory/Current/076-banner-flash-prevention-mailnavigationview.md) |
 | Test Isolation for `UserDefaults`-Backed State | [read in full](Companion/Memory/Current/077-test-isolation-for-userdefaults-backed-state.md) |
-| Delivered-Notification Cleanup | [read in full](Companion/Memory/Current/078-delivered-notification-cleanup.md) |
+| Delivered-Notification Cleanup (observer startup populate and active "Survives FG" superseded by 161, #1385) | [read in full](Companion/Memory/Current/078-delivered-notification-cleanup.md) |
 | Startup Data Migrations (`StartupMigrations.swift`) | [read in full](Companion/Memory/Current/079-startup-data-migrations-startupmigrations-swift.md) |
 | TextEditor/TextField Caret Jump — Never Save Per Keystroke (2026-07-02) | [read in full](Companion/Memory/Current/080-texteditor-textfield-caret-jump-never-save-per-keystroke-2026-07-02.md) |
 | Migration Splash / iOS Indeterminate Linear ProgressView Pitfall (2026-07-01) | [read in full](Companion/Memory/Current/081-migration-splash-ios-indeterminate-linear-progressview-pitfall-2026-07-0.md) |

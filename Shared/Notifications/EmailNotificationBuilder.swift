@@ -20,9 +20,11 @@ import UserNotifications
 /// overdue paths) have their own scheduling logic and are intentionally
 /// NOT governed by this function.
 ///
-/// Both paths use the same notification identifier + threadIdentifier so
-/// re-delivery from the other path replaces (doesn't duplicate) the
-/// existing notification.
+/// Both paths use the same threadIdentifier. The `identifier(accountId:messageId:)`
+/// scheme names only the notifications the main app posts itself: a banner the
+/// NSE delivers keeps the push's system-assigned identifier (the push sets no
+/// collapse id, and the NSE cannot change it), so the two paths' notifications for
+/// one email do not share an identifier.
 enum EmailNotificationBuilder {
 
     /// Bundle of facts about a newly-arrived email that feed the importance
