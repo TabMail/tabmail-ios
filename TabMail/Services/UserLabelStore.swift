@@ -171,60 +171,58 @@ enum UserLabelStore {
             .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    // MARK: - Menu Sorting
+    // MARK: - Menu
 
-    /// Returns all non-system labels for an account, sorted for the label management menu:
-    /// 1. Labels applied to this message (checkmarked, alphabetical)
-    /// 2. Labels appearing on inbox messages (by frequency descending)
-    /// 3. Remaining labels (alphabetical)
-    static func labelsSortedForMenu(
-        accountId: String,
-        messageId: String,
-        inboxFolderIds: [String],
-        in db: Database
-    ) throws -> [(label: UserLabel, isApplied: Bool)] {
-        // All non-system labels for account (filtered by exclusion rules)
-        let allLabels = try UserLabel
-            .filter(Column("accountId") == accountId && Column("isSystem") == false)
-            .fetchAll(db)
-            .filter { !shouldExcludeLabel(id: $0.providerLabelId, name: $0.name) }
+    enum Config {
+        /// How many recently used labels the label menu lists above the A-to-Z list.
+        static let menuRecentCount = 3
+    }
 
-        // Labels applied to this message
-        let appliedIds = Set(
-            try MessageUserLabel
-                .filter(Column("messageId") == messageId)
-                .fetchAll(db)
-                .map(\.userLabelId)
-        )
+    /// The label menu's rows for one message (#1386).
+    struct Menu: Sendable {
+        /// Up to `Config.menuRecentCount` labels the user applied in this app, most
+        /// recently applied first. Empty until the user applies a label here.
+        let recent: [UserLabel]
+        /// Every label of the account, A to Z (`allLabels`); the recent ones appear in
+        /// it again.
+        let all: [UserLabel]
+        /// The labels of `all` on this message: the menu's checkmarks.
+        let appliedIds: Set<String>
+    }
 
-        // Frequency: count of inbox messages per label
-        var frequency: [String: Int] = [:]
-        if !inboxFolderIds.isEmpty {
-            let sql = """
-                SELECT mul.userLabelId, COUNT(DISTINCT mul.messageId) as cnt
-                FROM messageUserLabel mul
-                JOIN messageHeader mh ON mh.id = mul.messageId
-                WHERE mh.folderId IN (\(inboxFolderIds.map { _ in "?" }.joined(separator: ",")))
-                GROUP BY mul.userLabelId
-                """
-            let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(inboxFolderIds))
-            for row in rows {
-                frequency[row["userLabelId"]] = row["cnt"]
-            }
-        }
+    /// The label menu for `messageId` in `accountId` (#1386, ADR-IOS-118). It reads the
+    /// account's labels, the times in `userLabelLastUsed`, and this message's own label
+    /// rows, and no other message: the menu used to rank labels by how many inbox
+    /// messages carried each, which read every inbox message and its label rows each
+    /// time the menu opened.
+    ///
+    /// `recent` keeps only labels that are also in `all`, so a system label, an excluded
+    /// keyword or another account's label never reaches the top even if it has a time.
+    /// That is also why the read of `userLabelLastUsed` names no account: the table
+    /// holds one row per label the user has applied in this app, so all of it is a
+    /// small read, and the lookup in `all` keeps this account's labels.
+    static func menu(accountId: String, messageId: String, in db: Database) throws -> Menu {
+        let all = try allLabels(accountId: accountId, in: db)
+        let byId = Dictionary(uniqueKeysWithValues: all.map { ($0.id, $0) })
+        let usedIds = try String.fetchAll(db, sql: """
+            SELECT userLabelId FROM userLabelLastUsed ORDER BY lastUsedAt DESC, userLabelId
+            """)
+        let recent = Array(usedIds.compactMap { byId[$0] }.prefix(Config.menuRecentCount))
+        let appliedIds = try Set(String.fetchAll(
+            db, MessageUserLabel.select(Column("userLabelId")).filter(Column("messageId") == messageId)))
+            .intersection(byId.keys)
+        return Menu(recent: recent, all: all, appliedIds: appliedIds)
+    }
 
-        // Sort: applied first (alpha), then by frequency desc, then alpha
-        let applied = allLabels.filter { appliedIds.contains($0.id) }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-            .map { ($0, true) }
-        let unapplied = allLabels.filter { !appliedIds.contains($0.id) }
-            .sorted { a, b in
-                let fa = frequency[a.id] ?? 0
-                let fb = frequency[b.id] ?? 0
-                if fa != fb { return fa > fb }
-                return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
-            }
-            .map { ($0, false) }
-        return applied + unapplied
+    /// Records that the user applied `labelId` (`UserLabel.id`) in this app at `time`
+    /// (#1386, ADR-IOS-118). Only the label menu's apply calls it, inside the transaction
+    /// that writes the label's join row and queues its operation, so a label has a time
+    /// exactly when such an apply was admitted. Removing a label, a label applied on
+    /// another device, and a label sync brings in leave it alone.
+    static func recordUse(of labelId: String, at time: Date, in db: Database) throws {
+        try db.execute(sql: """
+            INSERT INTO userLabelLastUsed (userLabelId, lastUsedAt) VALUES (?, ?)
+            ON CONFLICT(userLabelId) DO UPDATE SET lastUsedAt = excluded.lastUsedAt
+            """, arguments: [labelId, time])
     }
 }

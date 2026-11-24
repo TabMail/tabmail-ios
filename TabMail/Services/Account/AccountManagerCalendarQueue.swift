@@ -1536,8 +1536,9 @@ extension AccountManager {
     /// it from exactly two guards:
     ///   1. `guard !invalidated` — the account was removed. Those ops cannot wedge
     ///      anything: `pendingCalendarOperation.accountId` is declared
-    ///      `.references("account", onDelete: .cascade)`, one of the 10 live
-    ///      cascading foreign keys, so deleting the account already deleted them.
+    ///      `.references("account", onDelete: .cascade)`, one of the live cascading
+    ///      foreign keys (`MigrationForeignKeyModeTests.everyLiveForeignKeyCascades`),
+    ///      so deleting the account already deleted them.
     ///   2. `guard let refreshToken = KeychainHelper.loadString(…)` — and
     ///      `KeychainHelper.load` returns `nil` for **any** `SecItemCopyMatching`
     ///      failure, not only "the token is gone". That is an ABSENCE OF EVIDENCE,

@@ -253,12 +253,10 @@ struct UserLabelAccountIdentityTests {
         #expect(try db.read { try UserLabelStore.allLabels(accountId: "acc1", in: $0) }.map(\.name)
                 == ["Play", "Work"])
         let menu = try db.read { db in
-            try UserLabelStore.labelsSortedForMenu(
-                accountId: "acc1", messageId: msg.id, inboxFolderIds: ["acc1:INBOX"], in: db)
+            try UserLabelStore.menu(accountId: "acc1", messageId: msg.id, in: db)
         }
-        #expect(menu.count == 2)
-        let everyMenuRowIsChecked = menu.allSatisfy { $0.isApplied }
-        #expect(everyMenuRowIsChecked, "an applied label lost its checkmark")
+        #expect(menu.all.map(\.name) == ["Play", "Work"])
+        #expect(menu.appliedIds == [work.id, play.id], "an applied label lost its checkmark")
 
         // RENDER — the chips, both singly and through the batch reader.
         #expect(try db.read { try UserLabelStore.labelsForMessage(msg.id, in: $0) }.map(\.name)
