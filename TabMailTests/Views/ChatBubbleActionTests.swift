@@ -17,6 +17,8 @@ import UIKit
 ///  2. The bubble, each of its chips and its "+N" open that email's card, never another email's.
 ///  3. The invite card under a bubble is that email's invite, and its button adds that invite's
 ///     calendar file.
+///  4. A bubble that shows its sender offers VoiceOver "Copy <name>'s Address" (the avatar's menu,
+///     which VoiceOver does not reach), and it puts that sender's bare address on the clipboard.
 ///
 /// Each chip is pressed through its accessibility element, as VoiceOver presses it; the card it
 /// opens is read from the sheet the chat presents. The bubble's own element takes no press in the
@@ -65,7 +67,7 @@ struct ChatBubbleActionTests {
         for index in 0..<subjects.count {
             let address = senders[index] == "Bo Lee" ? "bo@example.com" : "alex@example.com"
             var header = MessageHeader(
-                messageId: "bubble\(index)", subject: subjects[index], from: "\(senders[index]) <\(address)>",
+                messageId: "bubble\(index)", subject: subjects[index], from: senders[index],
                 fromAddress: address, to: "me@example.com",
                 date: now.addingTimeInterval(TimeInterval(index - subjects.count) * 600), snippet: "Note \(index)",
                 folderId: MessageIdentity.folderId(accountId: account, folderPath: "INBOX"),
@@ -223,6 +225,25 @@ struct ChatBubbleActionTests {
         let thread = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(thread.components(separatedBy: "onOpen: { cardMessage = item.header })").count == 2)
         #expect(thread.components(separatedBy: "MessageDetailView(messageId: msg.id, expectedRfc822MessageId: msg.rfc822MessageId)").count == 2)
+    }
+
+    @Test("VoiceOver's Copy Address on a bubble puts that bubble's sender's address on the clipboard")
+    func bubbleCopiesItsSendersAddress() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await withChat { chat in
+                let copies = Set(HostedAccessibility.actionNames(in: chat.view).filter { $0.hasSuffix("'s Address") })
+                #expect(copies == ["Copy Alex Doe's Address", "Copy Bo Lee's Address"], "each sender once: \(copies)")
+                // The general clipboard, as the app writes it. What another app left there is not read
+                // (that would ask for paste permission); a marker the test writes first shows a no-op.
+                let pasteboard = UIPasteboard.general
+                pasteboard.string = "marker"
+                let performed = HostedAccessibility.perform("Copy Bo Lee's Address", in: chat.view)
+                let copied = pasteboard.string
+                #expect(performed, "a bubble offers it")
+                #expect(copied == "bo@example.com")
+            }
+        }
     }
 
     /// `path`'s source with every run of whitespace made one space.
