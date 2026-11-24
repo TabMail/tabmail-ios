@@ -26,7 +26,8 @@ import Testing
 ///   fetches during one run. It must not grow with the bodies that are NOT stale,
 ///   wherever the run reads them (writer or reader), by a ratio or by more than a
 ///   few pages.
-@Suite("Stale-body evict: what one write holds and what a run reads")
+// A run that never ends (a cursor that stops moving) fails here instead of hanging.
+@Suite("Stale-body evict: what one write holds and what a run reads", .timeLimit(.minutes(1)))
 struct StaleBodyEvictWriterHoldTests {
 
     /// Pages a connection has fetched so far (cumulative, never reset, so the
@@ -310,6 +311,7 @@ struct StaleBodyEvictWriterHoldTests {
         #expect(evictedArchive == Array(archived.suffix(olderArchived)),
                 "the archive bodies past the newest \(recent) are evicted, and only they")
         #expect(afterFirstRun.count == fewKept + recent, "every kept body stays")
+        let tableFew = try Self.wholeTableRead(fixture)
 
         try Self.seedKeptInboxBodies(fixture, uids: (fewKept + 1)..<(manyKept + 1))
         // Victims cached after every kept body, so they come last in the run's page
@@ -321,6 +323,15 @@ struct StaleBodyEvictWriterHoldTests {
         #expect(afterSecondRun.count == manyKept + recent, "every kept body stays")
         #expect(afterSecondRun.isDisjoint(with: lateVictims),
                 "the archive bodies behind the \(manyKept) kept ones are evicted")
+        let tableMany = try Self.wholeTableRead(fixture)
+
+        // Non-vacuous, and independent of the code under test: reading the kept
+        // bodies costs over twice the pages the second time, so a write that read
+        // them would break the bound below.
+        #expect(tableFew.rows == fewKept + recent && tableMany.rows == manyKept + recent,
+                "the control read every body: \(tableFew.rows), \(tableMany.rows)")
+        #expect(tableMany.pages > 2 * tableFew.pages,
+                "reading the table cost \(tableFew.pages) then \(tableMany.pages) pages; the fixture does not grow it enough to discriminate")
 
         // Non-vacuous: each run wrote once per page of its stale bodies.
         let pagesFew = fewKept / SyncConfig.pruneChunkSize
@@ -550,6 +561,10 @@ struct StaleBodyEvictWriterHoldTests {
         let fewFresh = 1_000
         let manyFresh = 10 * fewFresh
         try Self.seedFreshBodies(fixture, ids: 0..<fewFresh)
+        // A read before the first measured run, so a reader's first look at the
+        // schema after the migrations is not counted in it.
+        let seeded = try Self.bodyIds(fixture)
+        #expect(seeded.count == fewFresh)
         let few = Self.gatedRun(fixture)
         let afterFirstRun = try Self.bodyIds(fixture)
         let tableFew = try Self.wholeTableRead(fixture)

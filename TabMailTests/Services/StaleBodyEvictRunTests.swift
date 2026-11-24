@@ -16,7 +16,8 @@ import Testing
 /// reuses; here every test checks which bodies are left, so a cursor that skips
 /// rows, a rule that stops protecting one, or a run that does not stop where it
 /// should shows up as a wrong set of bodies.
-@Suite("Stale-body evict: what a run keeps, evicts and retries")
+// A run that never ends (a cursor that stops moving) fails here instead of hanging.
+@Suite("Stale-body evict: what a run keeps, evicts and retries", .timeLimit(.minutes(1)))
 struct StaleBodyEvictRunTests {
 
     typealias Hold = StaleBodyEvictWriterHoldTests

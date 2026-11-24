@@ -959,9 +959,10 @@ extension SyncEngine {
     ///
     /// FAILS SAFE. If this is skipped, cancelled or aborted, `markAllAsRead` sorts
     /// through a temp B-tree — slow, and correct in the sense that matters (identical
-    /// rows, identical order). Nothing is recorded on failure, so the next pass
-    /// retries. Recovery is automatic and needs no user gesture (THE MANTRA:
-    /// recoverable ⇒ fail closed).
+    /// rows, identical order) — and the stale-body evict step waits for its index
+    /// (`runEvictStaleBodiesIfIndexed`), so stale bodies stay cached a pass longer
+    /// (#1354). Nothing is recorded on failure, so the next pass retries. Recovery is
+    /// automatic and needs no user gesture (THE MANTRA: recoverable ⇒ fail closed).
     ///
     /// 🚨 IT IS **NOT** "THE ALREADY-SHIPPED BEHAVIOUR UP TO `v83`", WHICH IS WHAT
     /// THIS SENTENCE SAID UNTIL R16-4 (corrected 2026-08-06) — and the wording
@@ -983,9 +984,12 @@ extension SyncEngine {
     /// functions, the same argument shape, opposite truth values; that is why each
     /// one has to be checked against the tag rather than against its neighbour.
     ///
-    /// COST WHILE IT RUNS: one write transaction; 119 ms measured at 360k rows,
-    /// 5,050 ms on the owner's 5-account device — which is the whole point of it
-    /// being here rather than on the launch path.
+    /// COST WHILE IT RUNS: one write transaction; for `messageHeader_unreadSweep`
+    /// 119 ms measured at 360k rows, 5,050 ms on a real 5-account device — which
+    /// is the whole point of it being here rather than on the launch path.
+    /// `messageBody_staleEvict` (#1354) reads every cached body once, since
+    /// `fetchedAt` is stored after the HTML, so its build costs more than those
+    /// figures on a large body cache.
     @discardableResult
     nonisolated static func runBuildDeferredIndexesIfMissing(
         dbPool: PrioritizedDatabase
