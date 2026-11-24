@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Observation
 import Synchronization
 @testable import TabMail
 
@@ -158,7 +159,8 @@ struct UpgradeStepTests {
         let fixture = try Self.makeFixture()
         defer { Self.tearDown(fixture) }
         let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
-        #expect(!deferred.isEmpty && deferred.isDisjoint(with: try Self.existingIndexes(fixture.pool)),
+        let existing = try Self.existingIndexes(fixture.pool)
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: existing),
                 "the fixture must start without the deferred indexes, or the build proves nothing")
         let migrationBuilt = try Self.fullMessageHeaderIndexes(fixture.pool)
         #expect(!migrationBuilt.isEmpty, "the schema must have a migration-built messageHeader index")
@@ -191,7 +193,8 @@ struct UpgradeStepTests {
         let fixture = try Self.makeFixture()
         defer { Self.tearDown(fixture) }
         let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
-        #expect(!deferred.isEmpty && deferred.isDisjoint(with: try Self.existingIndexes(fixture.pool)),
+        let existing = try Self.existingIndexes(fixture.pool)
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: existing),
                 "the fixture must start without the deferred indexes, or the launches prove nothing")
         #expect(try Self.statisticsRows(fixture.pool).isEmpty)
 
@@ -239,9 +242,11 @@ struct UpgradeStepTests {
     /// the foreground, whose first paint records `AtFirstPaint`. A launch in the
     /// background is never an upgrade launch, and the foreground one here is not one
     /// either, so the probe answers false; the build is the real launch build.
+    /// `dbExisted` is whether the database file existed before the launch.
     @MainActor
     private static func startup(
-        _ fixture: Fixture, isForeground: Bool, atFirstPaint: @escaping @Sendable (AtFirstPaint) -> Void
+        _ fixture: Fixture, dbExisted: Bool = true, isForeground: Bool,
+        atFirstPaint: @escaping @Sendable (AtFirstPaint) -> Void
     ) -> AppStartup {
         let pool = fixture.pool
         let suiteName = fixture.suiteName
@@ -253,7 +258,7 @@ struct UpgradeStepTests {
             },
             preparation: {},
             upkeep: {},
-            launch: (dbExisted: true, isForeground: isForeground),
+            launch: (dbExisted: dbExisted, isForeground: isForeground),
             markerSuiteName: suiteName,
             firstPaint: {
                 let existing = (try? Self.existingIndexes(pool)) ?? []
@@ -272,13 +277,51 @@ struct UpgradeStepTests {
         return await AppDatabase.runUpgradeStep(pool: pool, isUpgradeLaunch: true, defaults: defaults)
     }
 
+    /// The label of the step's one write (`runRefreshPlannerStatisticsIfStale`).
+    private static let statisticsWriteLabel = "AnalyzePlannerStatistics"
+
+    /// What the user sees and what the writer runs at a first foreground, in order.
+    private enum StepEvent: Equatable, Sendable {
+        case updatingScreen
+        case statisticsWrite(WritePriority)
+    }
+
+    /// How long a test waits for something that must happen.
+    private static let waitTimeout: Duration = .seconds(10)
+    /// How long a test gives a second foreground entry to show the inbox, which it
+    /// must not do while the first entry's step runs.
+    private static let secondEntryWindow: Duration = .milliseconds(500)
+    private static let pollInterval: Duration = .milliseconds(5)
+
+    /// Polls `condition` until it holds or `timeout` passes; returns whether it held.
+    @MainActor
+    private static func waitUntil(timeout: Duration, _ condition: () async -> Bool) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: pollInterval)
+        }
+        return await condition()
+    }
+
+    /// Holds a write open until the test opens it.
+    private actor Gate {
+        private var opened = false
+        func open() { opened = true }
+        func wait() async {
+            while !opened { try? await Task.sleep(for: UpgradeStepTests.pollInterval) }
+        }
+    }
+
     @Test("A process launched in the background runs the step at its first foreground, behind the Updating screen, before the inbox shows")
     @MainActor
     func backgroundLaunchedProcessRunsTheStepAtItsFirstForeground() async throws {
         let fixture = try Self.makeFixture()
         defer { Self.tearDown(fixture) }
         let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
-        #expect(!deferred.isEmpty && deferred.isDisjoint(with: try Self.existingIndexes(fixture.pool)),
+        let existing = try Self.existingIndexes(fixture.pool)
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: existing),
                 "the fixture must start without the deferred indexes, or the launch proves nothing")
         let seen = Mutex<AtFirstPaint?>(nil)
         let startup = Self.startup(fixture, isForeground: false) { state in seen.withLock { $0 = state } }
@@ -291,10 +334,30 @@ struct UpgradeStepTests {
         #expect(builtInBackground.isEmpty, "the background launch built deferred indexes: \(builtInBackground.sorted())")
         #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
 
+        // What the user sees and what the writer runs, in order: the Updating screen
+        // switches on, then the step's write starts at the tier ahead of queued
+        // background writes. The suite's process-wide lock keeps every other
+        // statistics refresh out of this window.
+        let events = Mutex<[StepEvent]>([])
+        await DatabaseWriteQueue.shared.setTestObserverForTesting { priority, label in
+            guard label == Self.statisticsWriteLabel else { return }
+            events.withLock { $0.append(.statisticsWrite(priority)) }
+        }
+        withObservationTracking {
+            _ = startup.isMigrating
+        } onChange: {
+            events.withLock { $0.append(.updatingScreen) }
+        }
+
         // The user opens the app: the scene's task, in the same process.
         await startup.runIfNeeded(navigationStore: NavigationStore())
+        await DatabaseWriteQueue.shared.setTestObserverForTesting(nil)
         #expect(startup.isMigrating, "the step ran without the Updating screen")
         #expect(startup.isReady)
+        let order = events.withLock { $0 }
+        let expectedOrder: [StepEvent] = [.updatingScreen, .statisticsWrite(.priority)]
+        #expect(order == expectedOrder,
+                "the Updating screen must show before the step's write, which runs at .priority: \(order)")
         let recorded = seen.withLock { $0 }
         let atPaint = try #require(recorded, "the inbox never showed")
         #expect(atPaint.missing.isEmpty, "deferred indexes missing when the inbox showed: \(atPaint.missing.sorted())")
@@ -302,9 +365,86 @@ struct UpgradeStepTests {
                 "the statistics were not current when the inbox showed: marker \(String(describing: atPaint.marker)), live \(String(describing: atPaint.liveVersion))")
     }
 
+    @Test("A second foreground entry while the first one's step runs waits for that step before the inbox shows")
+    @MainActor
+    func aSecondForegroundEntryWaitsForTheRunningStep() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
+        let existing = try Self.existingIndexes(fixture.pool)
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: existing),
+                "the fixture must start without the deferred indexes, or the entries prove nothing")
+        let paints = Mutex<[AtFirstPaint]>([])
+        let startup = Self.startup(fixture, isForeground: false) { state in paints.withLock { $0.append(state) } }
+        #expect(await startup.ensureDatabaseReady())
+
+        // The writer is busy, so the first entry's step waits behind the Updating screen.
+        let gate = Gate()
+        let heldWrite = Task { try await DatabaseWriteQueue.shared.execute(priority: .priority) { await gate.wait() } }
+        let writerHeld = await Self.waitUntil(timeout: Self.waitTimeout) { await DatabaseWriteQueue.shared.isWriting }
+        #expect(writerHeld, "the test could not hold the writer")
+
+        let firstEntry = Task { @MainActor in await startup.runIfNeeded(navigationStore: NavigationStore()) }
+        let updating = await Self.waitUntil(timeout: Self.waitTimeout) { startup.isMigrating }
+        #expect(updating, "the first entry did not show the Updating screen")
+
+        // A second entry (a second scene, a scene reconnecting) while that step waits.
+        let secondEntry = Task { @MainActor in await startup.runIfNeeded(navigationStore: NavigationStore()) }
+        let paintedDuringStep = await Self.waitUntil(timeout: Self.secondEntryWindow) {
+            !paints.withLock { $0.isEmpty }
+        }
+        #expect(!paintedDuringStep, "the inbox showed while the first entry's step was still waiting for the writer")
+        #expect(!startup.isReady)
+
+        await gate.open()
+        try await heldWrite.value
+        await firstEntry.value
+        await secondEntry.value
+        #expect(startup.isReady)
+        let recorded = paints.withLock { $0 }
+        #expect(recorded.count == 2, "each entry shows the inbox once")
+        guard recorded.count == 2 else { return }
+        for atPaint in recorded {
+            #expect(atPaint.missing.isEmpty, "an entry showed the inbox with deferred indexes missing: \(atPaint.missing.sorted())")
+            #expect(atPaint.marker != nil && atPaint.marker == atPaint.liveVersion,
+                    "an entry showed the inbox before the statistics were current: marker \(String(describing: atPaint.marker)), live \(String(describing: atPaint.liveVersion))")
+        }
+    }
+
+    @Test("A process launched in the background on a database file it created runs no step at its first foreground")
+    @MainActor
+    func backgroundLaunchedFreshInstallRunsNoStepAtItsFirstForeground() async throws {
+        let fixture = try Self.makeFixture()
+        defer { Self.tearDown(fixture) }
+        let deferred = Set(SyncEngine.deferredIndexes.map(\.name))
+        let existing = try Self.existingIndexes(fixture.pool)
+        // The database has upgrade work, so only the build's own `dbExisted` can
+        // keep the first foreground from running the step.
+        #expect(!deferred.isEmpty && deferred.isDisjoint(with: existing),
+                "the fixture must start without the deferred indexes, or the launch proves nothing")
+        let seen = Mutex<AtFirstPaint?>(nil)
+        let startup = Self.startup(fixture, dbExisted: false, isForeground: false) { state in
+            seen.withLock { $0 = state }
+        }
+
+        #expect(await startup.ensureDatabaseReady())
+        await startup.runIfNeeded(navigationStore: NavigationStore())
+        #expect(!startup.isMigrating, "the Updating screen showed on a launch whose database file did not exist before it")
+        #expect(startup.isReady)
+        let recorded = seen.withLock { $0 }
+        let atPaint = try #require(recorded, "the inbox never showed")
+        #expect(atPaint.missing == deferred, "the first foreground ran the step on a fresh install")
+        #expect(atPaint.marker == nil)
+    }
+
     @Test("A process launched in the background whose database has no upgrade work shows no Updating screen at its first foreground")
     @MainActor
     func backgroundLaunchedProcessWithNothingToDoShowsNoUpdatingScreen() async throws {
+        // The one-time resets count as upgrade work too; they are done here, as in
+        // the sibling tests of `StartupMigrationsTests`.
+        let savedFlags = StartupMigrationsTests.snapshotFlags()
+        defer { StartupMigrationsTests.restoreFlags(savedFlags) }
+        for key in StartupMigrations.resetFlagKeys { UserDefaults.standard.set(true, forKey: key) }
         let fixture = try Self.makeFixture()
         defer { Self.tearDown(fixture) }
         let settled = await Self.runStep(fixture.pool, suiteName: fixture.suiteName)

@@ -1417,7 +1417,8 @@ extension SyncEngine {
     /// this instead of waiting behind it. The third caller, the upgrade step, passes
     /// `.priority`: it runs before the database is published, or at the first
     /// foreground of a process launched in the background, before the inbox shows;
-    /// either way the user is waiting for it and no user action can be queued behind it.
+    /// either way the user is waiting for it, and a write issued after it waits for
+    /// this one write.
     ///
     /// The schema-version READ stays synchronous deliberately — see
     /// `plannerStatisticsSchemaVersion`, which exists only to keep that binding.
