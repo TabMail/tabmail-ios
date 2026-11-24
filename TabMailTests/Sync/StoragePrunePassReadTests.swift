@@ -45,13 +45,20 @@ struct StoragePrunePassReadTests {
         // A deferred close: the header pass hands each chunk's content release to a
         // detached task, which can still be running when the test returns.
         defer { TestDatabaseTeardown.retire(pool: fixture.pool, directory: fixture.directory) }
-        let large = fixture.folderId("Archive")
-        let small = fixture.folderId("INBOX")
-        try Paging.seedHeaders(
-            fixture, path: "Archive",
-            rows: Paging.Shape(mode: mode, count: Paging.largeFolder, ties: [], pages: 0).rows())
+        // The small folder is the one the pass reaches first (it reads an account's
+        // folders through `folder(accountId, role)`, so the archive before the inbox).
+        // Its reads are then the baseline at the size the table has while the large
+        // folder is read. The header batch fetches each of its rows from the table,
+        // one descent of the table's b-tree per row, and that depth follows the whole
+        // table, not the folder: read after the large folder was pruned, the same batch
+        // costs a level less per row.
+        let large = fixture.folderId("INBOX")
+        let small = fixture.folderId("Archive")
         try Paging.seedHeaders(
             fixture, path: "INBOX",
+            rows: Paging.Shape(mode: mode, count: Paging.largeFolder, ties: [], pages: 0).rows())
+        try Paging.seedHeaders(
+            fixture, path: "Archive",
             rows: Paging.Shape(mode: mode, count: Self.smallFolder, ties: [], pages: 0).rows())
         try Paging.resetBodies(fixture)
 
@@ -87,6 +94,10 @@ struct StoragePrunePassReadTests {
              small: try MessageHeader.filter(Column("folderId") == small).fetchCount(db))
         }
 
+        let firstLarge = run.reads.firstIndex { $0.expandedSQL.contains("'\(large)'") } ?? run.reads.count
+        let firstSmall = run.reads.firstIndex { $0.expandedSQL.contains("'\(small)'") } ?? run.reads.count
+        #expect(firstSmall < firstLarge,
+                "setup: the pass read the large folder (read \(firstLarge)) before the small one (read \(firstSmall)), so the small folder's costs are not a baseline at the same table size")
         #expect(left.large <= Paging.floor && left.small <= Paging.floor,
                 "setup: the header pass did not run to the floor: \(left.large) rows left in the large folder, \(left.small) in the small one")
         #expect(largeCost.count >= Self.passStatements,
