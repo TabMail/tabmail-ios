@@ -38,6 +38,13 @@ import GRDB
 /// counter is documented best-effort drift that the next main-app recount
 /// overwrites, so failing open (possible transient overcount) is preferred
 /// over failing closed (missing badge movement entirely).
+///
+/// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+/// index, table or column added here, and every query that reads them, must be as
+/// cheap as the data allows. It must not add a new table or index scan unless no
+/// index or plainer query can avoid it; then state why at the query. Prove a query
+/// or index change on a mail-sized database with the DBProof harness
+/// (TabMailTests/Helpers/DBProofHarness.swift).
 enum NSEBadge {
     /// App Group key for the shared counter. NSE increments; the main app's
     /// `UnreadCountManager.updateBadge()` overwrites with the real count.

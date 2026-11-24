@@ -81,3 +81,5 @@ statement fixed its outer loop but left the inner `messageHeader` access to the 
 checked only the first line.
 
 **Related.** The startup budget a launch query must fit: [042](042-syncstartup-budget-discipline-v50-v51-lesson.md).
+
+**Where it is asked for.** A query-cost note at every schema and migration entry point (the main database's migrations, the notification staging database, the body-asset manifest, the badge table, the search and memory indexes, the deferred indexes) asks every new query, index, table or column to add no new scan unless no index or plainer query can avoid it, and points here. `QueryCostNoteFenceTests` keeps the note in place, word for word, and requires it in any new source file that defines schema.

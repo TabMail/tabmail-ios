@@ -159,6 +159,12 @@ enum BodyAssetStore {
     /// access in one seek of the index, without reading the message's rows. It replaces
     /// `idx_bodyAsset_header (headerId)`, which is its prefix and serves every other `headerId`
     /// lookup the same way, in the same build-then-drop order.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query, index, table
+    /// or column added here, and every query that reads them, must be as cheap as the data allows.
+    /// It must not add a new table or index scan unless no index or plainer query can avoid it;
+    /// then state why at the query. Prove a query or index change on a mail-sized database with the
+    /// DBProof harness (TabMailTests/Helpers/DBProofHarness.swift).
     static func migrateManifestSchema(_ db: Database) throws {
         try db.execute(sql: """
             CREATE TABLE IF NOT EXISTS bodyAsset (
