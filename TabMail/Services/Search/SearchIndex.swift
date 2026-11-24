@@ -814,17 +814,37 @@ actor SearchIndex {
     // MARK: - Document Count
 
     /// Count FTS documents belonging to a specific account.
-    /// Header IDs use format "accountId:folderPath:messageId" so LIKE prefix matches.
+    /// Header IDs use format "accountId:folderPath:messageId", so the account's
+    /// entries are exactly the `message_ids` keys in `accountHeaderIdRange`.
     func documentCountForAccount(accountId: String) throws -> Int {
         guard let dbPool else { return 0 }
-        let prefix = accountId + ":%"
-        return try dbPool.read { db in
-            try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM message_ids WHERE headerId LIKE ?",
-                arguments: [prefix]
-            ) ?? 0
-        }
+        return try dbPool.read { db in try Self.accountDocumentCount(db, accountId: accountId) }
+    }
+
+    /// The read behind `documentCountForAccount`, on a connection to the index's database.
+    nonisolated static func accountDocumentCount(_ db: Database, accountId: String) throws -> Int {
+        let range = accountHeaderIdRange(accountId: accountId)
+        return try Int.fetchOne(
+            db,
+            sql: accountDocumentCountSQL,
+            arguments: [range.lower, range.upper]
+        ) ?? 0
+    }
+
+    /// Counts one account's `message_ids` entries by a key range on the table's
+    /// primary key, so the count reads only that account's index entries. A
+    /// `headerId LIKE '<accountId>:%'` prefix cannot use that index (SQLite's
+    /// `LIKE` is case-insensitive and the key is BINARY): it read the whole
+    /// table, every other account's entries included, after every sync.
+    static let accountDocumentCountSQL =
+        "SELECT COUNT(*) FROM message_ids WHERE headerId >= ? AND headerId < ?"
+
+    /// The `[lower, upper)` key range, in BINARY order, holding exactly the
+    /// header ids of one account (`"<accountId>:<folderPath>:<messageId>"`):
+    /// every key that starts with `"<accountId>:"`, and no other. `upper` raises
+    /// the prefix's last character, `:` (0x3A), to the next one, `;` (0x3B).
+    static func accountHeaderIdRange(accountId: String) -> (lower: String, upper: String) {
+        (accountId + ":", accountId + ";")
     }
 
     /// Remove all FTS entries for a given account (used during account removal).
