@@ -46,10 +46,11 @@ struct FTSSelfHealCandidateProofTests {
 
     // MARK: - Modes
 
-    /// A read measured without and with the index, and the statement whose plan the report shows.
+    /// A read measured without and with the index, and the statement whose plan the report shows,
+    /// with the arguments its placeholders take.
     struct ReadCase: Sendable {
         let mode: DBProof.Mode
-        let statement: @Sendable (Database) throws -> String
+        let statement: @Sendable (Database) throws -> (sql: String, arguments: StatementArguments)
         /// The read this unit changes must read fewer pages on a large mailbox; a read the
         /// census checks (one the planner moves onto the index) must never read more.
         let mustImprove: Bool
@@ -62,7 +63,7 @@ struct FTSSelfHealCandidateProofTests {
             mode: DBProof.Mode(name: name, kind: .read,
                                old: DBProof.Variant(setupSQL: [dropIndex], sql: [sql]),
                                new: DBProof.Variant(sql: [sql])),
-            statement: { _ in sql },
+            statement: { _ in (sql, StatementArguments()) },
             mustImprove: mustImprove)
     }
 
@@ -84,7 +85,9 @@ struct FTSSelfHealCandidateProofTests {
                                    old: DBProof.Variant(setupSQL: [dropIndex], run: recovery),
                                    new: DBProof.Variant(run: recovery)),
                 statement: { db in
-                    try Self.incompleteHeadersRequest().makePreparedRequest(db, forSingleResult: false).statement.sql
+                    let statement = try Self.incompleteHeadersRequest()
+                        .makePreparedRequest(db, forSingleResult: false).statement
+                    return (statement.sql, statement.arguments)
                 },
                 mustImprove: false),
             readCase("census: full-history sweep page",
@@ -98,12 +101,13 @@ struct FTSSelfHealCandidateProofTests {
     }
 
     /// The plan of `statement` in a variant file `compare` left.
-    static func plan(_ statement: @Sendable (Database) throws -> String, in file: URL) throws -> String {
+    static func plan(_ statement: @Sendable (Database) throws -> (sql: String, arguments: StatementArguments),
+                     in file: URL) throws -> String {
         let queue = try DatabaseQueue(path: file.path)
         defer { try? queue.close() }
         return try queue.read { db in
-            let sql = try statement(db)
-            return try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql)
+            let (sql, arguments) = try statement(db)
+            return try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
                 .map { $0["detail"] as String? ?? "?" }
                 .joined(separator: " | ")
         }
