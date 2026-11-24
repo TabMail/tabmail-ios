@@ -55,7 +55,12 @@ Standing rules that came out of it:
    lease proof and the move run in one manifest transaction). Assets whose message was deleted are
    reclaimed by the pending-delete worker from the keys the main database queued, not by age;
    `pruneOrphanFiles` (age-gated) runs only once after the update and after a UIDVALIDITY reset's
-   folder purge. See ADR-IOS-046's 2026-11-24 amendment.
+   folder purge. See ADR-IOS-046's 2026-11-24 amendment. `bodyAssetPendingDelete` is the one table
+   this change adds that the app writes; it is not a marker a read relies on, because SQLite fills it
+   in the deleting transaction and each entry only asks the worker to judge a key again. An
+   `INSERT OR REPLACE` on `messageHeader` would delete a row without firing the delete trigger
+   (`recursive_triggers` is off); that path is closed by `MessageHeaderReplaceFenceTests`, not by
+   turning `recursive_triggers` on, which would change every connection's behaviour.
 
 **Accepted residual:** in a folder that has ever had a UIDVALIDITY reset, rfc-less attachments stay
 unopenable. `MessageHeader` carries no epoch and a retained view holds a stale snapshot, so a

@@ -142,6 +142,16 @@ struct BodyAssetPendingDeleteTests {
             checkpoint: checkpoint, foreground: foreground)
     }
 
+    /// A foreground answer that is true for its first `n` calls and false after, to
+    /// leave the foreground at an exact point of a pass.
+    private static func foreground(forCalls n: Int) -> @Sendable () -> Bool {
+        let calls = Locked(0)
+        return {
+            calls.mutate { $0 += 1 }
+            return calls.get() <= n
+        }
+    }
+
     /// Every statement the test manifest's one connection runs during `body`.
     /// `expandedDescription` carries bound values: acceptable only because this is
     /// a throwaway in-memory fixture.
@@ -271,8 +281,9 @@ struct BodyAssetPendingDeleteTests {
         let checkpoints = Locked(0)
         let pass = await runWorker(batchSize: 2, checkpoint: { checkpoints.mutate { $0 += 1 } })
 
-        #expect(pass.batches == 3, "5 entries in batches of 2")
-        #expect(checkpoints.get() == 3, "one checkpoint after each batch")
+        // At least 3: an entry another suite queued meanwhile would add a batch, not break the bound.
+        #expect(pass.batches >= 3, "5 entries in batches of 2")
+        #expect(checkpoints.get() == pass.batches, "one checkpoint after each batch")
         #expect(pass.deletedKeys == 5)
         #expect(pass.dropped == 5)
         for key in keys {
@@ -340,6 +351,58 @@ struct BodyAssetPendingDeleteTests {
         }
 
         #expect(statements.isEmpty, "no manifest statement outside the foreground")
+        #expect(try rows(for: key) == 1)
+        #expect(try await pendingEntries(for: key) == 1)
+        await cleanup(accountId: accountId)
+    }
+
+    /// Leaving the foreground during a pass stops it before its next manifest
+    /// access (ADR-IOS-046): the worker checks before the batch's manifest read and
+    /// before each key. Calls: 1 = the loop head, 2 = before the manifest read,
+    /// 3 = before the first key, 4 = before the second.
+    @Test("Leaving the foreground between keys stops the worker before the next key")
+    func foregroundLostBetweenKeysStopsBeforeTheNextKey() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "pending-background-mid-batch"
+        try await seedScope(accountId: accountId, folderPath: "INBOX")
+        try await clearPendingList()
+        let first = ContentKey(rawValue: "\(accountId):INBOX:7511")
+        let second = ContentKey(rawValue: "\(accountId):INBOX:7512")
+        #expect(attach(first) != nil)
+        #expect(attach(second) != nil)
+        try await queue([first, second])
+
+        await runWorker(batchSize: 2, foreground: Self.foreground(forCalls: 3))
+
+        let firstRows = try rows(for: first)
+        let secondRows = try rows(for: second)
+        let firstEntries = try await pendingEntries(for: first)
+        let secondEntries = try await pendingEntries(for: second)
+        #expect(firstRows == 0, "the key decided in the foreground is deleted")
+        #expect(firstEntries == 0)
+        #expect(secondRows == 1, "the key after the foreground was lost is not touched")
+        #expect(secondEntries == 1, "and stays queued")
+        await cleanup(accountId: accountId)
+    }
+
+    @Test("Leaving the foreground after the batch read stops the worker before any manifest access")
+    func foregroundLostAfterTheBatchReadStopsBeforeTheManifest() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "pending-background-after-read"
+        try await seedScope(accountId: accountId, folderPath: "INBOX")
+        try await clearPendingList()
+        let key = ContentKey(rawValue: "\(accountId):INBOX:7521")
+        #expect(attach(key) != nil)
+        try await queue([key])
+
+        let statements = await manifestStatements {
+            let pass = await runWorker(foreground: Self.foreground(forCalls: 1))
+            #expect(pass.batches == 1, "precondition: the loop head let the batch read run")
+        }
+
+        #expect(statements.isEmpty, "no manifest statement once the foreground is lost: \(statements)")
         #expect(try rows(for: key) == 1)
         #expect(try await pendingEntries(for: key) == 1)
         await cleanup(accountId: accountId)
@@ -421,7 +484,17 @@ struct BodyAssetPendingDeleteTests {
         defer { Self.teardownAssets(dir) }
         let owned = ContentKey(rawValue: "acc-owner:INBOX:1")
         let orphan = ContentKey(rawValue: "acc-owner:INBOX:2")
-        BodyAssetStore.setPublishOwnerCheck { $0 == owned }
+        // The leases that exist when the check is asked: the check must run while
+        // this write holds its lease (the check is called before `publish` opens its
+        // manifest transaction, so reading the manifest here is safe).
+        let leasesAtCheck = Locked<[Int]>([])
+        BodyAssetStore.setPublishOwnerCheck { key in
+            let leases = (try? BodyAssetStore.manifestQueue()?.read { db in
+                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM bodyAssetPreparation") ?? -1
+            }) ?? -1
+            leasesAtCheck.mutate { $0.append(leases) }
+            return key == owned
+        }
 
         #expect(attach(orphan) == nil, "a key no message names must not be published")
         #expect(try rows(for: orphan) == 0)
@@ -441,6 +514,8 @@ struct BodyAssetPendingDeleteTests {
         let ownedRows = try rows(for: owned)
         #expect(fileExists(ownedId))
         #expect(ownedRows == 1)
+        #expect(leasesAtCheck.get() == [1, 1],
+                "the check runs while the write holds its lease, for the refused key and the accepted one")
     }
 
     /// The production check answers from the main database's header table.
@@ -537,6 +612,43 @@ struct BodyAssetPendingDeleteTests {
         await cleanup(accountId: "pending-sweep-bg")
     }
 
+    /// Leaving the foreground after the pages, before the file prune, stops the
+    /// sweep there: no prune (a manifest access, ADR-IOS-046), flag unset. Calls:
+    /// 1 = the only page, 2 = before the prune.
+    @Test("A sweep that leaves the foreground before the prune does not prune and leaves its flag unset")
+    func sweepStopsBeforeThePruneOutsideTheForeground() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let suite = "pending-sweep-prune-bg-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            Issue.record("defaults unavailable")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let accountId = "pending-sweep-prune-bg"
+        try await seedScope(accountId: accountId, folderPath: "INBOX")
+        let dead = ContentKey(rawValue: "\(accountId):INBOX:7811")
+        #expect(attach(dead) != nil)
+        guard let storeDir = BodyAssetStore.storeDirectory() else { return }
+        let strayDir = storeDir.appendingPathComponent(String(repeating: "c", count: 16), isDirectory: true)
+        try FileManager.default.createDirectory(at: strayDir, withIntermediateDirectories: true)
+        let stray = strayDir.appendingPathComponent(String(repeating: "d", count: 16))
+        try Data("stray".utf8).write(to: stray)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-(BodyAssetStore.sweepMinAgeSeconds + 30))],
+            ofItemAtPath: stray.path)
+
+        let completed = await BodyAssetMaintenance.runOrphanSweepOnce(
+            defaults: defaults, checkpoint: {}, foreground: Self.foreground(forCalls: 1))
+
+        let deadEntries = try await pendingEntries(for: dead)
+        #expect(deadEntries == 1, "precondition: the page ran in the foreground")
+        #expect(!completed)
+        #expect(!defaults.bool(forKey: BodyAssetMaintenance.orphanSweepDoneKey))
+        #expect(FileManager.default.fileExists(atPath: stray.path), "no prune outside the foreground")
+        await cleanup(accountId: accountId)
+    }
+
     // MARK: - Plans
 
     private static func plan(_ db: Database, _ sql: String, _ arguments: StatementArguments) throws -> String {
@@ -545,15 +657,37 @@ struct BodyAssetPendingDeleteTests {
             .joined(separator: " | ")
     }
 
-    /// The worker and the one-time sweep touch only what they name: every read is
-    /// an index seek, with no statistics and after ANALYZE, on the manifest and on
-    /// the main database. A SCAN here would put a whole-store walk back.
-    @Test("The worker's and the sweep's reads are index seeks, with and without statistics")
+    private static var repoRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Services
+            .deletingLastPathComponent() // TabMailTests
+            .deletingLastPathComponent() // repo root
+    }
+
+    /// The worker and the one-time sweep touch only what they name: every statement
+    /// they run on a mail-sized table plans as an index seek, with no statistics and
+    /// after ANALYZE. A SCAN here would put a whole-store walk back. The statements
+    /// are the production ones, captured by tracing the connection that runs them:
+    /// the manifest's one connection, the main database's writer, and a read the
+    /// test runs `pendingDeleteDecision` in. The worker's batch read runs on a pool
+    /// reader a test cannot trace, so its planned text is tied to the source.
+    @Test("The worker's and the sweep's own statements are index seeks, with and without statistics")
     func pendingDeleteReadsAreSeeks() async throws {
-        let manifest = try BodyAssetStore._makeTestQueue()
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        guard let manifest = BodyAssetStore.manifestQueue() else {
+            Issue.record("manifest queue unavailable")
+            return
+        }
+        let accountId = "pending-plans"
+        try await seedScope(accountId: accountId, folderPath: "INBOX")
+        let keys = (1...3).map { ContentKey(rawValue: "\(accountId):INBOX:79\($0)") }
+        for key in keys { #expect(attach(key) != nil) }
+
+        // Manifest: `contentKeysWithAssets` (the worker) and `manifestContentKeys` (the sweep's pages).
         for analyzed in [false, true] {
-            let plans = try manifest.write { db -> [String] in
-                if analyzed {
+            if analyzed {
+                try manifest.write { db in
                     for index in 0..<200 {
                         try db.execute(
                             sql: """
@@ -564,35 +698,78 @@ struct BodyAssetPendingDeleteTests {
                     }
                     try db.execute(sql: "ANALYZE")
                 }
-                return [
-                    try Self.plan(db, "SELECT DISTINCT headerId FROM bodyAsset WHERE headerId IN (?, ?, ?)",
-                             ["acc:INBOX:1", "acc:INBOX:2", "acc:INBOX:3"]),
-                    try Self.plan(db, "SELECT DISTINCT headerId FROM bodyAsset WHERE headerId > ? ORDER BY headerId LIMIT ?",
-                             ["", 500]),
-                ]
             }
-            guard plans.count == 2 else { return }
-            #expect(plans[0].contains("SEARCH bodyAsset USING COVERING INDEX") && plans[0].contains("(headerId=?)"),
-                    "manifest key probe, analyzed=\(analyzed): \(plans[0])")
-            #expect(plans[1].contains("SEARCH bodyAsset USING COVERING INDEX") && plans[1].contains("(headerId>?)")
-                    && !plans[1].contains("TEMP B-TREE"),
-                    "one-time sweep page, analyzed=\(analyzed): \(plans[1])")
+            let statements = await manifestStatements {
+                _ = BodyAssetStore.contentKeysWithAssets(among: keys)
+                _ = BodyAssetStore.manifestContentKeys(after: nil, limit: SyncConfig.bodyAssetOrphanSweepPageSize)
+                _ = BodyAssetStore.manifestContentKeys(after: keys[0], limit: SyncConfig.bodyAssetOrphanSweepPageSize)
+            }
+            let assetReads = statements.filter { $0.contains("FROM bodyAsset ") }
+            #expect(assetReads.count >= 3, "precondition: the three calls' reads were captured: \(statements)")
+            for sql in assetReads {
+                let plan = try manifest.read { db in try Self.plan(db, sql, []) }
+                #expect(plan.contains("SEARCH bodyAsset USING COVERING INDEX") && !plan.contains("TEMP B-TREE"),
+                        "analyzed=\(analyzed): \(sql): \(plan)")
+            }
         }
 
-        let mainPlans = try await AppDatabase.dbPool.read { db -> [String] in
-            [
-                try Self.plan(db, "SELECT id, contentKey FROM bodyAssetPendingDelete WHERE id > ? ORDER BY id LIMIT ?", [0, 200]),
-                try Self.plan(db, "SELECT id FROM messageHeader WHERE id IN (?, ?)", ["a:INBOX:1", "a:INBOX:2"]),
-                try Self.plan(db, "SELECT ? WHERE NOT EXISTS (SELECT 1 FROM messageHeader WHERE id = ?)", ["k", "k"]),
-            ]
+        // Main database, the live probe: the statements `pendingDeleteDecision` runs.
+        let decisionTape = Locked<[String]>([])
+        _ = try await AppDatabase.rawPool.read { db in
+            db.trace(options: .statement) { event in
+                let sql = event.expandedDescription
+                decisionTape.mutate { $0.append(sql) }
+            }
+            defer { db.trace(options: .statement, nil) }
+            return try BodyAssetMaintenance.pendingDeleteDecision(for: keys, db: db)
         }
-        guard mainPlans.count == 3 else { return }
-        #expect(mainPlans[0].contains("SEARCH bodyAssetPendingDelete USING INTEGER PRIMARY KEY (rowid>?)"),
-                "list batch: \(mainPlans[0])")
-        #expect(mainPlans[1].contains("SEARCH messageHeader") && mainPlans[1].contains("(id=?)"),
-                "live probe: \(mainPlans[1])")
-        #expect(mainPlans[2].contains("SEARCH messageHeader") && mainPlans[2].contains("(id=?)"),
-                "sweep's header probe: \(mainPlans[2])")
+        let liveProbes = decisionTape.get().filter { $0.hasPrefix("SELECT id FROM messageHeader WHERE id IN") }
+        #expect(liveProbes.count == 1, "precondition: the live probe was captured: \(decisionTape.get())")
+
+        // Main database, the sweep's queue write: traced on the one writer connection.
+        let suite = "pending-plans-\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suite) else {
+            Issue.record("defaults unavailable")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let writerTape = Locked<[String]>([])
+        try await AppDatabase.rawPool.writeWithoutTransaction { db in
+            db.trace(options: .statement) { event in
+                let sql = event.expandedDescription
+                writerTape.mutate { $0.append(sql) }
+            }
+        }
+        await BodyAssetMaintenance.runOrphanSweepOnce(defaults: defaults, checkpoint: {}, foreground: { true })
+        try await AppDatabase.rawPool.writeWithoutTransaction { db in db.trace(options: .statement, nil) }
+        let sweepWrites = writerTape.get().filter { $0.contains("INSERT INTO bodyAssetPendingDelete") }
+        #expect(!sweepWrites.isEmpty, "precondition: the sweep's queue write was captured")
+
+        // The worker's batch read, tied to its source text.
+        let batchRead = "SELECT id, contentKey FROM bodyAssetPendingDelete WHERE id > ? ORDER BY id LIMIT ?"
+        let workerSource = try String(
+            contentsOf: Self.repoRoot.appendingPathComponent("TabMail/Services/BodyAssetMaintenance.swift"),
+            encoding: .utf8)
+        #expect(workerSource.contains("sql: \"\(batchRead)\""), "the planned batch read is the worker's statement")
+
+        let mainPlans = try await AppDatabase.dbPool.write { db -> [(String, String)] in
+            try (liveProbes + sweepWrites).map { ($0, try Self.plan(db, $0, [])) }
+                + [(batchRead, try Self.plan(db, batchRead, [0, 200]))]
+        }
+        for (sql, plan) in mainPlans {
+            #expect(!plan.contains("SCAN messageHeader") && !plan.contains("SCAN bodyAssetPendingDelete"),
+                    "\(sql): \(plan)")
+        }
+        for (sql, plan) in mainPlans where sql.contains("messageHeader") {
+            #expect(plan.contains("SEARCH messageHeader") && plan.contains("(id=?)"), "\(sql): \(plan)")
+        }
+        if let batchPlan = mainPlans.last?.1 {
+            #expect(batchPlan.contains("SEARCH bodyAssetPendingDelete USING INTEGER PRIMARY KEY (rowid>?)"),
+                    "list batch: \(batchPlan)")
+        }
+        await cleanup(accountId: accountId)
+        // The sweep also queued the analyzed fixture's keys.
+        try await clearPendingList()
     }
 
     // MARK: - Settings wipe

@@ -28,10 +28,18 @@ assets. Three cases leave the staged key unqueued, so its manifest rows and file
 
 The whole-store sweep this list replaced would have reclaimed these.
 
+A fourth leftover, in the main app, has the same shape and is accepted with them:
+
+4. **A process killed inside `BodyAssetStore.publish`, between the `rename` that moves a staged file
+   into the store and the manifest COMMIT.** The rollback restores the write's lease row, which ages
+   out, but no manifest row names the moved file. `recoverAbandonedPreparations` cleans only
+   `staging/`, and the periodic whole-store prune no longer runs, so only `pruneOrphanFiles` (after a
+   UIDVALIDITY purge) or the local index wipe removes it.
+
 ## When it happens
 
-Rare: each needs the extension to stop or resume at a narrow point, or a second render of a message
-already merged.
+Rare: each needs the extension (or, for case 4, the app) to stop or resume at a narrow point, or a
+second render of a message already merged.
 
 ## Recoverability
 
@@ -43,5 +51,6 @@ and the image cache wipe in Settings remove it.
 
 Body assets; notification extension; NSE; staged content key; `NSEDataBridge.stagedContentKey`;
 `queueStagedAssetKey`; `queueStagedAssetKeys`; orphan reap; `populated = 0`; placeholder;
-IOS-NSE-005; `stagedIdentityPositivelyDiffers`; zombie resume; leftover assets;
+IOS-NSE-005; `stagedIdentityPositivelyDiffers`; zombie resume; leftover assets; `publish`; `rename`;
+killed before COMMIT; store file with no row; `recoverAbandonedPreparations`;
 `bodyAssetPendingDelete`; IOS-ASSET-001; IOS-ASSET-003.

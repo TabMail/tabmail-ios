@@ -4457,8 +4457,12 @@ final class AppDatabase: Sendable {
         // the same transaction as every header delete, a foreign-key cascade from an
         // account removal included, and every in-place change of a header's id.
         // `BodyAssetMaintenance.processPendingDeletes` drains it. The list holds only
-        // deletes not done yet and only SQLite writes it from these triggers, so it
-        // cannot drift from `messageHeader`.
+        // deletes not done yet. Besides these triggers, two writers add keys: the
+        // notification-extension merge (`NSEDataBridge.queueStagedAssetKey`, a staged
+        // key whose staging row it lets go) and the one-time sweep
+        // (`BodyAssetMaintenance.runOrphanSweepOnce`, keys no header names). Every
+        // entry only asks the worker to judge a key again, so the list cannot drift
+        // from `messageHeader`.
         //
         // - Rowid key and NO unique constraint: a trigger's INSERT takes the outer
         //   statement's conflict policy (under an `UPDATE OR IGNORE` of a header, a

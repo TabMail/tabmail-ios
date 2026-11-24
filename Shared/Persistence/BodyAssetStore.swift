@@ -435,8 +435,14 @@ enum BodyAssetStore {
     ///     existing file holds the same content, because the address does not
     ///     name the content);
     ///   - the slot's file changes only inside `publish`'s manifest transaction,
-    ///     together with its row (#1376), so a failed publication leaves the slot,
-    ///     and any row that names it, exactly as they were.
+    ///     together with its row (#1376), so a publication refused before the
+    ///     `rename` (lease lost, owner check) leaves the slot, and any row that
+    ///     names it, exactly as they were. After the `rename` there are two
+    ///     exceptions: a transaction that fails removes the moved file, so an older
+    ///     row of the same slot names a missing file (a read notices and refetches);
+    ///     and a process killed between the `rename` and the COMMIT leaves a store
+    ///     file no row names, which only a UIDVALIDITY purge or the local index wipe
+    ///     reclaims (IOS-ASSET-004).
     struct PreparedWrite: Sendable {
         let preparationId: String
         let blobId: String

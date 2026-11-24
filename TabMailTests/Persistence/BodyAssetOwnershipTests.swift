@@ -329,7 +329,7 @@ struct BodyAssetSchemeHandlerWireTests {
     private func run(urlString: String, ownerKey: ContentKey, log: inout [String]) -> RecordingURLSchemeTask? {
         guard let url = URL(string: urlString) else { Issue.record("URL parse failed: \(urlString)"); return nil }
         let captured = LogBox()
-        let handler = BodyAssetSchemeHandler(ownerKey: ownerKey) { line in captured.append(line) }
+        let handler = BodyAssetSchemeHandler(ownerKey: ownerKey, log: { line in captured.append(line) })
         let task = RecordingURLSchemeTask(url: url)
         handler.webView(WKWebView(), start: task)
         log = captured.lines
