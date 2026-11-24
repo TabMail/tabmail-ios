@@ -67,7 +67,7 @@ struct ChatBubbleActionTests {
         for index in 0..<subjects.count {
             let address = senders[index] == "Bo Lee" ? "bo@example.com" : "alex@example.com"
             var header = MessageHeader(
-                messageId: "bubble\(index)", subject: subjects[index], from: "\(senders[index]) <\(address)>",
+                messageId: "bubble\(index)", subject: subjects[index], from: senders[index],
                 fromAddress: address, to: "me@example.com",
                 date: now.addingTimeInterval(TimeInterval(index - subjects.count) * 600), snippet: "Note \(index)",
                 folderId: MessageIdentity.folderId(accountId: account, folderPath: "INBOX"),
