@@ -3471,7 +3471,7 @@ final class AppDatabase: Sendable {
         //
         // 🚨🚨 THE BODY OF THIS MIGRATION IS EMPTY AS OF 2026-08-06. THE INDEX IS
         // REAL AND STILL REQUIRED; ONLY ITS BUILD MOVED. It is created by
-        // `SyncEngine.runBuildDeferredIndexesIfMissing`, the background WAL
+        // `SyncEngine.runRefreshPlannerStatisticsIfStale`, the background WAL
         // maintenance pass, from the SAME `CREATE INDEX IF NOT EXISTS` statement —
         // `SyncEngine.deferredIndexes` is the one place the DDL lives now. Everything
         // below about WHY the index exists, WHY it is partial, and WHY it must be
@@ -3722,7 +3722,7 @@ final class AppDatabase: Sendable {
         //     """)
         //
         // and that statement now lives in `SyncEngine.deferredIndexes`, executed by
-        // `SyncEngine.runBuildDeferredIndexesIfMissing` from the background WAL
+        // `SyncEngine.runRefreshPlannerStatisticsIfStale` from the background WAL
         // maintenance pass. The identifier and the registration stay because a
         // registered migration's NAME is frozen once any database has run it (Data
         // Integrity rule 5) — deleting the registration would make GRDB see an applied

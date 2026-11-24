@@ -250,10 +250,11 @@ struct SyncEngineMaintenanceTests {
     /// The maintenance pass runs the evict step only once its deferred index
     /// exists: without it every page would scan and sort the table inside its
     /// write. The first pass after an upgrade skips the step and builds the index
-    /// (`runBuildDeferredIndexesIfMissing`, later in the same pass); the next pass
-    /// evicts by the unchanged rules.
+    /// (inside `runRefreshPlannerStatisticsIfStale`'s write, later in the same
+    /// pass); the next pass evicts by the unchanged rules.
     /// `.processGlobalState`: the build gives up while
-    /// `DatabaseSuspension.isSuspended`, which `DatabaseSuspensionTests` holds.
+    /// `DatabaseSuspension.isSuspended`, which `DatabaseSuspensionTests` holds, and
+    /// the refresh carries a process-wide single-flight latch.
     @Test("The evict step waits for its index, then evicts", .processGlobalState)
     func evictStepWaitsForItsIndex() async throws {
         let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
@@ -261,14 +262,16 @@ struct SyncEngineMaintenanceTests {
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
         let recent = SyncConfig.bodyCacheRecentPerFolder
         let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
+        let markerKey = "analyzeMarker-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removeObject(forKey: markerKey) }
 
         let ranWithoutIndex = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
         let beforeIndex = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
         #expect(!ranWithoutIndex, "the step ran with no index to seek")
         #expect(beforeIndex == Set(archived), "a body was evicted before the index existed")
 
-        let build = await SyncEngine.runBuildDeferredIndexesIfMissing(dbPool: dbPool)
-        #expect(build == .built)
+        let build = await SyncEngine.runRefreshPlannerStatisticsIfStale(dbPool: dbPool, markerKey: markerKey)
+        #expect(build == .refreshed)
         let ranWithIndex = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
         let afterIndex = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
         #expect(ranWithIndex, "the step did not run once its index existed")
