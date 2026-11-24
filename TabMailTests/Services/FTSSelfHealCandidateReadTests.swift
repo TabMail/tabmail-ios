@@ -150,7 +150,8 @@ struct FTSSelfHealCandidateReadTests {
         let readDates = read.map { dates[$0] }
         let oracleDates = oracle.map { dates[$0] }
         if readDates != oracleDates {
-            let at = zip(readDates, oracleDates).firstIndex { $0 != $1 } ?? min(readDates.count, oracleDates.count)
+            let shared = min(readDates.count, oracleDates.count)
+            let at = (0..<shared).first { readDates[$0] != oracleDates[$0] } ?? shared
             found.append("dates differ from position \(at) (counts \(read.count) and \(oracle.count))")
             return found
         }
