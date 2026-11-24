@@ -1337,8 +1337,10 @@ struct PlannerStatisticsRefreshTests {
     func eachMaintenanceCallerRunsItsPruneGate() {
         let uses = SyncEngineMaintenanceTests.productionCodeLines()
             .filter { line in
-                ["prune: .", "prune: prune", "prune: StorageEstimator", "if let prune", "runPruneIfOverBudget("]
+                ["prune: .", "prune: prune", "prune: StorageEstimator", "runPruneIfOverBudget("]
                     .contains { line.code.contains($0) }
+                    // The gate binding as a whole word: catch-up's `if let pruneCutoff` is not a gate.
+                    || line.code.range(of: #"if let prune\b"#, options: .regularExpression) != nil
             }
             .map { "\($0.file): \($0.code)" }
             .sorted()
