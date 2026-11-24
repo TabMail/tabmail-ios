@@ -331,8 +331,10 @@ extension SyncEngine {
                     }
                     // 🚨 FAIL-SAFE DIRECTION. `protectedKeys` throws only when the
                     // folder/account roster itself cannot be read, and its contract
-                    // says the caller must then protect the WHOLE page. A leaked body
-                    // row is disk garbage this very sweep reclaims on a later pass; an
+                    // says the caller must then protect every key it asked about (all
+                    // of this page's orphan candidates; the page's header-backed
+                    // bodies still follow the rules below). A body row left
+                    // behind is disk garbage this very sweep reclaims on a later pass; an
                     // over-eviction silently drops cached mail.
                     let protectedOrphans: Set<ContentKey>
                     do {

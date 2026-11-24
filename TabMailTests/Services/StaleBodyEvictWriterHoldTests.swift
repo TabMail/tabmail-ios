@@ -247,16 +247,19 @@ struct StaleBodyEvictWriterHoldTests {
         return (fixture.connections.pagesSoFar - before, rows)
     }
 
-    /// One evict run: the writer's per-write reading, and the pages every
-    /// connection of the pool fetched during it.
+    /// One evict run as the maintenance pass runs it, through its index gate
+    /// (`runEvictStaleBodiesIfIndexed`): the writer's per-write reading, and the
+    /// pages every connection of the pool fetched from before the gate's check to
+    /// the run's end, so a read the gate adds counts as the run's.
     static func measuredRun(
         _ fixture: Fixture, meter: WriterWorkMeter
     ) throws -> (writes: WriterWorkMeter.Reading, pagesRead: Int) {
         fixture.pool.writeWithoutTransaction { db in meter.start(db) }
         let before = fixture.connections.pagesSoFar
-        SyncEngine.runEvictStaleBodies(
+        let ran = SyncEngine.runEvictStaleBodiesIfIndexed(
             dbPool: PrioritizedDatabase(pool: fixture.pool, priority: .background), undoProtectedBodyIds: [])
         let after = fixture.connections.pagesSoFar
+        #expect(ran, "the gated step did not run, though the fixture built its index")
         return (meter.current, after - before)
     }
 

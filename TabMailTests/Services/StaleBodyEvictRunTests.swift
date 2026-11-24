@@ -195,12 +195,12 @@ struct StaleBodyEvictRunTests {
         await SyncEngine.runWALMaintenance(
             dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterFirstPass = try Hold.bodyIds(fixture)
-        let built = try fixture.pool.read { db in
+        let built = try await fixture.pool.read { db in
             try Int.fetchOne(
                 db, sql: "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
                 arguments: [indexName]) ?? 0
         }
-        let statistics = try fixture.pool.read { db in
+        let statistics = try await fixture.pool.read { db in
             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_stat1 WHERE idx = ?", arguments: [indexName]) ?? 0
         }
         #expect(afterFirstPass == Set(archived), "the first pass evicted with no index to seek")
@@ -281,20 +281,26 @@ struct StaleBodyEvictRunTests {
 
     /// Each page is its own write. A page that fails rolls back whole, including
     /// the deletes it made before the failing row, while the pages before it stay
-    /// committed; the run stops, and the next run evicts the page again.
-    @Test("A page that fails rolls back alone, and the next run evicts it")
+    /// committed; the run stops there, so the victims on the page after it stay
+    /// too, and the next run evicts both pages.
+    @Test("A page that fails rolls back alone, the run stops there, and the next run evicts it")
     func aFailedPageRollsBackAloneAndTheNextRunRetriesIt() throws {
         let fixture = try Hold.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         let chunk = SyncConfig.pruneChunkSize
         let recent = SyncConfig.bodyCacheRecentPerFolder
-        // Oldest first, so the first two pages are all victims and the newest
-        // `recent` come last.
-        let archived = try Hold.seedArchiveBodies(fixture, count: 2 * chunk + recent, oldestFirst: true)
-        #expect(archived.count == 2 * chunk + recent)
-        guard archived.count == 2 * chunk + recent else { return }
+        // Victims on page three, after the page that fails: a run that went on
+        // past the failure would evict them.
+        let laterVictimCount = chunk / 5
+        let victimCount = 2 * chunk + laterVictimCount
+        // Oldest first, so the first `victimCount` bodies are the victims, in page
+        // order, and the newest `recent` come last.
+        let archived = try Hold.seedArchiveBodies(fixture, count: victimCount + recent, oldestFirst: true)
+        #expect(archived.count == victimCount + recent)
+        guard archived.count == victimCount + recent else { return }
         let pageTwo = Set(archived[chunk..<(2 * chunk)])
-        let keepers = Set(archived[(2 * chunk)...])
+        let laterVictims = Set(archived[(2 * chunk)..<victimCount])
+        let keepers = Set(archived[victimCount...])
         // A page-two row with page-two victims deleted before it.
         let failing = archived[chunk + chunk / 5]
         try fixture.pool.writeWithoutTransaction { db in
@@ -313,9 +319,9 @@ struct StaleBodyEvictRunTests {
         Self.run(fixture)
         let afterRetry = try Hold.bodyIds(fixture)
 
-        #expect(afterFailure == pageTwo.union(keepers),
-                "page one must stay evicted and page two must be rolled back whole")
-        #expect(afterRetry == keepers, "the next run must evict page two")
+        #expect(afterFailure == pageTwo.union(laterVictims).union(keepers),
+                "page one must stay evicted, page two must be rolled back whole, and the run must stop before page three")
+        #expect(afterRetry == keepers, "the next run must evict page two and page three's victims")
     }
 
     /// Cancellation is checked between pages: a run cancelled while it writes a
@@ -337,7 +343,7 @@ struct StaleBodyEvictRunTests {
         let cancelledOn = archived[chunk / 5]
 
         let runner = RunHandle()
-        try fixture.pool.writeWithoutTransaction { db in
+        try await fixture.pool.writeWithoutTransaction { db in
             db.add(function: DatabaseFunction("cancelEvictRunForTest", argumentCount: 0, pure: false) { _ in
                 runner.cancel()
                 return nil

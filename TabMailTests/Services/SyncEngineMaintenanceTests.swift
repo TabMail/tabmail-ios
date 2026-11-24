@@ -322,6 +322,57 @@ struct SyncEngineMaintenanceTests {
                 "the archive body past the newest \(recent) is evicted, and only it")
     }
 
+    /// The gate waits for the evict step's own index and no other: with that index
+    /// built and every other deferred index still missing, the step runs.
+    @Test("The evict step runs once its own index exists, whatever the other deferred indexes")
+    func evictStepNeedsOnlyItsOwnIndex() throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
+        let ownIndex = SyncEngine.deferredIndexes.filter { $0.name == SyncEngine.staleBodyIndexName }
+        let otherNames = SyncEngine.deferredIndexes.map(\.name).filter { $0 != SyncEngine.staleBodyIndexName }
+        #expect(ownIndex.count == 1, "the evict step's index is a deferred index")
+        #expect(!otherNames.isEmpty, "setup: another deferred index exists to leave missing")
+        // The production DDL of the step's index alone.
+        try fixture.pool.write { db in
+            for index in ownIndex { try db.execute(sql: index.sql) }
+        }
+        let present = try fixture.pool.read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'index'"))
+        }
+        let othersPresent = otherNames.filter { present.contains($0) }
+        #expect(present.contains(SyncEngine.staleBodyIndexName), "setup: the step's index exists")
+        #expect(othersPresent.isEmpty, "setup: every other deferred index is missing: \(othersPresent)")
+
+        let ran = SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let after = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
+        #expect(ran, "the step waited for an index other than its own")
+        #expect(after == Set(archived.prefix(recent)),
+                "the archive body past the newest \(recent) is evicted, and only it")
+    }
+
+    /// A schema that cannot be read is unknown, not present: the gate does not run
+    /// the step, which without its index would scan the table inside its writes.
+    /// The database is closed, so reading its catalog fails.
+    @Test("The evict step does not run when its index cannot be checked")
+    func evictStepWaitsWhenItsIndexCannotBeChecked() throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        try fixture.pool.close()
+        let catalogRead = Result {
+            try fixture.pool.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_master") ?? 0 }
+        }
+        var catalogReadFailed = false
+        if case .failure = catalogRead { catalogReadFailed = true }
+        #expect(catalogReadFailed, "setup: the closed database's catalog cannot be read")
+
+        let ran = SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        #expect(!ran, "the step ran though its index could not be checked")
+    }
+
     /// Production reaches the evict step only through its index gate: a call of
     /// `runEvictStaleBodies` anywhere but inside `runEvictStaleBodiesIfIndexed`
     /// would run its page with no index on a device that has not built it yet.
