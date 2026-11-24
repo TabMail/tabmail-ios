@@ -249,8 +249,24 @@ final class BodyAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     /// `#if DEBUG` that a release smoke test would strip.
     private let log: (@Sendable (String) -> Void)?
 
-    init(ownerKey: ContentKey, log: (@Sendable (String) -> Void)? = nil) {
+    /// Main app only (#1376): told this document's key when one of ITS OWN assets
+    /// has a manifest row but no file (a delete that stopped half way, or a key
+    /// that came back after its files went). The app then drops the message's
+    /// cached body and assets, so the next open fetches both again. Fired at most
+    /// once per handler, after the ownership check; it must not block, because this
+    /// handler answers synchronously on the main thread. The wire answer stays the
+    /// uniform failure. A request for an asset with no manifest row never fires
+    /// it: asset ids are not secrets, so a missing row is not evidence.
+    private let onMissingFile: (@Sendable (ContentKey) -> Void)?
+    private var reportedMissingFile = false
+
+    init(
+        ownerKey: ContentKey,
+        onMissingFile: (@Sendable (ContentKey) -> Void)? = nil,
+        log: (@Sendable (String) -> Void)? = nil
+    ) {
         self.ownerKey = ownerKey
+        self.onMissingFile = onMissingFile
         self.log = log
         super.init()
     }
@@ -284,6 +300,10 @@ final class BodyAssetSchemeHandler: NSObject, WKURLSchemeHandler {
         }
         guard let data = BodyAssetStore.read(assetId: assetId) else {
             fail(urlSchemeTask, assetId: assetId, refusal: .missingFile)
+            if let onMissingFile, !reportedMissingFile {
+                reportedMissingFile = true
+                onMissingFile(ownerKey)
+            }
             return
         }
         guard let response = HTTPURLResponse(

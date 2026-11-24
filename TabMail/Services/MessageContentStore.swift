@@ -26,7 +26,9 @@ import GRDB
 ///
 /// - `SyncEngine.pruneFTSOrphans`
 /// - `SyncEngine.backfillFolderIdsIfNeeded`
-/// - `BodyAssetMaintenance.pruneOrphans`
+/// - `BodyAssetMaintenance.pruneOrphans`, since #1376 the pending-delete worker
+///   `BodyAssetMaintenance.processPendingDeletes` (same gate, over the keys the
+///   main database queued instead of the whole manifest)
 /// - `SyncEngine.runEvictStaleBodies` — the fourth, gated at Stage D. Stage C's
 ///   census named only the first three: this one is a TTL cache evictor whose
 ///   orphan branch was unreachable while the FK cascade front-ran it, and Stage D

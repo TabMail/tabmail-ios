@@ -1220,9 +1220,10 @@ actor BackfillBodyQueue {
         // WHY IT MATTERS HERE SPECIFICALLY. The `.migrated` leg carries `oldBody`
         // forward under `newHeaderId`, and that HTML still embeds
         // `tabmail-asset://<oldHeaderId-hash>/…` URLs. Without the mirror the
-        // manifest rows keep the OLD `headerId`, so the next `pruneOrphans` sweep
-        // sees a key with no `messageHeader` row, judges it dead, and deletes a LIVE
-        // message's cached inline images and attachments. `recoverMovedContentKey`
+        // manifest rows keep the OLD `headerId`, so the pending-delete worker (the
+        // re-key's header delete queued the old id, #1376) sees a key with no
+        // `messageHeader` row, judges it dead, and deletes a LIVE message's cached
+        // inline images and attachments. `recoverMovedContentKey`
         // cannot save it: that recovery leg is gated `provider == .gmail || .outlook`
         // and returns nil for IMAP, which is the only family that reaches this
         // function. Nor does the replacement body fetch overwrite the carried one —
@@ -1239,9 +1240,9 @@ actor BackfillBodyQueue {
         // return the OTHER message's bytes — a content misattribution, C3-adjacent.
         // So the dropped duplicate's assets are DELETED, exactly as the sibling
         // `AccountManager.publishMoveFinish` disposes of its removed old ids, and
-        // exactly as `pruneOrphans` would dispose of them later anyway (its `dead`
-        // set is "manifest key with no `messageHeader` row", which is precisely what
-        // the dropped duplicate's key becomes). `rekeyContentKey` independently makes
+        // exactly as the pending-delete worker would dispose of them later anyway
+        // (the drop's header delete queues the duplicate's key, which then names no
+        // `messageHeader` row). `rekeyContentKey` independently makes
         // the same choice if it races (`newExists` ⇒ delete the old key).
         switch outcome {
         case .migrated:
