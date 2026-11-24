@@ -138,3 +138,31 @@ Two reads cost more:
 - **The total count, in the stale state only.** It moves to this index: 716 pages instead of 677 (+6%), because v40's index is the smaller covering index for that count.
   - **Accepted:** the pass no longer leaves this state. The deferred build runs inside the statistics refresh's write (amendment above), so no connection sees the index without its statistics. The census keeps the state as the worst case: before that change, a connection that loaded the schema between the build and the `ANALYZE` held it until it was closed.
   - **Why v40 stays:** in every other state the total still reads v40's `messageHeader_accountId_bodyComplete`, and it is the cheaper index there.
+
+---
+
+## Amendment 2026-11-24 (#1397): `messageHeader_completeByDate`
+
+**Rule 1 applied.** `messageHeader_completeByDate` on `messageHeader(date, id) WHERE headerComplete = 1 AND bodyComplete = 1` serves the start-up search self-check's candidate read (`SyncEngine.ftsBodyMembershipCandidateSQL`, the newest 2,000 complete headers of every account), which runs at every launch and every return to the foreground.
+- **Before:** `EXPLAIN QUERY PLAN` showed `SEARCH messageHeader USING INDEX idx_messageHeader_bodyStatus (headerComplete=? AND bodyComplete=?)` and `USE TEMP B-TREE FOR ORDER BY`. The read read and sorted every complete header before it returned the first.
+- **After:** `SCAN messageHeader USING COVERING INDEX messageHeader_completeByDate`. The read walks the index newest first, stops at the 2,000th entry, and reads no table page.
+- **No existing index could do this.** None orders the complete headers by `date`, so none could return them in date order.
+
+**A partial index, for its scope.** The complete set does not drain to empty: it is most of the table, so rule 2's reason does not apply. The index is partial so that only a statement whose WHERE implies `headerComplete = 1 AND bodyComplete = 1` can use it.
+- **The full-index version failed.** A first version was a full index on `(headerComplete, bodyComplete, date, id)`. The planner also chose it for the start-up recovery read (`headerComplete = 0`, `LIMIT 500`), which then read 40 to 97 percent more pages than through `idx_messageHeader_bodyStatus` (simulator proof at 105,000 and 525,000 headers). A partial index cannot serve that read.
+- **Only two statements can use it.** In the app, only the candidate read and the page of the one-time sweep `healAllFTSBodyMembership` have a WHERE that implies the index's. The candidate statement keeps its two literals: SQLite matches a partial index's WHERE against literal terms, not against parameters bound after the statement is prepared.
+- **Fewer writes.** A header enters the index only once both flags are 1. Inserting a header that has no body, or marking a header complete before its body arrives, does not write to the index.
+
+**Statistics states.**
+- **Statistics taken after the sync:** the candidate read uses the index; the recovery read and the sweep page keep their plans.
+- **`sqlite_stat1` emptied:** all three reads keep the plans they had without the index, with no gain and no loss.
+- **Statistics taken on an empty mailbox** (a fresh install whose first maintenance pass runs before its first sync): the candidate read uses the index, and the sweep page may too. That sweep runs once per device, seconds after the first launch's sync starts, when such a mailbox is still nearly empty. Before this index, the sweep page already sorted every complete header in that state.
+
+**Nothing dropped (rules 3, 4 and 6).** `idx_messageHeader_bodyStatus` still serves the recovery read, and serves the sweep page when no statistics exist.
+
+**Built deferred, rule 5 by the amended timing.** The index is in `SyncEngine.deferredIndexes` (IOS-PERF-005) for three reasons: building it reads every header once; without it no result changes, only the read's cost; and the statement names no index. It is built inside the statistics refresh's write with the other deferred indexes (amendment of 2026-11-24 above), so the index and its statistics commit together.
+
+**Pinned by:**
+- `FTSSelfHealCandidateReadTests` compares the read with the index against the replaced read, without the index, on these mailboxes: empty, one row, only incomplete headers, a window that cuts a run of equal dates, several accounts, and 100,000 rows both dense and sparse. It runs each comparison in the three statistics states, pins the plans in each state, and checks that the recovery read and the sweep page do not move to the index.
+- `FTSSelfHealCandidateProofTests` measures, on the proof databases: the read, the two other reads, the sync pass's header writes, and the index's size.
+- The query registry gives the read the verdict `STOPS: FTSSelfHealCandidateReadTests.candidateReadStopsAtTheWindow`, not `SEEK`: the plan check runs without statistics too, and there the planner does not choose a partial index.

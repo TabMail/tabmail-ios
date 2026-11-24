@@ -1121,6 +1121,30 @@ extension SyncEngine {
                 CREATE INDEX IF NOT EXISTS messageHeader_backfillProgress
                 ON messageHeader(accountId, bodyComplete, bodyEmptyConfirmed,
                                  bodyMetadataOversized, headerComplete)
+                """),
+        // Serves `SyncEngine.ftsBodyMembershipCandidateSQL`, the start-up search
+        // self-check's newest 2,000 complete headers (#1397). With it that read walks
+        // this index newest first, takes `id` from it (covering: no table page is read)
+        // and stops at the 2,000th entry; without it the read seeks
+        // `idx_messageHeader_bodyStatus` and sorts every complete header of every
+        // account before returning the first. Deferred because its absence degrades
+        // performance and nothing else: the statement names no index and picks the same
+        // headers either way, so until the first maintenance pass builds it the read
+        // costs what it cost before.
+        //
+        // PARTIAL, on purpose. It holds only complete headers, so SQLite can use it only
+        // for a statement whose WHERE implies `headerComplete = 1 AND bodyComplete = 1`.
+        // A full index led by `headerComplete` was also taken by the start-up recovery
+        // read (`headerComplete = 0`), which then read more pages than through
+        // `idx_messageHeader_bodyStatus`. Only a header whose two flags are both 1 is
+        // written to it: inserting a header with no body, or marking a header complete
+        // before its body, leaves it alone.
+        DeferredIndex(
+            name: "messageHeader_completeByDate",
+            sql: """
+                CREATE INDEX IF NOT EXISTS messageHeader_completeByDate
+                ON messageHeader(date, id)
+                WHERE headerComplete = 1 AND bodyComplete = 1
                 """)
     ]
 
