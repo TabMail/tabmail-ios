@@ -4448,6 +4448,60 @@ final class AppDatabase: Sendable {
                 t.add(column: "sentAt", .datetime)
             }
         }
+
+        // #1376: a message's cached inline images and attachments are deleted BY
+        // CONSTRUCTION instead of by a sweep over the whole asset store. The
+        // manifest lives in its own App Group database (the notification extension
+        // writes it), so no foreign key can reach it; instead SQLite itself writes
+        // "this content key's assets may be gone" into `bodyAssetPendingDelete` in
+        // the same transaction as every header delete, a foreign-key cascade from an
+        // account removal included, and every in-place change of a header's id.
+        // `BodyAssetMaintenance.processPendingDeletes` drains it. The list holds only
+        // deletes not done yet and only SQLite writes it from these triggers, so it
+        // cannot drift from `messageHeader`.
+        //
+        // - Rowid key and NO unique constraint: a trigger's INSERT takes the outer
+        //   statement's conflict policy (under an `UPDATE OR IGNORE` of a header, a
+        //   unique clash here would silently drop the entry), so nothing here can
+        //   clash. A duplicate key is harmless because the worker is idempotent.
+        // - No index on `contentKey`: the worker reads in rowid order and deletes by
+        //   rowid.
+        // - A move re-keys by DELETE + INSERT (`MessageHeaderRekey.apply`), so the
+        //   DELETE trigger covers it; the manifest rows follow the header through
+        //   `BodyAssetStore.rekeyContentKey`, after which the old key's entry finds
+        //   nothing to delete.
+        // - Independent of every other migration: it reads no column but `id` and
+        //   touches no other table, so it holds whatever runs before or after it. A
+        //   later migration that rebuilds `messageHeader` drops these triggers with
+        //   the old table and must create them again (`BodyAssetPendingDeleteTriggerTests`
+        //   checks them after the whole chain).
+        // Existing databases start with an empty list; assets orphaned before this
+        // version are reclaimed by the one-time sweep in the maintenance pass.
+        migrator.registerTimedMigration(
+            "v114_addBodyAssetPendingDelete", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: """
+                CREATE TABLE bodyAssetPendingDelete (
+                    id INTEGER PRIMARY KEY,
+                    contentKey TEXT NOT NULL
+                )
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_queueAssetDelete
+                AFTER DELETE ON messageHeader
+                BEGIN
+                    INSERT INTO bodyAssetPendingDelete (contentKey) VALUES (OLD.id);
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_queueAssetRekey
+                AFTER UPDATE OF id ON messageHeader
+                WHEN OLD.id IS NOT NEW.id
+                BEGIN
+                    INSERT INTO bodyAssetPendingDelete (contentKey) VALUES (OLD.id);
+                END
+                """)
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
