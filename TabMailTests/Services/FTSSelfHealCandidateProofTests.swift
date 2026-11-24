@@ -8,9 +8,10 @@ import Testing
 @testable import TabMail
 
 /// The simulator proof for the search self-check's candidate read (#1397): the read with
-/// the deferred index `messageHeader_ftsSelfHealWindow` against the same read without it
-/// (what a device runs before the maintenance pass builds it, and what every device ran
-/// before), and what the index costs the sync pass's header writes: a batch of new
+/// the deferred partial index `messageHeader_completeByDate` against the same read without
+/// it (what a device runs before the maintenance pass builds it, and what every device ran
+/// before); the two other reads on the same columns, which must read no more pages with
+/// it; and what the index costs the sync pass's header writes: a batch of new
 /// headers, a search-index batch marking headers complete, and a body flush marking
 /// bodies complete. On the large proof database (about 100,000 headers), on one five
 /// times its size, and on a small one (`Shape.small`, about 2,100 headers). Writes
@@ -25,7 +26,7 @@ struct FTSSelfHealCandidateProofTests {
     enum ProofSetupError: Error { case noInbox }
 
     static let unit = "ios-scan-fts-selfheal-candidates"
-    static let indexName = "messageHeader_ftsSelfHealWindow"
+    static let indexName = "messageHeader_completeByDate"
     static let dropIndex = "DROP INDEX IF EXISTS \(indexName)"
     /// One IMAP header fetch batch at the largest sync setting (`SyncConfig.imapFetchBatchSize`, `.turbo`).
     static let newHeaders = 500
@@ -51,8 +52,9 @@ struct FTSSelfHealCandidateProofTests {
     struct ReadCase: Sendable {
         let mode: DBProof.Mode
         let statement: @Sendable (Database) throws -> (sql: String, arguments: StatementArguments)
-        /// The read this unit changes must read fewer pages on a large mailbox; a read the
-        /// census checks (one the planner moves onto the index) must never read more.
+        /// The read this unit changes must read fewer pages on a large mailbox once the
+        /// app's statistics are taken (with none, the planner keeps the plan it had without
+        /// the index); every other read, and this one with no statistics, must never read more.
         let mustImprove: Bool
     }
 
@@ -78,8 +80,9 @@ struct FTSSelfHealCandidateProofTests {
         }
         return [
             readCase("candidate read", sql: SyncEngine.ftsBodyMembershipCandidateSQL, mustImprove: true),
-            // The reads the planner moves onto the index (a host census of every literal on
-            // messageHeader, without and with it, with no statistics and large ones).
+            // The two other reads that filter on the same columns: the start-up recovery read
+            // (`headerComplete = 0`, which a partial index on complete headers cannot serve)
+            // and the one-time sweep page (whose WHERE implies the index's own).
             ReadCase(
                 mode: DBProof.Mode(name: "census: incomplete-header recovery read", kind: .read,
                                    old: DBProof.Variant(setupSQL: [dropIndex], run: recovery),
@@ -245,7 +248,7 @@ struct FTSSelfHealCandidateProofTests {
                                                      Double(new.count(\.sorts).median)))
                     let context = "\(database.name), \(result.mode.name), \(result.statistics.label): "
                         + "pages old \(oldPages), new \(newPages)"
-                    if readCase.mustImprove && database.large {
+                    if readCase.mustImprove && database.large && result.statistics == .analyzed {
                         #expect(newPages < oldPages, "fewer pages on a large mailbox: \(context)")
                     } else {
                         #expect(newPages <= oldPages, "never more pages: \(context)")

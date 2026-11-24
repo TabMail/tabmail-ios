@@ -12,12 +12,15 @@ import SQLite3
 /// (`SyncEngine.selfHealFTSBodyMembership`) asks the search index about the newest
 /// 2,000 headers whose body is complete. Its statement read and sorted every such
 /// header of every account before it returned the first. The statement is unchanged;
-/// the deferred index `messageHeader_ftsSelfHealWindow` lets the planner read them
-/// newest first and stop at the 2,000th. These tests hold the read with the index to
-/// the read without it (what every device ran before, and runs until the maintenance
-/// pass builds the index) on databases built by the production migrations, with no
-/// statistics and with the app's ANALYZE statistics, and hold its cost to the window:
-/// the planner takes the index unaided, no sort, and no more work for a larger mailbox.
+/// the deferred partial index `messageHeader_completeByDate` (the `date, id` of the
+/// complete headers) lets the planner read them newest first and stop at the 2,000th.
+/// These tests hold the read with the index to the read without it (what every device
+/// ran before, and runs until the maintenance pass builds the index) on databases built
+/// by the production migrations, in each statistics state a device can be in
+/// (`Statistics`). Once statistics are taken the planner takes the index unaided: no
+/// sort, and no more work for a larger mailbox. With the statistics deleted it keeps the
+/// plan it had without the index. The start-up recovery read and the one-time sweep page,
+/// which filter on the same columns, keep their own indexes.
 @Suite("FTS self-heal candidate read")
 struct FTSSelfHealCandidateReadTests {
 
@@ -30,7 +33,29 @@ struct FTSSelfHealCandidateReadTests {
         LIMIT 2000
         """
     static let window = 2000
-    static let indexName = "messageHeader_ftsSelfHealWindow"
+    static let indexName = "messageHeader_completeByDate"
+
+    /// The planner statistics a device can hold when the read runs with the index built.
+    enum Statistics: String, CaseIterable, CustomTestStringConvertible {
+        /// None: `sqlite_stat1` and `sqlite_stat4` emptied once the index is built, as in
+        /// the proof harness's no-statistics state (`DBProof.apply(.none, to:)`).
+        case emptied
+        /// Taken on an empty mailbox: a fresh install whose first maintenance pass builds
+        /// the index and analyzes in one write (as `runRefreshPlannerStatisticsIfStale`
+        /// does) before its first sync stores a header. They stay until the next schema
+        /// change re-arms the pass.
+        case emptyMailbox
+        /// Taken once the headers exist: the maintenance pass on a synced mailbox.
+        case analyzed
+        var testDescription: String { rawValue }
+    }
+
+    /// The maintenance pass's write: the missing deferred indexes, then the statistics
+    /// over them, in one transaction.
+    static func buildAndAnalyze(_ db: Database) throws {
+        try SyncEngine.createDeferredIndexes(db)
+        try db.execute(sql: "ANALYZE")
+    }
 
     static func indexExists(_ pool: DatabasePool) async throws -> Bool {
         try await pool.read {
@@ -107,20 +132,31 @@ struct FTSSelfHealCandidateReadTests {
     }
 
     /// A database built by the production migrations, holding `headers` in the
-    /// given order, with every account and folder they name.
-    static func makeDatabase(_ headers: [Header]) throws -> (pool: DatabasePool, dir: URL, app: AppDatabase) {
+    /// given order, with every account and folder they name. With `statistics`, the
+    /// deferred indexes are built and the database is in that statistics state; without,
+    /// it is as the migrations leave it, without the index.
+    static func makeDatabase(_ headers: [Header], statistics: Statistics? = nil) throws
+        -> (pool: DatabasePool, dir: URL, app: AppDatabase) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
         config.foreignKeysEnabled = true
         let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
         let app = try AppDatabase(dbPool: pool)
+        let builtByMigrations = try pool.read {
+            try Int.fetchOne($0, sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                             arguments: [Self.indexName]) != nil
+        }
+        #expect(!builtByMigrations, "precondition: the migrations alone do not build \(Self.indexName)")
         for account in accounts {
             _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .imap, pool: pool)
             for path in paths {
                 try FolderEpochTestFixture.insertFolder(
                     accountId: account, path: path, role: path == "INBOX" ? .inbox : .archive, pool: pool)
             }
+        }
+        if statistics == .emptyMailbox {
+            try pool.write { try Self.buildAndAnalyze($0) }
         }
         try pool.write { db in
             let insert = try db.makeStatement(sql: """
@@ -135,7 +171,46 @@ struct FTSSelfHealCandidateReadTests {
                 ])
             }
         }
+        switch statistics {
+        case .analyzed?:
+            try pool.write { try Self.buildAndAnalyze($0) }
+        case .emptied?:
+            try pool.write { db in
+                try SyncEngine.createDeferredIndexes(db)
+                try DBProof.apply(.none, to: db)
+            }
+        case .emptyMailbox?, nil:
+            break
+        }
+        if let statistics {
+            try Self.expectState(statistics, of: pool, complete: headers.filter { $0.bodyComplete && $0.headerComplete }.count)
+        }
         return (pool, dir, app)
+    }
+
+    /// The database is in the state it claims: the index exists, and its own statistics
+    /// row counts no header when taken on an empty mailbox and every complete header when
+    /// taken after the sync; with the statistics emptied there is no row at all. The
+    /// creating write bumps the schema version, so every connection reloads these rows.
+    static func expectState(_ statistics: Statistics, of pool: DatabasePool, complete: Int) throws {
+        let (exists, stat, statRows) = try pool.read { db -> (Bool, String?, Int) in
+            let exists = try Int.fetchOne(db, sql: "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?",
+                                          arguments: [Self.indexName]) != nil
+            let stat = try String.fetchOne(db, sql: "SELECT stat FROM sqlite_stat1 WHERE idx = ?",
+                                           arguments: [Self.indexName])
+            let statRows = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_stat1") ?? 0
+            return (exists, stat, statRows)
+        }
+        #expect(exists, "precondition: the deferred indexes include \(Self.indexName)")
+        let counted = stat?.split(separator: " ").first.flatMap { Int($0) }
+        switch statistics {
+        case .emptied:
+            #expect(statRows == 0, "precondition: no statistics, found \(statRows) rows")
+        case .emptyMailbox:
+            #expect(counted == 0, "precondition: statistics taken on an empty mailbox, found \(stat ?? "no row")")
+        case .analyzed:
+            #expect(counted == complete, "precondition: statistics over \(complete) complete headers, found \(stat ?? "no row")")
+        }
     }
 
     /// Where `read` differs from `oracle` as an answer to "the newest 2,000 headers
@@ -168,36 +243,26 @@ struct FTSSelfHealCandidateReadTests {
         return found
     }
 
-    @Test("With its index built, the candidate read returns the answer it returned without it, with and without statistics",
-          arguments: Mailbox.allCases)
-    func candidateReadMatchesTheReplacedRead(mailbox: Mailbox) async throws {
+    @Test("With its index built, the candidate read returns the answer the replaced read returns without it, in every statistics state",
+          arguments: Mailbox.allCases, Statistics.allCases)
+    func candidateReadMatchesTheReplacedRead(mailbox: Mailbox, statistics: Statistics) async throws {
         let headers = Self.headers(mailbox)
-        let (pool, dir, app) = try Self.makeDatabase(headers)
+        let (pool, dir, app) = try Self.makeDatabase(headers, statistics: statistics)
         defer { withExtendedLifetime(app) {}; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let dates = Dictionary(uniqueKeysWithValues: headers.map { ($0.id, $0.date) })
         let complete = headers.filter { $0.bodyComplete && $0.headerComplete }
-        let candidates = SyncEngine.ftsBodyMembershipCandidateSQL
 
-        // No statistics: the replaced read before the maintenance pass builds the
-        // index, then the read once it has.
-        let builtByMigrations = try await Self.indexExists(pool)
-        #expect(!builtByMigrations, "precondition: the migrations alone do not build the index")
-        let oracleUnanalyzed = try await pool.read { try String.fetchAll($0, sql: Self.replacedSQL) }
-        try await pool.write { try SyncEngine.createDeferredIndexes($0) }
-        let builtByPass = try await Self.indexExists(pool)
-        #expect(builtByPass, "precondition: the deferred indexes include \(Self.indexName)")
-        let readUnanalyzed = try await pool.read { try String.fetchAll($0, sql: candidates) }
-        // The app's statistics: the read with the index, then the replaced read once it is dropped.
-        try await pool.write { try $0.execute(sql: "ANALYZE") }
-        let readAnalyzed = try await pool.read { try String.fetchAll($0, sql: candidates) }
+        // The read with the index, then the replaced read on the same database once the
+        // index is dropped (what a device runs before the maintenance pass builds it).
+        let read = try await pool.read { try String.fetchAll($0, sql: SyncEngine.ftsBodyMembershipCandidateSQL) }
         try await pool.write { try $0.execute(sql: "DROP INDEX IF EXISTS \(Self.indexName)") }
-        let oracleAnalyzed = try await pool.read { try String.fetchAll($0, sql: Self.replacedSQL) }
+        let dropped = try await Self.indexExists(pool)
+        #expect(!dropped, "precondition: the oracle runs without \(Self.indexName)")
+        let oracle = try await pool.read { try String.fetchAll($0, sql: Self.replacedSQL) }
 
-        for (analyzed, read, oracle) in [(false, readUnanalyzed, oracleUnanalyzed), (true, readAnalyzed, oracleAnalyzed)] {
-            let found = Self.differences(read, oracle, dates: dates)
-            #expect(found.isEmpty, "\(mailbox), analyzed \(analyzed): \(found)")
-            #expect(oracle.count == min(complete.count, Self.window), "precondition: the oracle read the window")
-        }
+        let found = Self.differences(read, oracle, dates: dates)
+        #expect(found.isEmpty, "\(mailbox), \(statistics): \(found)")
+        #expect(oracle.count == min(complete.count, Self.window), "precondition: the oracle read the window")
 
         // The mailboxes exercise what they are named for.
         switch mailbox {
@@ -225,13 +290,15 @@ struct FTSSelfHealCandidateReadTests {
         let plan: [String]
     }
 
-    static func cost(of sql: String, in pool: DatabasePool) async throws -> Cost {
+    static func cost(of sql: String, arguments: StatementArguments = StatementArguments(),
+                     in pool: DatabasePool) async throws -> Cost {
         try await pool.read { db in
             let statement = try db.makeStatement(sql: sql)
-            let rows = try String.fetchAll(statement).count
+            let rows = try Row.fetchAll(statement, arguments: arguments).count
             let vmSteps = Int(sqlite3_stmt_status(statement.sqliteStatement, SQLITE_STMTSTATUS_VM_STEP, 0))
             let sorts = Int(sqlite3_stmt_status(statement.sqliteStatement, SQLITE_STMTSTATUS_SORT, 0))
-            let plan = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).map { $0["detail"] as String }
+            let plan = try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql, arguments: arguments)
+                .map { $0["detail"] as String }
             return Cost(rows: rows, vmSteps: vmSteps, sorts: sorts, plan: plan)
         }
     }
@@ -265,29 +332,23 @@ struct FTSSelfHealCandidateReadTests {
         return broken
     }
 
-    @Test("With its index built, the planner takes it unaided and the candidate read stops at its window: no sort, and no more work for a mailbox twice as large",
-          arguments: [false, true])
-    func candidateReadStopsAtTheWindow(analyzed: Bool) async throws {
-        let (smallPool, smallDir, smallApp) = try Self.makeDatabase(Self.denseHeaders(8_000))
-        let (largePool, largeDir, largeApp) = try Self.makeDatabase(Self.denseHeaders(16_000))
+    @Test("With its index built and statistics taken, on an empty mailbox or a synced one, the planner takes it unaided and the candidate read stops at its window: no sort, and no more work for a mailbox twice as large",
+          arguments: [Statistics.emptyMailbox, .analyzed])
+    func candidateReadStopsAtTheWindow(statistics: Statistics) async throws {
+        let (smallPool, smallDir, smallApp) = try Self.makeDatabase(Self.denseHeaders(8_000), statistics: statistics)
+        let (largePool, largeDir, largeApp) = try Self.makeDatabase(Self.denseHeaders(16_000), statistics: statistics)
         defer {
             withExtendedLifetime((smallApp, largeApp)) {}
             TestDatabaseTeardown.retire(pool: smallPool, directory: smallDir)
             TestDatabaseTeardown.retire(pool: largePool, directory: largeDir)
         }
-        for pool in [smallPool, largePool] {
-            try await pool.write { db in
-                try SyncEngine.createDeferredIndexes(db)
-                if analyzed { try db.execute(sql: "ANALYZE") }
-            }
-        }
         let small = try await Self.cost(of: SyncEngine.ftsBodyMembershipCandidateSQL, in: smallPool)
         let large = try await Self.cost(of: SyncEngine.ftsBodyMembershipCandidateSQL, in: largePool)
         #expect(small.rows == Self.window && large.rows == Self.window, "precondition: both fill the window")
         let takesIndex = large.plan.contains { $0.contains("COVERING INDEX \(Self.indexName)") }
-        #expect(takesIndex, "analyzed \(analyzed): the planner does not take \(Self.indexName): \(large.plan)")
+        #expect(takesIndex, "\(statistics): the planner does not take \(Self.indexName): \(large.plan)")
         let broken = Self.costViolations(small: small, large: large)
-        #expect(broken.isEmpty, "analyzed \(analyzed): \(broken); plan \(large.plan)")
+        #expect(broken.isEmpty, "\(statistics): \(broken); plan \(large.plan)")
 
         // Negative control: without the index (before the pass builds it, and on every
         // device before this change) the same read breaks the same rule on the same mailboxes.
@@ -297,6 +358,50 @@ struct FTSSelfHealCandidateReadTests {
         let replacedSmall = try await Self.cost(of: Self.replacedSQL, in: smallPool)
         let replacedLarge = try await Self.cost(of: Self.replacedSQL, in: largePool)
         let replacedBroken = Self.costViolations(small: replacedSmall, large: replacedLarge)
-        #expect(!replacedBroken.isEmpty, "analyzed \(analyzed): the rule must catch the replaced read")
+        #expect(!replacedBroken.isEmpty, "\(statistics): the rule must catch the replaced read")
+    }
+
+    @Test("With its index built and the statistics deleted, the candidate read keeps the plan it had without the index and costs no more")
+    func candidateReadWithoutStatisticsKeepsTheReplacedPlan() async throws {
+        let (pool, dir, app) = try Self.makeDatabase(Self.denseHeaders(16_000), statistics: .emptied)
+        defer { withExtendedLifetime(app) {}; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let read = try await Self.cost(of: SyncEngine.ftsBodyMembershipCandidateSQL, in: pool)
+        try await pool.write { try $0.execute(sql: "DROP INDEX IF EXISTS \(Self.indexName)") }
+        let replaced = try await Self.cost(of: Self.replacedSQL, in: pool)
+        #expect(read.rows == replaced.rows, "precondition: both read the window")
+        #expect(read.plan == replaced.plan, "the plan changed: \(read.plan) against \(replaced.plan)")
+        #expect(read.vmSteps <= replaced.vmSteps, "more work than without the index: \(read.vmSteps) > \(replaced.vmSteps)")
+    }
+
+    /// `SyncEngine.healAllFTSBodyMembership`'s page, as it runs it: the one-time sweep of
+    /// every complete header in rowid order.
+    static let sweepPageSQL = """
+        SELECT rowid, id FROM messageHeader
+        WHERE rowid > ? AND bodyComplete = 1 AND headerComplete = 1
+        ORDER BY rowid LIMIT ?
+        """
+
+    @Test("The two other reads on the same columns keep their own indexes: the start-up recovery read in every statistics state, and the one-time sweep page once statistics are taken on a synced mailbox or deleted",
+          arguments: Statistics.allCases)
+    func otherReadsKeepTheirIndexes(statistics: Statistics) async throws {
+        let (pool, dir, app) = try Self.makeDatabase(Self.headers(.large), statistics: statistics)
+        defer { withExtendedLifetime(app) {}; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let (recoverySQL, recoveryArguments) = try await pool.read { db -> (String, StatementArguments) in
+            let statement = try FTSSelfHealCandidateProofTests.incompleteHeadersRequest()
+                .makePreparedRequest(db, forSingleResult: false).statement
+            return (statement.sql, statement.arguments)
+        }
+        let recovery = try await Self.cost(of: recoverySQL, arguments: recoveryArguments, in: pool)
+        let sweep = try await Self.cost(of: Self.sweepPageSQL, arguments: [0, SyncConfig.ftsOrphanPruneChunk], in: pool)
+        let recoveryTakesIndex = recovery.plan.contains { $0.contains(Self.indexName) }
+        #expect(!recoveryTakesIndex, "\(statistics): the recovery read takes \(Self.indexName): \(recovery.plan)")
+        // On statistics taken on an empty mailbox the planner may take the index for the
+        // sweep page: that sweep runs once per device, seconds after the first launch,
+        // when such a mailbox is still nearly empty, and before this change the page
+        // already sorted every complete header in that state.
+        if statistics != .emptyMailbox {
+            let sweepTakesIndex = sweep.plan.contains { $0.contains(Self.indexName) }
+            #expect(!sweepTakesIndex, "\(statistics): the sweep page takes \(Self.indexName): \(sweep.plan)")
+        }
     }
 }

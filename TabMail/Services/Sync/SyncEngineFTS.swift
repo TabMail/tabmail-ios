@@ -92,13 +92,17 @@ extension SyncEngine {
     /// candidate contract (a reintroduced `isInInbox` filter must fail a test).
     ///
     /// It runs at every launch and foreground, so it must cost the window and not the
-    /// mailbox (#1397): the deferred index `messageHeader_ftsSelfHealWindow`
-    /// (`SyncEngine.deferredIndexes`) holds `(headerComplete, bodyComplete, date, id)`,
-    /// which the planner walks newest first with no sort, reading `id` from the index
-    /// and stopping at the 2,000th entry. The statement names no index on purpose:
-    /// before the maintenance pass has built it, the same statement seeks
-    /// `idx_messageHeader_bodyStatus` and sorts, as it always did, and returns the same
-    /// headers. `FTSSelfHealCandidateReadTests` pins both the answer and the plan.
+    /// mailbox (#1397): the deferred partial index `messageHeader_completeByDate`
+    /// (`SyncEngine.deferredIndexes`) holds `(date, id)` of exactly the headers this
+    /// WHERE selects (`headerComplete = 1 AND bodyComplete = 1`), which the planner
+    /// walks newest first with no sort, reading `id` from the index and stopping at the
+    /// 2,000th entry. SQLite uses a partial index only for a statement whose WHERE
+    /// implies the index's own, so keep the two literals as they are: a bound
+    /// parameter or a changed condition loses the index. The statement names no index
+    /// on purpose: before the maintenance pass has built it, and on a database whose
+    /// statistics were deleted, the same statement seeks `idx_messageHeader_bodyStatus`
+    /// and sorts, as it always did, and returns the same headers.
+    /// `FTSSelfHealCandidateReadTests` pins both the answer and the plan.
     static let ftsBodyMembershipCandidateSQL = """
         SELECT id FROM messageHeader
         WHERE bodyComplete = 1 AND headerComplete = 1

@@ -955,14 +955,21 @@ extension SyncEngine {
         // account before returning the first. Deferred because its absence degrades
         // performance and nothing else: the statement names no index and picks the same
         // headers either way, so until the first maintenance pass builds it the read
-        // costs what it cost before. It holds every header, complete or not, so every
-        // header insert and every change of `headerComplete`, `bodyComplete` or `date`
-        // also writes it.
+        // costs what it cost before.
+        //
+        // PARTIAL, on purpose. It holds only complete headers, so SQLite can use it only
+        // for a statement whose WHERE implies `headerComplete = 1 AND bodyComplete = 1`.
+        // A full index led by `headerComplete` was also taken by the start-up recovery
+        // read (`headerComplete = 0`), which then read more pages than through
+        // `idx_messageHeader_bodyStatus`. Only a header whose two flags are both 1 is
+        // written to it: inserting a header with no body, or marking a header complete
+        // before its body, leaves it alone.
         DeferredIndex(
-            name: "messageHeader_ftsSelfHealWindow",
+            name: "messageHeader_completeByDate",
             sql: """
-                CREATE INDEX IF NOT EXISTS messageHeader_ftsSelfHealWindow
-                ON messageHeader(headerComplete, bodyComplete, date, id)
+                CREATE INDEX IF NOT EXISTS messageHeader_completeByDate
+                ON messageHeader(date, id)
+                WHERE headerComplete = 1 AND bodyComplete = 1
                 """),
     ]
 
