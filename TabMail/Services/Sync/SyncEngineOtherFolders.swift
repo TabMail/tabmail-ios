@@ -75,8 +75,11 @@ extension SyncEngine {
     /// The account's other folders as they are now (`isSyncable` false, a
     /// non-empty path), those whose read finished, moved or failed longest ago
     /// first (never first of all), else in stored order. The account's attempt
-    /// times keep only the folders it still has, so a deleted folder's time
-    /// neither stays in memory nor passes to a folder made later at its id.
+    /// times keep only the folders this read finds, so a deleted folder's time
+    /// does not stay in memory. A folder deleted and made again at the same id
+    /// between two reads keeps the old folder's time (and, in a run under way,
+    /// its place among the folders tried or failed): it is still read, in its
+    /// turn, from the account's next run on.
     func otherFolderReadOrder(accountId: String) async throws -> [String] {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
@@ -91,7 +94,8 @@ extension SyncEngine {
     /// One slice of an other-folder run, inside the account's turn and its
     /// `.headerFetch` slot: the change read of `folderIds` (those still other
     /// folders now), in that order, for its share of the slice
-    /// (`SyncConfig.otherFolderReadShare`), then the passes' apply, then the
+    /// (`otherFolderReadContext`: the first folder in the slice's whole time,
+    /// the others started within the share), then the passes' apply, then the
     /// listing of each changed folder no bookmark covers while the slice
     /// (`context.deadline`) has time to start one, each of its requests bounded
     /// as an older-mail request is (`ListingRequestBound`: none starts after
@@ -128,16 +132,11 @@ extension SyncEngine {
         }
         guard !folders.isEmpty else { return CatchUpSliceResult() }
 
-        // The read may use its share of the slice (`SyncConfig.otherFolderReadShare`),
-        // so a listing can still start before the slice's end; the listings
-        // use the rest.
-        let now = context.clock()
-        let readEnd = now.addingTimeInterval(max(0, context.deadline.timeIntervalSince(now)) * SyncConfig.otherFolderReadShare)
         let sliceContext = ChangeContext(deadline: context.deadline, clock: context.clock, onProgress: { _ in })
         let request = ChangeRequest(
             folders: folders.map { Self.changeFolder($0, isSynced: true) },
             scope: .otherFolders, recheck: [:],
-            context: ChangeContext(deadline: readEnd, clock: context.clock, onProgress: { _ in }),
+            context: Self.otherFolderReadContext(sliceDeadline: context.deadline, clock: context.clock),
             localRows: SyncEngineCatchUpRowReader(pool: dbPool))
         var changeSet: ChangeSet
         do {
@@ -218,6 +217,21 @@ extension SyncEngine {
             "[OtherFolders] \(accountId.prefix(8)): slice asked \(folders.count), finished \(slice.finishedFolderIds.count), "
             + "moved \(slice.progressedFolderIds.count - slice.finishedFolderIds.count), failed or tried \(slice.inFlightFolderIds.count), cut \(cut.count)")
         return slice
+    }
+
+    /// The change read's time in a slice of an other-folder run. New folders
+    /// start within the read's share of the slice
+    /// (`SyncConfig.otherFolderReadShare`), so a listing can still start before
+    /// the slice's end, and the listings use the rest. The read's first folder
+    /// is read in the slice's whole time (`ChangeContext.firstFolderDeadline`):
+    /// a slow check of the session before it cannot leave the slice with no
+    /// folder read. No request starts after the slice's end either way.
+    nonisolated static func otherFolderReadContext(
+        sliceDeadline: Date, clock: @escaping @Sendable () -> Date
+    ) -> ChangeContext {
+        let now = clock()
+        let readEnd = now.addingTimeInterval(max(0, sliceDeadline.timeIntervalSince(now)) * SyncConfig.otherFolderReadShare)
+        return ChangeContext(deadline: readEnd, clock: clock, firstFolderDeadline: sliceDeadline, onProgress: { _ in })
     }
 
     /// Records that these folders' reads finished, moved or failed now, for the

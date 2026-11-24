@@ -16,6 +16,23 @@ final class OtherFolderShared<Value: Sendable>: Sendable {
     var get: Value { value.withLock { $0 } }
 }
 
+/// Whether the folder's next full sync lists it deep: what
+/// `SyncEngine.fullSyncIsDeepPass` would answer, read without counting a full
+/// sync, so the witness leaves the count a later run reads as it was.
+func otherFolderOwesDeepListing(_ folderId: String) -> Bool {
+    (SyncEngine.fullSyncSkipStreakForTesting(folderId: folderId) ?? 0) + 1 >= max(1, SyncConfig.fullSyncDeepEveryN)
+}
+
+/// The folders' full-sync counts, to set back when a test ends (the counts are
+/// process-wide).
+func otherFolderSkipStreaks(_ folderIds: [String]) -> [(folderId: String, streak: Int?)] {
+    folderIds.map { ($0, SyncEngine.fullSyncSkipStreakForTesting(folderId: $0)) }
+}
+
+func restoreOtherFolderSkipStreaks(_ streaks: [(folderId: String, streak: Int?)]) {
+    for saved in streaks { SyncEngine.setFullSyncSkipStreakForTesting(folderId: saved.folderId, saved.streak) }
+}
+
 // MARK: - The rules
 
 /// The rules the other-folder run (#1110) rests on: the catch-up checks an other
@@ -582,6 +599,36 @@ struct OtherFolderIMAPTests {
         }
     }
 
+    @Test("A pass due by its clock whose full sync fails starts no run: nothing is asked of the other folders")
+    func aFailedFullSyncStartsNoRun() async throws {
+        try await Self.withWorld("full-sync-failed", .plain) { w in
+            let uid = w.nextUid(in: Self.alpha)
+            w.deliver(uid, to: Self.alpha)
+            try await w.setFullSyncDue()
+            let account = try w.account()
+            let start = w.server.recordedCommands().count
+            // The full sync's folder list is refused, so the full sync fails.
+            let refused = "LIST"
+            w.server.failEveryCommand(containing: refused, message: "Injected full sync failure")
+            var threw = false
+            do {
+                _ = try await w.engine.sync(account: account)
+            } catch {
+                threw = true
+            }
+            w.server.stopFailingCommands(containing: refused)
+            await w.settle()
+
+            let listed = w.server.recordedCommands().dropFirst(start).contains { $0.uppercased().contains(refused) }
+            let sent = Self.others.flatMap { w.commands(naming: $0, since: start) }
+            let arrived = try w.holds(uid, in: Self.alpha)
+            #expect(listed && threw, "precondition: the pass's full sync asked for the folder list, and the pass failed")
+            #expect(w.runSlices.isEmpty, "the pass started no run")
+            #expect(sent.isEmpty, "and nothing was asked of the other folders: \(sent)")
+            #expect(!arrived, "so the message filed into Alpha waits for a later run")
+        }
+    }
+
     @Test("A run stores an other folder's first bookmark and reads from it after, without touching the account's clocks or bookmark, and never turns the folder's coverage on")
     func aRunLeavesTheAccountsClocks() async throws {
         try await Self.withWorld("clocks", .qresync) { w in
@@ -700,9 +747,34 @@ struct OtherFolderIMAPTests {
 
     // MARK: Timing (sync timing promises 1, 2, 3 and 8)
 
-    @Test("A new-mail trigger that finds a run's slice holding the turn asks for its stage 2 without waiting, and that stage 2 reads when the slice ends, before the run's next slice")
-    func aTriggerDuringASliceWaitsAtMostThatSlice() async throws {
-        try await Self.withWorld("trigger", .plain) { w in
+    /// A new-mail signal's way into the engine, as the app sends it, each with
+    /// its caller's deadline: the foreground poll (`AccountManager.foregroundSyncOne`),
+    /// an IDLE new-mail event (`SyncScheduler.backgroundPoll` ->
+    /// `AccountManager.backgroundPollRun`) and a silent push
+    /// (`SyncScheduler.syncStartup(inboxOnly: true)` -> `backgroundPollRun`).
+    enum TriggerEntry: String, CaseIterable, Sendable {
+        case poll
+        case idle
+        case push
+
+        /// Sends the trigger. True when it found another pass of the account
+        /// holding the turn and returned at once.
+        func send(to engine: SyncEngine, account: Account) async throws -> Bool {
+            switch self {
+            case .poll:
+                let deadline = Date().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
+                return try await engine.syncOrFollowUp(account: account, deadline: deadline) == nil
+            case .idle, .push:
+                let deadline = Date().addingTimeInterval(SyncConfig.backgroundPerAccountTimeoutSeconds)
+                return try await engine.backgroundDeltaSync(account: account, inboxOnly: self == .push, deadline: deadline) == nil
+            }
+        }
+    }
+
+    @Test("A new-mail trigger that finds a run's slice holding the turn asks for its stage 2 without waiting, and that stage 2 reads when the slice ends, before the run's next slice: from the poll, an IDLE event and a push",
+          arguments: TriggerEntry.allCases)
+    func aTriggerDuringASliceWaitsAtMostThatSlice(_ entry: TriggerEntry) async throws {
+        try await Self.withWorld("trigger-\(entry.rawValue)", .plain) { w in
             let engine = w.engine
             let accountId = w.accountId
             let pool = w.pool
@@ -743,9 +815,9 @@ struct OtherFolderIMAPTests {
             w.offset.add(SyncConfig.catchUpSliceSeconds + 1)
             w.deliver(newUid, to: "INBOX")
 
-            let trigger: Bool?
+            let foundBusy: Bool
             do {
-                trigger = try await engine.syncOrFollowUp(account: account, deadline: nil)
+                foundBusy = try await entry.send(to: engine, account: account)
             } catch {
                 await w.watchSlices()
                 w.releaseStatus(of: first.get)
@@ -753,7 +825,7 @@ struct OtherFolderIMAPTests {
                 throw error
             }
             let wanted = await engine.syncFollowUpWanted.contains(accountId)
-            #expect(trigger == nil, "the trigger found the account busy and did not wait")
+            #expect(foundBusy, "the \(entry) trigger found the account busy and did not wait")
             #expect(wanted, "it asked for its stage 2")
             let followUp = Task { try await engine.followUpPass(accountId: accountId, mayStart: { true }) }
             guard await OneSyncAtATimeTests.eventually({ await engine.syncPassWaiters[accountId]?.count == 1 }) else {
@@ -1010,7 +1082,7 @@ struct OtherFolderIMAPTests {
             clock: { offset.now() }, onProgress: { _ in })
         let request = ChangeRequest(
             folders: folders, scope: scope, recheck: [:], context: context,
-            localRows: SyncEngineCatchUpRowReader(pool: w.pool))
+            localRows: SyncEngineCatchUpRowReader(pool: PrioritizedDatabase(pool: w.pool)))
         let first = others[0]
         w.holdStatus(of: first)
         let provider = w.provider
@@ -1058,33 +1130,177 @@ struct OtherFolderIMAPTests {
         }
     }
 
+    // MARK: A slow session check (sync timing: the slice's whole time for its first folder)
+
+    /// One change read of the other folders, made as a run's slice makes it
+    /// (`SyncEngine.otherFolderReadContext`), on a clock that stands still until
+    /// the test moves it. The server holds the pass-start NOOP until the clock
+    /// is `heldFor` past the slice's start, then answers it. The folders'
+    /// changes by folder id, and the commands sent after that NOOP; nil on a
+    /// failed precondition.
+    static func readAfterASlowSessionCheck(
+        _ w: World, heldFor: TimeInterval
+    ) async throws -> (folders: [String: FolderChanges], afterCheck: [String])? {
+        let account = try w.account()
+        let folders = try others.map { SyncEngine.changeFolder(try w.folder($0), isSynced: true) }
+        let start = Date()
+        let clock = IMAPChangeEngineTests.StillClock(start)
+        let context = SyncEngine.otherFolderReadContext(
+            sliceDeadline: start.addingTimeInterval(SyncConfig.catchUpSliceSeconds), clock: { clock.read() })
+        let request = ChangeRequest(
+            folders: folders, scope: .otherFolders, recheck: [:], context: context,
+            localRows: SyncEngineCatchUpRowReader(pool: PrioritizedDatabase(pool: w.pool)))
+        let logStart = w.server.recordedCommands().count
+        w.server.holdNextCommand(containing: "NOOP")
+        let provider = w.provider
+        let since = ChangeCursor(account: account.lastHistoryId)
+        let read = Task { try await provider.fetchChanges(since: since, request: request) }
+        guard await OneSyncAtATimeTests.eventually({ w.server.isHoldingCommand(containing: "NOOP") }) else {
+            Issue.record("precondition: the pass-start NOOP is held")
+            w.server.releaseHeldCommand(containing: "NOOP")
+            _ = await read.result
+            return nil
+        }
+        clock.set(start.addingTimeInterval(heldFor))
+        w.server.releaseHeldCommand(containing: "NOOP")
+        let set = try await read.value
+        let sent = Array(w.server.recordedCommands().dropFirst(logStart))
+        guard let check = sent.firstIndex(where: { $0.uppercased().hasPrefix("NOOP") }) else {
+            Issue.record("precondition: the read sent its NOOP: \(sent)")
+            return nil
+        }
+        let changes = Dictionary(
+            (set?.folders ?? []).map { ($0.folderId, $0) }, uniquingKeysWith: { a, _ in a })
+        return (changes, Array(sent[(check + 1)...]))
+    }
+
+    /// A request about a mailbox (its STATUS, SELECT, a FETCH or SEARCH on it),
+    /// as opposed to the session's own NOOP or LOGOUT.
+    static func isFolderRequest(_ command: String) -> Bool {
+        let upper = command.uppercased()
+        return ["STATUS", "SELECT", "EXAMINE", "UID", "FETCH", "SEARCH"].contains { upper.hasPrefix($0) }
+            || (["INBOX"] + others).contains { names(command, $0) }
+    }
+
+    /// Sync timing (the turn's bound; owner: "use the whole turn"). A slice
+    /// whose pass-start NOOP answers after the read's share of the slice, but
+    /// before the slice's end, still reads its first folder, and starts no
+    /// folder after it; a slice whose NOOP answers after the slice's end
+    /// starts no request at all. So a slow session check never leaves a slice
+    /// with nothing read, and no request starts after the slice's end: the
+    /// turn ends by the slice's end plus one request. RED while the first
+    /// folder, like the rest, could start only within the read's share.
+    @Test("A slice whose session check answers late still reads its first folder, and starts no request after the slice's end",
+          arguments: Server.allCases)
+    func aSlowSessionCheckStillReadsTheFirstFolder(_ kind: Server) async throws {
+        try await Self.withWorld("slow-check", kind) { w in
+            let first = Self.others[0]
+            let second = Self.others[1]
+            let readEnd = SyncConfig.catchUpSliceSeconds * SyncConfig.otherFolderReadShare
+            let betweenReadEndAndSliceEnd = (readEnd + SyncConfig.catchUpSliceSeconds) / 2
+
+            guard let late = try await Self.readAfterASlowSessionCheck(w, heldFor: betweenReadEndAndSliceEnd)
+            else { return }
+            let firstRead = late.folders[w.id(first)]
+            var firstNotRun = firstRead == nil
+            if case .notRun = firstRead?.status { firstNotRun = true }
+            let firstAsked = late.afterCheck.contains { Self.names($0, first) }
+            #expect(firstAsked && !firstNotRun && firstRead?.readCut == false,
+                    "the NOOP answered after the read's share, before the slice's end: \(first) is still read: \(late.afterCheck)")
+            let secondRead = late.folders[w.id(second)]
+            var secondNotRun = false
+            if case .notRun = secondRead?.status { secondNotRun = true }
+            let secondAsked = late.afterCheck.contains { Self.names($0, second) }
+            #expect(!secondAsked && secondNotRun && secondRead?.readCut == false,
+                    "a folder after the first still starts only within the read's share: \(late.afterCheck)")
+
+            guard let past = try await Self.readAfterASlowSessionCheck(w, heldFor: SyncConfig.catchUpSliceSeconds + 1)
+            else { return }
+            let requests = past.afterCheck.filter(Self.isFolderRequest)
+            #expect(requests.isEmpty, "the NOOP answered after the slice's end: no request starts: \(requests)")
+            for path in Self.others {
+                let read = past.folders[w.id(path)]
+                var notRun = false
+                if case .notRun = read?.status { notRun = true }
+                #expect(notRun && read?.readCut == false, "\(path): reported not run, with no cut mark")
+            }
+        }
+    }
+
     // MARK: The listing's bound (sync timing promise 1)
 
-    /// The request limit a test gives a run's listing: long enough for the test
-    /// to see the listing held and send its trigger inside it, short enough that
-    /// the limit plus `stageTwoReadSeconds` stays well under the default limit.
+    /// The request limit a test gives a run's listing: long enough for the
+    /// listing to reach its held FETCH, short enough that the limit plus
+    /// `stageTwoReadSeconds` stays under the default limit.
     static let shortRequestSeconds: TimeInterval = 0.75
 
-    /// What follows the listing given up before the trigger's read is done: the
-    /// rest of the slice (the other folder's listing) and the stage 2's own read
-    /// of the Inbox, against the local server, with room for scheduling.
+    /// The room the follow-up's stage 2 has, after the listing's limit ends the
+    /// slice and before the default limit could have: the rest of the slice and
+    /// the stage 2's own read of the Inbox, against the local server.
     static let stageTwoReadSeconds: TimeInterval = 1
+
+    /// What the bounded-listing test's slice hook saw and started, and what the
+    /// test waits on: each is an event, set once.
+    struct HeldListingProbe: Sendable {
+        /// The changed folder whose listing's answer the server holds.
+        let held = OtherFolderShared<String?>(nil)
+        /// Whether the trigger sent inside the slice found the turn held: it
+        /// asked for a follow-up and returned without a pass.
+        let triggerFoundTheTurnHeld = OtherFolderShared<Bool?>(nil)
+        /// The follow-up stage 2, started inside the slice.
+        let followUp = OtherFolderShared<Task<Bool?, any Error>?>(nil)
+        /// Whether the follow-up was in line for the turn before the slice went on.
+        let followUpInLine = OtherFolderShared<Bool>(false)
+        /// When the hook returned: the slice's provider work, and so the
+        /// listing's request, starts after this.
+        let listingMayStart = OtherFolderShared<Date?>(nil)
+        let followUpEnded = OtherFolderShared<Bool>(false)
+        let runEnded = OtherFolderShared<Bool>(false)
+    }
 
     @Test("With no change tracking, a run's listing is bounded as an older-mail request: while the server holds its answer, a new-mail trigger finds the slice holding the turn and its read waits at most the request limit, the run ends without the answer, owes no deep listing and marks nothing due, still lists the other folder, and a later run lists the folder before the old answer comes")
     func aRunsListingIsBoundedLikeAnOlderMailRequest() async throws {
-        #expect(Self.shortRequestSeconds + Self.stageTwoReadSeconds + 1 < SyncConfig.catchUpRequestTimeoutSeconds,
+        #expect(Self.shortRequestSeconds + Self.stageTwoReadSeconds < SyncConfig.catchUpRequestTimeoutSeconds,
                 "precondition: a read bounded by the listing's limit is told apart from one bounded by the default")
         #expect(SyncConfig.fullSyncDeepEveryN > 1, "precondition: an owed deep listing is told apart from none")
         try await Self.withWorld("listing-bound", .plain) { w in
             let server = w.server
             let uids = Self.others.map { w.nextUid(in: $0) }
             for (path, uid) in zip(Self.others, uids) { w.deliver(uid, to: path) }
-            let first = OtherFolderShared<String?>(nil)
+            let account = try w.account()
+            let engine = w.engine
+            let accountId = w.accountId
+            let inboxUid = w.nextUid(in: "INBOX")
+            let probe = HeldListingProbe()
+            let streaks = otherFolderSkipStreaks(try Self.others.map { try w.folder($0).id })
+            defer { restoreOtherFolderSkipStreaks(streaks) }
+            #expect(!streaks.contains { otherFolderOwesDeepListing($0.folderId) },
+                    "precondition: no folder owes a deep listing before the run")
+            // Inside the run's first slice, holding the turn, before its provider
+            // work: the server will hold the first changed folder's listing
+            // answer, and new mail comes. The poll's trigger, sent from its own
+            // task as the scheduler sends it, finds the turn held, so it asks for
+            // the follow-up stage 2 and returns at once; the follow-up then waits
+            // in line for the turn (sync timing promise 1).
             await w.watchSlices { folderIds in
-                guard first.get == nil, folderIds.count == Self.others.count else { return }
+                guard probe.held.get == nil, folderIds.count == Self.others.count else { return }
                 let path = w.path(ofId: folderIds[0])
-                first.set(path)
+                probe.held.set(path)
                 server.holdNextFetchAfterSnapshot(in: path)
+                w.deliver(inboxUid, to: "INBOX")
+                let trigger = await Task.detached { try await engine.syncOrFollowUp(account: account, deadline: nil) }.result
+                var foundTheTurnHeld = false
+                if case .success(.none) = trigger { foundTheTurnHeld = true }
+                probe.triggerFoundTheTurnHeld.set(foundTheTurnHeld)
+                probe.followUp.set(Task.detached { () async throws -> Bool? in
+                    defer { probe.followUpEnded.set(true) }
+                    return try await engine.followUpPass(accountId: accountId, mayStart: { true })
+                })
+                let inLine = await OneSyncAtATimeTests.eventually {
+                    await engine.syncPassWaiterCountForTesting(accountId: accountId) > 0
+                }
+                probe.followUpInLine.set(inLine)
+                probe.listingMayStart.set(Date())
             }
             var run = SyncEngine.CatchUpRun(
                 storageLimitInForce: false, deadline: nil, sliceSeconds: SyncConfig.catchUpSliceSeconds,
@@ -1093,22 +1309,21 @@ struct OtherFolderIMAPTests {
             run.readsOtherFolders = true
             run.requestTimeoutSeconds = Self.shortRequestSeconds
             let theRun = run
-            let account = try w.account()
-            let engine = w.engine
-            let ended = OtherFolderShared<Bool>(false)
             let runTask = Task {
                 _ = await engine.runCatchUpRun(account: account, run: theRun)
-                ended.set(true)
+                probe.runEnded.set(true)
             }
-            // Every exit, a throw included, lets the held answer go and joins the
-            // run before the world is torn down.
+            // Every exit, a failed check or a throw included, lets the held answer
+            // go BEFORE it joins the run and the follow-up, so neither join can
+            // wait on the withheld answer.
             func releaseAndEnd() async {
                 await w.watchSlices()
-                if let path = first.get { server.releaseFetchAfterSnapshot(in: path) }
+                if let path = probe.held.get { server.releaseFetchAfterSnapshot(in: path) }
                 await runTask.value
+                _ = try? await probe.followUp.get?.value
             }
             do {
-                try await Self.checkTheBoundedListing(w, run: theRun, account: account, uids: uids, first: first, ended: ended)
+                try await Self.checkTheBoundedListing(w, run: theRun, account: account, uids: uids, inboxUid: inboxUid, probe: probe)
             } catch {
                 await releaseAndEnd()
                 throw error
@@ -1117,56 +1332,61 @@ struct OtherFolderIMAPTests {
         }
     }
 
-    /// The body of `aRunsListingIsBoundedLikeAnOlderMailRequest`, from the held
-    /// listing on; the caller releases the answer and joins the run on every exit.
+    /// The body of `aRunsListingIsBoundedLikeAnOlderMailRequest`, from the
+    /// slice's hook on. It never joins the run or the follow-up while the answer
+    /// may be held: it waits for events with a bound, and returns after a failed
+    /// check that a later step would wait on; the caller releases the answer,
+    /// then joins.
     static func checkTheBoundedListing(
-        _ w: World, run: SyncEngine.CatchUpRun, account: Account, uids: [Int],
-        first: OtherFolderShared<String?>, ended: OtherFolderShared<Bool>
+        _ w: World, run: SyncEngine.CatchUpRun, account: Account, uids: [Int], inboxUid: Int,
+        probe: HeldListingProbe
     ) async throws {
         let engine = w.engine
         func holdingListing() -> Bool {
-            guard let path = first.get else { return false }
+            guard let path = probe.held.get else { return false }
             return w.server.isHoldingFetchAfterSnapshot(in: path)
         }
-        guard await OneSyncAtATimeTests.eventually({ holdingListing() }), let held = first.get else {
-            Issue.record("precondition: the first changed folder's listing is held at the server")
+        guard await OneSyncAtATimeTests.eventually({ probe.listingMayStart.get != nil }),
+              let held = probe.held.get, let listingMayStart = probe.listingMayStart.get else {
+            Issue.record("precondition: the run's first slice asked for the changed folders")
             return
         }
-        // The listing's request started before its FETCH reached the server, so
-        // its limit runs out at most `shortRequestSeconds` after this.
-        let heldSeen = Date()
         let otherPath = others.first { $0 != held }
         let heldUid = uids[others.firstIndex(of: held) ?? 0]
+        let triggerFoundTheTurnHeld = probe.triggerFoundTheTurnHeld.get
+        let followUpInLine = probe.followUpInLine.get
+        #expect(triggerFoundTheTurnHeld == true, "the trigger found the run's slice holding the turn and asked for a follow-up")
+        #expect(followUpInLine, "the follow-up waited in line for the turn")
 
-        // New mail while the listing's answer is held: the trigger finds the
-        // run's slice holding the turn, and its stage 2 reads once the listing's
-        // request limit ends the slice, not the default limit and not the answer
-        // (sync timing promise 1).
-        let inboxUid = w.nextUid(in: "INBOX")
-        w.deliver(inboxUid, to: "INBOX")
-        let admitted = try await engine.syncOrFollowUp(account: account, deadline: nil)
-        let runWasRunning = !ended.get
-        #expect(admitted == nil && runWasRunning, "the trigger found the run's slice holding the turn")
-        if admitted == nil {
-            _ = try await engine.followUpPass(accountId: w.accountId, mayStart: { true })
-        }
-        let readAfter = Date().timeIntervalSince(heldSeen)
-        let newMailRead = try w.holds(inboxUid, in: "INBOX")
+        // The follow-up gets the turn when the slice ends. The listing's request
+        // started after `listingMayStart`, and its answer stays withheld until the
+        // test releases it, so a slice that only the default limit ended would
+        // let the follow-up in no earlier than `catchUpRequestTimeoutSeconds`
+        // after it. A follow-up done before then was let in by the listing's own
+        // limit (sync timing promise 1).
+        let room = SyncConfig.catchUpRequestTimeoutSeconds - Date().timeIntervalSince(listingMayStart)
+        let followedUp = await OneSyncAtATimeTests.eventually(seconds: room) { probe.followUpEnded.get }
         let answerStillHeld = holdingListing()
-        #expect(newMailRead, "the trigger's read brought the new mail")
+        let newMailRead = try w.holds(inboxUid, in: "INBOX")
+        #expect(followedUp, "the follow-up's read ended within the listing's request limit, not the default one")
         #expect(answerStillHeld, "while the listing's answer was still held")
-        #expect(readAfter < shortRequestSeconds + stageTwoReadSeconds,
-                "within the listing's request limit, not the default one: \(readAfter) s")
+        #expect(newMailRead, "the follow-up's read brought the new mail")
+        guard followedUp, let followUp = probe.followUp.get else { return }
+        let ranStageTwo = try await followUp.value
+        #expect(ranStageTwo != nil, "the follow-up ran stage 2: the trigger was not dropped")
 
-        let endedWhileHeld = await OneSyncAtATimeTests.eventually { ended.get }
+        // A second run would wait in line behind a run still holding the turn,
+        // which only the withheld answer could end: none after a failed check.
+        let endedWhileHeld = await OneSyncAtATimeTests.eventually { probe.runEnded.get }
         #expect(endedWhileHeld, "the run ended while the listing's answer was still held: the listing did not hold the turn")
+        guard endedWhileHeld else { return }
 
         // The answer is still withheld: the listing given up owes nothing, and a
         // later run lists the folder again without waiting for it.
         let heldBefore = try w.holds(heldUid, in: held)
         let heldFolder = try w.folder(held)
         let markedDue = FolderChangeState(raw: heldFolder.changeState).listingDue
-        let owesDeepListing = SyncEngine.fullSyncIsDeepPass(folderId: heldFolder.id, everyN: SyncConfig.fullSyncDeepEveryN)
+        let owesDeepListing = otherFolderOwesDeepListing(heldFolder.id)
         let otherArrived = try otherPath.map { try w.holds(uids[others.firstIndex(of: $0) ?? 0], in: $0) }
         _ = await engine.runCatchUpRun(account: account, run: run)
         let relisted = try w.holds(heldUid, in: held)
@@ -1177,6 +1397,92 @@ struct OtherFolderIMAPTests {
         #expect(!owesDeepListing, "and owes no deep listing")
         #expect(otherArrived == true, "the run still listed the other folder, and its new mail arrived")
         #expect(relisted, "a later run listed \(held) while the old answer was still withheld, and its new mail arrived")
+    }
+
+    /// The forms of a SELECT or EXAMINE of `path`, as `statusFragments` names a STATUS.
+    static func selectFragments(_ path: String) -> [String] {
+        ["SELECT", "EXAMINE"].flatMap { verb in ["\(verb) \(path)", "\(verb) \"\(path)\""] }
+    }
+
+    @Test("With no change tracking, a run's listing is bounded as one whole request, its SELECT included: while the server holds the folder's SELECT, the listing is given up at its request limit, writes nothing, the run still lists the other folder, and a later run lists the folder")
+    func aListingsSelectIsWithinItsBound() async throws {
+        #expect(Self.shortRequestSeconds < SyncConfig.catchUpRequestTimeoutSeconds,
+                "precondition: a listing bounded by its own limit is told apart from one bounded by the default")
+        try await Self.withWorld("listing-select", .plain) { w in
+            let server = w.server
+            let uids = Self.others.map { w.nextUid(in: $0) }
+            for (path, uid) in zip(Self.others, uids) { w.deliver(uid, to: path) }
+            let account = try w.account()
+            let engine = w.engine
+            let streaks = otherFolderSkipStreaks(try Self.others.map { try w.folder($0).id })
+            defer { restoreOtherFolderSkipStreaks(streaks) }
+            // Inside the run's first slice, before its provider work: the server
+            // will hold the SELECT of the first changed folder's listing.
+            let held = OtherFolderShared<String?>(nil)
+            let listingMayStart = OtherFolderShared<Date?>(nil)
+            await w.watchSlices { folderIds in
+                guard held.get == nil, folderIds.count == Self.others.count else { return }
+                let path = w.path(ofId: folderIds[0])
+                held.set(path)
+                for fragment in Self.selectFragments(path) { server.holdNextCommand(containing: fragment) }
+                listingMayStart.set(Date())
+            }
+            var run = SyncEngine.CatchUpRun(
+                storageLimitInForce: false, deadline: nil, sliceSeconds: SyncConfig.catchUpSliceSeconds,
+                intervalSeconds: 0, clock: { Date() })
+            run.workSeconds = SyncConfig.otherFolderRunSeconds
+            run.readsOtherFolders = true
+            run.requestTimeoutSeconds = Self.shortRequestSeconds
+            let theRun = run
+            let runEnded = OtherFolderShared<Bool>(false)
+            let runTask = Task {
+                _ = await engine.runCatchUpRun(account: account, run: theRun)
+                runEnded.set(true)
+            }
+            func holdingSelect() -> Bool {
+                guard let path = held.get else { return false }
+                return Self.selectFragments(path).contains { server.isHoldingCommand(containing: $0) }
+            }
+            // Every exit lets the held SELECT go before it joins the run.
+            func release() {
+                guard let path = held.get else { return }
+                for fragment in Self.selectFragments(path) { server.releaseHeldCommand(containing: fragment) }
+            }
+            func releaseAndEnd() async {
+                await w.watchSlices()
+                release()
+                await runTask.value
+            }
+            guard await OneSyncAtATimeTests.eventually({ holdingSelect() }),
+                  let heldPath = held.get, let mayStart = listingMayStart.get else {
+                Issue.record("precondition: the run's listing sent its SELECT, and the server holds it")
+                return await releaseAndEnd()
+            }
+
+            // The SELECT stays held until the test lets it go, so a run that only
+            // the default limit, or none, could end would still be running
+            // `catchUpRequestTimeoutSeconds` after the listing could start.
+            let room = SyncConfig.catchUpRequestTimeoutSeconds - Date().timeIntervalSince(mayStart)
+            let ended = await OneSyncAtATimeTests.eventually(seconds: room) { runEnded.get }
+            let stillHeld = holdingSelect()
+            #expect(ended, "the run ended within the listing's request limit, not the default one")
+            #expect(stillHeld, "while the folder's SELECT was still held")
+            guard ended else { return await releaseAndEnd() }
+
+            let heldUid = uids[Self.others.firstIndex(of: heldPath) ?? 0]
+            let heldBefore = try w.holds(heldUid, in: heldPath)
+            let heldFolder = try w.folder(heldPath)
+            let otherPath = Self.others.first { $0 != heldPath }
+            let otherArrived = try otherPath.map { try w.holds(uids[Self.others.firstIndex(of: $0) ?? 0], in: $0) }
+            await releaseAndEnd()
+            _ = await engine.runCatchUpRun(account: account, run: theRun)
+            let relisted = try w.holds(heldUid, in: heldPath)
+
+            #expect(!heldBefore, "the listing given up wrote nothing")
+            #expect(heldFolder.lastKnownUidNext == OtherFolderIMAPTests.held.count + 1, "and \(heldPath)'s counters stayed as they were, so it stayed changed")
+            #expect(otherArrived == true, "the run still listed the other folder, and its new mail arrived")
+            #expect(relisted, "a later run listed \(heldPath), and its new mail arrived")
+        }
     }
 
     // MARK: The weekly whole-folder check, end to end
@@ -1548,6 +1854,9 @@ struct OtherFolderSliceRuleTests {
         try await Self.withWorld { w in
             #expect(SyncConfig.fullSyncDeepEveryN > 1, "precondition: an owed deep listing is told apart from none")
             let alpha = w.alphaId
+            let streaks = otherFolderSkipStreaks([alpha])
+            defer { restoreOtherFolderSkipStreaks(streaks) }
+            #expect(!otherFolderOwesDeepListing(alpha), "precondition: the folder owes no deep listing before the listing")
             let before = try await w.pool.read { db in try Folder.fetchOne(db, key: alpha) }
             // The slice has time when the listing starts and none when its window
             // read would start: the clock is read once for each.
@@ -1566,7 +1875,7 @@ struct OtherFolderSliceRuleTests {
             let after = try await w.pool.read { db in try Folder.fetchOne(db, key: alpha) }
             let log = await w.mock.callLog
             let readSent = log.contains { $0.hasPrefix("fetchMessages(") }
-            let owesDeepListing = SyncEngine.fullSyncIsDeepPass(folderId: alpha, everyN: SyncConfig.fullSyncDeepEveryN)
+            let owesDeepListing = otherFolderOwesDeepListing(alpha)
             let markedDue = FolderChangeState(raw: after?.changeState).listingDue
             #expect(checks.get == 2, "precondition: the listing started, and its window read found the slice over")
             #expect(refresh == .listingNotStarted, "the listing has not started, so a later slice lists the folder")
@@ -1578,10 +1887,25 @@ struct OtherFolderSliceRuleTests {
         }
     }
 
-    @Test("A slice takes no account bookmark and no folder list from its reader, and asks for the other-folder scope only")
+    @Test("A slice takes no account bookmark and no folder list from its reader, and asks for the other-folder scope only, with no re-read list though a folder holds one, which stays for the passes")
     func aSliceIgnoresTheAccountParts() async throws {
         try await Self.withWorld { w in
             let before = try w.account().lastHistoryId
+            // Alpha holds ids a pass would read again.
+            let alphaId = w.alphaId
+            let rereads = ["7", "9"]
+            let seeded = FolderChangeState(recheck: rereads).encoded
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [seeded, alphaId])
+            }
+            func storedRereads() async throws -> [String] {
+                let raw = try await w.pool.read { db in
+                    try String.fetchOne(db, sql: "SELECT changeState FROM folder WHERE id = ?", arguments: [alphaId])
+                }
+                return FolderChangeState(raw: raw).recheck
+            }
+            let rereadsBefore = try await storedRereads()
+            #expect(rereadsBefore == rereads, "precondition: Alpha holds its re-read list")
             let result = try await w.slice(on: SyncEngine()) { request in
                 ChangeSet(account: .set("999"), folderList: .complete([]), folders: request.folders.map {
                     FolderChanges(folderId: $0.id, status: .tracked)
@@ -1604,6 +1928,8 @@ struct OtherFolderSliceRuleTests {
             #expect(asked?.scope == .otherFolders, "the read was asked for the other folders")
             #expect(askedIds == order, "in the run's order")
             #expect(askedRereads == true, "with no re-read list")
+            let rereadsAfter = try await storedRereads()
+            #expect(rereadsAfter == rereads, "Alpha's re-read list stays for the passes")
         }
     }
 
@@ -1614,6 +1940,50 @@ struct OtherFolderSliceRuleTests {
             let none = try await w.slice(on: SyncEngine(), nil)
             #expect(!thrown.progressed && thrown.inFlightFolderIds.isEmpty, "a throwing reader: nothing read, nothing tried")
             #expect(!none.progressed && none.inFlightFolderIds.isEmpty, "no reader: nothing read, nothing tried")
+        }
+    }
+
+    @Test("A run whose slice reads nothing new ends with that slice, with time left: a reader that throws, one that sends nothing for any folder, or none")
+    func aSliceThatReadsNothingEndsTheRun() async throws {
+        try await Self.withWorld { w in
+            let account = try w.account()
+            let readers: [(name: String, answer: (@Sendable (ChangeRequest) throws -> ChangeSet?)?)] = [
+                ("a reader that throws", { _ in throw Failure() }),
+                ("a reader that sends nothing", { request in Self.answer(request, [:]) }),
+                ("no reader", nil),
+            ]
+            for reader in readers {
+                if let answer = reader.answer {
+                    await w.mock.setChangeReader { _, request in try answer(request) }
+                } else {
+                    await w.mock.setChangeReader(nil)
+                }
+                // A fresh engine: the run's order is kept in memory per engine.
+                let engine = SyncEngine()
+                await engine.register(
+                    accountId: w.accountId, provider: w.mock, workQueue: ProviderWorkQueue(provider: w.mock, maxConcurrency: 1))
+                // A run that went on would take slice after slice: the third is
+                // cancelled, so the test ends either way.
+                let slices = OtherFolderShared<Int>(0)
+                let running = OtherFolderShared<Task<Bool, Never>?>(nil)
+                await engine.setCatchUpSliceStartHookForTesting { _ in
+                    slices.set(slices.get + 1)
+                    if slices.get >= 3 { running.get?.cancel() }
+                }
+                var run = SyncEngine.CatchUpRun(
+                    storageLimitInForce: false, deadline: nil, sliceSeconds: SyncConfig.catchUpSliceSeconds,
+                    intervalSeconds: 0, clock: { Date() })
+                run.workSeconds = SyncConfig.otherFolderRunSeconds
+                run.readsOtherFolders = true
+                let theRun = run
+                let task = Task { await engine.runCatchUpRun(account: account, run: theRun) }
+                running.set(task)
+                let progressed = await task.value
+                await engine.setCatchUpSliceStartHookForTesting(nil)
+                await engine.remove(accountId: w.accountId)
+                #expect(slices.get == 1, "\(reader.name): the run took one slice and ended: \(slices.get) slices")
+                #expect(!progressed, "\(reader.name): and read nothing")
+            }
         }
     }
 }

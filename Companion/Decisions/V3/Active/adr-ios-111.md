@@ -1547,8 +1547,13 @@ pass's history read reports every label.
    failed": a long baseline first in the order kept its never-read place and took every slice's read share
    before a folder never reached, run after run. The slice reads them
    through the provider's change reader with the new scope `ChangeScope.otherFolders` (every folder of the
-   request is read: `ChangeFolder.isSynced` true), for at most half the slice (`otherFolderReadShare`), and
-   applies the answer with the passes' one generic apply (`applyChangeSet`). Readers read the request's
+   request is read: `ChangeFolder.isSynced` true), for at most half the slice (`otherFolderReadShare`), its
+   first folder excepted: that folder's read may start while the slice itself still has time
+   (`ChangeContext.firstFolderDeadline`, `ChangeRequest.forFirstFolder`; decided 2026-11-24), so a slow
+   session check (the NOOP before the reads) never leaves a slice with no folder read, and no request
+   starts after the slice's end. *Superseded (2026-11-24):* the first folder too only within the read
+   share: on a slow link the NOOP used up the share, every folder came back not run, and every later run
+   did the same. The slice applies the answer with the passes' one generic apply (`applyChangeSet`). Readers read the request's
    folders in its order and report a folder they did not reach as `.notRun`, which stays pending. A folder
    whose read was started and cut by the slice's time is kept apart from one not reached (#1358): the IMAP
    reader, which always sends a run's folder its STATUS (or SELECT) first, reports it `.notRun` with
@@ -1569,7 +1574,10 @@ pass's history read reports every label.
      request at most `SyncConfig.catchUpRequestTimeoutSeconds`, as a request of the older-mail check; its
      progress rides in the bookmark, so later slices and runs take the next steps until the window is done
      (decided 2026-11-23). A pass still takes every step its budget pays for whole. Before, a run priced
-     each step at the passes' request limit, above its read share, so the check never moved in a run.
+     each step at the passes' request limit, above its read share, so the check never moved in a run. A
+     check finished in a slice whose arrivals cannot start in it (no time left) stays in the bookmark's
+     progress (`pendingCheck`) with its proven removals, so a later slice reads the arrivals instead of
+     taking the check again; a pass is unchanged.
    - IMAP with no change tracking: each folder's STATUS. A folder whose counters moved is listed
      (`refreshUntrackedFolder`, `otherFolderSlice:`) only while the slice has time to start a listing
      (`.listingNotStarted` otherwise: a later slice of the run lists it). The listing (the 50-message window
@@ -1692,4 +1700,4 @@ listingNotStarted, listedByFullSync, changeRecheckLimit, later wakes, rule-filed
 syncable set, 15-minute clock, clockDue, readCut, cut folder, tried, slow link, ListingRequestBound,
 listing bound, catchUpRequestTimeoutSeconds, Outlook baseline page not passed, baselining readCut, #1110,
 #1358, runRemovalCheck, removal check step, CONDSTORE without QRESYNC, per provider call, account removal,
-headerFetch slot, staging merge.
+headerFetch slot, staging merge, firstFolderDeadline, forFirstFolder, slow NOOP, first folder in the slice, pendingCheck kept.

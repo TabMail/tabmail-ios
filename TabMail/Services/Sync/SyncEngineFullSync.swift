@@ -67,6 +67,19 @@ extension SyncEngine {
         }
     }
 
+    #if DEBUG
+    /// The folder's count of full syncs since its last deep pass, read without
+    /// counting one (`fullSyncIsDeepPass` counts one). Nil: none counted.
+    nonisolated static func fullSyncSkipStreakForTesting(folderId: String) -> Int? {
+        fullSyncSkipStreak.withLock { $0[folderId] }
+    }
+
+    /// Sets the folder's count back (nil removes it), for a test that ends.
+    nonisolated static func setFullSyncSkipStreakForTesting(folderId: String, _ value: Int?) {
+        fullSyncSkipStreak.withLock { $0[folderId] = value }
+    }
+    #endif
+
     /// Full-sync fetch-skip decision. Skip re-fetching a folder ONLY when CONDSTORE proves
     /// nothing changed since our last sync: HIGHESTMODSEQ is present on BOTH sides and
     /// equal. NEVER skip the inbox (always fully synced), a deep pass, or a folder

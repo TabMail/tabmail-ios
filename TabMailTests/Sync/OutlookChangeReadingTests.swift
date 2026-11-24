@@ -241,7 +241,16 @@ struct OutlookChangeReadingTests {
         }
         let world = World(pool: pool, accountId: accountId, server: server, provider: server.provider())
         await AccountManager.shared.clearRecentlyCompletedForTesting()
-        try await body(world)
+        do {
+            try await body(world)
+        } catch {
+            // A test that throws after an apply leaves no download or recount of
+            // this world's account running past its database.
+            await BackfillBodyQueue.shared.emptyForTesting()
+            await ActiveBodyQueue.shared.emptyForTesting()
+            await UnreadCountManager.shared.awaitIdleForTesting()
+            throw error
+        }
         await UnreadCountManager.shared.awaitIdleForTesting()
     }
 

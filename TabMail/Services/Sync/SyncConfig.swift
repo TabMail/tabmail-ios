@@ -909,7 +909,11 @@ enum SyncConfig {
     /// spends the whole slice on one STATUS per folder, no listing ever starts,
     /// and the same folders are read again at every run. A reader whose read is
     /// all its work (a bookmark, an Outlook delta) gets the same time per run in
-    /// more, shorter slices: a run's working time counts slice time only.
+    /// more, shorter slices: a run's working time counts slice time only. The
+    /// share bounds when a folder after the first may start: the read's first
+    /// folder is read in the slice's whole time, so a slow session check before
+    /// it never leaves a slice with no folder read
+    /// (`SyncEngine.otherFolderReadContext`).
     static let otherFolderReadShare: Double = 0.5
     /// About how many messages one IMAP listing range holds (`UID FETCH lo:hi
     /// (UID FLAGS)`, then one membership `UID SEARCH` of the same range). The

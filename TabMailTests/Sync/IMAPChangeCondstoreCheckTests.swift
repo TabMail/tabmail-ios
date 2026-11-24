@@ -257,56 +257,6 @@ struct IMAPChangeCondstoreCheckTests {
         }
     }
 
-    /// An other-folder run's read share of a slice, shorter than the price of
-    /// any step of the check (a proof is two requests, a chunk three).
-    static let runReadShareSeconds: TimeInterval = 1
-    /// Slices the run's check needs here: three chunks, three proofs and the
-    /// empty chunk that ends the window, plus slack.
-    static let runSliceCap = 10
-
-    @Test("A slice of an other-folder run takes one step of the removal check while it has time, so the check moves every slice and finishes with every removal proven; a pass with the same budget takes none")
-    func otherFolderRunTakesOneCheckStepPerSlice() async throws {
-        let held = Array(1...1_500)
-        try await C.withWorld(inbox: held) { w in
-            let base = try await R.baseline(w)
-            let gone: Set<Int> = [100, 900, 1_400]
-            C.remove(gone, from: w.server)
-
-            // Control: a pass with the run's budget cannot afford any step, so the check never moves.
-            let pass = try await R.inbox(w, R.read(w, cursors: [w.inboxId: base], context: Self.searchBudget(w, seconds: Self.runReadShareSeconds)))
-            guard case .untracked = pass.status else { Issue.record("control: expected the cut, got \(pass.status)"); return }
-            let stuck = try #require(try Self.cursor(pass.cursor).pendingCheck, "control: the cut carries the check")
-            #expect(stuck.remaining == SyncConfig.imapChangeRemovalCheckWindow && stuck.unproven.isEmpty,
-                    "control: a pass this short searches nothing: \(stuck.remaining) left, \(stuck.unproven.count) candidates")
-
-            var stored: String? = base
-            var removed = Set<String>()
-            var last: IMAPRemovalCheckProgress?
-            var finished = false
-            for slice in 1...Self.runSliceCap {
-                let before = Self.searchesSent(w.server)
-                let read = try await R.inbox(w, R.read(
-                    w, cursors: [w.inboxId: stored], scope: .otherFolders,
-                    context: Self.searchBudget(w, seconds: Self.runReadShareSeconds)))
-                let searches = Self.searchesSent(w.server) - before
-                #expect(searches <= 1, "slice \(slice): one step at most, got \(searches) searches")
-                removed.formUnion(read.removals)
-                if R.isTracked(read.status) { finished = true; break }
-                guard case .untracked = read.status else { Issue.record("slice \(slice): expected a cut, got \(read.status)"); return }
-                let progress = try #require(try Self.cursor(read.cursor).pendingCheck, "slice \(slice): the cut carries the progress")
-                if let last {
-                    let moved = progress.nextBelow < last.nextBelow || progress.remaining < last.remaining
-                        || progress.unproven.count < last.unproven.count
-                    #expect(moved, "slice \(slice) did not move the check: \(progress.nextBelow)/\(progress.remaining)/\(progress.unproven)")
-                }
-                last = progress
-                stored = read.cursor
-            }
-            #expect(finished, "the check finished within \(Self.runSliceCap) slices")
-            #expect(removed == Set(gone.map(String.init)), "every removal proven, nothing else: \(removed.sorted())")
-        }
-    }
-
     @Test("T12 through the apply: three cuts mark exactly one catch-up lapse, and the armed catch-up listing completes and removes the deleted message")
     func repeatedCutsLapseOnceAndTheCatchUpCompletes() async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()

@@ -148,6 +148,18 @@ extension IMAPProvider {
             }
         }
         guard try await fetchArrivals(toFetch, server: server, context: context, into: &changes) else {
+            // A slice of an other-folder run whose check step finished but
+            // whose arrivals cannot start keeps the finished check and what it
+            // proved, under the old reading position (the cut): the next read
+            // takes no step, fetches the arrivals and commits the check's
+            // bookmark. A pass reads the folder again next pass.
+            if let check, request.scope == .otherFolders {
+                var bookmark = cursor.cleared
+                bookmark.pendingCheck = check
+                return cutFolder(
+                    folder, changes: proven, bookmark: bookmark, arm: created,
+                    observation: observation, selection: selection)
+            }
             return FolderChanges(folderId: folder.id, status: .notRun)
         }
         changes.records += proven.records

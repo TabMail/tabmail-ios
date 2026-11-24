@@ -56,7 +56,9 @@ import SwiftMail
 // A slice of an other-folder run (`ChangeScope.otherFolders`, #1110) reads the
 // request's folders in its order, the same way, and reports a folder it did not
 // reach `.notRun` whatever stopped it, and a folder whose read it started and the
-// slice's time cut `.notRun` with `FolderChanges.readCut` (#1358).
+// slice's time cut `.notRun` with `FolderChanges.readCut` (#1358). Its first
+// folder is read in the slice's whole time (`ChangeContext.firstFolderDeadline`),
+// after the pass-start NOOP however long that took, as long as the slice has time.
 
 /// IMAP's opaque per-folder change bookmark, stored as JSON in
 /// `Folder.changeCursor`. Three server-assigned integers about the mailbox
@@ -223,7 +225,14 @@ extension IMAPProvider {
                     // never a connection lost mid-pass that leaves no failure time.
                     sessionOpened = true
                     while next < work.count {
-                        guard context.hasBudget() else { budgetSpent = true; return }
+                        // A slice of an other-folder run reads its first folder in
+                        // the slice's whole time (`ChangeContext.firstFolderDeadline`),
+                        // so a slow NOOP above never leaves the slice with no folder
+                        // read (#1110); the folders after it start within the read's
+                        // own deadline.
+                        let firstFolder = results.isEmpty ? request.forFirstFolder() : nil
+                        let folderRequest = firstFolder ?? request
+                        guard folderRequest.context.hasBudget() else { budgetSpent = true; return }
                         let folder = work[next]
                         if request.scope != .otherFolders {
                             changeReadFirst.remove(folder.id)
@@ -231,7 +240,7 @@ extension IMAPProvider {
                         }
                         do {
                             var read = try await self.readChangeFolder(
-                                folder, server: server, mode: mode, request: request)
+                                folder, server: server, mode: mode, request: folderRequest)
                             // A run's folder is always sent its STATUS (or SELECT)
                             // first: one that comes back not run was cut by the
                             // slice's time, not left unreached (#1358).

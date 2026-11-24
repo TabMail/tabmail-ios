@@ -8,7 +8,7 @@ import Synchronization
 import Testing
 @testable import TabMail
 
-// MARK: - A run's lifecycle and its slot (#1110)
+// MARK: - A run's lifecycle, its slot and its wait for the slot (#1110)
 
 extension OtherFolderIMAPTests {
 
@@ -92,9 +92,14 @@ extension OtherFolderIMAPTests {
             guard let held = try await Self.holdTheFirstSlice(w) else { return }
             let engine = w.engine
             let accountId = w.accountId
-            // The engine's part of the app leaving the screen
-            // (`SyncScheduler.stopPolling`). The run reads no lifecycle state of
-            // its own, so this is the whole of what the leave can reach.
+            // The app leaves the screen while the slice is held: the app-active
+            // fact `DatabaseSuspension` keeps turns false
+            // (`appDidEnterBackground`), and the engine's part of the leave runs
+            // (`SyncScheduler.stopPolling`). The databases stay resumed, as they
+            // do until the quiesce window ends.
+            DatabaseSuspension.setAppActiveForTesting(false)
+            defer { DatabaseSuspension.setAppActiveForTesting(true) }
+            #expect(!DatabaseSuspension.isAppActive, "precondition: the app is off the screen")
             await engine.cancelMaintenance()
             let running = await engine.otherFolderRunTasks[accountId]
             w.releaseStatus(of: held.first)
@@ -170,6 +175,83 @@ extension OtherFolderIMAPTests {
             #expect(userFirst, "the user action was let in before the slice sent anything: user \(String(describing: userActionAt.get)), slice \(String(describing: sliceAt))")
             #expect(sliceBeforeDownload, "the slice was let in before the download that asked first: slice \(String(describing: sliceAt)), download \(String(describing: downloadAt.get))")
             await letGo()
+        }
+    }
+
+    @Test("A run's working time is its slices' time, not its waits for a slot: a slice that waits for its slot while the run's clock moves on twice its working time still reads, and the run takes its next slice after it")
+    func waitingForTheSlotIsNotWorkingTime() async throws {
+        try await Self.withWorld("slot-wait", .plain) { w in
+            let engine = w.engine
+            let accountId = w.accountId
+            let registered = await engine.workQueues[accountId]
+            let queue = try #require(registered)
+            let width = SyncConfig.imapMaxConnectionCeiling
+            // Read before the slots are taken, so nothing below can throw while
+            // they are held.
+            let account = try w.account()
+
+            // The run's first slice asks both other folders: the second gets new
+            // mail, and the first folder's STATUS is held at the server.
+            let first = OtherFolderShared<String?>(nil)
+            let second = OtherFolderShared<String?>(nil)
+            let newUid = OtherFolderShared<Int?>(nil)
+            await w.watchSlices { folderIds in
+                guard first.get == nil, folderIds.count == Self.others.count else { return }
+                let paths = folderIds.map { w.path(ofId: $0) }
+                let uid = w.nextUid(in: paths[1])
+                w.deliver(uid, to: paths[1])
+                newUid.set(uid)
+                second.set(paths[1])
+                first.set(paths[0])
+                w.holdStatus(of: paths[0])
+            }
+            // Every slot is taken, each by work the test lets go.
+            let gates = (0..<width).map { _ in AsyncStream<Void>.makeStream() }
+            let holders = gates.map { gate in
+                Task { await queue.execute(priority: .userAction) { for await _ in gate.stream { break } } }
+            }
+            func freeTheSlots() async {
+                for gate in gates { gate.continuation.finish() }
+                for holder in holders { await holder.value }
+            }
+            // A failure path disarms the slice hook and lets everything go, so
+            // the run ends.
+            func stop(_ reason: Comment) async {
+                Issue.record(reason)
+                await w.watchSlices()
+                w.releaseStatus(of: first.get)
+                await freeTheSlots()
+                await w.settle()
+            }
+            guard await OneSyncAtATimeTests.eventually({ await queue.activeOperations == width }) else {
+                return await stop("precondition: every slot of the account is taken")
+            }
+            await engine.startOtherFolderRun(account: account)
+            guard await OneSyncAtATimeTests.eventually({ await queue.waitingCount == 1 }) else {
+                return await stop("precondition: the run's first slice waits for a slot")
+            }
+            // The run's clock moves on twice its working time while the slice
+            // waits for its slot.
+            w.offset.add(2 * SyncConfig.otherFolderRunSeconds)
+            let readsWhileWaiting = Self.others.map { w.statusCount($0) }.reduce(0, +)
+            #expect(readsWhileWaiting == 0, "the slice sent nothing while it waited for its slot")
+
+            await freeTheSlots()
+            guard await OneSyncAtATimeTests.eventually({ w.isHoldingStatus(of: first.get) }),
+                  let secondPath = second.get, let uid = newUid.get else {
+                return await stop("precondition: once it had its slot, the slice read its first folder")
+            }
+            // The slice's own time runs out while its first read is held, so it
+            // stops after that folder. The run's working time is that slice's
+            // time alone, so the run takes its next slice for the second folder.
+            w.offset.add(SyncConfig.catchUpSliceSeconds + 1)
+            w.releaseStatus(of: first.get)
+            await w.settle()
+
+            let slices = w.runSlices.count
+            let arrived = try w.holds(uid, in: secondPath)
+            #expect(slices >= 2, "the run took its next slice after the one that waited for its slot: \(slices) slices")
+            #expect(arrived, "which read \(secondPath) and brought its new mail")
         }
     }
 }

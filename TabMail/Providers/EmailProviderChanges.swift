@@ -108,14 +108,22 @@ struct ChangeContext: Sendable {
     let deadline: Date
     /// The clock the budget is measured on; injectable for tests.
     let clock: @Sendable () -> Date
+    /// In a slice of an other-folder run (#1110), the slice's end. The read's
+    /// FIRST folder is read in the slice's whole time: its requests start while
+    /// the clock is before this instant (each bounded as usual, none after it),
+    /// so a slow check of the session before it (IMAP's NOOP) cannot spend the
+    /// read's share and leave the slice with no folder read. Every later folder
+    /// starts only within `deadline`. Nil: every folder reads within `deadline`.
+    let firstFolderDeadline: Date?
     /// The reader calls this with the number of messages it is about to fetch,
     /// so the engine can show "downloading N".
     let onProgress: @Sendable (Int) -> Void
 
     init(deadline: Date = .distantFuture, clock: @escaping @Sendable () -> Date = { Date() },
-         onProgress: @escaping @Sendable (Int) -> Void) {
+         firstFolderDeadline: Date? = nil, onProgress: @escaping @Sendable (Int) -> Void) {
         self.deadline = deadline
         self.clock = clock
+        self.firstFolderDeadline = firstFolderDeadline
         self.onProgress = onProgress
     }
 
@@ -155,6 +163,17 @@ struct ChangeRequest: Sendable {
         self.recheck = recheck
         self.context = context
         self.localRows = localRows
+    }
+
+    /// This request with the time its first folder is read in
+    /// (`ChangeContext.firstFolderDeadline`) as its deadline, or nil when it
+    /// has none.
+    func forFirstFolder() -> ChangeRequest? {
+        guard let end = context.firstFolderDeadline else { return nil }
+        return ChangeRequest(
+            folders: folders, scope: scope, recheck: recheck,
+            context: ChangeContext(deadline: end, clock: context.clock, onProgress: context.onProgress),
+            localRows: localRows)
     }
 }
 
