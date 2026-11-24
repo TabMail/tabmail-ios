@@ -81,11 +81,26 @@ struct UpgradeStepTests {
         }
     }
 
-    private static func statisticsRows(_ pool: DatabasePool) throws -> Set<String> {
+    /// Every index's `sqlite_stat1` row, index name to stat text. The migrations
+    /// already wrote rows for the indexes they analyzed while the tables were empty
+    /// (leading count 0), so "the step ran `ANALYZE`" shows as changed values, not
+    /// as rows appearing.
+    private static func statistics(_ pool: DatabasePool) throws -> [String: String] {
         try pool.read { db in
-            guard try db.tableExists("sqlite_stat1") else { return [] }
-            return Set(try String.fetchAll(db, sql: "SELECT idx FROM sqlite_stat1 WHERE idx IS NOT NULL"))
+            guard try db.tableExists("sqlite_stat1") else { return [:] }
+            let rows = try Row.fetchAll(db, sql: "SELECT idx, stat FROM sqlite_stat1 WHERE idx IS NOT NULL")
+            var byIndex: [String: String] = [:]
+            for row in rows {
+                let index: String = row["idx"]
+                byIndex[index] = row["stat"]
+            }
+            return byIndex
         }
+    }
+
+    /// The entry count a stat row records for its index (its leading integer).
+    private static func recordedCount(_ stat: String?) -> Int? {
+        stat?.split(separator: " ").first.flatMap { Int($0) }
     }
 
     private static func schemaVersion(_ pool: DatabasePool) throws -> Int? {
@@ -108,7 +123,7 @@ struct UpgradeStepTests {
         let after = try Self.existingIndexes(fixture.pool)
         let missing = deferred.subtracting(after)
         #expect(missing.isEmpty, "deferred indexes missing after the upgrade step: \(missing.sorted())")
-        let withoutStatistics = deferred.subtracting(try Self.statisticsRows(fixture.pool))
+        let withoutStatistics = deferred.subtracting(try Self.statistics(fixture.pool).keys)
         #expect(withoutStatistics.isEmpty,
                 "deferred indexes with no sqlite_stat1 row after the upgrade step: \(withoutStatistics.sorted())")
         let marker = fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) as? Int
@@ -128,7 +143,7 @@ struct UpgradeStepTests {
         let fixture = try Self.makeFixture()
         defer { Self.tearDown(fixture) }
         let indexesBefore = try Self.existingIndexes(fixture.pool)
-        let statisticsBefore = try Self.statisticsRows(fixture.pool)
+        let statisticsBefore = try Self.statistics(fixture.pool)
         let versionBefore = try Self.schemaVersion(fixture.pool)
 
         let outcome = await AppDatabase.runUpgradeStep(
@@ -136,7 +151,8 @@ struct UpgradeStepTests {
         #expect(outcome == nil)
 
         #expect(try Self.existingIndexes(fixture.pool) == indexesBefore)
-        #expect(try Self.statisticsRows(fixture.pool) == statisticsBefore)
+        let statisticsAfter = try Self.statistics(fixture.pool)
+        #expect(statisticsAfter == statisticsBefore)
         #expect(try Self.schemaVersion(fixture.pool) == versionBefore)
         #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
     }
@@ -164,7 +180,12 @@ struct UpgradeStepTests {
                 "the fixture must start without the deferred indexes, or the build proves nothing")
         let migrationBuilt = try Self.fullMessageHeaderIndexes(fixture.pool)
         #expect(!migrationBuilt.isEmpty, "the schema must have a migration-built messageHeader index")
-        #expect(try Self.statisticsRows(fixture.pool).isEmpty)
+        // The migrations analyzed an empty table, so no full index records the
+        // seeded mail yet; the build has to be what writes it.
+        let statisticsBefore = try Self.statistics(fixture.pool)
+        let alreadyCounted = migrationBuilt.filter { Self.recordedCount(statisticsBefore[$0]) == Self.seededMessages }
+        #expect(alreadyCounted.isEmpty,
+                "migration-built indexes already record the seeded mail before the build: \(alreadyCounted.sorted())")
 
         let db = try await AppDatabase.openForLaunch(
             pool: fixture.pool, isUpgradeLaunch: true, runStartupResets: false, defaults: fixture.defaults)
@@ -174,14 +195,15 @@ struct UpgradeStepTests {
         // could publish the database.
         let missing = deferred.subtracting(try Self.existingIndexes(fixture.pool))
         #expect(missing.isEmpty, "deferred indexes missing after the launch build: \(missing.sorted())")
-        let statistics = try Self.statisticsRows(fixture.pool)
-        let deferredWithout = deferred.subtracting(statistics)
+        let statistics = try Self.statistics(fixture.pool)
+        let deferredWithout = deferred.subtracting(statistics.keys)
         #expect(deferredWithout.isEmpty,
                 "deferred indexes with no sqlite_stat1 row after the launch build: \(deferredWithout.sorted())")
-        // The ANALYZE covers the whole database, not only the indexes it built.
-        let migrationBuiltWithout = migrationBuilt.subtracting(statistics)
-        #expect(migrationBuiltWithout.isEmpty,
-                "migration-built messageHeader indexes with no sqlite_stat1 row: \(migrationBuiltWithout.sorted())")
+        // The ANALYZE covers the whole database, not only the indexes it built: every
+        // full messageHeader index now records the seeded mail.
+        let migrationBuiltStale = migrationBuilt.filter { Self.recordedCount(statistics[$0]) != Self.seededMessages }
+        #expect(migrationBuiltStale.isEmpty,
+                "migration-built messageHeader indexes not recording the \(Self.seededMessages) seeded rows: \(migrationBuiltStale.sorted())")
         let marker = fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) as? Int
         let liveVersion = try Self.schemaVersion(fixture.pool)
         #expect(marker != nil && marker == liveVersion,
@@ -196,7 +218,7 @@ struct UpgradeStepTests {
         let existing = try Self.existingIndexes(fixture.pool)
         #expect(!deferred.isEmpty && deferred.isDisjoint(with: existing),
                 "the fixture must start without the deferred indexes, or the launches prove nothing")
-        #expect(try Self.statisticsRows(fixture.pool).isEmpty)
+        let statisticsBefore = try Self.statistics(fixture.pool)
 
         // The first launch after the update is a background one (a silent push):
         // the file existed and the update left upgrade work.
@@ -208,7 +230,8 @@ struct UpgradeStepTests {
             defaults: fixture.defaults)
         let builtInBackground = deferred.intersection(try Self.existingIndexes(fixture.pool))
         #expect(builtInBackground.isEmpty, "a background launch built deferred indexes: \(builtInBackground.sorted())")
-        #expect(try Self.statisticsRows(fixture.pool).isEmpty, "a background launch ran ANALYZE")
+        let statisticsAfterBackground = try Self.statistics(fixture.pool)
+        #expect(statisticsAfterBackground == statisticsBefore, "a background launch ran ANALYZE")
         #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
 
         // The next launch is the user opening the app: an upgrade launch, so the
@@ -221,7 +244,7 @@ struct UpgradeStepTests {
             defaults: fixture.defaults)
         let missing = deferred.subtracting(try Self.existingIndexes(fixture.pool))
         #expect(missing.isEmpty, "deferred indexes missing after the foreground launch: \(missing.sorted())")
-        let withoutStatistics = deferred.subtracting(try Self.statisticsRows(fixture.pool))
+        let withoutStatistics = deferred.subtracting(try Self.statistics(fixture.pool).keys)
         #expect(withoutStatistics.isEmpty,
                 "deferred indexes with no sqlite_stat1 row after the foreground launch: \(withoutStatistics.sorted())")
         let marker = fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) as? Int
@@ -484,14 +507,15 @@ struct UpgradeStepTests {
         let fixture = try Self.makeFixture()
         defer { Self.tearDown(fixture) }
         let indexesBefore = try Self.existingIndexes(fixture.pool)
-        let statisticsBefore = try Self.statisticsRows(fixture.pool)
+        let statisticsBefore = try Self.statistics(fixture.pool)
 
         let db = try await AppDatabase.openForLaunch(
             pool: fixture.pool, isUpgradeLaunch: false, runStartupResets: false, defaults: fixture.defaults)
         #expect(db.dbPool === fixture.pool)
 
         #expect(try Self.existingIndexes(fixture.pool) == indexesBefore)
-        #expect(try Self.statisticsRows(fixture.pool) == statisticsBefore)
+        let statisticsAfter = try Self.statistics(fixture.pool)
+        #expect(statisticsAfter == statisticsBefore)
         #expect(fixture.defaults.object(forKey: SyncEngine.plannerStatisticsSchemaVersionKey) == nil)
     }
 }
