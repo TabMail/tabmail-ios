@@ -878,33 +878,20 @@ struct ChatNewThreadScreenTests {
                     #expect(Self.panelOpen(screen), "control: the panel is open")
 
                     let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
-                    var copy = MessageHeader(
-                        messageId: "screen-sent-copy-panel", subject: "Lunch", from: "me@example.com", fromAddress: "me@example.com",
-                        to: "maria@example.com", date: Date(), snippet: "Lunch on Friday?",
-                        folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: "Sent"),
-                        accountId: Self.accountId, folderPath: "Sent", isInInbox: false)
-                    copy.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
-                    copy.headerComplete = true
-                    copy.bodyComplete = true
-                    copy.isRead = true
-                    let stored = copy
-                    try await fixture.pool.write { try stored.insert($0) }
+                    let copy = Self.sentFolderHeader("screen-sent-copy-panel", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    try await fixture.pool.write { try copy.insert($0) }
 
-                    @MainActor func isThread() -> Bool {
-                        let ids = HostedAccessibility.identifiers(in: screen.view)
-                        return ids.contains(ChatThreadView.forwardId) && Self.labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
-                    }
                     // Longer than the swap takes with nothing open (`sentCopyTurnsTheChatIntoItsThread`).
                     for _ in 0..<30 {
-                        if isThread() || !Self.panelOpen(screen) { break }
+                        if Self.isThread(screen) || !Self.panelOpen(screen) { break }
                         try await Task.sleep(for: .milliseconds(100))
                     }
-                    #expect(!isThread(), "the swap waits while the panel is open")
+                    #expect(!Self.isThread(screen), "the swap waits while the panel is open")
                     #expect(Self.panelOpen(screen), "the panel the user opened stays")
 
                     #expect(HostedAccessibility.activate("chatClose", in: screen.view), "the panel's close takes a tap")
-                    try await Self.waitUntil { isThread() }
-                    #expect(isThread(), "with the panel closed, the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    #expect(Self.isThread(screen), "with the panel closed, the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
                     #expect(screen.stage.pushed != nil, "control: still open")
                 }
             }
