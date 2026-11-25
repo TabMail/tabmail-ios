@@ -178,10 +178,13 @@ final class PendingSendService {
     /// keeps exactly one visible Undo. The bubble offers it for a reply (the chat shows a send by its
     /// In-Reply-To, `ChatUnsentReply`) sent with the chat view on (read once at the Send tap) from a
     /// compose the chat opened for one of its own emails (`ComposeScreen.chat`, given as the compose
-    /// opened): that compose closes back onto the chat that shows the bubble. Every other send keeps
-    /// the toast: a new email, a reply from a compose opened anywhere else (the Drafts list, the
-    /// inbox, the compose an Undo reopens), and a chat's card for an email of another thread, whose
-    /// screen shows no bubble. A later change that gives new emails a bubble changes this one rule.
+    /// opened): that compose closes back onto the chat that shows the bubble. The compose an Undo
+    /// reopens counts as the chat's when the bubble's Undo reopened it (`ReopenSnapshot.openedOn`):
+    /// the Undo was made in that chat, so a send again shows its bubble filling again. Every other
+    /// send keeps the toast: a new email, a reply from a compose opened anywhere else (the Drafts
+    /// list, the inbox, the compose the toast's Undo reopens), and a chat's card for an email of
+    /// another thread, whose screen shows no bubble. A later change that gives new emails a bubble
+    /// changes this one rule.
     nonisolated static func sendHasBubbleUndo(
         chatViewActive: Bool, openedOn: ComposeScreen?, inReplyTo: String?
     ) -> Bool {
@@ -208,6 +211,11 @@ final class PendingSendService {
         /// Whether the confirmed Undo also saved the kept row back to Drafts.
         /// `false` reopens the compose as unsaved, so Close asks to save it.
         let returnedToDrafts: Bool
+        /// The screen the reopened compose records as opened on (`ComposeView.openedOn`), from
+        /// the Undo that cancelled the send: the chat after its bubble's Undo, so a send again
+        /// from this compose has its Undo on the bubble again; nil after the toast's Undo, so it
+        /// keeps the toast (`sendHasBubbleUndo`).
+        let openedOn: ComposeScreen?
     }
 
     private(set) var current: Pending?
@@ -453,8 +461,12 @@ final class PendingSendService {
                 return .refused
             }
             clearToast(ifShowing: p.id)
+            // The Undo is the toast's only when the toast owns this send (`undoOwners`, still
+            // set here; `endUndone` clears it after). Any other Undo is the bubble's, made in
+            // the chat that shows it, so the compose it reopens is that chat's.
             return .reopen(ReopenSnapshot(
-                id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts))
+                id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts,
+                openedOn: undoOwners[p.id] == .toast ? nil : .chat))
         }
     }
 
