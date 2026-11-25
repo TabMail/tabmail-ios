@@ -59,10 +59,17 @@ enum ChatSwipe {
         guard finished else { return .closed }
         let distance = offset * sign
         let flick = velocity * sign
-        if allowsFull, width > 0, distance > width * ChatViewLayout.swipeFullFraction { return .full }
+        if isPastFull(offset: offset, sign: sign, width: width, allowsFull: allowsFull) { return .full }
         if flick < -ChatViewLayout.swipeFlickVelocity { return .closed }
         if distance > revealWidth / 2 || (distance > 0 && flick > ChatViewLayout.swipeFlickVelocity) { return .open }
         return .closed
+    }
+
+    /// Whether a drag at `offset` is past the full-swipe point, where a finished let-go runs the edge
+    /// button whatever its speed (`settle`). The reveal shows it while the finger is down: the edge
+    /// button's icon grows, and a haptic marks the crossing.
+    static func isPastFull(offset: CGFloat, sign: CGFloat, width: CGFloat, allowsFull: Bool) -> Bool {
+        allowsFull && width > 0 && offset * sign > width * ChatViewLayout.swipeFullFraction
     }
 
     /// Whether a reveal's pan takes a sideways drag, from what is open and where the drag starts.
@@ -210,25 +217,42 @@ struct ChatSwipeReveal: ViewModifier {
     @State private var width: CGFloat = 0
     @State private var frame: CGRect = .null
     @State private var buttonsFrame: CGRect = .null
+    /// Counts the full swipes that ran their edge button: each one is a haptic.
+    @State private var fullSwipes = 0
 
     private var sign: CGFloat { edge == .trailing ? -1 : 1 }
     private var revealWidth: CGFloat { CGFloat(buttons.count) * ChatViewLayout.swipeButtonWidth }
     private var edgeButton: ChatSwipeButton? { edge == .trailing ? buttons.last : buttons.first }
+    /// The drag is past the full-swipe point: letting go now runs the edge button.
+    private var isPastFull: Bool {
+        ChatSwipe.isPastFull(offset: drag.offset, sign: sign, width: width, allowsFull: allowsFullSwipe)
+    }
     private static let spring = Animation.spring(response: ChatViewLayout.swipeSpringResponse, dampingFraction: 0.86)
+    private static let iconSpring = Animation.spring(response: ChatViewLayout.swipeFullIconSpringResponse,
+                                                     dampingFraction: ChatViewLayout.swipeFullIconSpringDamping)
+    /// How far the grown edge icon reaches above and below its round button.
+    nonisolated private static let iconRoom = ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2
 
     func body(content: Content) -> some View {
         content
             .offset(x: drag.offset)
             .overlay(alignment: edge == .trailing ? .trailing : .leading) {
                 if drag.offset != 0 {
-                    HStack(spacing: 0) {
+                    // Top-aligned, so the round buttons sit in one row whatever their labels.
+                    HStack(alignment: .top, spacing: 0) {
                         ForEach(buttons) { button in
                             buttonView(button)
                         }
                     }
+                    // Room above and below for the edge icon grown past the full-swipe point, so
+                    // the clip (which keeps the buttons inside the revealed width) never flattens it.
+                    .padding(.vertical, Self.iconRoom)
                     .frame(width: abs(drag.offset), alignment: edge == .trailing ? .leading : .trailing)
                     .clipped()
-                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(ChatSwipeOpen.space)) } action: {
+                    // The buttons' own frame, without that room: a tap beside them only closes.
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .named(ChatSwipeOpen.space)).insetBy(dx: 0, dy: Self.iconRoom)
+                    } action: {
                         buttonsFrame = $0
                         open.moved(id, frame: frame, buttons: $0)
                     }
@@ -248,6 +272,10 @@ struct ChatSwipeReveal: ViewModifier {
                                         startsAtScreenEdge: atEdge)
                 },
                 changed: changed, ended: ended))
+            // The system's haptics: one as the drag crosses the full-swipe point (the edge button's
+            // icon grows then), one when a full swipe runs the edge button.
+            .sensoryFeedback(.impact(weight: .medium), trigger: isPastFull) { _, past in past }
+            .sensoryFeedback(.success, trigger: fullSwipes)
             // A swipe torn down mid-drag or while it settles lets the data it held through, and an
             // open reveal whose view leaves the chat is no longer open.
             .onDisappear {
@@ -268,6 +296,7 @@ struct ChatSwipeReveal: ViewModifier {
                           width: width, allowsFull: allowsFullSwipe) {
         case .full:
             close()
+            fullSwipes += 1
             edgeButton?.action()
         case .open:
             open.open(id, frame: frame, buttons: buttonsFrame)
@@ -293,11 +322,16 @@ struct ChatSwipeReveal: ViewModifier {
                     .foregroundStyle(.white)
                     .frame(width: ChatViewLayout.swipeCircleSize, height: ChatViewLayout.swipeCircleSize)
                     .background(button.tint, in: Circle())
+                    // Past the full-swipe point the edge button's icon grows: letting go runs it.
+                    .scaleEffect(button.id == edgeButton?.id && isPastFull ? ChatViewLayout.swipeFullIconScale : 1)
+                    .animation(Self.iconSpring, value: isPastFull)
+                // One line, centered under its button: a longer title ("Unread from here") shrinks
+                // to fit rather than wrapping.
                 Text(button.title)
                     .font(.caption2)
                     .foregroundStyle(Theme.textSecondary)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
+                    .lineLimit(1)
+                    .minimumScaleFactor(ChatViewLayout.swipeLabelMinScale)
             }
             .frame(width: ChatViewLayout.swipeButtonWidth)
         }

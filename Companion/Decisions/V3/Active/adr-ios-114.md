@@ -892,6 +892,24 @@ same AI result, kept as long as the email itself is shown.
    as opening it does); Unread stays on the newest email.
    **Product choices of the swipes:** Unread from here skips the user's own emails. Decided
    2026-11-15. A bubble has no full swipe: this follows the 2026-11-04 swipe rules.
+   *Amended 2026-11-25 (simulator check of the whole branch):* a bubble has a full swipe, which
+   replaces the earlier "a bubble has no full swipe" (decided at that check). A long
+   right swipe opened the buttons and stopped there (`allowsFullSwipe: false`, and the clamp held the
+   drag at the buttons' width), so it never ran the read action and read as broken beside the left
+   swipe's full Archive. The read action is the right swipe's edge button, so a full right swipe runs
+   Unread from here or Read up to here. Both swipes show the full-swipe point: past it the edge
+   button's round icon grows (`ChatViewLayout.swipeFullIconScale`, spring
+   `swipeFullIconSpringResponse`), and the system haptic (`.sensoryFeedback(.impact)`) fires once as
+   the drag crosses it; a full swipe that runs its button fires `.success`. The hint and the let-go
+   read one rule (`ChatSwipe.isPastFull`, which `settle` uses). The clip that keeps the buttons inside
+   the revealed width leaves room above and below for the grown icon, and the frame an open reveal
+   owns for taps stays the buttons' row, so a tap above or below them still only closes. The swipe stays custom: SwiftUI's
+   `.swipeActions` exist only on `List` rows. A label stays on one line, shrinking to
+   `ChatViewLayout.swipeLabelMinScale`, and the round buttons are top-aligned in one row: "Unread
+   from here" wrapped onto two lines and lifted its button above Move's. Tests:
+   `ChatSwipeTests.fullSwipeHintMatchesTheLetGo`, `fullSwipeFeelWiring`, `bubbleSwipeWiring`;
+   `ChatSwipeUITests.testFullRightSwipeOnABubbleRunsUnreadFromHere`,
+   `testOwnActionsOpenTapJustAboveTheButtonsOnlyCloses`.
    **Decided 2026-11-06:** a whole-chat action leaves the user's sent copies and
    drafts where they are (a draft must stay in Drafts to stay editable; on Gmail a sent copy is the
    same email as its other labels).

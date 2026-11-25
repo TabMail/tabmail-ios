@@ -657,9 +657,11 @@ struct ChatThreadView: View {
                 ChatSwipeButton(title: "\(button.title) chat", systemImage: button.systemImage, tint: button.tint, action: button.action)
             },
             onOpen: { cardMessage = item.header })
+        // A full right swipe runs the read action at the edge (Unread from here, Read up to here), as
+        // a full left swipe archives.
         .modifier(ChatSwipeReveal(
             id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread),
-            allowsFullSwipe: false, open: swipeOpen))
+            allowsFullSwipe: true, open: swipeOpen))
         .id(item.id)
         // Shown by one rule for every height (`ChatRowVisibility`), measured against the scroll
         // view, so a row taller than the screen is shown too.
@@ -876,7 +878,8 @@ struct ChatThreadView: View {
         return buttons
     }
 
-    /// Right swipe: Unread from here (or Read up to here) for this email, Move for the whole chat.
+    /// Right swipe: Unread from here (or Read up to here) for this email, at the edge so a full swipe
+    /// runs it; Move for the whole chat.
     private func bubbleSwipeButtons(_ item: ChatThread.Item, thread: ChatThread) -> [ChatSwipeButton] {
         let action = ChatSwipe.ReadAction(for: item.header)
         return [
