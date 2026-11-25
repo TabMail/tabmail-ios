@@ -346,6 +346,16 @@ struct ChatUndoSendTests {
         #expect(bubbles == 1, "the bubble needs the chat view, a compose the chat opened, and a reply")
     }
 
+    @Test("A new email sent from the compose card its own chat opened has its Undo on that chat's bubble with the chat view on, though it has no In-Reply-To")
+    func newEmailChatHasTheBubble() {
+        #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .newEmailChat, inReplyTo: nil),
+                "the new email's chat shows the send, found by the card's draft")
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, openedOn: .newEmailChat, inReplyTo: nil),
+                "with the chat view off, the toast")
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: nil),
+                "control: a new email from an email's chat keeps the toast")
+    }
+
     /// The presenters that offer a send's Undo right now, read as the app reads them: the toast
     /// RootView shows (`visibleToast`), and the bubble of a chat showing the row.
     private static func presenters(of row: OutboxMessage, chat: Set<String>, pool: DatabasePool) async throws -> Int {
@@ -471,6 +481,108 @@ struct ChatUndoSendTests {
 
         service.finishReopen()
         #expect(service.reopenSnapshot?.id == reply.id, "the second compose opens when the first closes")
+    }
+
+    @Test("A new email's chat finds its send by the card's draft: the row while it is queued, then its copy in the account's Sent folder by Message-ID, after the row has gone too")
+    func newEmailSendFoundByItsDraft() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let fixture = try await Self.makeFixture(pool)
+        var key = ChatNewEmailSend.Key(draftId: "draft-found")
+        let nothing = try await pool.read { [key] in try ChatNewEmailSend.fetch(key, db: $0) }
+        #expect(nothing == ChatNewEmailSend(reply: nil, email: nil, sentCopyId: nil), "nothing sent yet")
+
+        _ = try await Self.queueReply(fixture, draftId: "draft-other", newEmail: true)
+        let row = try await Self.queueReply(fixture, draftId: "draft-found", newEmail: true)
+        let queued = try await pool.read { [key] in try ChatNewEmailSend.fetch(key, db: $0) }
+        #expect(queued.reply?.id == row.id, "the row of the card's own draft, not another send's")
+        let rowMessageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+        let messageId = EmailFilter.normalizeMessageId(rowMessageId)
+        let email = ChatNewEmailSend.Email(accountId: row.accountId, messageId: messageId)
+        #expect(queued.email == email, "the email the row names")
+        #expect(queued.sentCopyId == nil && queued.reply?.filed == false, "no Sent copy yet")
+
+        // A copy outside the Sent folder (the email received back, say) is not the sent copy.
+        func header(_ id: String, folder: String) -> MessageHeader {
+            var header = MessageHeader(
+                messageId: id, subject: "Re: Lunch plans", from: "me@example.com", fromAddress: "me@example.com",
+                to: "sender@example.com", date: Date(), snippet: "Tuesday",
+                folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: folder),
+                accountId: Self.account, folderPath: folder, isInInbox: folder == "INBOX")
+            header.rfc822MessageId = messageId
+            return header
+        }
+        let received = header("found-received", folder: "INBOX")
+        try await pool.write { try received.insert($0) }
+        let elsewhere = try await pool.read { [key] in try ChatNewEmailSend.fetch(key, db: $0) }
+        #expect(elsewhere.sentCopyId == nil, "a copy in another folder is not the sent copy")
+
+        let copy = header("found-sent", folder: "Sent")
+        try await pool.write { try copy.insert($0) }
+        let filed = try await pool.read { [key] in try ChatNewEmailSend.fetch(key, db: $0) }
+        #expect(filed.sentCopyId == copy.id, "the copy in the account's Sent folder")
+        #expect(filed.reply?.filed == true, "the bubble reads as filed")
+
+        // The row gone before the chat saw the copy: the email the chat kept from the row finds it.
+        let rowId = row.id
+        _ = try await pool.write { try OutboxMessage.deleteOne($0, key: rowId) }
+        let forgotten = try await pool.read { [key] in try ChatNewEmailSend.fetch(key, db: $0) }
+        #expect(forgotten == ChatNewEmailSend(reply: nil, email: nil, sentCopyId: nil), "control: with no email kept, nothing names it")
+        key.email = email
+        let kept = try await pool.read { [key] in try ChatNewEmailSend.fetch(key, db: $0) }
+        #expect(kept.reply == nil && kept.sentCopyId == copy.id, "the kept email finds the Sent copy")
+    }
+
+    @Test("Undo on a new email's chat's bubble reopens a compose that records that chat; the chat modal on top presents the outcome, and RootView only once none is open")
+    func newEmailChatPresentsItsUndoOutcome() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        let search = UUID(), chat = UUID()
+        defer {
+            service.chatModalClosed(chat)
+            service.chatModalClosed(search)
+            service.dismiss()
+            service.resetUndoOwnersForTesting()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        #expect(service.chatModals.isEmpty, "control: no chat modal is open")
+        let fixture = try await Self.makeFixture(pool)
+        let email = try await Self.queueReply(fixture, draftId: "draft-new-email-chat", newEmail: true)
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, email.id, hold)
+        service.present(outboxId: email.id, draftId: "draft-new-email-chat", instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
+        // Search open, and a new email's chat over it.
+        service.chatModalOpened(search)
+        service.chatModalOpened(chat)
+        #expect(service.chatModals == [search, chat])
+        #expect(service.reopen(presentedBy: chat) == nil && !service.closesForOutcome(search), "control: nothing waits yet")
+
+        service.undoAndReopen(PendingSendService.Pending(
+            id: email.id, draftId: "draft-new-email-chat", instanceEpoch: "E1", toSummary: "",
+            presentedAt: Date(), holdUntil: hold), bubbleScreen: .newEmailChat)
+        let reopen = try #require(service.reopenSnapshot, "the bubble's Undo reopens the compose")
+        #expect(reopen.openedOn == .newEmailChat, "the reopened compose records the new email's chat, so a send again keeps its bubble")
+        #expect(service.reopen(presentedBy: chat)?.id == email.id, "the chat on top presents it over itself")
+        #expect(service.reopen(presentedBy: search) == nil, "not Search under it")
+        #expect(!service.closesForOutcome(search), "and Search under it stays open")
+        #expect(service.topLevelReopen == nil, "RootView waits while a chat modal is open")
+
+        // The chat closed (Back) before its compose opened: Search is on top, and closes for it.
+        service.chatModalClosed(chat)
+        #expect(service.reopen(presentedBy: chat) == nil)
+        #expect(service.closesForOutcome(search), "Search, now on top, closes so RootView can present it")
+        #expect(service.topLevelReopen == nil)
+        service.chatModalClosed(search)
+        #expect(service.topLevelReopen?.id == email.id, "with none open, RootView presents it")
+
+        // A screen that opens again goes to the top.
+        service.chatModalOpened(chat)
+        service.chatModalOpened(search)
+        service.chatModalOpened(chat)
+        #expect(service.chatModals == [search, chat])
     }
 
     @Test("RootView shows the toast only for a send whose Undo is not on a bubble, and both Undos share one reopen")
@@ -1075,9 +1187,9 @@ struct ChatUndoSendTests {
         let fixture = try await Self.makeFixture(pool)
         let row = try await Self.queueReply(fixture, draftId: "draft-db-sent")
         try await Self.setHold(pool, row.id, Date().addingTimeInterval(3600))
-        // The summary made at Send, which the bubble shows (`ChatUnsentReply.summary`): the real Send
-        // writes it to the AI cache under the row's Sent folder and Message-ID; the queue write alone
-        // does not. The cache keeps a summary's text only with its blurb, as `SentEmailSummary` writes both.
+        // The summary made at Send, which the bubble shows (`SentEmailSummary.textMessage`): the real
+        // Send writes it to the AI cache under the row's Sent folder and Message-ID; this queue write,
+        // with no text version, does not. The cache keeps a summary's text only with its blurb, as `SentEmailSummary` writes both.
         let sentMessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId, "control: the queued row has its Message-ID"))
         try await pool.write { db in
             try MessageAICache.writeThrough(

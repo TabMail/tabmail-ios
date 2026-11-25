@@ -175,20 +175,28 @@ final class PendingSendService {
     }
 
     /// Whether the send gets a chat bubble with its own Undo, so its toast is not shown. Every send
-    /// keeps exactly one visible Undo. The bubble offers it for a reply (the chat shows a send by its
-    /// In-Reply-To, `ChatUnsentReply`) sent with the chat view on (read once at the Send tap) from a
-    /// compose the chat opened for one of its own emails (`ComposeScreen.chat`, given as the compose
-    /// opened): that compose closes back onto the chat that shows the bubble. The compose an Undo
-    /// reopens counts as the chat's when the bubble's Undo reopened it (`ReopenSnapshot.openedOn`):
-    /// the Undo was made in that chat, so a send again shows its bubble filling again. Every other
-    /// send keeps the toast: a new email, a reply from a compose opened anywhere else (the Drafts
-    /// list, the inbox, the compose the toast's Undo reopens), and a chat's card for an email of
-    /// another thread, whose screen shows no bubble. A later change that gives new emails a bubble
-    /// changes this one rule.
+    /// keeps exactly one visible Undo. With the chat view on (read once at the Send tap), the bubble
+    /// offers it for:
+    /// - a reply (the chat shows a send by its In-Reply-To, `ChatUnsentReply`) from a compose the
+    ///   chat opened for one of its own emails (`ComposeScreen.chat`, given as the compose opened):
+    ///   that compose closes back onto the chat that shows the bubble;
+    /// - a new email from the card its new email's chat opened (`ComposeScreen.newEmailChat`): that
+    ///   chat shows the send by the card's draft (`ChatNewEmailSend`), In-Reply-To or not.
+    ///
+    /// The compose an Undo reopens counts as the bubble's screen's when the bubble's Undo reopened it
+    /// (`ReopenSnapshot.openedOn`): the Undo was made on that screen, so a send again shows its
+    /// bubble filling again. Every other send keeps the toast: a new email from anywhere else, a
+    /// reply from a compose opened anywhere else (the Drafts list, the inbox, the compose the toast's
+    /// Undo reopens), and a chat's card for an email of another thread, whose screen shows no bubble.
     nonisolated static func sendHasBubbleUndo(
         chatViewActive: Bool, openedOn: ComposeScreen?, inReplyTo: String?
     ) -> Bool {
-        chatViewActive && openedOn == .chat && inReplyTo != nil
+        guard chatViewActive else { return false }
+        switch openedOn {
+        case .chat: return inReplyTo != nil
+        case .newEmailChat: return true
+        case nil: return false
+        }
     }
 
     struct RetainedDraftAuthority: Sendable, Equatable {
@@ -212,9 +220,9 @@ final class PendingSendService {
         /// `false` reopens the compose as unsaved, so Close asks to save it.
         let returnedToDrafts: Bool
         /// The screen the reopened compose records as opened on (`ComposeView.openedOn`), from
-        /// the Undo that cancelled the send: the chat after its bubble's Undo, so a send again
-        /// from this compose has its Undo on the bubble again; nil after the toast's Undo, so it
-        /// keeps the toast (`sendHasBubbleUndo`).
+        /// the Undo that cancelled the send: the bubble's screen after its Undo (a chat, or a new
+        /// email's chat), so a send again from this compose has its Undo on the bubble again; nil
+        /// after the toast's Undo, so it keeps the toast (`sendHasBubbleUndo`).
         let openedOn: ComposeScreen?
         /// The undone send's text version, when it had one: sent again with its body unchanged,
         /// the reopened compose's email keeps it (`ComposeView.writtenEmail`).
@@ -265,27 +273,45 @@ final class PendingSendService {
 
     var reopenSnapshot: ReopenSnapshot? { reopenQueue.first }
 
-    /// Modals open over RootView that can hold a chat, and so a bubble's Undo (the Search sheet,
-    /// `chatModalSheet`). RootView is the one presenter of an Undo's outcome, the reopened compose
-    /// and the "Couldn't undo" notice, and UIKit cannot present it over another modal. So once an
-    /// outcome waits (`outcomeWaits`), those modals close themselves, and RootView presents only
-    /// while none is open (`topLevelReopen`, `topLevelUndoFailureMessage`). The head of the queue
-    /// is never tried under a modal, so it never stalls there and nothing waits behind it.
-    private(set) var openChatModals = 0
+    /// Screens over RootView's own that can hold a chat, and so a bubble's Undo, oldest first: the
+    /// Search sheet (`chatModalSheet`) and a new email's chat (`undoOutcomesPresented`). UIKit
+    /// cannot present an Undo's outcome, the reopened compose or the "Couldn't undo" notice, over
+    /// another modal, so the newest of them, the one on top, deals with it: Search closes itself
+    /// (`closesForOutcome`) and the one under it, or RootView, takes the outcome; a new email's chat
+    /// presents it over itself (`reopen(presentedBy:)`, `undoFailureMessage(presentedBy:)`), so
+    /// closing the reopened compose returns to that chat. RootView presents only while none is open
+    /// (`topLevelReopen`, `topLevelUndoFailureMessage`). The head of the queue is offered to one
+    /// presenter at a time, so it never stalls under a modal and nothing waits behind it.
+    private(set) var chatModals: [UUID] = []
 
-    func chatModalOpened() { openChatModals += 1 }
+    var openChatModals: Int { chatModals.count }
 
-    func chatModalClosed() { openChatModals = max(0, openChatModals - 1) }
+    /// The screen `id` opened (again: it moves to the top).
+    func chatModalOpened(_ id: UUID) {
+        chatModals.removeAll { $0 == id }
+        chatModals.append(id)
+    }
+
+    func chatModalClosed(_ id: UUID) { chatModals.removeAll { $0 == id } }
 
     /// An Undo's outcome waits for RootView: a compose to reopen, or the notice that it did not take.
     /// Set only once the outcome is known, never by the tap itself.
     var outcomeWaits: Bool { reopenSnapshot != nil || undoFailureMessage != nil }
 
     /// The reopen RootView presents now: the queue's head, once no chat modal is open.
-    var topLevelReopen: ReopenSnapshot? { openChatModals == 0 ? reopenSnapshot : nil }
+    var topLevelReopen: ReopenSnapshot? { chatModals.isEmpty ? reopenSnapshot : nil }
 
     /// The send's undo notice RootView presents now, once no chat modal is open.
-    var topLevelUndoFailureMessage: String? { openChatModals == 0 ? undoFailureMessage : nil }
+    var topLevelUndoFailureMessage: String? { chatModals.isEmpty ? undoFailureMessage : nil }
+
+    /// Whether the sheet `id` closes now for an outcome: one waits and the sheet is on top.
+    func closesForOutcome(_ id: UUID) -> Bool { outcomeWaits && chatModals.last == id }
+
+    /// The reopen the screen `id` presents over itself now: the queue's head, while it is on top.
+    func reopen(presentedBy id: UUID) -> ReopenSnapshot? { chatModals.last == id ? reopenSnapshot : nil }
+
+    /// The send's undo notice the screen `id` presents over itself now, while it is on top.
+    func undoFailureMessage(presentedBy id: UUID) -> String? { chatModals.last == id ? undoFailureMessage : nil }
 
     /// RootView closed the compose of the first reopen; the next one, if any, opens.
     func finishReopen() {
@@ -382,12 +408,14 @@ final class PendingSendService {
     }
 
     /// Undo, then reopen the compose: the one path for the toast's Undo and a chat bubble's.
-    /// `pending` is the send to cancel; nil means the toast's `current`. The reopen is admitted to
-    /// `reopenQueue` in the same main-actor turn as the cancellation, and the queue takes every
-    /// reopen, so no cancelled send can lose its compose to another Undo.
-    func undoAndReopen(_ pending: Pending? = nil) {
+    /// `pending` is the send to cancel; nil means the toast's `current`. `bubbleScreen`: the screen
+    /// of the bubble whose Undo this is, which the reopened compose records unless the toast owns
+    /// the send. The reopen is admitted to `reopenQueue` in the same main-actor turn as the
+    /// cancellation, and the queue takes every reopen, so no cancelled send can lose its compose to
+    /// another Undo.
+    func undoAndReopen(_ pending: Pending? = nil, bubbleScreen: ComposeScreen = .chat) {
         guard let p = pending ?? current, !undoneSendIds.contains(p.id) else { return }
-        switch undo(p) {
+        switch undo(p, bubbleScreen: bubbleScreen) {
         case .reopen(let snapshot):
             endUndone(p.id)
             reopenQueue.append(snapshot)
@@ -422,7 +450,7 @@ final class PendingSendService {
     /// in place. Reopen requires both the confirmed cancellation and exact retained authority. The
     /// read's THREE answers are routed separately (see `RetainedAuthorityOutcome`).
     /// Clears the toast only when it is this send's.
-    private func undo(_ p: Pending) -> UndoOutcome {
+    private func undo(_ p: Pending, bubbleScreen: ComposeScreen) -> UndoOutcome {
         switch retainedAuthorityOutcome(for: p) {
         case .readFailed:
             // We could not determine anything, so we decide nothing: the Outbox row
@@ -465,11 +493,11 @@ final class PendingSendService {
             }
             clearToast(ifShowing: p.id)
             // The Undo is the toast's only when the toast owns this send (`undoOwners`, still
-            // set here; `endUndone` clears it after). Any other Undo is the bubble's, made in
-            // the chat that shows it, so the compose it reopens is that chat's.
+            // set here; `endUndone` clears it after). Any other Undo is the bubble's, made on
+            // the screen that shows it, so the compose it reopens is that screen's.
             return .reopen(ReopenSnapshot(
                 id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts,
-                openedOn: undoOwners[p.id] == .toast ? nil : .chat, sentTextVersion: sentTextVersion))
+                openedOn: undoOwners[p.id] == .toast ? nil : bubbleScreen, sentTextVersion: sentTextVersion))
         }
     }
 
