@@ -167,6 +167,7 @@ struct TutorialChatViewContentTests {
         }
     }
 
+    @MainActor
     @Test("The closed field holds the drag-up hint only at the drag-up step")
     func dragHint() {
         typealias C = TutorialCoordinator
@@ -207,6 +208,7 @@ struct TutorialChatViewContentTests {
         #expect(plain(TutorialChatScript.editedReply.body).contains("i'm in"))
     }
 
+    @MainActor
     @Test("The welcome and the recap name the chat view's reply, its templates and its switch")
     func welcomeAndRecap() {
         #expect(TutorialFinishView.thingsToTry == [
