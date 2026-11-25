@@ -141,6 +141,12 @@ extension AccountManager {
             }
         }
 
+        // Queuing marked the original (#1490): an open email screen re-reads it
+        // and the inbox shows the cleared Reply tag.
+        if let originalId = result.changedOriginalHeaderId {
+            NotificationCenter.default.post(name: .messageDataDidChange, object: originalId)
+            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
+        }
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
         // synchronous=NORMAL durability: the OutboxMessage row is committed, but NORMAL
         // does not fsync per commit. Harden the send NOW (async, off the compose-dismiss
@@ -180,13 +186,14 @@ extension AccountManager {
     /// "turn this draft into (at most) one outbox row", with NO drain side effects
     /// (so tests can drive it deterministically). Saves attachments to disk
     /// (outside the txn), then in ONE async write transaction either dedups against
-    /// an existing in-flight row (the firewall) or inserts the new row. It never
-    /// touches the original message: its replied/forwarded mark and the cleared
-    /// Reply tag are written when the send goes out (`deleteCompletedSendAtomic`).
+    /// an existing in-flight row (the firewall) or inserts the new row together with
+    /// the original's replied/forwarded mark and cleared Reply tag
+    /// (`markOriginalAtQueue`, #1490). A deduped send changes nothing.
     ///
     /// Returns the id of the outbox row that now represents this send (the freshly
     /// inserted one, or the pre-existing in-flight one when deduped), whether it
-    /// deduped, and that row's durable `holdUntil`.
+    /// deduped, that row's durable `holdUntil`, and the original message whose row
+    /// this send changed, if any.
     ///
     /// `holdUntil` is returned because it is the ONLY authoritative statement of
     /// how long the send can still be undone, and it is anchored at persist START
@@ -207,7 +214,7 @@ extension AccountManager {
         draftId: String,
         instanceEpoch: String,
         holdsForUndo: Bool = true
-    ) async throws -> (outboxId: String, deduped: Bool, holdUntil: Date?) {
+    ) async throws -> (outboxId: String, deduped: Bool, holdUntil: Date?, changedOriginalHeaderId: String?) {
         guard !instanceEpoch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OutboxAdmissionError.invalidInstanceEpoch
         }
@@ -253,7 +260,7 @@ extension AccountManager {
         let outboxToInsert = outbox
         let hadAttachments = !draft.attachments.isEmpty
         do {
-            let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, holdUntil: Date?) in
+            let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, holdUntil: Date?, changedOriginalHeaderId: String?) in
                 // PORT/SUBTRACT — the v2final authority projection and bounded
                 // same-account census, strengthened to require the live Draft.
                 // Replacement or disappearance fails closed before dedup/insert.
@@ -288,15 +295,16 @@ extension AccountManager {
                     // send was persisted and may already have elapsed. Reporting
                     // this send's discarded deadline would offer an Undo the
                     // drain has long since stopped honouring.
-                    return (existing.id, true, existing.holdUntil)
+                    return (existing.id, true, existing.holdUntil, nil)
                 }
-                try outboxToInsert.insert(db)
-                // No mark on the original here. Its replied/forwarded mark and the cleared
-                // Reply tag are written when the send goes out (deleteCompletedSendAtomic),
-                // together with the server ops, so an Undo inside the hold leaves the
-                // original exactly as it was. Sync never clears isReplied, so an early
-                // mark here outlived every undone send (#1468).
-                return (outboxToInsert.id, false, outboxToInsert.holdUntil)
+                // The original shows the send at once (#1490): its mark and the
+                // cleared Reply tag are written in this transaction, and the row
+                // records exactly what they changed, so an unsent removal undoes
+                // only that (`revertQueuedOriginalChanges`).
+                var row = outboxToInsert
+                let changedOriginalHeaderId = try Self.markOriginalAtQueue(&row, db: db)
+                try row.insert(db)
+                return (row.id, false, row.holdUntil, changedOriginalHeaderId)
             }
             // Deduped → the attachments dir we just wrote (named by the discarded
             // new outbox.id) is orphaned; clean it up. The kept (existing) row owns
@@ -1206,7 +1214,49 @@ extension AccountManager {
                         tagValue: ActionTag.none.rawValue)
                     try setTagOp.insert(db)
                     changedOriginalHeaderId = originalId
+                } else if Self.isStillQueuedTagClear(of: outbox, on: original) {
+                    // Queuing cleared the tag (#1490) and queued no op for it.
+                    // Now that the reply has gone out, the clear gets the
+                    // `.setTag` op every tag change queues (local-only, as
+                    // above). A tag set since is left alone; a Reply tag is
+                    // cleared by the branch above.
+                    var setTagOp = PendingOperation(
+                        type: .setTag,
+                        messageIds: [original.stableId],
+                        accountId: original.accountId,
+                        folderPath: original.folderPath,
+                        tagValue: ActionTag.none.rawValue)
+                    try setTagOp.insert(db)
                 }
+            }
+            // This send has gone out, so no other unsent send of the same kind
+            // to this original may take back what it stands for (#1490). A
+            // reply (a forward) that changed the original at its Send and is
+            // removed unsent later (a failed row the user discards after
+            // sending again, a held row undone) must leave the original as
+            // this completion leaves it. So their records lose those changes
+            // here, each on the terms this completion applied it: the mark
+            // only when it admits the original (the mark and its server op
+            // share one fate, above), a reply's cleared Reply tag always (the
+            // clear above is local and runs whatever the admission). A reply
+            // never speaks for a forward's mark, nor a forward for a reply's.
+            // This row matches too and is deleted below; a row already sent
+            // cannot be removed unsent. A released tag clear gets no `.setTag`
+            // op: this completion did not make that clear, and the other row's
+            // completion no longer finds it in its record. The op is local-only
+            // (ADR-IOS-036), so only the demo account's shield against a tag
+            // write-back (IOS-OUTBOX-010) is missing for it. outboxMessage
+            // holds only unsent, failed and unfinalized sends.
+            var released: OutboxMessage.QueuedOriginalChanges = flagAdmission != nil ? [.setMark] : []
+            if !outbox.isForward { released.insert(.clearedReplyTag) }
+            if !released.isEmpty {
+                try db.execute(
+                    sql: """
+                        UPDATE outboxMessage
+                        SET originalChangesAtQueue = originalChangesAtQueue & ~?
+                        WHERE originalMessageHeaderId = ? AND isForward = ?
+                        """,
+                    arguments: [released.rawValue, originalId, outbox.isForward])
             }
             try original.update(db)
         }
@@ -1402,6 +1452,147 @@ extension AccountManager {
             return nil
         }
         return header
+    }
+
+    /// Mark the original of a reply or forward being queued (#1490), inside the
+    /// queuing write, and record on `outbox` exactly what changed.
+    ///
+    /// The original is resolved as the completion resolves it. The mark is
+    /// written only when the original is addressable now, the same admission the
+    /// completion's server op needs, so the local mark never claims a flag the
+    /// server cannot be sent. A reply's Reply tag goes to none, stamped with the
+    /// row's `createdAt` so an unsent removal can tell the tap's own value from a
+    /// later one; it is local-only, so it is cleared whatever the admission. No
+    /// op is queued here: the completion queues the server's mark (and the tag
+    /// clear's local-only `.setTag`) once the send has gone out, so an unsent
+    /// removal has nothing to take back on the server.
+    ///
+    /// Returns the original's id when its row changed.
+    nonisolated static func markOriginalAtQueue(
+        _ outbox: inout OutboxMessage, db: Database
+    ) throws -> String? {
+        var changes: OutboxMessage.QueuedOriginalChanges = []
+        outbox.originalChangesAtQueue = changes.rawValue
+        guard let originalId = outbox.originalMessageHeaderId,
+              var original = try resolveOriginalMessage(
+                  originalId: originalId,
+                  parentRfc822MessageId: Self.queuedParentRfc822MessageId(of: outbox),
+                  accountId: outbox.accountId,
+                  db: db
+              ) else {
+            return nil
+        }
+        // No gesture stamp, as at completion: the original is read here, inside
+        // this write, not from a row someone was shown.
+        let admitted = try FolderResetGeneration.$gestureStamp.withValue(nil) {
+            try AccountManager.admittedOrdinaryActionTargets(
+                [original], accountId: original.accountId,
+                folderPath: original.folderPath, db: db)
+        } != nil
+        if outbox.isForward {
+            if admitted, !original.isForwarded {
+                original.isForwarded = true
+                changes.insert(.setMark)
+            }
+        } else {
+            if admitted, !original.isReplied {
+                original.isReplied = true
+                changes.insert(.setMark)
+            }
+            if original.actionTag == .reply {
+                original.setActionTag(ActionTag.none, at: outbox.createdAt)
+                changes.insert(.clearedReplyTag)
+            }
+        }
+        outbox.originalChangesAtQueue = changes.rawValue
+        guard !changes.isEmpty else { return nil }
+        try original.update(db)
+        return originalId
+    }
+
+    /// Undo what queuing `outbox` changed on its original (#1490), inside the
+    /// write that removes the unsent row: Undo, Undo to Drafts, and the Outbox
+    /// discard (`cancelHeldOutboxRow`). Only this row's own record is undone, so
+    /// a mark another send set, or one the server already had, stays.
+    ///
+    /// The mark goes back to unset. The tag goes back to Reply only while it is
+    /// still the tap's none (same stamp); any later tag wins. The restored Reply
+    /// gets the `.setTag` op every tag change queues (action tags are
+    /// local-only, ADR-IOS-036), after any clear a pass queued during the hold.
+    ///
+    /// A reply the user has sent since keeps both. One this device sent has
+    /// already taken them off this row's record at its completion
+    /// (`deleteCompletedSendAtomic`). One sent from another client is found by
+    /// its copy in Sent (`ReplyParentResolver.hasStoredReply`; not on Outlook,
+    /// where Graph gives no In-Reply-To), asked only by a reply that set the
+    /// mark: its original was unreplied at Send, so a stored reply is news.
+    /// Another app's forward stored there does not count, though it may name
+    /// the original in In-Reply-To (`ReplyParentResolver.SentCopy.isForward`).
+    /// A reply that found the original already replied gives back the Reply tag
+    /// the user had.
+    ///
+    /// Kept to primary-key reads, that one indexed read (it visits only the
+    /// stored copies naming one Message-ID), one update and at most one op insert:
+    /// Undo runs this synchronously inside the hold's deadline.
+    ///
+    /// Returns the original's id when its row changed.
+    nonisolated static func revertQueuedOriginalChanges(
+        of outbox: OutboxMessage, db: Database
+    ) throws -> String? {
+        let changes = outbox.queuedOriginalChanges
+        guard !changes.isEmpty,
+              let originalId = outbox.originalMessageHeaderId,
+              var original = try resolveOriginalMessage(
+                  originalId: originalId,
+                  parentRfc822MessageId: Self.queuedParentRfc822MessageId(of: outbox),
+                  accountId: outbox.accountId,
+                  db: db
+              ) else {
+            return nil
+        }
+        // The Message-ID here only stops a change; the original is the row the
+        // send names by primary key (ADR-IOS-068 D4).
+        if !outbox.isForward, changes.contains(.setMark),
+           try ReplyParentResolver.hasStoredReply(
+               toRfc822MessageId: original.rfc822MessageId,
+               accountId: original.accountId,
+               db: db) {
+            return nil
+        }
+        var changed = false
+        if changes.contains(.setMark) {
+            if outbox.isForward, original.isForwarded {
+                original.isForwarded = false
+                changed = true
+            } else if !outbox.isForward, original.isReplied {
+                original.isReplied = false
+                changed = true
+            }
+        }
+        if Self.isStillQueuedTagClear(of: outbox, on: original) {
+            original.setActionTag(.reply)
+            var setTagOp = PendingOperation(
+                type: .setTag,
+                messageIds: [original.stableId],
+                accountId: original.accountId,
+                folderPath: original.folderPath,
+                tagValue: ActionTag.reply.rawValue)
+            try setTagOp.insert(db)
+            changed = true
+        }
+        guard changed else { return nil }
+        try original.update(db)
+        return originalId
+    }
+
+    /// Whether `original` still carries the none tag queuing `outbox` wrote: the
+    /// row recorded the clear, and the tag is none with the row's own stamp.
+    nonisolated static func isStillQueuedTagClear(
+        of outbox: OutboxMessage, on original: MessageHeader
+    ) -> Bool {
+        outbox.queuedOriginalChanges.contains(.clearedReplyTag)
+            && original.actionTag == ActionTag.none
+            && original.actionTagSetAt == outbox.createdAt
     }
 
     // draftsFolderPath is defined in AccountManagerActions
@@ -1766,7 +1957,7 @@ extension AccountManager {
                 try Self.cancelHeldOutboxRow(db: db, messageId: messageId)
             }
             guard outcome.deleted else { return false }
-            finishOutboxCancellation(attachmentsDirName: outcome.dir)
+            finishOutboxCancellation(outcome)
             return true
         } catch {
             BackgroundSyncLogger.logDebug("[Outbox] ERROR: Failed to cancel \(messageId): \(error)")
@@ -1774,27 +1965,48 @@ extension AccountManager {
         }
     }
 
+    /// What an Outbox cancellation committed.
+    struct HeldOutboxCancellation: Sendable {
+        let deleted: Bool
+        /// The attachment directory the deleted row owned.
+        let dir: String?
+        /// The original whose queue-time changes the cancellation undid.
+        let revertedOriginalHeaderId: String?
+
+        static let refused = HeldOutboxCancellation(
+            deleted: false, dir: nil, revertedOriginalHeaderId: nil)
+    }
+
     /// The database half of `discardOutboxMessageConfirmed`, so it can join a
-    /// larger write: delete the row only while it is unsent and not sending.
-    /// Returns whether it was deleted and the attachment directory it owned.
+    /// larger write: delete the row only while it is unsent and not sending,
+    /// and undo what queuing it changed on its original
+    /// (`revertQueuedOriginalChanges`, #1490). Every unsent removal runs this.
     static func cancelHeldOutboxRow(
         db: Database, messageId: String
-    ) throws -> (deleted: Bool, dir: String?) {
+    ) throws -> HeldOutboxCancellation {
         guard let msg = try OutboxMessage.fetchOne(db, key: messageId),
               msg.outboxStatus != .sending,
               msg.sentAt == nil,
               try OutboxMessage.deleteOne(db, key: messageId) else {
-            return (false, nil)
+            return .refused
         }
-        return (true, msg.attachmentsDirName)
+        let reverted = try revertQueuedOriginalChanges(of: msg, db: db)
+        return HeldOutboxCancellation(
+            deleted: true, dir: msg.attachmentsDirName,
+            revertedOriginalHeaderId: reverted)
     }
 
     /// The work after an Outbox cancellation commits.
-    nonisolated func finishOutboxCancellation(attachmentsDirName: String?) {
-        if let dirName = attachmentsDirName {
+    nonisolated func finishOutboxCancellation(_ cancellation: HeldOutboxCancellation) {
+        if let dirName = cancellation.dir {
             let dir = OutboxMessage.attachmentsBaseDir
                 .appendingPathComponent(dirName, isDirectory: true)
             try? FileManager.default.removeItem(at: dir)
+        }
+        // The original lost this send's mark or got its Reply tag back (#1490).
+        if let originalId = cancellation.revertedOriginalHeaderId {
+            NotificationCenter.default.post(name: .messageDataDidChange, object: originalId)
+            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
         }
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
         Task { await self.drainOutbox() }
@@ -1824,7 +2036,7 @@ extension AccountManager {
             // A failed return is reported after the write commits: a log line
             // written inside the write would outlive a rollback.
             let outcome = try AppDatabase.dbPool.write {
-                db -> (cancel: (deleted: Bool, dir: String?), admission: DraftsAdmission?, returnError: Error?) in
+                db -> (cancel: HeldOutboxCancellation, admission: DraftsAdmission?, returnError: Error?) in
                 let cancel = try Self.cancelHeldOutboxRow(db: db, messageId: messageId)
                 guard cancel.deleted else { return (cancel, nil, nil) }
                 var admission: DraftsAdmission?
@@ -1844,7 +2056,7 @@ extension AccountManager {
                 BackgroundSyncLogger.logDebug("[UndoSend] kept draft not returned to Drafts: \(authority.draftId) \(returnError)")
             }
             guard outcome.cancel.deleted else { return (false, false) }
-            finishOutboxCancellation(attachmentsDirName: outcome.cancel.dir)
+            finishOutboxCancellation(outcome.cancel)
             if let admission = outcome.admission {
                 Task { await self.finishDraftsAdmission(admission) }
             }

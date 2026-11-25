@@ -106,6 +106,14 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 > In-Reply-To marks it replied when its subject does not start with `Fwd:` or `Fw:` (an edited subject,
 > or a localized or `VS:` prefix); and `IOS-OUTBOX-009`, what Apple Mail and Outlook write on a forward
 > is not measured.
+
+> **Current tracker census (2026-11-25, #1490): unchanged at 6 `open` records.** Adds two
+> `accepted` records: `IOS-OUTBOX-010`, while a reply is held a change pass can bring a
+> server-reported Reply tag back onto the original until the reply goes out (only where a provider
+> reports tags, today the demo account), and an AI tag written during the hold stays after an Undo;
+> `IOS-OUTBOX-011`, with two replies to one original waiting to go out, undoing the first leaves no
+> reply arrow until the second is sent, and a forward sent from another client while TabMail's
+> waited leaves no forwarded mark when TabMail's is removed unsent, as in 1.11.6.
 >
 > *Preserved:* **Current tracker census (2026-11-24, #1400): unchanged at 6 `open` records.** Adds one
 > `accepted` record, `IOS-BODY-007`: each body queue's refill now admits the newest window of the rows
@@ -356,12 +364,14 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 | [IOS-CATCHUP-004](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-004.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — the IMAP older-mail check lists and loads nothing in a folder whose UIDVALIDITY is not known or whose reset is pending (C3: nothing is decided about an unproven numbering). The deleted date-based self-heal also repaired such folders; that is not replaced. The folder stays owed, and the next listing after a SELECT reports the epoch loads what is missing. |
 | [IOS-CATCHUP-005](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-005.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — on a nonconforming server whose SELECT omits UIDNEXT (RFC 3501 §6.3.1, RFC 9051 §6.3.2 require it), a listing of a folder with no bookmark and no stored top lists only up to the last local UID (flags and removals as before) and completes only as not clean: mail above it is not looked for, and an owed folder stays owed and is listed again at the daily check. A later range SELECT without UIDNEXT keeps the stored top. A SELECT that reports UIDNEXT resumes the full listing. |
 
-### OUTBOX (2)
+### OUTBOX (4)
 
 | ID | Class | Executive statement |
 |---|---|---|
 | [IOS-OUTBOX-008](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-008.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1492).** A forward sent from another mail app that names its original in In-Reply-To (Thunderbird does) is read as a forward only when its subject starts with `Fwd:` or `Fw:`; with an edited subject, a localized prefix (`WG:`, `TR:`, `RV:`) or the ambiguous `VS:`, the original is marked replied and its Reply tag cleared. Tagging it Reply again restores the tag. |
 | [IOS-OUTBOX-009](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-009.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1492).** Not measured: whether Apple Mail and Outlook set In-Reply-To on a forward, and which prefix they write in each language. Only an In-Reply-To with a prefix outside `Fwd:`/`Fw:` gives a wrong mark (IOS-OUTBOX-008). |
+| [IOS-OUTBOX-010](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-010.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1490).** Send clears a reply's Reply tag at once and queues its local-only `setTag` only when the reply goes out. Where a provider reports tags (today only the demo account; no real provider does), a change pass during the hold writes the reported Reply tag back (its reply detection runs only when the server newly reports the message replied); the completion clears it again, and a full pass during the hold clears it before that. An Undo in that state keeps the Reply tag the user had before Send. Also: an AI tag written during the hold (`none`, since Send marked the original) stays after an Undo when the original had no Reply tag before Send; one gesture sets it. Rare; recovers by itself or with one gesture |
+| [IOS-OUTBOX-011](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-011.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1490).** Each unsent removal (Undo, Undo to Drafts, the Outbox discard) undoes exactly what its own Send recorded and reads no other outbox row, which keeps a scan out of the synchronous Undo write. With two replies to one original waiting to go out, the first marked it and cleared its Reply tag and the second recorded nothing, so undoing the first leaves the Reply tag and no reply arrow until the second is sent; its completion marks the original and clears the tag, and undoing the second instead leaves the original as it was before both. The other order is covered: a send that went out takes the same-kind changes off the other sends' records, and a reply from another client stored in Sent keeps the mark (not on Outlook, where Graph gives no In-Reply-To). Accepted as in 1.11.6: a forward sent from another client while TabMail's waited leaves no forwarded mark when TabMail's is removed unsent (on IMAP the server's `$Forwarded` comes back at the next full pass). Rare; recovers by itself |
 
 ### TEST (1)
 

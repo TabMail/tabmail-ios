@@ -4656,6 +4656,24 @@ final class AppDatabase: Sendable {
                 END
                 """)
         }
+
+        // #1490: Send marks the original at once again (its replied or forwarded
+        // mark, and a Reply tag changed to none), and a send that leaves the
+        // Outbox unsent undoes exactly what its queuing changed. The row records
+        // those changes (`OutboxMessage.QueuedOriginalChanges`) because nothing
+        // else on disk keeps the original's state from before the send: the queue
+        // write overwrites the original's row, and no other outbox column can
+        // carry it (ADR-IOS-019 amendment, #1490). Written with the row, read
+        // with it, gone with it. NULL for every existing row: such a send changed
+        // nothing when it was queued and behaves as before. No index: it is read
+        // only from a row already fetched by its primary key.
+        migrator.registerTimedMigration(
+            "v117_addOutboxOriginalChangesAtQueue", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "originalChangesAtQueue", .integer)
+            }
+        }
     }
 
     /// PORT — v2final `AppDatabase.seedDraftLastTouchedSeq`. Extracted to a static
