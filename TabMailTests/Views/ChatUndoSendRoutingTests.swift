@@ -20,9 +20,11 @@ import UIKit
 ///     reply sent with it off, and any new email, has the toast. Changing the setting right after
 ///     the tap changes nothing for that send. A later bubble send leaves an earlier send's toast
 ///     showing.
-///  1b. A reply from a compose another screen opened keeps the toast with the chat view on: sent
-///     again from the compose an Undo reopened (after an Undo in the chat or in Search), or opened
-///     from Drafts and sent. No screen there shows its bubble.
+///  1b. The compose an Undo reopens keeps the Undo where the undone send had it. Sent again after
+///     its bubble's Undo, its Undo is on the bubble again: the fill starts at the tap, on a fresh
+///     hold the drain does not claim before it ends. Sent again after its toast's Undo, it keeps the
+///     toast. A reply from a compose another screen opened keeps the toast with the chat view on:
+///     opened from Drafts and sent. No screen there shows its bubble.
 ///  1c. The chat records itself only for a compose of one of its own emails, seen as the user sees it:
 ///     in the real chat with RootView's toast presenter over it, an agent's reply or Forward card of
 ///     the chat's email shows its one Undo on the bubble; one for an email of another thread shows its
@@ -840,13 +842,13 @@ struct ChatUndoSendRoutingTests {
             #expect(afterUndo == since, "the Undo keeps the words typed since: \(afterUndo)")
             // Sent again from the compose the Undo reopened: the user's own compose, not the request's.
             let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
-            #expect(PendingSendService.shared.undoOwner(for: again.id) == .toast, "control: that compose is not the chat's")
+            #expect(PendingSendService.shared.undoOwner(for: again.id) == .bubble, "control: the bubble's Undo reopened it, so the bubble's again")
             let afterResend = store.fill(for: key).words
             #expect(afterResend == since, "and keeps the words typed since: \(afterResend)")
         }
     }
 
-    // MARK: - 1b. A compose another screen opened
+    // MARK: - 1b. The compose an Undo reopens, and one another screen opened
 
     /// Sends the AI Suggestion from the chat, then taps Undo on its Sending bubble as the chat does
     /// (`ChatUnsentReply.undo()` on the row the chat reads). Returns the compose the Undo queued to
@@ -873,16 +875,60 @@ struct ChatUndoSendRoutingTests {
         return reopen
     }
 
-    @Test("A reply undone on its bubble and sent again from the compose the Undo reopened has the toast: that compose is not the chat's")
-    func reopenedComposeSendsWithTheToast() async throws {
+    /// Seen on the simulator: a reply sent from the chat filled its bubble, then after Undo
+    /// and Send again from the reopened compose its bubble was solid at once, as if sent with no
+    /// undo window. The reopened compose recorded no screen, so the send again had the toast's Undo
+    /// and its bubble drew solid from the first frame.
+    @Test("A reply undone on its bubble and sent again from the compose the Undo reopened has its Undo on the bubble again: the fill starts at the tap, on a fresh hold the drain does not claim before it ends")
+    func reopenedComposeKeepsTheBubble() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
         try await withSendEnvironment { fixture, saved in
             saved.setChatView(on: true)
             let reopen = try await Self.sendFromTheChatAndUndoOnTheBubble(fixture)
             let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            // Before anything else: the claim the drain makes, while the send's own hold runs.
+            let claimed = await AccountManager.shared.atomicClaimForTesting(again)
+            let claimTriedInTime = Date() < (again.holdUntil ?? .distantPast)
+            #expect(claimTriedInTime, "control: the claim was tried before the hold ended")
+            #expect(!claimed, "the drain does not claim the send again before its hold ends")
             #expect(again.inReplyTo != nil, "control: still a reply to the chat's email")
-            #expect(PendingSendService.shared.undoOwner(for: again.id) == .toast, "its Undo is on the toast")
-            #expect(PendingSendService.shared.visibleToast?.id == again.id, "RootView shows its toast, its one Undo")
+            try Self.expectQueuedHold(again, "the send again")
+            let owner = PendingSendService.shared.undoOwner(for: again.id)
+            #expect(owner == .bubble, "its Undo is on the bubble again")
+            #expect(PendingSendService.shared.visibleToast?.id != again.id, "no toast for it")
+            let chat = fixture.chatMessageIds
+            let bubbles = try await fixture.pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+            let shown = bubbles.first { $0.id == again.id }
+            let bubble = try #require(shown, "control: the chat shows the send again's bubble")
+            // At the tap (the row is queued then): pending, with the fill not yet risen.
+            let atTap = bubble.bubbleUndoLook(at: again.createdAt, reduceMotion: false, owner: owner)
+            #expect(atTap == .pending(fill: 0), "its bubble starts filling at the tap: \(atTap)")
+            let secondsLeft = bubble.bubbleUndoSecondsLeft(at: again.createdAt, owner: owner)
+            #expect(secondsLeft != nil, "its bubble offers the Undo from the tap")
+        }
+    }
+
+    @Test("A reply undone on its toast and sent again from the compose the Undo reopened keeps the toast, with the chat view on at the send again")
+    func toastReopenedComposeKeepsTheToast() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
+        try await withSendEnvironment { fixture, saved in
+            let service = PendingSendService.shared
+            // Sent from the chat's card with the chat view off at the tap: its Undo is the toast's.
+            saved.setChatView(on: false)
+            let first = try await Self.send(Self.readyAIReply(fixture), fixture: fixture)
+            #expect(service.undoOwner(for: first.id) == .toast, "control: sent with the chat view off, Undo on the toast")
+            #expect(service.visibleToast?.id == first.id, "control: RootView shows its toast")
+            // The test, not the clock, ends the window.
+            try await Self.holdOpen(first, fixture)
+            // Undo on the toast, as its button does (`PendingSendToastPresenter`).
+            service.undoAndReopen()
+            let reopen = try #require(service.reopenSnapshot, "the toast's Undo reopens the compose")
+            #expect(reopen.openedOn == nil, "the compose the toast's Undo reopens records no screen")
+            saved.setChatView(on: true)
+            let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            #expect(again.inReplyTo != nil, "control: still a reply to the chat's email")
+            #expect(service.undoOwner(for: again.id) == .toast, "its Undo is on the toast")
+            #expect(service.visibleToast?.id == again.id, "RootView shows its toast, its one Undo")
         }
     }
 

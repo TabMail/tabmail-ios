@@ -46,7 +46,9 @@ struct UndoReopenCompose: View {
             // as unsaved, so Close asks to save it through the normal Save.
             prefillTreatAsUnsavedChanges: !snapshot.returnedToDrafts,
             prefillDraftId: snapshot.authority.draftId,
-            retainedDraftAuthority: snapshot.authority
+            retainedDraftAuthority: snapshot.authority,
+            // The chat after its bubble's Undo, so a send again keeps the bubble's Undo.
+            openedOn: snapshot.openedOn
         )
     }
 }
