@@ -440,5 +440,7 @@ during a running catch-up slice, with two other readers' slices in line, reads r
 slice and ahead of both, which then run in their order) and
 `followUpTakesItsPlaceBeforeTheFirstWaitingSlice` (a listing that joined before the first waiting slice
 stays ahead of the follow-up; a slice that joins after it queues behind it; with no slice waiting it joins
-the back). `OneSyncAtATimeTests.waitingPassesRunOneAtATimeInArrivalOrder` still pins arrival order for
-every other pass.
+the back). `SyncFollowUpTests.fuzzEveryTriggerGetsALaterRead` now runs half its held work as catch-up
+slices, so its invariants (every trigger gets a later read, passes never overlap, the flag ends empty) hold
+with the follow-up overtaking them. `OneSyncAtATimeTests.waitingPassesRunOneAtATimeInArrivalOrder` still
+pins arrival order for every other pass.

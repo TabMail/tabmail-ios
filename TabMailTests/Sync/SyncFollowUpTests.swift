@@ -782,7 +782,9 @@ struct SyncFollowUpTests {
     /// values: every trigger gets a change read that starts after it before the
     /// account goes quiet (checked at seeded checkpoints and at the end), one
     /// account never runs two passes at once, and the flag is empty whenever all
-    /// is quiet. Over the seeds, both trigger kinds find the account busy.
+    /// is quiet. Over the seeds, both trigger kinds find the account busy. Half
+    /// the held work waits as catch-up slices, which the follow-up joins the
+    /// line ahead of (#1360): the invariants hold with the line reordered too.
     /// RED with a trigger that waits for its turn and counts its time limit from
     /// its arrival (#1289): one behind held work reaches its turn with no time
     /// left and reads nothing.
@@ -832,8 +834,13 @@ struct SyncFollowUpTests {
                             } catch {}
                         })
                     case .held(let milliseconds):
+                        // Half the held work waits as a catch-up slice, so the
+                        // follow-up also joins the line ahead of waiting slices
+                        // (#1360). Taken from the duration, not a new draw, so
+                        // every seed's schedule stays as it was.
+                        let place: SyncTurnPlace = milliseconds.isMultiple(of: 2) ? .backgroundChunk : .arrivalOrder
                         work.append(Task {
-                            await engine.oneSyncAtATime(accountId: Self.accountId) {
+                            await engine.oneSyncAtATime(accountId: Self.accountId, place: place) {
                                 wire.heldStarts()
                                 try? await Task.sleep(for: .milliseconds(milliseconds))
                                 clock.advance(stageTwoLimit + 1)
