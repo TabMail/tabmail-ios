@@ -174,8 +174,10 @@ struct ChatThreadLayoutTests {
                 #expect(abs(mic.midY - lineMid) < 1, "mic \(mic) on the line at \(lineMid)")
                 #expect(abs(send.midX - (field.maxX - ChatViewLayout.fieldSendInset - ChatViewLayout.fieldSendSize / 2)) < 1,
                         "Send circle 6 in from the edge: \(send), field \(field)")
-                #expect(abs(mic.midX - (field.minX + ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2)) < 1,
-                        "mic 12 in from the edge: \(mic), field \(field)")
+                // The mic circle mirrors Send: as far in from the field's start as Send is from its end.
+                #expect(abs((mic.midX - field.minX) - (field.maxX - send.midX)) < 1,
+                        "mic \(mic) mirrors Send \(send) in the field \(field)")
+                #expect(abs(mic.width - send.width) < 1, "the mic's tap area is Send's: \(mic.width) and \(send.width)")
                 #expect(send.height >= 44 && mic.height >= 44, "tap areas stay 44 tall")
             }
         }
@@ -562,6 +564,45 @@ struct ChatThreadLayoutTests {
                 }?.accessibilityFrame, "the oldest email's bubble shows: \(HostedAccessibility.labels(in: controller.view).prefix(20))")
                 #expect(oldest.minY >= (try subjectFrame()).maxY - 0.5, "at the oldest: the first bubble \(oldest) sits below the subject")
             }
+        }
+    }
+
+    @Test("The jump button's distance is 0 at the chat's bottom whatever the top bar's height, and grows as the chat scrolls up")
+    func jumpDistanceCountsTheTopBar() {
+        // The scroll view's full height is the container plus both bars' insets; at the bottom the
+        // offset is the content plus the bottom inset minus that height (UIKit's own bottom).
+        func atBottom(content: CGFloat, top: CGFloat, bottom: CGFloat, container: CGFloat) -> CGFloat {
+            content + bottom - (container + top + bottom)
+        }
+        func distance(content: CGFloat, offset: CGFloat, top: CGFloat, container: CGFloat) -> CGFloat {
+            ChatThreadView.distanceBelowVisible(contentHeight: content, offsetY: offset, topInset: top, containerHeight: container)
+        }
+        let threshold = ChatViewLayout.jumpButtonThreshold
+
+        // The tutorial's practice chat, as measured on the simulator: a short chat under the coach
+        // card, held at the bottom with the room above it filled by the top inset.
+        let tutorial = distance(content: 413.33, offset: -376.67, top: 376.67, container: 495.67)
+        #expect(tutorial <= 0, "the short chat at its bottom has nothing below: \(tutorial)")
+        #expect(tutorial <= threshold)
+
+        // A long chat at its bottom, under an ordinary top bar and under one taller than the threshold.
+        let content: CGFloat = 3000
+        let bottomInset: CGFloat = 84
+        let screen: CGFloat = 874
+        for top in [CGFloat(136), threshold + 54] {
+            let container = screen - top - bottomInset
+            let bottomOffset = atBottom(content: content, top: top, bottom: bottomInset, container: container)
+            let still = distance(content: content, offset: bottomOffset, top: top, container: container)
+            #expect(abs(still) < 0.01, "top bar \(top): at the bottom the distance is 0, got \(still)")
+            #expect(still <= threshold, "top bar \(top): no jump button at the bottom")
+
+            let little = distance(content: content, offset: bottomOffset - threshold / 2, top: top, container: container)
+            #expect(abs(little - threshold / 2) < 0.01, "top bar \(top): scrolled up by half the threshold, got \(little)")
+            #expect(little <= threshold, "top bar \(top): no jump button a little above the bottom")
+
+            let far = distance(content: content, offset: bottomOffset - threshold * 2, top: top, container: container)
+            #expect(abs(far - threshold * 2) < 0.01, "top bar \(top): scrolled up by twice the threshold, got \(far)")
+            #expect(far > threshold, "top bar \(top): the jump button shows once well above the bottom")
         }
     }
 }

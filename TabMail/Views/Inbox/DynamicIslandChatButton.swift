@@ -956,18 +956,15 @@ struct DynamicIslandChat: View {
             case .transcribing: break
             }
         } label: {
-            Image(systemName: micSymbol)
-                .contentTransition(.symbolEffect(.replace))
-                .font(.body)
-                .foregroundStyle(dictation.phase == .listening || speech.isRecording ? .red : Theme.accent)
-                .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
+            ChatMicCircle(symbol: micSymbol, listening: micListening)
+                .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .contentShape(Rectangle())
         }
         // Dictation is transcribed on the AI backend (off without a connection), or on this iPhone
         // when opted out of AI (off if the language has no on-device model).
         .disabled(isWorking || dictation.phase == .transcribing
             || (!dictation.isActive && !speech.isRecording && !speech.isStarting && !canDictate))
-        .accessibilityLabel(dictation.phase == .listening || speech.isRecording ? "Stop dictation" : "Dictate")
+        .accessibilityLabel(micListening ? "Stop dictation" : "Dictate")
         .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
     }
 
@@ -1463,8 +1460,15 @@ struct DynamicIslandChat: View {
             hasUnacknowledgedFailure: gate.hasUnacknowledgedFailure) == .ready
     }
 
+    /// The mic listens: a dictation on the backend, or on this iPhone when opted out of AI.
+    private var micListening: Bool {
+        dictation.phase == .listening || speech.isRecording
+    }
+
+    /// The mic's glyph: the stop square while listening, else the outlined mic, struck through when
+    /// dictation is off.
     private var micSymbol: String {
-        if dictation.phase == .listening || speech.isRecording { return "mic.fill" }
+        if micListening { return "stop.fill" }
         return canDictate ? "mic" : "mic.slash"
     }
 

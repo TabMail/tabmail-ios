@@ -61,29 +61,19 @@ extension DynamicIslandChat {
             ChatFieldBarRow {
                 micButton
             } text: {
-                VStack(alignment: .leading, spacing: 2) {
-                    if isWorking, let sent = fieldSentText {
-                        Text(sent)
-                            .lineLimit(1...6)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
-                            // The drag stays on while the agent works: so does its VoiceOver action.
-                            .showChatAction(field.showChat, isExpanded: isExpanded)
-                    } else {
-                        if let attach = field.paperclip {
-                            // The paperclip sits at the text's end, inside the field: the row's
-                            // mic, text and Send keep their places.
-                            HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
-                                replyInput(field)
-                                ChatPaperclipButton(attach: attach)
-                            }
-                        } else {
-                            replyInput(field)
-                        }
-                        if showsExample, let example = field.example {
-                            exampleLine(example)
-                        }
+                if let attach = field.paperclip {
+                    // The paperclip sits at the field's end on Send's row: bottom-aligned with the
+                    // words and the "e.g." line as the row aligns Send, so it stays level with Send
+                    // whether or not that line shows. It stays in its place in every state; while
+                    // the agent works on a Send it is dimmed and not tappable.
+                    HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
+                        fieldText(field)
+                        ChatPaperclipButton(attach: attach)
+                            .disabled(sentWorking)
+                            .opacity(sentWorking ? ChatViewLayout.fieldPaperclipDimmedOpacity : 1)
                     }
+                } else {
+                    fieldText(field)
                 }
             } send: {
                 trailingButton
@@ -91,6 +81,31 @@ extension DynamicIslandChat {
         }
         // A drag up swells the field itself toward the panel, its top following the finger.
         .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))
+    }
+
+    /// The agent works on a Send from the field: its words pulse in the field.
+    private var sentWorking: Bool {
+        isWorking && fieldSentText != nil
+    }
+
+    /// The field's text: the sent words pulsing while the agent works on them, else the input with
+    /// the "e.g." line under it.
+    private func fieldText(_ field: ChatReplyField) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if isWorking, let sent = fieldSentText {
+                Text(sent)
+                    .lineLimit(1...6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
+                    // The drag stays on while the agent works: so does its VoiceOver action.
+                    .showChatAction(field.showChat, isExpanded: isExpanded)
+            } else {
+                replyInput(field)
+                if showsExample, let example = field.example {
+                    exampleLine(example)
+                }
+            }
+        }
     }
 
     private func replyInput(_ field: ChatReplyField) -> some View {

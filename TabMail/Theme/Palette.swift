@@ -39,6 +39,12 @@ enum Palette {
     static let chatSuggestionFill = Color(light: Color(hex: 0x0060DF).opacity(0.14), dark: Color(hex: 0x0A84FF).opacity(0.22))
     static let chatSuggestionStroke = Color(light: Color(hex: 0x0060DF).opacity(0.75), dark: Color(hex: 0x0A84FF).opacity(0.85))
     static let chatSuggestionText = Color(light: Color(hex: 0x1D3F73), dark: Color(hex: 0xD6E6FB))
+    /// The field's mic circle (`ChatMicCircle`), in grays only, so Send is the field's one colour:
+    /// idle, a gray outline and mic; listening, a black circle with a white stop square in light
+    /// mode, a white circle with a black one in dark mode.
+    static let chatMicIdle = textMuted
+    static let chatMicListeningFill = Color(light: Color(hex: 0x000000), dark: Color(hex: 0xFFFFFF))
+    static let chatMicListeningStop = Color(light: Color(hex: 0xFFFFFF), dark: Color(hex: 0x000000))
     /// Incoming bubble gray (from the chat view design; the app had no equivalent).
     static let chatIncomingBubble = Color(light: Color(hex: 0xE9E9EB), dark: Color(hex: 0x26262A))
     /// Sender colors for avatars and names in group chats, picked per address.
