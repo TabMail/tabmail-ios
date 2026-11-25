@@ -224,6 +224,9 @@ final class PendingSendService {
         /// email's chat), so a send again from this compose has its Undo on the bubble again; nil
         /// after the toast's Undo, so it keeps the toast (`sendHasBubbleUndo`).
         let openedOn: ComposeScreen?
+        /// The undone send's text version, when it had one: sent again with its body unchanged,
+        /// the reopened compose's email keeps it (`ComposeView.writtenEmail`).
+        var sentTextVersion: String? = nil
     }
 
     private(set) var current: Pending?
@@ -476,7 +479,7 @@ final class PendingSendService {
             }
             clearToast(ifShowing: p.id)
             return .cancelled
-        case .verified(let authority):
+        case .verified(let authority, let sentTextVersion):
             // The cancellation and the kept draft's return to Drafts commit in one
             // write, in this same synchronous turn (ADR-IOS-065, as superseded on v3).
             let outcome = AccountManager.shared.discardOutboxMessageReturningDraftConfirmed(
@@ -494,7 +497,7 @@ final class PendingSendService {
             // the screen that shows it, so the compose it reopens is that screen's.
             return .reopen(ReopenSnapshot(
                 id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts,
-                openedOn: undoOwners[p.id] == .toast ? nil : bubbleScreen))
+                openedOn: undoOwners[p.id] == .toast ? nil : bubbleScreen, sentTextVersion: sentTextVersion))
         }
     }
 
@@ -555,8 +558,9 @@ final class PendingSendService {
     /// is precisely how a documented invariant went on reading as evidence that the
     /// work was done (`MIS-018`'s tell).
     private enum RetainedAuthorityOutcome {
-        /// Both rows read, and this toast's generation matches them exactly.
-        case verified(RetainedDraftAuthority)
+        /// Both rows read, and this toast's generation matches them exactly. `sentTextVersion`:
+        /// the send's text version, when it has one yet (`SentEmailSummary.textMessage`).
+        case verified(RetainedDraftAuthority, sentTextVersion: String?)
         /// The rows read, and the identity PROVABLY differs — or the row is absent.
         case mismatchOrAbsent
         /// The read threw. We could not determine the answer.
@@ -576,10 +580,13 @@ final class PendingSendService {
                       outbox.instanceEpoch == p.instanceEpoch else {
                     return .mismatchOrAbsent
                 }
+                // Read with the row it belongs to, before the Undo deletes it. Not part of the
+                // authority: a failed read of it only means the reopened compose has none.
+                let sentTextVersion = (try? SentEmailSummary.textMessage(of: outbox, db: db)) ?? nil
                 return .verified(RetainedDraftAuthority(
                     draftId: draft.id,
                     accountId: draft.accountId,
-                    instanceEpoch: p.instanceEpoch))
+                    instanceEpoch: p.instanceEpoch), sentTextVersion: sentTextVersion)
             }
         } catch {
             return .readFailed

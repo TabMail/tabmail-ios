@@ -24,7 +24,9 @@ import UIKit
 ///     "Sending", or "Not sent" once failed; a sent row, a deleted row and a reply to an email of
 ///     another chat show nothing.
 ///  5. A queued (not deduplicated) send summarizes at once, through the real `queueSend`, only with
-///     the chat view on and AI allowed; the gate is driven through each of its real inputs.
+///     the chat view on and AI allowed; the gate is driven through each of its real inputs. A send
+///     with its text version in hand writes it with the queue write instead, behind the same gate,
+///     and asks for no summary.
 ///  6. A send that failed for good shows the red mark beside its bubble; the
 ///     mark's Retry puts the same outbox row back in the queue and the bubble back to "Sending",
 ///     and its Delete removes the row and the bubble. Driven through the hosted chat's own actions.
@@ -442,6 +444,80 @@ struct ChatSendingBubbleTests {
         try await Task.sleep(for: .seconds(2))
         #expect(http.recordedCalls().count == (gateOpen ? 1 : 0), "one summary per queued email, none when gated")
         if !gateOpen { #expect(try await cached() == nil, "nothing written when gated") }
+    }
+
+    /// A send's text version as `queueSend` is given it.
+    enum InHand: String, CaseIterable, Sendable {
+        /// A text version, with the gate open.
+        case written
+        /// A text version, with the gate closed (the chat view off).
+        case gated
+        /// A text version that says nothing, with the gate open.
+        case blank
+    }
+
+    /// The real producer with the text version in hand (ADR-IOS-114 decision 10): with the gate
+    /// open it is written in the queue write itself, blurb and text message alike, under the email's
+    /// Sent folder and Message-ID, so the Sending bubble's first value has it and no summary is asked;
+    /// with the gate closed nothing is written or asked; one that says nothing is summarized as before.
+    @Test("A send with its text version in hand writes it with the queue write and asks for no summary, only with the gate open",
+          arguments: InHand.allCases)
+    func queueSendWritesTheTextVersionInHand(_ inHand: InHand) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restore = try Self.openGate(except: inHand == .gated ? .chatViewOff : .none)
+        defer { restore() }
+        let fixture = try await Self.makeFixture(pool)
+        let http = Self.summaryBackend(textMessage: "I said Tuesday works.")
+        defer { http.close() }
+        let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        try await pool.write { db in
+            var draft = Draft(
+                id: "draft-in-hand", accountId: Self.account, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Lunch plans", body: "Tuesday works for me.", replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        let textVersion = inHand == .blank ? "  " : "Tuesday works!"
+        let outboxId = try await AccountManager.shared.queueSend(
+            draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: "Tuesday works for me.",
+                                inReplyTo: fixture.parent.rfc822MessageId),
+            from: fixture.account, replyToHeaderId: fixture.parent.id, draftId: "draft-in-hand", instanceEpoch: "E1",
+            textVersion: textVersion, summaryService: service).outboxId
+        let row = try #require(try await pool.read { try OutboxMessage.fetchOne($0, key: outboxId) })
+        let sentMessageId = try #require(row.sentMessageId)
+        let key = try #require(MessageAICache.cacheKey(
+            accountId: Self.account, folderPath: "Sent",
+            rfc822MessageId: EmailFilter.normalizeMessageId(sentMessageId)))
+        func cached() async throws -> MessageAICache? {
+            try await pool.read { try MessageAICache.filter(Column("key") == key).fetchOne($0) }
+        }
+        let parentMessageId = try #require(fixture.parent.rfc822MessageId)
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(parentMessageId)]
+        // Read at once, as the queue write left it: no summary could have landed yet.
+        let atQueue = try await cached()
+        let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+        let bubbleText = bubbles.first { $0.id == outboxId }?.textMessage
+        switch inHand {
+        case .written:
+            #expect(atQueue?.summaryTextMessage == "Tuesday works!", "written with the queue write")
+            #expect(atQueue?.summaryBlurb == "Tuesday works!", "as the summary's blurb too, so it counts as summarized")
+            #expect(bubbleText == "Tuesday works!", "the Sending bubble's first value, never Summarizing")
+        case .gated:
+            #expect(atQueue == nil, "nothing written with the gate closed")
+        case .blank:
+            for _ in 0..<100 where try await cached() == nil { try await Task.sleep(for: .milliseconds(100)) }
+            #expect(try await cached()?.summaryTextMessage == "I said Tuesday works.", "summarized as before")
+        }
+        // Long enough for a summary to have been asked.
+        try await Task.sleep(for: .seconds(2))
+        #expect(http.recordedCalls().count == (inHand == .blank ? 1 : 0), "a summary only without a text version")
+        if inHand == .written {
+            #expect(try await cached()?.summaryTextMessage == "Tuesday works!", "no summary replaced it")
+        } else if inHand == .gated {
+            #expect(try await cached() == nil, "still nothing with the gate closed")
+        }
     }
 
     // MARK: - 6. A send that failed for good

@@ -621,7 +621,9 @@ struct ChatHeldGhost: Equatable {
 /// with nothing kept in memory: every outbox row whose In-Reply-To is the
 /// Message-ID of an email in the chat, from any account (the reply may go out from another account
 /// than the email it answers). A failed row reads "Not sent", with Retry and Delete; any other
-/// "Sending". Its text is the summary made at Send (`SentEmailSummary`), "Summarizing" until then.
+/// "Sending". Its text is the email's text version (`SentEmailSummary.textMessage`): the one written
+/// with its body when it was sent unchanged, from its first value; otherwise the summary made at
+/// Send, "Summarizing" until then.
 ///
 /// The hand-over from the ghost: a ghost tapped open is held in its place while its card is up
 /// (`ChatHeldGhost`), and after a send it turns into this bubble.
@@ -672,7 +674,7 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             }
             return ChatUnsentReply(outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
                                    draftId: row.draftId, instanceEpoch: row.instanceEpoch, filed: filed,
-                                   textMessage: try summary(of: row, db: db))
+                                   textMessage: try SentEmailSummary.textMessage(of: row, db: db))
         }
     }
 
@@ -690,18 +692,6 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             .tracking { db in try fetch(answering: messageIds, db: db) }
             .removeDuplicates()
             .values(in: AppDatabase.rawPool)
-    }
-
-    /// The summary made at Send, from the AI cache under the row's Sent folder and Message-ID.
-    nonisolated static func summary(of row: OutboxMessage, db: Database) throws -> String? {
-        guard let messageId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
-              let sentPath = try Folder
-                .filter(Column("accountId") == row.accountId && Column("role") == FolderRole.sent.rawValue)
-                .fetchOne(db)?.path,
-              let key = MessageAICache.cacheKey(accountId: row.accountId, folderPath: sentPath, rfc822MessageId: messageId),
-              let text = try MessageAICache.fetchOne(db, key: key)?.summaryTextMessage,
-              !text.isEmpty else { return nil }
-        return text
     }
 
     /// Retry on a "Not sent" bubble: the Outbox's own Retry for the same row.

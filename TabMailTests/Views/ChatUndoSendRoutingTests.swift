@@ -45,6 +45,10 @@ import UIKit
 ///  1g. The reply card the chat's field asked for: its request hears its send, the field's sent
 ///     words go and the answer hands nothing back; the bubble's Undo and the send again from the
 ///     compose it reopens keep the words typed since.
+///  1h. The sent reply's text in the chat is the text version already in hand: the AI Suggestion's
+///     card sent as written shows the suggestion's text version from the queue write, with no
+///     summary; undone and sent again with the body unchanged, it keeps the undone send's text
+///     version; with words typed into the body it is summarized instead.
 ///  2. Drawn: the solid blue rises from the bottom edge, inside the bubble's shape; in light mode the
 ///     text is the pending text colour over the tint and white over the solid; under Reduce Motion
 ///     there is no rising fill; a mounted bubble drops its Undo when its deadline passes.
@@ -75,17 +79,18 @@ struct ChatUndoSendRoutingTests {
         }
     }
 
-    private static func makeFixture(_ pool: DatabasePool) async throws -> Fixture {
-        let account = try FolderEpochTestFixture.makeAccount(id: Self.account, provider: .gmail, pool: pool)
-        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "INBOX", role: .inbox, pool: pool)
-        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "Sent", role: .sent, pool: pool)
+    /// `id`: the account the chat's emails and its sends belong to.
+    private static func makeFixture(_ pool: DatabasePool, id: String = Self.account) async throws -> Fixture {
+        let account = try FolderEpochTestFixture.makeAccount(id: id, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: id, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: id, path: "Sent", role: .sent, pool: pool)
         // Where an undone send returns (`AccountManager.admitDraftToDrafts`).
-        try FolderEpochTestFixture.insertFolder(accountId: Self.account, path: "Drafts", role: .drafts, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: id, path: "Drafts", role: .drafts, pool: pool)
         var parent = MessageHeader(
             messageId: "routing-parent", subject: "Lunch plans", from: "sender@example.com", fromAddress: "sender@example.com",
             to: account.emailAddress, date: Date().addingTimeInterval(-600), snippet: "Note",
-            folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
-            accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+            folderId: MessageIdentity.folderId(accountId: id, folderPath: "INBOX"),
+            accountId: id, folderPath: "INBOX", isInInbox: true)
         parent.rfc822MessageId = "routing-parent@example.com"
         parent.summaryTextMessage = Self.parentText
         parent.headerComplete = true
@@ -94,8 +99,8 @@ struct ChatUndoSendRoutingTests {
         var otherThread = MessageHeader(
             messageId: "routing-other-thread", subject: "Budget", from: "finance@example.com", fromAddress: "finance@example.com",
             to: account.emailAddress, date: Date().addingTimeInterval(-900), snippet: "Numbers",
-            folderId: MessageIdentity.folderId(accountId: Self.account, folderPath: "INBOX"),
-            accountId: Self.account, folderPath: "INBOX", isInInbox: true)
+            folderId: MessageIdentity.folderId(accountId: id, folderPath: "INBOX"),
+            accountId: id, folderPath: "INBOX", isInInbox: true)
         otherThread.rfc822MessageId = "routing-other-thread@example.com"
         otherThread.headerComplete = true
         otherThread.bodyComplete = true
@@ -234,8 +239,8 @@ struct ChatUndoSendRoutingTests {
     /// The ready AI Suggestion's compose card, built as the chat builds it (`ChatThreadView`): the
     /// suggestion's envelope for the email's people, saving to the suggestion's own draft
     /// (`ChatReadyReply.draftId`).
-    private static func readyAIReply(_ fixture: Fixture) -> some View {
-        let ready = ChatReadyReply(message: fixture.parent, suggestion: Self.readySuggestion, accounts: [fixture.account])
+    private static func readyAIReply(_ fixture: Fixture, suggestion: ReplyResult = Self.readySuggestion) -> some View {
+        let ready = ChatReadyReply(message: fixture.parent, suggestion: suggestion, accounts: [fixture.account])
         return ready.composeView(
             openedOn: ChatThreadView.composeScreen(answering: ready.message, chatMessageIds: fixture.chatMessageIds),
             onOutcome: { _ in })
@@ -248,7 +253,10 @@ struct ChatUndoSendRoutingTests {
             onAgentOutcome: { _ in })
     }
 
-    private func withSendEnvironment(_ body: (Fixture, ChatSummaryQueueTests.SavedChatViewState) async throws -> Void) async throws {
+    /// `accountId`: the fixture's account (`makeFixture`).
+    private func withSendEnvironment(
+        accountId: String = Self.account, _ body: (Fixture, ChatSummaryQueueTests.SavedChatViewState) async throws -> Void
+    ) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         // A real Send summarizes its email through the shared AI service when the host has a session
         // and the consent (`SentEmailSummary.mayRun`). The consent is held off here, so no test send
@@ -274,7 +282,7 @@ struct ChatUndoSendRoutingTests {
         service.dismiss()
         while service.reopenSnapshot != nil { service.finishReopen() }
         try await HostedAccessibility.withAutomation { @MainActor in
-            try await body(try await Self.makeFixture(pool), saved)
+            try await body(try await Self.makeFixture(pool, id: accountId), saved)
         }
     }
 
@@ -853,9 +861,11 @@ struct ChatUndoSendRoutingTests {
     /// Sends the AI Suggestion from the chat, then taps Undo on its Sending bubble as the chat does
     /// (`ChatUnsentReply.undo()` on the row the chat reads). Returns the compose the Undo queued to
     /// reopen, which RootView presents at the top level after an Undo in the chat or in Search alike.
-    private static func sendFromTheChatAndUndoOnTheBubble(_ fixture: Fixture) async throws -> PendingSendService.ReopenSnapshot {
+    private static func sendFromTheChatAndUndoOnTheBubble(
+        _ fixture: Fixture, suggestion: ReplyResult = Self.readySuggestion
+    ) async throws -> PendingSendService.ReopenSnapshot {
         let service = PendingSendService.shared
-        let first = try await Self.send(Self.readyAIReply(fixture), fixture: fixture)
+        let first = try await Self.send(Self.readyAIReply(fixture, suggestion: suggestion), fixture: fixture)
         #expect(service.undoOwner(for: first.id) == .bubble, "control: sent from the chat, Undo on its bubble")
         let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
         // On the hold Send gave it, before the test moves it: its bubble offers the Undo.
@@ -1000,6 +1010,89 @@ struct ChatUndoSendRoutingTests {
             #expect(again.inReplyTo != nil, "control: still a reply to the chat's email")
             #expect(PendingSendService.shared.undoOwner(for: again.id) == .toast, "its Undo is on the toast")
             #expect(PendingSendService.shared.visibleToast?.id == again.id, "RootView shows its toast, its one Undo")
+        }
+    }
+
+    // MARK: - 1h. The sent reply's text: the text version in hand
+
+    /// The AI Suggestion with the text version written with it, which the chat's ghost shows.
+    nonisolated private static let writtenSuggestion = ReplyResult(body: "Tuesday works for me.", textMessage: "Tuesday works!")
+
+    /// What the chat shows for `row`, its Sending bubble and then its Sent copy: the email's text
+    /// version under its Sent folder and Message-ID.
+    private static func sentText(_ row: OutboxMessage, _ fixture: Fixture) async throws -> String? {
+        try await fixture.pool.read { try SentEmailSummary.textMessage(of: row, db: $0) }
+    }
+
+    /// Sent from the demo account, which makes no AI request at Send whatever the gate: an email
+    /// sent without a text version is summarized on the device in its own words
+    /// (`SentEmailSummary.summarizeLocally`), so the two are told apart with no backend.
+    /// Waits long enough for a summary at Send to have landed, then expects `row`'s text to be the
+    /// written suggestion's text version still.
+    private static func expectNoSummaryReplaces(_ row: OutboxMessage, _ fixture: Fixture) async throws {
+        try await Task.sleep(for: .seconds(1))
+        let later = try await Self.sentText(row, fixture)
+        #expect(later == Self.writtenSuggestion.textMessage, "no summary replaced it")
+    }
+
+    @Test("The AI Suggestion's card sent as written shows the text version written with it from the queue write, with no summary")
+    func sentReplyShowsItsTextVersion() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
+        try await withSendEnvironment(accountId: DemoSeed.demoAccountId) { fixture, saved in
+            saved.setChatView(on: true)
+            let row = try await Self.send(Self.readyAIReply(fixture, suggestion: Self.writtenSuggestion), fixture: fixture)
+            #expect(row.accountId == DemoSeed.demoAccountId, "control: sent from the demo account")
+            // As the queue write left it: the bubble's first value.
+            let atQueue = try await Self.sentText(row, fixture)
+            #expect(atQueue == Self.writtenSuggestion.textMessage, "written with the queue write: never Summarizing")
+            let bubbles = try await fixture.pool.read { try ChatUnsentReply.fetch(answering: fixture.chatMessageIds, db: $0) }
+            let bubble = bubbles.first { $0.id == row.id }
+            #expect(bubble?.textMessage == Self.writtenSuggestion.textMessage, "the Sending bubble shows it")
+            try await Self.expectNoSummaryReplaces(row, fixture)
+        }
+    }
+
+    /// The compose an Undo reopens holds the undone send's body in its editor, with that send's text
+    /// version (`ReopenSnapshot.sentTextVersion`). The card's suggestion box cannot be tapped in a
+    /// hosted test (tabmail-ios#1124), so the words a user types into a body are typed here.
+    @Test("A reply undone on its bubble and sent again keeps the undone send's text version with its body unchanged, with no summary; with words typed into its body it is summarized from the email as sent",
+          arguments: [false, true])
+    func sendAgainAfterUndo(typedInto: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
+        try await withSendEnvironment(accountId: DemoSeed.demoAccountId) { fixture, saved in
+            saved.setChatView(on: true)
+            let reopen = try await Self.sendFromTheChatAndUndoOnTheBubble(fixture, suggestion: Self.writtenSuggestion)
+            #expect(reopen.sentTextVersion == Self.writtenSuggestion.textMessage, "the Undo carries the send's text version")
+            let hosted = try Self.host(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            defer { hosted.close() }
+            if typedInto {
+                let view: UIView = hosted.controller.view
+                // Typed only once the reopened draft's words show, so its load does not replace them.
+                @MainActor func editor() -> UITextView? {
+                    Self.firstView(UITextView.self, in: view) { $0.isEditable && $0.text.contains(Self.writtenSuggestion.body) }
+                }
+                for _ in 0..<50 where editor() == nil { try await Task.sleep(for: .milliseconds(100)) }
+                let found = editor()
+                let body = try #require(found, "the reopened compose's body holds the undone send's words")
+                body.selectedRange = NSRange(location: (body.text as NSString).length, length: 0)
+                body.insertText(" See you then.")
+            }
+            let again = try await Self.tapSend(in: hosted.controller, fixture: fixture)
+            #expect(again.accountId == DemoSeed.demoAccountId, "control: sent from the demo account")
+            // As the queue write left it: the bubble's first value.
+            let atQueue = try await Self.sentText(again, fixture)
+            if typedInto {
+                var summarized = atQueue
+                for _ in 0..<50 where summarized == nil {
+                    try await Task.sleep(for: .milliseconds(100))
+                    summarized = try await Self.sentText(again, fixture)
+                }
+                #expect(summarized != Self.writtenSuggestion.textMessage, "a body edited by hand keeps no text version")
+                #expect(summarized?.contains("See you then.") == true, "it is summarized from the email as sent: \(summarized ?? "nil")")
+            } else {
+                #expect(atQueue == Self.writtenSuggestion.textMessage, "the send again writes it with its queue write")
+                try await Self.expectNoSummaryReplaces(again, fixture)
+            }
         }
     }
 

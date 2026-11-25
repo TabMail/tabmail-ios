@@ -105,6 +105,10 @@ extension AccountManager {
     ///
     /// `summaryService` makes the Send-time summary (`SentEmailSummary`): production uses
     /// `AIService.shared`; tests pass one built on a `FakeHTTP` session (AIService's own seam).
+    ///
+    /// `textVersion`: the email's text version already in hand (written with its body, sent
+    /// unchanged; ADR-IOS-114 decision 10). Where the Send-time summary would run, it is written
+    /// with the queue write instead (`SentEmailSummary.writeTextVersion`), and no summary is made.
     @discardableResult
     nonisolated func queueSend(
         draft: DraftMessage,
@@ -119,8 +123,11 @@ extension AccountManager {
         draftId: String,
         instanceEpoch: String,
         holdsForUndo: Bool = true,
+        textVersion: String? = nil,
         summaryService: AIService = .shared
     ) async throws -> (outboxId: String, holdUntil: Date?) {
+        let isDemo = account.id == DemoSeed.demoAccountId
+        let writtenTextVersion = await SentEmailSummary.textVersionToWrite(textVersion, isDemo: isDemo)
         let result = try await Self.persistQueuedSend(
             draft: draft,
             accountId: account.id,
@@ -133,7 +140,8 @@ extension AccountManager {
             serverDraftGmailMessageId: serverDraftGmailMessageId,
             draftId: draftId,
             instanceEpoch: instanceEpoch,
-            holdsForUndo: holdsForUndo
+            holdsForUndo: holdsForUndo,
+            textVersion: writtenTextVersion
         )
         if DebugModeManager.isLoggingEnabled() {
             if result.deduped {
@@ -155,11 +163,12 @@ extension AccountManager {
         // is the outbox's cardinal sin. Skip on dedup (no new row was written).
         if !result.deduped {
             Task { await AppDatabase.checkpointForDurability() }
-            // The chat view summarizes the email now, for its Sending bubble and its Sent copy.
-            // The demo account's sends (the tutorial's practice reply) are summarized on the device.
+            // The chat view summarizes the email now, for its Sending bubble and its Sent copy,
+            // unless its text version went in with the queue write. The demo account's sends (the
+            // tutorial's practice reply) are summarized on the device.
             let outboxId = result.outboxId
-            let isDemo = account.id == DemoSeed.demoAccountId
             Task {
+                guard writtenTextVersion == nil else { return }
                 if isDemo {
                     await SentEmailSummary.summarizeLocally(outboxId: outboxId)
                     return
@@ -225,7 +234,8 @@ extension AccountManager {
         serverDraftGmailMessageId: String? = nil,
         draftId: String,
         instanceEpoch: String,
-        holdsForUndo: Bool = true
+        holdsForUndo: Bool = true,
+        textVersion: String? = nil
     ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?, holdUntil: Date?) {
         guard !instanceEpoch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OutboxAdmissionError.invalidInstanceEpoch
@@ -316,6 +326,11 @@ extension AccountManager {
                 let senderEmail = try Account.fetchOne(db, key: accountId)?.emailAddress
                 inserted.sentMessageId = AccountManager.generateMessageId(senderEmail: senderEmail ?? "user@tabmail.local")
                 try inserted.insert(db)
+                // The text version already in hand goes in with the row, so the chat's Sending
+                // bubble never reads "Summarizing" for it (`SentEmailSummary.writeTextVersion`).
+                if let textVersion {
+                    try SentEmailSummary.writeTextVersion(textVersion, outboxId: inserted.id, db: db)
+                }
                 // Optimistic isReplied/isForwarded — matches markRead/archive pattern.
                 // Server state overwrites on next sync (~90s). No rollback needed.
                 guard let originalId = replyToHeaderId else {
