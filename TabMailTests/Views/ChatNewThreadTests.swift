@@ -169,7 +169,9 @@ struct ChatNewThreadTests {
         let req = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: ["someone@example.com"], cc: [], bcc: [], subject: "Agent's subject",
             body: "The email.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat))
-        let card = model.card(for: req, account: nil) { _ in }
+        let draftId = ChatNewThreadModel.newCardDraftId()
+        let card = model.card(for: req, account: nil, draftId: draftId) { _ in }
+        #expect(card.prefillDraftId == draftId, "the card writes under the draft id the chat gave it, which finds its send")
         #expect(card.prefillTo == ["\"Maria\" <maria@example.com>"], "To is the chat's people, as a save writes them")
         #expect(card.prefillCc == ["lee@example.com"])
         #expect(card.prefillBcc == ["sam@example.com"])
@@ -178,7 +180,7 @@ struct ChatNewThreadTests {
         #expect(card.prefillAttachments == [file])
         let plain = ChatNewThreadModel(account: nil)
         plain.setPeople([Self.maria])
-        #expect(plain.card(for: req, account: nil) { _ in }.prefillSubject == "Agent's subject",
+        #expect(plain.card(for: req, account: nil, draftId: ChatNewThreadModel.newCardDraftId()) { _ in }.prefillSubject == "Agent's subject",
                 "with no subject of its own, the agent's")
     }
 
@@ -606,6 +608,11 @@ struct ChatNewThreadTests {
         #expect(Self.count("if phase == .background { Task { await saveInBackground() } }", in: view) == 1)
         #expect(Self.count("Button(\"Leave without saving\", role: .destructive) { leaveWithoutSaving() }", in: view) == 1)
         #expect(Self.count(".onAppear { opened() }", in: view) == 1)
+        // The new email and the sent email's thread share one host, so the swap from one to the
+        // other neither closes the screen nor takes down what it presents (a Group would give each
+        // its own open, close and covers).
+        #expect(Self.count("var body: some View { // One container for both, never a Group: a Group gives its modifiers to each child, so the // swap would run this screen's close and open, and take down a cover presented over it // (a reopened compose included). The ZStack keeps one host for the whole presentation. ZStack { if let threadId { // The sent email's thread, with its own header, Forward and reply field. ChatThreadView(messageId: threadId) } else { newEmail } } // Back saves first", in: view) == 1,
+                "one host for the new email and its thread")
         #expect(Self.count(".onDisappear { if !showsCamera { closed() } }", in: view) == 1,
                 "the camera's cover hides the screen without closing it")
         #expect(Self.count("DraftSessionRegistry.shared.register(model.draftId)", in: view) == 1)
@@ -1087,6 +1094,41 @@ struct ChatNewDraftSaveTests {
         let again = ChatNewThreadModel(reopening: draft, account: fixture.account)
         #expect(again.draftId == model.draftId, "control: the same draft opened again")
         #expect(again.sessionKey != model.sessionKey, "each opening has its own in-memory session")
+    }
+
+    @Test("After the card's Send the chat goes on as a new email to the same people, with the subject, Cc and Bcc it carries, an empty field and no attachments, in a draft and session of its own; left as it is it saves nothing, and typed words save to its own draft")
+    func nextEmailAfterSend() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let draft = try await savedDraft(fixture, subject: "Lunch", cc: ["lee@example.com"], bcc: ["sam@example.com"])
+        let recorder = QueueRecorder()
+        let sent = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        #expect(!sent.attachments.isEmpty && !sent.words.isEmpty, "control: the sent chat had words and a file")
+        let next = ChatNewThreadModel(after: sent)
+        #expect(next.draftId != sent.draftId, "a draft of its own: the sent chat's was discarded at the send")
+        #expect(Draft.isNewEmailKey(next.draftId), "a new email's chat draft, which reopens as a chat")
+        #expect(next.sessionKey != sent.sessionKey, "an agent session of its own")
+        #expect(next.cursor.newEpoch != sent.cursor.newEpoch, "a generation of its own")
+        #expect(next.account?.id == fixture.account.id)
+        #expect(next.people == sent.people, "the same people")
+        #expect(next.carried == sent.carried, "the same subject, Cc and Bcc")
+        #expect(next.startWords.isEmpty && next.words.isEmpty, "an empty field")
+        #expect(next.attachments.isEmpty, "no attachments")
+        #expect(next.savedAt == nil, "never saved")
+
+        let untouched = await next.saveIfNeeded()
+        #expect(untouched == .saved && recorder.calls.isEmpty, "left as it is, nothing is saved")
+        let rowsBefore = try await rowCount(fixture)
+
+        next.words = "And dessert?"
+        let typed = await next.saveIfNeeded()
+        #expect(typed == .saved)
+        #expect(recorder.calls == ["\(next.draftId)|\(fixture.account.id)"], "typed words save to its own draft")
+        let written = try await row(fixture, next.draftId)
+        #expect(written?.body == "And dessert?")
+        #expect(written?.subject == "Lunch", "with the carried subject")
+        let rowsAfter = try await rowCount(fixture)
+        #expect(rowsAfter == rowsBefore + 1, "a row of its own: the sent chat's draft is left to its own discard")
     }
 
     @Test("A reopened draft left unchanged is not written")
