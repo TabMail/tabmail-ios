@@ -12,7 +12,7 @@ when it landed (a Gmail move; an IMAP or Graph move without proven destination e
 re-keys it. ADR-IOS-068 D4 stays: the Message-ID never selects the original. Registered beside
 `IOS-GRAPH-006`, the same rule for the same mark.
 
-⚠️ **Corrected 2026-11-25 (review of #1479):** this record first said every move made in TabMail is
+⚠️ **Corrected 2026-11-25 (#1479):** this record first said every move made in TabMail is
 covered. Only a move the drain re-keys when it lands is; see the second bullet below.
 
 📌 **Narrowed 2026-11-25 (#1500, same release): a Gmail move is covered.** The listing of the
@@ -44,6 +44,11 @@ The completion (`deleteCompletedSendAtomic`) and an unsent removal (`cancelHeldO
   the provider's own id and, in the same write, carries the queued send's pointer to the new key. The
   provider's id proves that re-key, so ADR-IOS-068 D4 is not engaged. The re-key is skipped when
   another row already holds the destination key; the row then keeps its key, and so does the pointer.
+  A pointer to a row the listing merges away as a duplicate is not carried (`canonicalizeLocalRows`
+  keeps one row per message in a folder and deletes the others), so the send then finds no original,
+  as in the next bullet; an archive cannot produce that, because the All Mail listing excludes Inbox
+  messages and no All Mail row exists beside the archived one, so only a stale duplicate left by an
+  older build can (accepted 2026-11-25).
 - **Any other move made in TabMail that is not re-keyed when it lands is covered only until sync
   re-keys the row.** An IMAP move with no admissible `COPYUID` or with a positive epoch disagreement,
   and a Graph move whose response withheld the new id, leave the row at its source key until the
