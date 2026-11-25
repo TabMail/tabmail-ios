@@ -383,7 +383,7 @@ final class ChatNewThreadModel: Hashable {
 
     /// A new draft id for each compose card the chat opens (`card`), as compose gives a new email
     /// of its own: a card closed with Save is an ordinary draft, which reopens in compose.
-    static func newCardDraftId() -> String { UUID().uuidString }
+    nonisolated static func newCardDraftId() -> String { UUID().uuidString }
 
     var content: ChatNewDraft.Content {
         ChatNewDraft.Content(
