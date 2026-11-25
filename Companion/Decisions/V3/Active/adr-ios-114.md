@@ -946,6 +946,20 @@ same AI result, kept as long as the email itself is shown.
    `threadCopies` rows that `excludeCopies` left out under that email's Message-ID), each by its
    own id, as the open reads them (decision 9). A copy the thread did not load keeps its state
    (ADR-IOS-068 D4). Test: `ChatCopiesTests.readSwipesChangeEveryCopy`.
+   *Amended 2026-11-24 (simulator smoke):* every chat swipe, both ways, did nothing on the
+   simulator while the inbox's list swipes worked; a finger's drag did work (the swipe UI tests
+   passed on the same code). A UIKit pan takes no scrolls unless told to, and a list's swipe
+   actions take a trackpad's two-finger swipe, so the swipes' pan now takes a trackpad's swipe and
+   a mouse's scroll wheel as well as a drag (`ChatHorizontalPan.makePan`, `allowedScrollTypesMask`).
+   A scroll has no touch, so it never starts at the screen's edge: the pan forgets where its last
+   touch came down once each drag, tap or scroll is over (`ChatHorizontalPan.Recognizer.reset`,
+   `Coordinator.gestureEnded`). The touch count at the begin decision cannot tell a scroll from a
+   drag, since UIKit can decide a quick drag's start once its touch has lifted (the swipe UI run
+   2026-11-25 took edge drags as bubble swipes that way). The closer's pan takes scrolls only while something is open, so a scroll
+   elsewhere closes it as a drag does, and with nothing open no swipe waits for it to decline one
+   (`ChatSwipeCloser.Coordinator.takesScrolls`). Tests (`ChatSwipeTests`): `swipesTakeScrolls`,
+   `scrollNeverStartsAtTheEdge`, `closerTakesScrollsOnlyWhileOpen`; a trackpad's swipe itself
+   cannot be made by a UI test on an iPhone simulator, so the simulator check is by hand.
 
 13. **The tutorial in the chat view (amendment 2026-11-05).** A
    tutorial run teaches the view it starts in: with Chat View on and AI not opted out
