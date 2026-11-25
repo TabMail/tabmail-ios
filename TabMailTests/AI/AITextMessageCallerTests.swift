@@ -815,7 +815,7 @@ struct AITextMessageCallerTests {
         }
     }
 
-    @Test("A recompute does not store its reply on a different email that took the same address")
+    @Test("A recompute neither asks the AI about, nor stores its reply on, a different email that took the same address")
     func composeRecomputeReplacedEmail() async throws {
         try await withAIEnabled {
             let fixture = try Fixture()
@@ -841,7 +841,10 @@ struct AITextMessageCallerTests {
                 for: original, account: fixture.account, kbText: "", compositionPrompt: "",
                 aiService: backend.service, dbPool: AppDatabase.dbPool)
 
-            #expect(suggestion == nil, "the AI is never asked about, or shown a reply for, another email")
+            #expect(suggestion == nil, "no reply is shown for another email")
+            // The read checks the email before the AI is asked: a request would send the other
+            // email's body to the model even though the store afterwards refuses its reply.
+            #expect(backend.http.recordedCalls().isEmpty, "the AI is never asked about another email")
             let row = try #require(try fixture.row())
             #expect(row.rfc822MessageId == "different@example.com")
             #expect(row.cachedReply == "The other email's reply")

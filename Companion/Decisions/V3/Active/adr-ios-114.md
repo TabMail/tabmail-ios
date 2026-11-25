@@ -1127,8 +1127,8 @@ one stored (`queueReplyFailureRecovers`), the "no content" summary clearing the 
 (`noContentClearsTextMessage`, `confirmedEmptyClearsTextMessage`), the opened-email direct path in full and
 reply-only, a peer result through both, a whole queue job adopting a peer's action while keeping this
 device's summary and reply text messages (`queuePeerActionKeepsLocalPairs`), compose's recompute
-(`ComposeView.recomputedReply`) and its refusal to store on a replacement email at the same address
-(`composeRecomputeReplacedEmail`), a filtered recompute and one from the snippet
+(`ComposeView.recomputedReply`) and its refusal to ask the AI about, or store on, a replacement email at
+the same address (`composeRecomputeReplacedEmail`), a filtered recompute and one from the snippet
 (`composeRecomputeFiltered`, `composeRecomputeFromSnippet`), and the extension's request, each through its real producer and a
 fake backend or peer); `AITextMessageStorageTests.upgradeKeepsResults` (a v94 database with results,
 upgraded) and `legacyEntriesSurviveUpgradeAndPurge` (the purge keeps only the entries v106 filled; including v106 filling the Message-ID that a peer's
