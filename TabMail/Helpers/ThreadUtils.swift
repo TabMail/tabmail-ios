@@ -299,14 +299,27 @@ enum ThreadUtils {
     ///
     /// Reply and forward share ONE derivation path: per Gmail convention a
     /// forward stays under the source conversation on the sender's side, so it
-    /// gets the same headers as a reply (the forward-specific differences —
-    /// empty `To`, `Fwd:` subject, quoted block — live in ComposeView, not here).
-    /// A `nil` `replyTo` (a true new composition) yields `.none`.
+    /// gets the same `References` chain and Gmail `threadId` as a reply (the
+    /// forward-specific differences — empty `To`, `Fwd:` subject, quoted block —
+    /// live in ComposeView, not here).
+    ///
+    /// The one difference: a forward carries NO `In-Reply-To` (ADR-IOS-043
+    /// amendment, #1483). In-Reply-To names the message this one is a reply to
+    /// (RFC 5322 §3.6.4), and the Sent copy's sync reads it back as exactly that
+    /// (`ReplyParentResolver` marks the named message replied), so a forward that
+    /// carried it marked its original replied and cleared its Reply tag. A
+    /// forward's `References` ends with the original's Message-ID, which is how
+    /// the send's completion still names the original
+    /// (`AccountManager.deleteCompletedSendAtomic`).
+    ///
+    /// A `nil` `replyTo` (a true new composition) yields `.none`. `isForward` has
+    /// no default, so every caller states which one it sends.
     ///
     /// Adapter over the scalar core below; ComposeView and
     /// `DraftStore.uploadThreadHeaders` pass the resolved header.
     static func outgoingThreadHeaders(
         replyTo: MessageHeader?,
+        isForward: Bool,
         sendAccountId: String,
         sendSubject: String,
         providerKind: AccountProvider
@@ -318,6 +331,7 @@ enum ThreadUtils {
             parentThreadId: parent.threadId,
             parentAccountId: parent.accountId,
             parentSubject: parent.subject,
+            isForward: isForward,
             sendAccountId: sendAccountId,
             sendSubject: sendSubject,
             providerKind: providerKind
@@ -331,12 +345,13 @@ enum ThreadUtils {
         parentThreadId: String?,
         parentAccountId: String,
         parentSubject: String,
+        isForward: Bool,
         sendAccountId: String,
         sendSubject: String,
         providerKind: AccountProvider
     ) -> OutgoingThreadHeaders {
-        // In-Reply-To = the parent's own Message-ID (bare/normalized). Many IMAP
-        // messages lack a Message-ID, in which case there is nothing to thread on.
+        // The parent's own Message-ID (bare/normalized). Many IMAP messages lack
+        // a Message-ID, in which case there is nothing to thread on.
         let parentMsgId: String? = parentRfc822MessageId
             .map { EmailFilter.normalizeMessageId($0) }
             .flatMap { $0.isEmpty ? nil : $0 }
@@ -351,6 +366,14 @@ enum ThreadUtils {
         }
         if let pid = parentMsgId, seen.insert(pid).inserted { references.append(pid) }
 
+        // A forward names its original only through References, so the
+        // original's Message-ID must be the LAST id even when the parent's own
+        // chain already listed it. A reply keeps today's chain byte for byte.
+        if isForward, let pid = parentMsgId, references.last != pid {
+            references.removeAll { $0 == pid }
+            references.append(pid)
+        }
+
         // threadId: Gmail only, and only when the stored id belongs to the
         // sending mailbox AND the subject still matches the thread. Both guards
         // prevent a Gmail 400 (invalid thread / subject mismatch) and correctly
@@ -364,6 +387,8 @@ enum ThreadUtils {
             threadId = tid
         }
 
-        return OutgoingThreadHeaders(inReplyTo: parentMsgId, references: references, threadId: threadId)
+        // In-Reply-To = the parent's Message-ID, for a reply only (see above).
+        return OutgoingThreadHeaders(
+            inReplyTo: isForward ? nil : parentMsgId, references: references, threadId: threadId)
     }
 }

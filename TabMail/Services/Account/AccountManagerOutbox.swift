@@ -1107,7 +1107,7 @@ extension AccountManager {
         if let originalId = outbox.originalMessageHeaderId,
            var original = try resolveOriginalMessage(
                 originalId: originalId,
-                inReplyTo: outbox.inReplyTo,
+                parentRfc822MessageId: Self.queuedParentRfc822MessageId(of: outbox),
                 accountId: outbox.accountId,
                 db: db
            ) {
@@ -1368,24 +1368,35 @@ extension AccountManager {
             }
         }
     }
+
+    /// The original's Message-ID as the queued send carries it: a reply's
+    /// In-Reply-To, or the last References id of a forward, which carries no
+    /// In-Reply-To (`ThreadUtils.outgoingThreadHeaders`, #1483). A forward queued
+    /// before that change still ends its References with the original's id, the
+    /// way the builder has always appended it.
+    nonisolated static func queuedParentRfc822MessageId(of outbox: OutboxMessage) -> String? {
+        outbox.isForward ? outbox.references.last : outbox.inReplyTo
+    }
+
     /// Resolve the original message for isReplied/isForwarded updates.
     ///
     /// PORT/SUBTRACT — v2final's ADR-IOS-061 F6/F7 guard, reduced to the
     /// provider-ID forward-port boundary. The exact local provider key must still
-    /// belong to the sending account, and the outbox's own In-Reply-To must
-    /// corroborate the row's RFC identity. Missing or disagreeing evidence fails
-    /// closed. The reference's RFC candidate search, sibling expansion, and
-    /// reset/redrive machinery are intentionally omitted; sync reconciles a moved
-    /// or otherwise unprovable original without risking a wrong-message mutation.
+    /// belong to the sending account, and the queued send's own record of the
+    /// original's Message-ID (`queuedParentRfc822MessageId`) must corroborate the
+    /// row's RFC identity. Missing or disagreeing evidence fails closed. The
+    /// reference's RFC candidate search, sibling expansion, and reset/redrive
+    /// machinery are intentionally omitted; sync reconciles a moved or otherwise
+    /// unprovable original without risking a wrong-message mutation.
     private nonisolated static func resolveOriginalMessage(
         originalId: String,
-        inReplyTo: String?,
+        parentRfc822MessageId: String?,
         accountId: String,
         db: Database
     ) throws -> MessageHeader? {
         guard let header = try MessageHeader.fetchOne(db, key: originalId),
               header.accountId == accountId,
-              let expectedRfc = MessageIdentity.comparableRfc822Identity(inReplyTo),
+              let expectedRfc = MessageIdentity.comparableRfc822Identity(parentRfc822MessageId),
               let headerRfc = MessageIdentity.comparableRfc822Identity(header.rfc822MessageId),
               expectedRfc == headerRfc else {
             return nil

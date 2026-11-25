@@ -3563,9 +3563,11 @@ struct ComposeView: View {
         // Threading headers for reply / reply-all / forward. Single source of
         // truth (ThreadUtils) builds the In-Reply-To + full References chain and,
         // for Gmail, the conversation threadId (guarded by account + subject
-        // match). Forward threads like reply per Gmail convention. See ADR-IOS-043.
+        // match). Forward threads like reply per Gmail convention, but carries no
+        // In-Reply-To (#1483). See ADR-IOS-043.
         let threadHeaders = ThreadUtils.outgoingThreadHeaders(
             replyTo: sendTarget,
+            isForward: isForward,
             sendAccountId: account.id,
             sendSubject: subject,
             providerKind: account.provider

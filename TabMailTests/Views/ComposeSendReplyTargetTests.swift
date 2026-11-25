@@ -180,7 +180,8 @@ private func driveSend(
         target = header
     }
     let threadHeaders = ThreadUtils.outgoingThreadHeaders(
-        replyTo: target, sendAccountId: "acc1", sendSubject: subject, providerKind: .imap)
+        replyTo: target, isForward: isForward, sendAccountId: "acc1", sendSubject: subject,
+        providerKind: .imap)
     let outbound = DraftMessage(
         to: ["recipient@example.com"], subject: subject, body: authoredBody,
         inReplyTo: threadHeaders.inReplyTo, references: threadHeaders.references,
@@ -367,7 +368,7 @@ struct ComposeSendReplyTargetTests {
         // NON-VACUITY / the superseded end state: the compose parameter is what the
         // pre-fix send threaded from, and on this path there is none.
         let supersededHeaders = ThreadUtils.outgoingThreadHeaders(
-            replyTo: nil, sendAccountId: "acc1",
+            replyTo: nil, isForward: false, sendAccountId: "acc1",
             sendSubject: "Re: Original subject", providerKind: .imap)
         #expect(supersededHeaders.inReplyTo == nil)
         #expect(supersededHeaders.references.isEmpty)

@@ -450,7 +450,8 @@ actor DraftStore {
             expectedProviderMessageId: draft.replyToProviderMessageId,
             expectedUidValidity: draft.replyToUidValidity, db: db)
         return ThreadUtils.outgoingThreadHeaders(
-            replyTo: parent, sendAccountId: draft.accountId, sendSubject: draft.subject, providerKind: .gmail)
+            replyTo: parent, isForward: false, sendAccountId: draft.accountId,
+            sendSubject: draft.subject, providerKind: .gmail)
     }
 
     static func priorIdentity(

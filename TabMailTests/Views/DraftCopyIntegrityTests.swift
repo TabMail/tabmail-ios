@@ -194,7 +194,8 @@ struct DraftCopyIntegrityTests {
                 expectedUidValidity: row.replyToUidValidity, db: db)
         }
         return ThreadUtils.outgoingThreadHeaders(
-            replyTo: parent, sendAccountId: row.accountId, sendSubject: row.subject, providerKind: .gmail).inReplyTo
+            replyTo: parent, isForward: row.isForward, sendAccountId: row.accountId,
+            sendSubject: row.subject, providerKind: .gmail).inReplyTo
     }
 
     @Test("Gmail adoption never pairs a newer message's text with the listed message's reply parent")
