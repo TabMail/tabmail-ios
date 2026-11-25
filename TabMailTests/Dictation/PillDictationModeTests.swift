@@ -155,4 +155,16 @@ struct PillDictationModeTests {
         // The chat view's TabMail panel says its words go to TabMail.
         #expect(PillDictationMode.placeholder(isCompose: false, isChatPanel: true, offNote: nil) == "Ask TabMail")
     }
+
+    /// While the words are transcribed, the button that stopped the dictation spins: the mic for
+    /// its own stop, Send for a send while listening. Nothing spins before or after.
+    @Test func theButtonThatStoppedTheDictationSpins() {
+        #expect(DictationSpinnerPlace.resolve(phase: .transcribing, sendWhenDictated: false) == .mic)
+        #expect(DictationSpinnerPlace.resolve(phase: .transcribing, sendWhenDictated: true) == .send)
+        for phase in [DictationController.Phase.idle, .listening] {
+            for sendWhenDictated in [false, true] {
+                #expect(DictationSpinnerPlace.resolve(phase: phase, sendWhenDictated: sendWhenDictated) == nil)
+            }
+        }
+    }
 }

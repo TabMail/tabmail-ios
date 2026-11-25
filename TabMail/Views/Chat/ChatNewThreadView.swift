@@ -38,6 +38,16 @@ struct ChatNewThreadView: View {
     @State private var photoPickerItems: [PhotosPickerItem] = []
     @State private var showsFilePicker = false
     @State private var showsCamera = false
+    /// The app's accounts, read as the chat opens: a card opens only from an account still here
+    /// (`AgentToolRouter.canOpen`).
+    @State private var accounts: [Account] = []
+    /// The compose card the agent wrote from the field's words (`email_compose`), taken by this
+    /// chat's pill for this chat's own session only.
+    @State private var agentCompose: AgentToolRouter.ComposeRequest?
+    /// A card opened for the field's latest Send: the agent's closing words then open nothing.
+    @State private var cardOpened = false
+    /// The card's Send has a durable outbox row: once the card has gone, the chat closes.
+    @State private var cardSent = false
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
 
@@ -150,6 +160,7 @@ struct ChatNewThreadView: View {
         .fullScreenCover(isPresented: $showsCamera) {
             CameraPickerView { image in model.addCameraPhoto(image) }
         }
+        .fullScreenCover(item: $agentCompose, onDismiss: cardClosed) { cardView(for: $0) }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { Task { await saveInBackground() } }
         }
@@ -181,6 +192,7 @@ struct ChatNewThreadView: View {
                 isExpanded: $chatExpanded,
                 isInputFocused: $chatInputFocused,
                 isWorking: $chatWorking,
+                onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
                     example: example,
                     newEmail: ChatNewEmailField(
@@ -188,7 +200,12 @@ struct ChatNewThreadView: View {
                         sessionKey: model.sessionKey,
                         wordsChanged: { model.words = $0 },
                         send: { _ in send() },
-                        attach: attach)))
+                        attach: attach)),
+                onFieldSend: { _ in cardOpened = false },
+                onAgentCompose: openAgentCompose,
+                composeFromAccountId: model.account?.id,
+                composeHostCovered: showsAddRecipient || showsCamera || showsPhotoPicker || showsFilePicker
+                    || agentCompose != nil)
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.fieldId)
         }
@@ -196,15 +213,61 @@ struct ChatNewThreadView: View {
         .padding(.bottom, ChatViewLayout.fieldBottomGap)
     }
 
-    /// Send: with nobody to send to, ask; the words and attachments stay either way.
-    private func send() {
+    /// Send: with nobody to send to, ask, and the words stay. With people picked, the people the
+    /// field's words go to the agent for: it writes the email to them and opens the compose card
+    /// (`openAgentCompose`), as a reply sent from a chat's field does. The words and attachments
+    /// stay until the card's Send.
+    private func send() -> [ChatThread.Person]? {
         switch model.sendAction {
         case .askForRecipient:
             asksForRecipient = true
+            return nil
         case .write:
-            // Writing the email for its recipients is not handled in this chat yet.
-            break
+            return model.people
         }
+    }
+
+    /// The compose card this chat's agent asked for, taken by this chat's pill (ADR-IOS-053 Phase
+    /// 2). A new email opens from the account bound when its turn started; when that account is
+    /// gone the request ends and nothing opens.
+    private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
+        guard AgentToolRouter.shared.canOpen(req, accounts: accounts) else { return }
+        cardOpened = true
+        agentCompose = req
+    }
+
+    /// The card, as the chat's reply cards open: today's compose. The email the agent wrote goes
+    /// to this chat's people, with its Cc, Bcc, subject and attachments (`ChatNewThreadModel.card`).
+    private func cardView(for req: AgentToolRouter.ComposeRequest) -> ComposeView {
+        let account = accounts.first { $0.id == req.fromAccountId }
+        let ended: @MainActor (ComposeOutcome) -> Void = { outcome in
+            req.onOutcome(outcome)
+            if case .sent = outcome { cardSent = true }
+        }
+        guard req.mode == .compose else { return req.composeView(account: account, onOutcome: ended) }
+        return model.card(for: req, account: account, onOutcome: ended)
+    }
+
+    /// The card has gone. Sent: the email is in the outbox (its Undo is the toast's), so the
+    /// chat's own draft is discarded through compose's Discard and the chat closes without saving.
+    /// Closed unsent: the words and attachments are still here.
+    private func cardClosed() {
+        guard cardSent else { return }
+        cardSent = false
+        Task {
+            if case .refused(let message) = await model.discardSavedDraft(), DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ChatNewEmail] draft discard after send refused for \(model.draftId): \(message)")
+            }
+            leavesWithoutSaving = true
+            dismiss()
+        }
+    }
+
+    /// The agent answered the field's Send with something to say: the chat rises with the request
+    /// and the answer. After a compose card the email was the point, so nothing opens.
+    private func agentAnswered() {
+        guard !cardOpened else { return }
+        withAnimation { chatExpanded = true }
     }
 
     private func attach(_ source: ChatNewEmailField.AttachSource) {
@@ -291,10 +354,12 @@ struct ChatNewThreadView: View {
         }
     }
 
-    /// The user's own addresses, which "Add recipient" does not add.
+    /// The user's own addresses, which "Add recipient" does not add, and the accounts a card may
+    /// open from.
     private func loadOwnAddresses() async {
         do {
             let accounts = try await AppDatabase.dbPool.read { db in try Account.fetchAll(db) }
+            self.accounts = accounts
             ownAddresses = Set(accounts.map { $0.emailAddress.lowercased() })
         } catch {
             if DebugModeManager.isLoggingEnabled() {

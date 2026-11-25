@@ -446,7 +446,7 @@ same AI result, kept as long as the email itself is shown.
    ends the send with the words kept in the field and a note (`ChatFieldFill.Change.notWritten`,
    `DynamicIslandChat.notWrittenNote`). A no-reply sender's field composes too, under its "Replies
    won't be read" line. The field's compose skips the 120-second repeat check
-   (`RecentlyCompletedComposeCache`, `dedupesRecentSend`), which guards an agent turn sending the
+   (`RecentlyCompletedComposeCache`, `EmailReplyTool.openReplyCard(usesRecentSendCache:)`), which guards an agent turn sending the
    same reply twice; each field Send is the user's own ask. With the panel open the words go to the
    agent about this chat, with no nudge. The placeholders say which: "Write your reply" in the closed
    field (`ChatReplyField.writePlaceholder`), "Ask TabMail" in the open panel
@@ -455,7 +455,7 @@ same AI result, kept as long as the email itself is shown.
    only for the tutorial's scripted field ask, until the tutorial moves that ask into the panel;
    the field-reply logic of ADR-IOS-053 amendment 3 in `EmailReplyTool` (the shown row's check,
    who it goes to, the edit of the shown suggestion) is now reached from the field only through
-   `composeFromField`, and the agent's requests from the panel carry no field. Tests:
+   `composeFromField`, and the agent's requests from the panel carry no field. A new email's chat (amendment 24 and *Every new email*) still sends its field's words to the agent with its own nudge (`ChatNewEmailField.agentMessage`), as the first round of its Send built it; moving it to a direct compose is the part of this decision still to do. Tests:
    `ChatReplyFieldTests.fieldSendWiring` and `noAgentNudge`, `ChatComposeRoutingTests` (case 3: the
    words reach only the compose edit; a failed compose keeps them), `ChatReplyRecoveryTests`
    (an edit in place or on the field's own card asks the agent nothing),

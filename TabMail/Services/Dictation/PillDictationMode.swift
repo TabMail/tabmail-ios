@@ -67,3 +67,16 @@ extension PillDictationMode {
         offNote ?? (isCompose ? "Describe your edit..." : isChatPanel ? ChatReplyField.panelPlaceholder : "Type or speak...")
     }
 }
+
+/// The field button that spins while a dictation's words are transcribed: the button that stopped
+/// it. Send, when Send stopped it (its words are sent once they land); else the mic. Nil while
+/// nothing is transcribed.
+enum DictationSpinnerPlace: Equatable {
+    case mic
+    case send
+
+    static func resolve(phase: DictationController.Phase, sendWhenDictated: Bool) -> DictationSpinnerPlace? {
+        guard phase == .transcribing else { return nil }
+        return sendWhenDictated ? .send : .mic
+    }
+}

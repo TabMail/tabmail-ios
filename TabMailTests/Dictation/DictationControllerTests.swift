@@ -1969,8 +1969,9 @@ struct DictationOptOutFlagTests {
 
     /// While listening, send finishes the dictation, then sends its text once it lands; a
     /// dictation that brings back nothing sends nothing, and nothing carries over to the next.
-    /// While the words are transcribed, the button is a spinner. A pending retry doesn't take
-    /// the slot while dictating.
+    /// While the words Send stopped are transcribed, Send is a spinner; the words the mic stopped
+    /// spin in the mic, and Send keeps its look (`DictationSpinnerPlace`). A pending retry doesn't
+    /// take the slot while dictating.
     @Test func sendFinishesTheDictationThenSendsItsText() throws {
         let source = try flatPillSource()
         let send = try slice(source, from: "// Normal send button", to: ".disabled(!canTapSend)")
@@ -1985,9 +1986,11 @@ struct DictationOptOutFlagTests {
         #expect(source.contains("} else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil)"))
         #expect(!source.contains("Image(systemName: \"stop.circle.fill\") .font(.title2) .foregroundStyle(Theme.accent)"))
 
-        let transcribing = try slice(source, from: "} else if dictation.phase == .transcribing {", to: "} else if !isWorking && !dictation.isActive && (pendingResume != nil")
+        let transcribing = try slice(source, from: "} else if spinnerPlace == .send {", to: "} else if !isWorking && !dictation.isActive && (pendingResume != nil")
         #expect(transcribing.contains("DictationSpinner(isRetrying: dictation.isRetrying)"))
         #expect(!transcribing.contains("Button"))
+        #expect(source.contains("DictationSpinnerPlace.resolve(phase: dictation.phase, sendWhenDictated: sendWhenDictated)"))
+        #expect(source.components(separatedBy: "DictationSpinner(").count == 2, "one spinner in the pill; the mic's is the circle's own")
 
         let start = String(try slice(source, from: "private func startDictation(auto: Bool = false)", to: "private var canSend: Bool"))
         let onText = try slice(start, from: "dictation.start(context: dictationContext, canUseAI: canUseAI, input: { inputText }) { text in", to: "scrollPosition.scrollTo(edge: .bottom)")
