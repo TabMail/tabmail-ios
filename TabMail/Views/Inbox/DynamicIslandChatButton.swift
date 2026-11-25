@@ -533,6 +533,10 @@ struct DynamicIslandChat: View {
                             .font(.subheadline)
                             .foregroundStyle(.white)
                             .lineLimit(2)
+                            // The overlay offers the toast only the closed field's height, too
+                            // short for a second line: take the text's own height, up to its two
+                            // lines.
+                            .fixedSize(horizontal: false, vertical: true)
                         Spacer()
                         Image(systemName: "xmark")
                             .font(.caption)
