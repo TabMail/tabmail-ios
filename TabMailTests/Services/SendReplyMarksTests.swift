@@ -1558,6 +1558,70 @@ struct SendReplyMarksTests {
         #expect(copyAfter == copyBefore, "\(outcome.rawValue): the copy sync stored is unchanged")
     }
 
+    /// The archive lands on an address sync has already stored a row for: the
+    /// re-key's collision arm drops the moved row (with Send's marks) and keeps
+    /// the stored one. That row is not the row Send marked, and its numbering is
+    /// not proven by this move, so the queued send is not carried to it: the
+    /// completion finds no original and changes nothing on it (`IOS-OUTBOX-012`).
+    @Test("An archive that lands on a row sync already stored: the send is not carried to it, and its completion changes nothing")
+    func originalArchivedOntoAStoredCopy() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-collide")
+        try Self.insertArchive(pool, accountId: accountId)
+        let parentRfc = "collide-parent@example.com"
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: parentRfc, tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: false, before: before)
+
+        // The archive gesture moves the row locally, and sync stores the Archive
+        // copy at the address the move will report before the move lands.
+        let originalId = original.id
+        let archiveFolderId = MessageIdentity.folderId(accountId: accountId, folderPath: Self.archivePath)
+        let stored = try await pool.write { db -> MessageHeader in
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderPath = ?, folderId = ?, isInInbox = 0, observedUidValidity = NULL WHERE id = ?",
+                arguments: [Self.archivePath, archiveFolderId, originalId])
+            var copy = MessageHeader(
+                messageId: "9", subject: "Original", from: "Sender",
+                fromAddress: "sender@example.com", to: "me@example.com", date: Date(),
+                snippet: "original", folderId: archiveFolderId,
+                accountId: accountId, folderPath: Self.archivePath, isInInbox: false)
+            copy.rfc822MessageId = parentRfc
+            copy.headerComplete = true
+            copy.observedUidValidity = Self.archiveEpoch
+            copy.setActionTag(.reply, at: Date().addingTimeInterval(-3_600))
+            try copy.insert(db)
+            return copy
+        }
+        let storedBefore = try Self.rowSnapshot(pool, headerId: stored.id)
+        let move = PendingOperation(
+            type: .move, messageIds: [original.messageId], accountId: accountId,
+            folderPath: Self.imapPath, destinationPath: Self.archivePath, observedUidValidity: Self.imapEpoch)
+        let finished = try await pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                move, destinations: [ProvenDestinationAddress(
+                    sourceProviderId: original.messageId, destinationProviderId: "9",
+                    destinationUidValidity: UInt32(Self.archiveEpoch))],
+                addressChangesOnMove: true, accountScopedIds: false, db: db)
+        }
+        #expect(finished.applied.isEmpty, "precondition: the re-key collided")
+        #expect(finished.removedOldHeaderIds == [originalId], "precondition: the moved row was dropped: \(finished.removedOldHeaderIds)")
+        let outboxId = queued.outboxId
+        let pointer = try await pool.read { db in
+            try OutboxMessage.fetchOne(db, key: outboxId)?.originalMessageHeaderId
+        }
+        #expect(pointer == originalId, "the queued send is not carried to the stored row: \(pointer ?? "nil")")
+
+        let disposition = try await Self.complete(pool: pool, outboxId: outboxId)
+        #expect(disposition.changedOriginalHeaderId == nil, "the completion finds no original")
+        let queuedTypes = try Self.markOps(pool).map(\.type.rawValue)
+        #expect(queuedTypes.isEmpty, "nothing is queued for the stored row: \(queuedTypes)")
+        let storedAfter = try Self.rowSnapshot(pool, headerId: stored.id)
+        #expect(storedAfter == storedBefore, "the stored row is unchanged")
+    }
+
     /// Sync's own re-key of a row (its UID remap, through
     /// `MessageHeaderRekey.apply`) rests on Message-ID evidence, so it does not
     /// carry the queued send's pointer: the completion finds no original and

@@ -27,6 +27,10 @@ The completion (`deleteCompletedSendAtomic`) and an unsent removal (`cancelHeldO
   completion writes no mark and queues no server mark, and an unsent removal changes nothing. Send's
   marks were on the removed row; the new row holds the server's state, and nothing on it needs taking
   back.
+- **A move that lands on a row sync already stored** (sync read the destination between the server's
+  move and its retirement): the re-key's collision arm drops the moved row, with Send's marks, and
+  keeps the stored one. That row is not the row Send marked, and this move did not prove its numbering,
+  so the pointer is not carried and the send finds no original, as above.
 
 What the user then sees on the moved message:
 - **A reply on Gmail or IMAP:** once the Sent copy syncs, `ReplyParentResolver` marks it replied on this
@@ -58,12 +62,13 @@ Replying again sets it.
 `SendReplyMarksTests/originalMovedElsewhereWhileTheSendIsHeld` (reply and forward; completion and
 Undo: nothing is queued and the stored copy is unchanged) and
 `SendReplyMarksTests/syncRekeyDoesNotCarryTheSend` (sync's own re-key leaves the send naming the old
-id, and its completion queues nothing). The covered TabMail move:
+id, and its completion queues nothing) and `SendReplyMarksTests/originalArchivedOntoAStoredCopy` (the
+collision arm: the send is not carried, and the stored row is unchanged). The covered TabMail move:
 `SendReplyMarksTests/originalArchivedWhileTheSendIsHeld`.
 
 ## Subsystem and search terms
 
 Outbox; reply; forward; moved original; archived original; `originalMessageHeaderId`;
-`MessageHeaderRekey.finishMove`; `readdressQueuedOperations`; re-key; UID remap; `deleteCompletedSendAtomic`; `cancelHeldOutboxRow`;
+`MessageHeaderRekey.finishMove`; `readdressQueuedOperations`; re-key; UID remap; collision arm; `deleteCompletedSendAtomic`; `cancelHeldOutboxRow`;
 `revertQueuedOriginalChanges`; `resolveOriginalMessage`; `ReplyParentResolver`; Message-ID; RFC 822;
 ADR-IOS-068 D4; `IOS-GRAPH-006`; `IOS-OUTBOX-003`; #1479.
