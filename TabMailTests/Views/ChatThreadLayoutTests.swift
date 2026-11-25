@@ -259,9 +259,13 @@ struct ChatThreadLayoutTests {
                 // Plain values only inside the macro: closures in its arguments do not compile.
                 let focusable = carriers.first(where: { $0.isAccessibilityElement })
                 let carrierList = carriers.map { describe($0) }.joined(separator: "; ")
-                // Known issue tabmail-ios#1169: today the only carrier is SwiftUI's VerticalTextView,
-                // which VoiceOver cannot focus. Remove this wrapper when #1169 is fixed.
-                withKnownIssue("#1169 the action sits on an element VoiceOver cannot focus") {
+                // Known issue tabmail-ios#1169: the action can sit only on SwiftUI's VerticalTextView,
+                // which VoiceOver cannot focus. Intermittent: which element carries the action depends
+                // on when the hosted accessibility tree is read after the field appears (since the
+                // reply field's layout change in #1466 some runs find a focusable carrier, others only
+                // the VerticalTextView). Remove this wrapper when #1169 is fixed and checked with
+                // VoiceOver on a device.
+                withKnownIssue("#1169 the action sits on an element VoiceOver cannot focus", isIntermittent: true) {
                     #expect(focusable != nil, "an element VoiceOver can focus carries the action; carriers: \(carrierList)")
                 }
                 let carrier = try #require(focusable ?? carriers.first, "the action is offered; carriers: \(carrierList)")
