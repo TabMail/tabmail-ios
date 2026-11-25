@@ -361,7 +361,7 @@ final class ChatNewThreadModel: Hashable {
     /// the subject, Cc and Bcc the chat carries, from the same account, with an empty field and no
     /// attachments, in a draft and agent session of its own. Left as it is, it is not saved. Its own
     /// draft, not the sent chat's: that one's row was discarded at the send, and its generation
-    /// with it.
+    /// with it, or kept as it was when its attachments could not be read (`discardSavedDraft`).
     init(after sent: ChatNewThreadModel) {
         draftId = Draft.newEmailKey()
         queueDraftSave = sent.queueDraftSave
@@ -476,7 +476,10 @@ final class ChatNewThreadModel: Hashable {
     /// After the card's Send has its durable outbox row: this chat's saved draft, if it has one,
     /// is discarded through compose's own Discard (`ComposeDraftDiscard`, which also removes the
     /// server's copy), after any save of it in flight. With no saved draft there is nothing to do.
+    /// A draft whose attachments could not be read stays as it is, as the chat said when it
+    /// opened: its files are not in the email sent, and they may be only in that draft.
     func discardSavedDraft() async -> ComposeDraftDiscard.Outcome {
+        guard !attachmentLoadFailed else { return .refused(Self.attachmentLoadMessage) }
         while let running = inFlight { _ = await running.value }
         return await ComposeDraftDiscard.run(
             .wholeDraft, draftId: draftId, epoch: cursor.newEpoch, readState: .loaded,

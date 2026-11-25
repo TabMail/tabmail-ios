@@ -1064,6 +1064,18 @@ same AI result, kept as long as the email itself is shown.
    `dragHint`, `chatCards`, `welcomeAndRecap`); `TutorialChatViewWiringTests.fieldAndPanelWiring`;
    `ChatReplyFieldTests` (the drag's `opensPanel`); `ChatThreadContextTests.opensInChat`.
 
+   *Amended 2026-11-25 (simulator check of the whole branch):* the panel's card is no longer above its
+   input. It sits at the panel's top, directly under the email card ("Re: ... / sender"), so it never
+   covers the conversation or the Create card's buttons; this holds for both panel cards (the request,
+   then Create). And compose's practice reply has a new stage after "Make it shorter": the card says
+   that Send sends the AI Suggestion as it is and asks for a tap on Send, which in the tutorial sends
+   nothing, opens no undo window and turns the page (`TutorialCoordinator.practiceSendIsNoOp`,
+   `sendAsIsTapped`); the next card asks for Use Suggestion, an edit by hand if wanted, then Send, the
+   practice send as before. Use Suggestion is locked until that tap. Part 2 stays "2 of 3"; Skip works
+   from every stage. Detail in ADR-IOS-038's amendment of the same day. Tests:
+   `TutorialTests.composeFollowsTheSuggestion` (the stage order), `skipFromTheSendAsIsStageResetsIt`,
+   `TutorialChatViewWiringTests.composeSendAsIsWiring` and the placement check in `fieldAndPanelWiring`.
+
 14. **One TabMail chat per thread (amendment 2026-11-16).** An email's TabMail chat belongs to its
    thread, with the chat view on or off. Decided 2026-11-16: "per-mail chat sessions now should be
    per-thread chat sessions, which is fine even when chat view is off", with "a simple migration +
@@ -2027,7 +2039,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        and agent session of its own (`ChatNewThreadModel.init(after:)`; left as it is, it saves
        nothing, and the sent email's discarded generation is never written again). The sent email's
        chat draft, if it was saved, is discarded through compose's own Discard after any save in
-       flight (`ChatNewThreadModel.discardSavedDraft`, `ComposeDraftDiscard`, which removes the
+       flight, except a reopened draft whose attachments could not be read: it is kept as it is, as
+       its save is refused, since those files were not in the email sent and may exist only in that
+       draft (`ChatNewThreadModel.discardSavedDraft`, `ComposeDraftDiscard`, which removes the
        server's copy too), and its session ends. The field starts each new email from that email's
        own words, once per session key (`DynamicIslandChat.startNewEmail`), so the sent words go.
      - The chat shows the email's Sending bubble (`ChatUnsentReplyBubble`: the fill, "Sending · Undo
