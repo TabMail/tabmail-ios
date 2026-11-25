@@ -383,13 +383,13 @@ struct OutboxDoubleSendTests {
         #expect(heldUntil > Date())
     }
 
-    /// Reply path: the first send sets optimistic `isReplied` on the original
-    /// message and returns its id; a second (double-tap) send dedups WITHOUT
-    /// inserting a second row and without re-touching the original. Guards that the
-    /// firewall short-circuit doesn't lose the reply-badge side effect on the first
-    /// pass nor double-apply it.
-    @Test("Reply double-tap sets isReplied once and queues one row")
-    func replyDoubleTapPreservesSingleRowAndFlags() async throws {
+    /// Reply path: the first send queues one row that names the original; a second
+    /// (double-tap) send dedups WITHOUT inserting a second row. Neither touches the
+    /// original: its replied mark is written when the send goes out
+    /// (`deleteCompletedSendAtomic`), from the row's `originalMessageHeaderId`, so
+    /// the one kept row must carry that link.
+    @Test("Reply double-tap queues one row naming the original and leaves the original unmarked")
+    func replyDoubleTapPreservesSingleRowAndOriginal() async throws {
         let (dir, pool, previous) = try makeOutboxTestDatabase()
         defer {
             AppDatabase.shared.withLock { $0 = previous }
@@ -422,7 +422,6 @@ struct OutboxDoubleSendTests {
             draftId: "draft-reply", instanceEpoch: "E1"
         )
         #expect(first.deduped == false)
-        #expect(first.resolvedOriginalId == originalId, "first reply send should resolve the original header")
 
         let second = try await AccountManager.persistQueuedSend(
             draft: replyDraft, accountId: "acc1",
@@ -430,14 +429,18 @@ struct OutboxDoubleSendTests {
             draftId: "draft-reply", instanceEpoch: "E1"
         )
         #expect(second.deduped == true, "second reply send (double-tap) must dedup")
-        #expect(second.resolvedOriginalId == nil, "deduped send must not re-resolve / re-touch the original")
+        #expect(second.outboxId == first.outboxId, "the double-tap must answer with the kept row")
 
-        let count = try await outboxCount(pool)
-        #expect(count == 1, "reply double-tap must leave exactly ONE outbox row, got \(count)")
+        let rows = try await pool.read { db in try OutboxMessage.fetchAll(db) }
+        #expect(rows.count == 1, "reply double-tap must leave exactly ONE outbox row, got \(rows.count)")
+        guard rows.count == 1 else { return }
+        #expect(rows[0].originalMessageHeaderId == originalId,
+                "the kept row must name the original its completion marks replied")
+        #expect(!rows[0].isForward)
         let isReplied = try await pool.read { db in
-            try MessageHeader.fetchOne(db, key: originalId)?.isReplied ?? false
+            try MessageHeader.fetchOne(db, key: originalId)?.isReplied ?? true
         }
-        #expect(isReplied == true, "original message should be flagged isReplied")
+        #expect(isReplied == false, "queuing must not mark the original replied; the send has not gone out")
     }
 
     @Test("Outbox in-flight census is same-account, exact-draft, bounded to two, and ambiguity fails closed")

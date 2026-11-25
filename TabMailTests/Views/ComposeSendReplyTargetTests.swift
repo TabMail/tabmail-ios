@@ -86,6 +86,24 @@ private func insertHeader(
 
 private let authoredBody = "the words the user actually typed and must never lose"
 
+private enum CompletionFixtureError: Error { case outboxRowMissing }
+
+/// The queued send going out: the drain's claim, the delivery and the Sent append
+/// as the row records them, then the production completion step
+/// (`AccountManager.deleteCompletedSendAtomic`), which marks the original.
+private func completeQueuedSend(_ pool: DatabasePool, outboxId: String) async throws {
+    try await pool.write { db in
+        guard var sent = try OutboxMessage.fetchOne(db, key: outboxId) else {
+            throw CompletionFixtureError.outboxRowMissing
+        }
+        sent.status = OutboxStatus.sending.rawValue
+        sent.sentAt = Date()
+        sent.appendedToSent = true
+        try sent.update(db)
+        _ = try AccountManager.deleteCompletedSendAtomic(outboxId: outboxId, db: db)
+    }
+}
+
 @discardableResult
 private func insertDraft(
     _ pool: DatabasePool,
@@ -285,8 +303,8 @@ struct ComposeSendReplyTargetTests {
         guard state.outbox.count == 1 else { return }
         #expect(state.outbox[0].inReplyTo == "orig@example.com")
         #expect(state.outbox[0].references == ["root@example.com", "orig@example.com"])
-        #expect(state.parent?.isReplied == true,
-                "the parent must be marked replied by the queued send")
+        #expect(state.outbox[0].originalMessageHeaderId == parent.id,
+                "the queued send must name the parent its completion marks replied")
     }
 
     /// NON-REGRESSION (a): a fresh compose with no persisted row and no parent
@@ -330,7 +348,7 @@ struct ComposeSendReplyTargetTests {
     ///
     /// RED PROOF (recorded): with `ComposeDraftGuards.sendReplyTarget` inverted to
     /// always return `.send(composeParameter)`, this fails at `inReplyTo` and at
-    /// `parent.isReplied` — the resend leaves as a brand-new message.
+    /// `originalMessageHeaderId` — the resend leaves as a brand-new message.
     @Test("The Undo-Send reopen of a reply sends, and now sends threaded")
     func undoSendReopenSendsAndThreads() async throws {
         let (dir, pool, previous) = try makeReplyTargetTestDatabase()
@@ -368,8 +386,8 @@ struct ComposeSendReplyTargetTests {
         #expect(state.outbox[0].inReplyTo == "orig@example.com",
                 "the resend must thread against the row's resolved parent")
         #expect(state.outbox[0].references == ["root@example.com", "orig@example.com"])
-        #expect(state.parent?.isReplied == true,
-                "the parent bookkeeping this path used to skip must now happen")
+        #expect(state.outbox[0].originalMessageHeaderId == parent.id,
+                "the parent bookkeeping this path used to skip must now happen: the send names its parent")
     }
 
     /// THE `IOS-OUTBOX-004` INVARIANT: a forward that is undone and re-sent is
@@ -439,18 +457,28 @@ struct ComposeSendReplyTargetTests {
             isForward: reopened.isForward, instanceEpoch: "E1")
 
         #expect(!outcome.blocked, "undo-then-resend of a forward must never dead-end")
-        let state = try await pool.read { db -> (outbox: [OutboxMessage], parent: MessageHeader?) in
-            (try OutboxMessage.fetchAll(db), try MessageHeader.fetchOne(db, key: parent.id))
-        }
-        #expect(state.outbox.count == 1)
-        guard state.outbox.count == 1 else { return }
-        #expect(state.outbox[0].isForward,
+        let queued = try await pool.read { db in try OutboxMessage.fetchAll(db) }
+        #expect(queued.count == 1)
+        guard queued.count == 1 else { return }
+        #expect(queued[0].isForward,
                 "the queued send must be recorded as a forward — delivery reads this to choose \\$Forwarded over \\Answered")
-        #expect(state.parent?.isForwarded == true,
+        #expect(queued[0].originalMessageHeaderId == parent.id)
+
+        // The send goes out. The parent's folder holds the epoch its row was
+        // observed under, as a sync records it, so the completion can address the
+        // parent and queue its server mark.
+        let inboxId = MessageIdentity.folderId(accountId: "acc1", folderPath: "INBOX")
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = ? WHERE id = ?", arguments: [100, inboxId])
+        }
+        try await completeQueuedSend(pool, outboxId: queued[0].id)
+
+        let after = try await pool.read { db in try MessageHeader.fetchOne(db, key: parent.id) }
+        #expect(after?.isForwarded == true,
                 "the parent must end up recorded as forwarded")
-        #expect(state.parent?.isReplied == false,
+        #expect(after?.isReplied == false,
                 "a forward must never record its parent as replied-to")
-        #expect(state.parent?.actionTag == .reply,
+        #expect(after?.actionTag == .reply,
                 "a forward must not clear a Reply action tag the user never acted on")
     }
 
@@ -497,7 +525,7 @@ struct ComposeSendReplyTargetTests {
         #expect(state.outbox[0].isReplyAll,
                 "the queued send must stay a reply-all; delivery reads this to mark the original reply-all")
         #expect(!state.outbox[0].isForward)
-        #expect(state.parent?.isReplied == true)
+        #expect(state.outbox[0].originalMessageHeaderId == parent.id)
     }
 }
 

@@ -890,9 +890,9 @@ enum ComposeDraftGuards {
     /// and by `saveDraftAndDismiss`'s `existing` branch). Deriving the send's
     /// parent from the parameter there shipped the reply as a BRAND-NEW message:
     /// `ThreadUtils.outgoingThreadHeaders(replyTo: nil)` returns `.none`, so no
-    /// `In-Reply-To` and no `References`, and
-    /// `AccountManager.persistQueuedSend` skipped the parent's
-    /// `isReplied`/`isForwarded` write and the Reply action-tag clear.
+    /// `In-Reply-To` and no `References`, and the queued row named no original, so
+    /// the send's completion (`AccountManager.deleteCompletedSendAtomic`) skipped
+    /// the parent's `isReplied`/`isForwarded` write and the Reply action-tag clear.
     enum PersistedReplyTargetClaim: Equatable {
         /// The row names no reply/forward parent AND none could be established from
         /// its key either. Deliberately NOT spelled `none`: a bare `.none` in a
@@ -3505,7 +3505,8 @@ struct ComposeView: View {
         // only for a fresh reply/forward with no row. Defense-in-depth twin of the
         // `.disabled` on Send, so no alternate path (the empty-body prompt) can
         // send a draft whose claimed parent resolved to nothing — that would ship
-        // the reply UNTHREADED and hand `persistQueuedSend` an id it cannot verify.
+        // the reply UNTHREADED and queue a parent id the send's completion
+        // (`deleteCompletedSendAtomic`) cannot verify.
         // Blocks the SEND only: save, close and discard are untouched.
         let sendTarget: MessageHeader?
         switch sendReplyTarget {
