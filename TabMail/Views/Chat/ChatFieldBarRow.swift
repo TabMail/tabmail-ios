@@ -42,24 +42,27 @@ struct ChatFieldBarRow<Mic: View, Field: View, Send: View>: View {
 }
 
 /// The field's mic, a circle that mirrors Send (`ChatViewLayout.fieldMicSize`), in grays only so
-/// Send stays the field's one colour (`Palette.chatMic*`). Idle: a gray outline around `symbol`
-/// (the outlined mic, or the struck-through one when dictation is off). Listening: a solid circle
-/// with `symbol` (the stop square) in the opposite colour.
+/// Send stays the field's one colour (`Palette.chatMic*`). Idle: a light gray circle with `symbol`
+/// (the outlined mic, or the struck-through one when dictation is off) in dark gray. Listening: a
+/// solid circle with `symbol` (the stop square) in the opposite colour. Transcribing a dictation
+/// the mic stopped: the idle circle with the spinner in the mic's gray in place of `symbol`.
 struct ChatMicCircle: View {
     let symbol: String
     let listening: Bool
+    var transcribing = false
 
     var body: some View {
         ZStack {
             Circle()
-                .fill(listening ? Palette.chatMicListeningFill : .clear)
-            Circle()
-                .strokeBorder(listening ? Palette.chatMicListeningFill : Palette.chatMicIdle,
-                              lineWidth: ChatViewLayout.fieldMicOutlineWidth)
-            Image(systemName: symbol)
-                .contentTransition(.symbolEffect(.replace))
-                .font(.system(size: listening ? ChatViewLayout.fieldMicStopPointSize : ChatViewLayout.fieldMicGlyphPointSize))
-                .foregroundStyle(listening ? Palette.chatMicListeningStop : Palette.chatMicIdle)
+                .fill(listening ? Palette.chatMicListeningFill : Palette.chatMicIdleFill)
+            if transcribing {
+                DictationSpinner(tint: Palette.chatMicIdleGlyph, diameter: ChatViewLayout.fieldMicSpinnerSize)
+            } else {
+                Image(systemName: symbol)
+                    .contentTransition(.symbolEffect(.replace))
+                    .font(.system(size: listening ? ChatViewLayout.fieldMicStopPointSize : ChatViewLayout.fieldMicGlyphPointSize))
+                    .foregroundStyle(listening ? Palette.chatMicListeningStop : Palette.chatMicIdleGlyph)
+            }
         }
         .frame(width: ChatViewLayout.fieldMicSize, height: ChatViewLayout.fieldMicSize)
     }
