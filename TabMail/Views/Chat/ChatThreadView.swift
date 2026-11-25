@@ -505,7 +505,8 @@ struct ChatThreadView: View {
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
                 .onScrollGeometryChange(for: Bool.self) { geo in
-                    let isAbove = geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
+                    let isAbove = Self.distanceBelowVisible(contentHeight: geo.contentSize.height, offsetY: geo.contentOffset.y,
+                                                            topInset: geo.contentInsets.top, containerHeight: geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
                     #if DEBUG
                     if isAbove { NSLog("[cv10diag] jump shows at %@", String(describing: geo)) }
                     #endif
@@ -702,6 +703,15 @@ struct ChatThreadView: View {
     /// Whether a scroll phase is the user's own scroll, the only thing that ends the landing's pin.
     static func userTookOver(_ phase: ScrollPhase) -> Bool {
         phase == .tracking || phase == .interacting
+    }
+
+    /// How far the chat's end sits below the part of the screen between the top bar and the
+    /// field: 0 at the bottom, d once scrolled up by d, below 0 when a short chat leaves room.
+    /// The scroll geometry's container height leaves out both bars, while its offset counts from
+    /// under the top bar, so the top bar's inset is added back. Without it a tall top bar (the
+    /// tutorial's coach card) reads as chat below the screen and the jump button shows at the bottom.
+    static func distanceBelowVisible(contentHeight: CGFloat, offsetY: CGFloat, topInset: CGFloat, containerHeight: CGFloat) -> CGFloat {
+        contentHeight - (offsetY + topInset + containerHeight)
     }
 
     /// A scroll phase began: the user's own scroll ends the landing.
