@@ -1100,7 +1100,7 @@ struct ChatThreadView: View {
                 withAnimation(Self.pillSpring) { fieldStatus = status }
             }
             // Debug UI tests only: the glass's top, swell included (`ChatFieldDragMarker`).
-            .modifier(ChatFieldDragMarker.Glass())
+            .modifier(ChatFieldDragMarker.Glass(model: fieldDrag))
             // The swell is not the field's room: its glass grows upward, and the same swell is taken
             // back out of the layout here, springing back in the same transaction, so the field's
             // measured height, the bar, its inset and the chat never move under a drag.
