@@ -25,14 +25,19 @@ The completion (`deleteCompletedSendAtomic`) and an unsent removal (`cancelHeldO
   the address the server proved (IMAP's `COPYUID`, the Graph move response),
   `MessageHeaderRekey.finishMove` re-keys the row and carries the queued send's pointer with it, in
   the same transaction, as it re-addresses queued operations. The completion marks the moved original and queues the server's mark at its
-  new address; an Undo takes Send's marks back from it.
+  new address; an Undo takes Send's marks back from it. Only a send already queued at the landing is
+  carried: a reply or forward composed on the message before the move landed and sent after it names
+  the old id, so Send and the completion find no original and it gets no arrow (rare: the landing
+  takes seconds online; nothing else changes).
 - **A move made in TabMail that is not re-keyed when it lands is covered only until sync re-keys the
   row.** A Gmail move does not change the message's address, so `finishMove` re-keys nothing; the row
   keeps its Inbox-shaped key until a listing of the destination runs `canonicalizeLocalRows`
   (`SyncEngineFullSync`), which re-keys it on the provider's stable id. An IMAP move with no
   admissible `COPYUID` or with a positive epoch disagreement, and a Graph move whose response withheld
   the new id, leave the row at its source key until the destination listing's UID remap re-keys it, on
-  Message-ID evidence. Both re-keys go through `MessageHeaderRekey.apply`, which carries no pointer.
+  Message-ID evidence; so can the body backfill's re-key (`BackfillBodyQueue.rekeyRemappedHeader`),
+  when the row's body fetch keeps missing, to the UID its Message-ID now has. These re-keys go through
+  `MessageHeaderRekey.apply`, which carries no pointer.
   Until then the send finds its original; from then on:
   - the completion finds nothing: no server mark and no tag clear. On Gmail nothing is lost on the
     server (Gmail keeps no replied flag), and the Sent copy marks the original on this device
@@ -94,7 +99,7 @@ collision arm: the send is not carried, and the stored row is unchanged). The co
 ## Subsystem and search terms
 
 Outbox; reply; forward; moved original; archived original; `originalMessageHeaderId`;
-`MessageHeaderRekey.finishMove`; `readdressQueuedOperations`; re-key; UID remap; collision arm;
+`MessageHeaderRekey.finishMove`; `readdressQueuedOperations`; re-key; UID remap; `BackfillBodyQueue.rekeyRemappedHeader`; compose sent after the move landed; collision arm;
 `canonicalizeLocalRows`; `MessageHeaderRekey.apply`; Gmail archive; All Mail; no `COPYUID`; reply arrow
 that stays; #1500; `deleteCompletedSendAtomic`; `cancelHeldOutboxRow`;
 `revertQueuedOriginalChanges`; `resolveOriginalMessage`; `ReplyParentResolver`; Message-ID; RFC 822;

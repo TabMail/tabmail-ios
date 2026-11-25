@@ -1532,6 +1532,8 @@ struct SendReplyMarksTests {
         let tags = try Self.queuedTags(pool)
         #expect(tags.isEmpty, "the archive cleared the tag, so there is no clear to queue and no Reply to restore: \(tags)")
         let folders = try Self.markOps(pool).map(\.folderPath)
+        let wantOps = outcome == .completed ? 1 : 0
+        #expect(folders.count == wantOps, "\(outcome.rawValue): mark and tag ops queued: \(folders)")
         let archivePath = Self.archivePath
         let allInArchive = folders.allSatisfy { $0 == archivePath }
         #expect(allInArchive, "every queued mark names the Archive copy: \(folders)")
