@@ -17,6 +17,8 @@ import UniformTypeIdentifiers
 @MainActor
 struct ChatNewThreadTests {
     private static let maria = ChatThread.Person(address: "maria@example.com", name: "Maria")
+    /// An email the field's compose edit wrote, with its text version and change command.
+    private static let written = ReplyResult(body: "The email.", textMessage: "Short.", changeCommand: "make it shorter")
     private static let sam = ChatThread.Person(address: "sam@example.com", name: "Sam")
     private static let lee = ChatThread.Person(address: "lee@example.com", name: "Lee")
 
@@ -146,7 +148,7 @@ struct ChatNewThreadTests {
         #expect(ChatReplyField.statusLine(composing) == "Writing your email")
     }
 
-    @Test("The card opens with the chat's people, Cc, Bcc and attachments; a carried subject wins over the agent's")
+    @Test("The card opens with the chat's people, Cc, Bcc and attachments, and the email written with its text version; a carried subject wins over the written one")
     func cardFields() throws {
         let request = MailtoRequest(to: ["Maria <maria@example.com>"], cc: ["lee@example.com"], bcc: ["sam@example.com"],
                                     subject: "Lunch", body: "words")
@@ -155,7 +157,7 @@ struct ChatNewThreadTests {
         model.addAttachment(file)
         let req = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: ["someone@example.com"], cc: [], bcc: [], subject: "Agent's subject",
-            body: "The email.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat))
+            body: "The email.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat), suggestion: Self.written)
         let draftId = ChatNewThreadModel.newCardDraftId()
         let card = model.card(for: req, account: nil, draftId: draftId) { _ in }
         #expect(card.prefillDraftId == draftId, "the card writes under the draft id the chat gave it, which finds its send")
@@ -164,6 +166,7 @@ struct ChatNewThreadTests {
         #expect(card.prefillBcc == ["sam@example.com"])
         #expect(card.prefillSubject == "Lunch", "the link's subject, not the agent's")
         #expect(card.suggestedBody == "The email.")
+        #expect(card.suggestion == Self.written, "the email written, with its text version and change command")
         #expect(card.prefillAttachments == [file])
         let plain = ChatNewThreadModel(account: nil)
         plain.setPeople([Self.maria])

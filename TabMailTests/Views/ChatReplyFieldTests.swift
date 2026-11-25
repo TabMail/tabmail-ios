@@ -321,7 +321,7 @@ struct ChatReplyFieldTests {
 
     // MARK: - 3. No message to the agent
 
-    @Test("A reply's words reach the agent only from the open panel, with no reply-field nudge; only a new email's chat keeps its own")
+    @Test("Words reach the agent only from the open panel: no field's words go with a nudge, a reply's or a new email's")
     func noAgentNudge() throws {
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         let field = try Self.source("TabMail/Views/Chat/ChatReplyField.swift")
@@ -330,7 +330,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("typed in its reply field", in: island + field) == 0)
         // A new email's chat composes directly too (ADR-IOS-114 decision 10), so its nudge is gone.
         #expect(Self.count("agentMessage(", in: island + field) == 0, "no field's words reach the agent with a nudge")
-        #expect(Self.count("newEmailTo:", in: island) == 0, "and no agent request names a new email's people")
+        #expect(Self.count("newEmailTo:", in: island) == 1, "only the Send's own variable names a new email's people; no agent request takes them")
     }
 
     // MARK: - 4. The status line
@@ -713,7 +713,10 @@ struct ChatReplyFieldTests {
         #expect(Self.count("guard let newEmail = replyField?.newEmail, newEmail.sessionKey != newEmailSession else { return } let opening = newEmailSession == nil newEmailSession = newEmail.sessionKey if opening { if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) } focusedInput = .replyField } else { fieldFill.apply(.put(newEmail.startWords)) } }", in: text) == 1)
         #expect(Self.count("focusedInput = .replyField", in: text) == 1, "the new email's opening is the only one that focuses the reply field")
         #expect(Self.count("isTextFieldFocused = true", in: text) == 1, "the forked chat's put is the only one that focuses the panel's input")
-        #expect(Self.count("fieldFill.apply(", in: text) == 10)
+        // A new email's field compose ends with the words the user's again, whatever became of them:
+        // sent, the next email's own words have already replaced them (`startNewEmail`).
+        #expect(Self.count("} ended: { written in fieldFill.apply(.notWritten) if case .nothing? = written { showAgentToast(Self.newEmailNotWrittenNote) } }", in: text) == 1)
+        #expect(Self.count("fieldFill.apply(", in: text) == 11)
     }
 
     @Test("The closed field's Send writes the email from the words and never reaches the agent; a new email's chat's own Send first says who it is to, or asks and stops there")

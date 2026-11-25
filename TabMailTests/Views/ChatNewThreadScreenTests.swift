@@ -408,7 +408,7 @@ struct ChatNewThreadScreenTests {
         let fixture = try fixture()
         defer { finish(fixture) }
         // A fake backend that writes the email the words ask for (the compose edit), on no real network.
-        let backend = ChatComposeRoutingTests.Backend()
+        let backend = ChatComposeRoutingTests.Backend(composedSubject: "Lunch")
         ChatPillState.shared.aiService = backend.service
         defer {
             ChatPillState.shared.aiService = .shared
@@ -433,12 +433,10 @@ struct ChatNewThreadScreenTests {
             let asked = backend.bodies.first ?? ""
             #expect(asked.contains(words) && asked.contains("maria@example.com") && asked.contains("Maria"),
                     "the words are its request, to the picked people under their names: \(asked.prefix(400))")
-            @MainActor func shown() -> [String] {
-                HostedAccessibility.labels(in: card.view) + ChatFieldWordsRuntimeTests.fieldTexts(card.view)
-            }
-            try await Self.waitUntil { shown().contains { $0.contains("Friday works for us.") } }
-            let seen = shown()
-            #expect(seen.contains { $0.contains("Friday works for us.") }, "the card holds the email written: \(seen.prefix(20))")
+            // The email written is the card's (its suggestion: `ChatNewThreadTests.cardFields`), under the subject it wrote.
+            try await Self.waitUntil { ChatFieldWordsRuntimeTests.fieldTexts(card.view).contains("Lunch") }
+            let texts = ChatFieldWordsRuntimeTests.fieldTexts(card.view)
+            #expect(texts.contains("Lunch"), "the card holds the subject the edit wrote: \(texts)")
             #expect(model.words == words, "the words stay")
             #expect(recorder.calls.isEmpty, "Send saves nothing")
             let rows = try await rowCount(fixture)
@@ -589,7 +587,7 @@ struct ChatNewThreadScreenTests {
         let standard = UserDefaults.standard
         let consentBefore = standard.object(forKey: AgeAndTermsConsent.completedKey)
         standard.set(false, forKey: AgeAndTermsConsent.completedKey)
-        let backend = ChatComposeRoutingTests.Backend()
+        let backend = ChatComposeRoutingTests.Backend(composedSubject: "Lunch")
         ChatPillState.shared.aiService = backend.service
         let service = PendingSendService.shared
         defer {
