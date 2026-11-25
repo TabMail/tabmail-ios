@@ -420,8 +420,10 @@ and then for every other reader's slice already in line.
    this one change covers each of them. The follow-up's first steps (the first paint, the account read,
    the connection check) are unchanged: work that takes the turn before the follow-up is in line still goes
    first (#1329).
-4. **Open questions, not decided here:** a silent push in a background wake, where no follow-up
-   runs (item 4 of the 2026-11-23 amendment); whether the follow-up should also pass a listing or a Settings
+4. **The background is unchanged.** A silent push in a background wake that finds the account busy only
+   sets the flag, which waits for the next opening (item 4 of the 2026-11-23 amendment; sync timing promise
+   1): no follow-up runs in the background, so it has no place in the line to change.
+5. **Open questions, not decided here:** whether the follow-up should also pass a listing or a Settings
    pass queued behind the first waiting slice; whether pull to refresh's listing of the folder on screen
    should take the follow-up's place.
 
