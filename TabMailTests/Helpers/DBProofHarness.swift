@@ -175,17 +175,29 @@ enum DBProof {
     // MARK: - Building the database
 
     /// Builds the proof database at `url`, replacing any file there. Deterministic for
-    /// a given shape, seed and anchor.
-    static func build(at url: URL, shape: Shape, seed: UInt64 = Config.seed, anchor: Date) throws {
+    /// a given shape, seed and anchor. `migratedUpTo` stops the schema at that
+    /// migration (a proof that measures a later migration runs it itself); nil runs
+    /// the whole chain. `deferredIndexes` are the deferred indexes built on it: an
+    /// earlier schema has only those its app version had.
+    static func build(
+        at url: URL, shape: Shape, seed: UInt64 = Config.seed, anchor: Date, migratedUpTo: String? = nil,
+        deferredIndexes: [SyncEngine.DeferredIndex] = SyncEngine.deferredIndexes
+    ) throws {
         try removeDatabaseFiles(at: url)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         var config = Configuration()
         config.foreignKeysEnabled = true
         let queue = try DatabaseQueue(path: url.path, configuration: config)
-        try AppDatabase.runMigrations(on: queue)
+        if let migratedUpTo {
+            var migrator = DatabaseMigrator()
+            AppDatabase.registerAllMigrations(on: &migrator)
+            try migrator.migrate(queue, upTo: migratedUpTo)
+        } else {
+            try AppDatabase.runMigrations(on: queue)
+        }
         try queue.write { db in
-            try SyncEngine.createDeferredIndexes(db)
+            try SyncEngine.createDeferredIndexes(db, deferredIndexes)
             var rng = SeededGenerator(seed: seed)
             for (index, accountShape) in shape.accounts.enumerated() {
                 try seedAccount(index: index, shape: accountShape, labels: shape.labels,

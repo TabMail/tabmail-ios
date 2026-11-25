@@ -191,10 +191,11 @@ struct SyncEngineMaintenanceTests {
     /// The maintenance sweeps reclaim bodies EXPLICITLY as of Stage D
     /// (`v70_dropMessageBodyHeaderFK`): `pruneOldMessages` routes its header ids
     /// through `MessageContentStore.releaseUnowned(…, stores: [.searchIndex,
-    /// .body])`, and `runEvictStaleBodies` is the TTL/orphan backstop. Neither
-    /// depends on a cascade any more, and the cascade had to go — it deletes
-    /// content below the application layer, where the ownership gate cannot
-    /// veto it once N headers can share one content key.
+    /// .body])`. Since #1433 `runEvictStaleBodies` reads only bodies whose header
+    /// exists, so a body this leaves behind stays (#1446). Nothing depends on a
+    /// cascade any more, and the cascade had to go — it deletes content below the
+    /// application layer, where the ownership gate cannot veto it once N headers
+    /// can share one content key.
     @Test("Deleting MessageHeader no longer cascades to MessageBody")
     func headerDeletionLeavesBodyToTheSweeps() throws {
         let db = try TestDatabase.make()
@@ -213,25 +214,24 @@ struct SyncEngineMaintenanceTests {
         #expect(body != nil, "the schema must not delete cached content as a side effect")
     }
 
-    // MARK: - Stale-body evict page (#1354)
+    // MARK: - Stale-body evict page (#1354, #1433)
 
     /// The evict step's page must seek its own index and come out in that index's
     /// order, for the first page and for every page after the cursor: a `SCAN`
-    /// reads every body (overflow pages included, since `fetchedAt` is stored after
-    /// the HTML), and a `TEMP B-TREE` sorts the whole stale set once per page. The
-    /// index is built through the production DDL (`createDeferredIndexes`), never
-    /// re-typed here.
+    /// reads every header, and a `TEMP B-TREE` sorts the whole candidate set once
+    /// per page. The index is built through the production DDL
+    /// (`createDeferredIndexes`), never re-typed here.
     @Test("The stale-body page seeks its index in index order, first page and after the cursor")
     func staleBodyPageSeeksItsIndex() throws {
         let db = try TestDatabase.make()
         try db.write { try SyncEngine.createDeferredIndexes($0) }
         let cutoff = Date()
-        let cursorFetchedAt = cutoff.addingTimeInterval(-86_400)
+        let cursorCachedAt = cutoff.addingTimeInterval(-86_400)
         for afterCursor in [false, true] {
-            let sql = "EXPLAIN QUERY PLAN " + SyncEngine.staleBodyPageSQL(afterCursor: afterCursor)
+            let sql = "EXPLAIN QUERY PLAN " + HTMLCachePair.evictCandidatesPageSQL(afterCursor: afterCursor)
             let arguments: StatementArguments
             if afterCursor {
-                arguments = [cutoff, cursorFetchedAt, 1, SyncConfig.pruneChunkSize]
+                arguments = [cutoff, cursorCachedAt, 1, SyncConfig.pruneChunkSize]
             } else {
                 arguments = [cutoff, SyncConfig.pruneChunkSize]
             }
@@ -240,7 +240,7 @@ struct SyncEngineMaintenanceTests {
                     .map { $0["detail"] as String }
                     .joined(separator: " | ")
             }
-            #expect(plan.contains("USING INDEX \(SyncEngine.staleBodyIndexName)"),
+            #expect(plan.contains("USING INDEX \(HTMLCachePair.indexName) (isInInbox=?"),
                     "afterCursor \(afterCursor): the page does not seek its index: \(plan)")
             #expect(!plan.contains("SCAN"), "afterCursor \(afterCursor): the page reads the whole table: \(plan)")
             #expect(!plan.contains("TEMP B-TREE"), "afterCursor \(afterCursor): the page sorts: \(plan)")
@@ -279,6 +279,45 @@ struct SyncEngineMaintenanceTests {
                 "the archive body past the newest \(recent) is evicted, and only it")
     }
 
+    /// A refresh that builds a deferred index wrote many pages in one transaction (the
+    /// HTML-cache pair's fill rewrites a header per cached body), and autocheckpoint is
+    /// off: it checkpoints the WAL once, after the write. A refresh that builds nothing
+    /// writes only the statistics and adds none; neither does one that finds the
+    /// statistics fresh.
+    /// `.processGlobalState`: the refresh carries a process-wide single-flight latch and
+    /// gives up while `DatabaseSuspension.isSuspended`.
+    @Test("A refresh that builds a deferred index checkpoints the WAL after it; one that builds nothing does not",
+          .processGlobalState)
+    func refreshCheckpointsTheWALAfterABuild() async throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        _ = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: SyncConfig.bodyCacheRecentPerFolder + 1)
+        let markerKey = "analyzeMarker-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removeObject(forKey: markerKey) }
+        let checkpoints = CheckpointCount()
+        let count: @Sendable (PrioritizedDatabase) async -> Void = { _ in await checkpoints.record() }
+
+        let build = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterBuild = await checkpoints.calls
+        // Every index present and the marker stale: the ANALYZE alone.
+        UserDefaults.standard.removeObject(forKey: markerKey)
+        let analyzeOnly = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterAnalyzeOnly = await checkpoints.calls
+        let fresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterFresh = await checkpoints.calls
+
+        #expect(build == .refreshed)
+        #expect(afterBuild == 1, "one checkpoint after the write that built the deferred indexes")
+        #expect(analyzeOnly == .refreshed)
+        #expect(afterAnalyzeOnly == 1, "a refresh that built nothing checkpointed")
+        #expect(fresh == .alreadyFresh)
+        #expect(afterFresh == 1, "a refresh that found the statistics fresh checkpointed")
+    }
+
     /// The gate waits for the evict step's own index and no other: with that index
     /// built and every other deferred index still missing, the step runs.
     /// `.processGlobalState`: the gate runs production's checkpoint between pages,
@@ -290,20 +329,17 @@ struct SyncEngineMaintenanceTests {
         let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
         let recent = SyncConfig.bodyCacheRecentPerFolder
         let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
-        let ownIndex = SyncEngine.deferredIndexes.filter { $0.name == SyncEngine.staleBodyIndexName }
-        let otherNames = SyncEngine.deferredIndexes.map(\.name).filter { $0 != SyncEngine.staleBodyIndexName }
+        let ownIndex = SyncEngine.deferredIndexes.filter { $0.name == HTMLCachePair.indexName }
+        let otherNames = SyncEngine.deferredIndexes.map(\.name).filter { $0 != HTMLCachePair.indexName }
         #expect(ownIndex.count == 1, "the evict step's index is a deferred index")
         #expect(!otherNames.isEmpty, "setup: another deferred index exists to leave missing")
-        // The production DDL of the step's index alone.
-        let ownSQL = ownIndex.map(\.sql)
-        try await fixture.pool.write { db in
-            for sql in ownSQL { try db.execute(sql: sql) }
-        }
+        // The production DDL of the step's index alone, with its fill.
+        try await fixture.pool.write { db in try SyncEngine.createDeferredIndexes(db, ownIndex) }
         let present = try await fixture.pool.read { db in
             try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'index'"))
         }
         let othersPresent = otherNames.filter { present.contains($0) }
-        #expect(present.contains(SyncEngine.staleBodyIndexName), "setup: the step's index exists")
+        #expect(present.contains(HTMLCachePair.indexName), "setup: the step's index exists")
         #expect(othersPresent.isEmpty, "setup: every other deferred index is missing: \(othersPresent)")
 
         let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
@@ -390,6 +426,31 @@ struct SyncEngineMaintenanceTests {
         ]
         #expect(uses == expected,
                 "the step's parameter with its default and its one call, and no caller passing another: \(uses)")
+    }
+
+    /// Production's checkpoint after a deferred index build is the throttled TRUNCATE on
+    /// the pool the step wrote to, `checkpointWALThrottled(truncate: true, pool:)`, the
+    /// refresh's default, and no production caller passes another. One that did nothing
+    /// would leave the build's whole WAL for later; one on `backgroundPool` would
+    /// checkpoint another database than the one a pass on its own pool wrote; a PASSIVE
+    /// one would make the pass's closing TRUNCATE skip inside the throttle's interval
+    /// and leave the WAL file at its largest ("THE WAL AFTER A BUILD"). The AI-cache
+    /// purge's `checkpointWAL` (a PASSIVE between batches, never after its last) is
+    /// listed too, as every production line naming the parameter is. The tests that run
+    /// the refresh pass their own, so only the source shows which one production runs.
+    @Test("Production's deferred index step checkpoints after a build with the throttled TRUNCATE on its own pool, its default, and no caller passes another")
+    func deferredBuildCheckpointsWithTheThrottledTruncate() {
+        let uses = Self.productionCodeLines()
+            .filter { $0.code.contains("checkpointWAL:") || $0.code.contains("checkpointWAL(") }
+            .map { "\($0.file): \($0.code)" }
+        let expected = [
+            "SyncEngineMaintenance.swift: checkpointWAL: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }",
+            "SyncEngineMaintenance.swift: await checkpointWAL()",
+            "SyncEngineMaintenance.swift: checkpointWAL: @Sendable (PrioritizedDatabase) async -> Void = { await SyncEngine.checkpointWALThrottled(truncate: true, pool: $0) }",
+            "SyncEngineMaintenance.swift: if !missing.isEmpty { await checkpointWAL(dbPool) }",
+        ]
+        #expect(uses == expected,
+                "each step's parameter with its default and its one call, and no caller passing another: \(uses)")
     }
 
     /// The storage prune's checkpoint after each batch (#1437): its default is the
@@ -486,4 +547,10 @@ struct SyncEngineMaintenanceTests {
         #expect(firstChunk[0].messageId == "1")
         #expect(secondChunk[0].messageId == "4")
     }
+}
+
+/// Counts the WAL checkpoints a refresh asks for (`refreshCheckpointsTheWALAfterABuild`).
+private actor CheckpointCount {
+    private(set) var calls = 0
+    func record() { calls += 1 }
 }

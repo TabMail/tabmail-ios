@@ -63,3 +63,28 @@ Performance; migrations; `v83_markAllAsReadUnreadSweepIndex`; `messageHeader_unr
 
 `SyncEngine.deferredIndexes` gains `messageHeader_backfillProgress` on `messageHeader(accountId, bodyComplete, bodyEmptyConfirmed, bodyMetadataOversized, headerComplete)`, the index the backfill progress counts read (`SyncEngine.backfillProgressCounts`; ADR-IOS-029 amendment of the same date). It qualifies under this row's rule: its absence changes no result, no write depends on it, and nothing names it in an `INDEXED BY`. Its build reads every header once. During this row's transient window the counts read header rows as they did before, with the same results, so nothing is gated on it. Point (ii) above applies unchanged to the one-time build. It is built in the statistics refresh's one write, like every deferred index since the amendment above.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Amendment 2026-11-24 (#1433): `messageHeader_htmlCachedAt` replaces `messageBody_staleEvict` in the deferred set
+
+The stale-body evict reads its candidates from `messageHeader_htmlCachedAt` (ADR-IOS-119), so nothing
+reads `messageBody_staleEvict` any more and it is out of `SyncEngine.deferredIndexes`.
+`messageHeader_htmlCachedAt` takes its place there, with a fill: migration v116 adds only the column
+`messageHeader.htmlCachedAt` and its triggers, and the deferred step's one write fills the column from
+`messageBody` (`HTMLCachePair.fillSQL`, only while the index is missing), builds the index and runs
+`ANALYZE`. The fill reads every cached body once, as `messageBody_staleEvict`'s build did, and also
+rewrites one header row per cached body, and the index build reads every header (the index is partial:
+it holds only the cached headers outside the inbox), all in the one write, so
+the step costs more than that build did (`StaleBodyEvictPairProofTests` reports it at 105k and 525k
+headers, with the WAL size its write leaves and the time of the TRUNCATE checkpoint the step runs
+after it commits, a second writer hold). This row's points apply to it as they did to that build: it runs
+in the first background maintenance pass after the upgrade, never on the launch path, and a
+`.priority` write issued during it (a Send) waits for it once. The evict waits for it
+(`runEvictStaleBodiesIfIndexed`, now pointed at `messageHeader_htmlCachedAt`). **A named exception to
+this row's negative case** (and ADR-IOS-029 NEGATIVE CASE 3): the fill is a data repair a reader
+assumes, deferred only because until the step commits a body cached before v116 reads as not cached,
+so it may be fetched or merged again; nothing is deleted and no message is given another's content
+(ADR-IOS-119 decision 7). It licenses no other deferred repair. As of
+2026-11-24 no released or TestFlight build ran the step with `messageBody_staleEvict` in the list, so
+no user's database holds it. The 2026-11-23 amendment above describes the state from #1354 to #1433
+and stays as history.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->

@@ -68,13 +68,13 @@ struct ContentOwnershipSweepTests {
     @discardableResult
     private func seedHeader(
         accountId: String, folderPath: String, messageId: String, rfc822: String? = nil,
-        inReplyTo: String? = nil
+        inReplyTo: String? = nil, date: Date = Date()
     ) async throws -> MessageHeader {
         let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
         var header = MessageHeader(
             messageId: messageId,
             subject: "stage C fixture", from: "a", fromAddress: "a@example.com", to: "b@example.com",
-            date: Date(), snippet: "",
+            date: date, snippet: "",
             folderId: folderId, accountId: accountId, folderPath: folderPath,
             isInInbox: false
         )
@@ -310,28 +310,29 @@ struct ContentOwnershipSweepTests {
     /// `runEvictStaleBodies`, because it is not an orphan sweep by name — it is a TTL
     /// cache evictor whose orphan branch (`no messageHeader holds this id` → delete)
     /// was unreachable while the `messageBody → messageHeader` FK cascade removed the
-    /// row first. `v70_dropMessageBodyHeaderFK` is exactly what makes it reachable,
-    /// which is why the gate ships with the migration and not after it.
+    /// row first. `v70_dropMessageBodyHeaderFK` made it reachable, and Stage D gated it.
+    /// Since #1433 the evictor reads its candidates from the headers
+    /// (`HTMLCachePair.evictCandidatesPage`), so the branch is gone: a body no header
+    /// holds is never read, quarantined or not, and stays as a harmless leftover
+    /// (#1446).
     ///
     /// Two-sided by construction — an evictor that simply stopped deleting would fail
     /// the second half:
     ///
-    /// - a stale orphan in a QUARANTINED folder must be KEPT (red without the gate);
-    /// - a stale orphan nothing owns must STILL be evicted;
-    /// - a stale orphan whose folder no longer exists must STILL be evicted — the
-    ///   deliberate "unresolvable scope is not protected" rule, without which a
-    ///   removed account's cached HTML would be a FOREVER leak rather than the
-    ///   reclaimed-on-a-later-pass kind the fail-safe direction trades for;
-    /// - a body a live header still holds must be KEPT, so the sweep is demonstrably
-    ///   still doing its normal job around the new branch.
+    /// - stale bodies no header holds, in a QUARANTINED folder, in a live folder and
+    ///   in a folder that does not exist, all stay;
+    /// - in a live folder holding one message more than `bodyCacheRecentPerFolder`,
+    ///   the oldest message's stale body is evicted and the newest ones' stay, so the
+    ///   sweep is demonstrably still doing its normal job around the bodies it skips.
     ///
     /// The bounded wait is deliberate. `206ec48cf` had to repair a sibling sweep whose
     /// loop stopped terminating when the Stage C gate added a third per-row outcome;
-    /// this sweep is cursored (a `(fetchedAt, rowid)` keyset since #1354, `LIMIT/OFFSET`
-    /// before it) and the cursor moves past a KEEP as past any other row — asserted
-    /// here as an OUTCOME (the sweep returns) rather than by reading the loop.
-    @Test("#37 — the stale-body evictor keeps what it cannot prove dead, and still reclaims what is")
-    func evictStaleBodiesGatesItsOrphanLegAndStillReclaims() async throws {
+    /// this sweep is cursored (a `(htmlCachedAt, rowid)` keyset on the headers since
+    /// #1433, on the bodies since #1354, `LIMIT/OFFSET` before it) and the cursor moves
+    /// past a KEEP as past any other row — asserted here as an OUTCOME (the sweep
+    /// returns) rather than by reading the loop.
+    @Test("#37, #1433 — the stale-body evictor leaves bodies no header holds, and still reclaims stale ones")
+    func evictStaleBodiesLeavesHeaderlessBodiesAndStillReclaims() async throws {
         let accountId = "stageD-evict"
         try await seedScope(
             accountId: accountId, folderPath: "INBOX", provider: .imap, quarantined: true)
@@ -341,21 +342,30 @@ struct ContentOwnershipSweepTests {
         // Older than the TTL by a clear margin, computed from `Date()` — never a
         // hardcoded date.
         let staleHours = SyncConfig.bodyCacheTTLHours + 24
+        let recent = SyncConfig.bodyCacheRecentPerFolder
 
-        // KEEP: orphan under a UIDVALIDITY quarantine.
+        // KEEP: no header, under a UIDVALIDITY quarantine.
         let quarantinedOrphan = ContentKey(rawValue: "\(accountId):INBOX:3701")
         try await seedBody(key: quarantinedOrphan, html: "<p>quarantined</p>", ageHours: staleHours)
-        // EVICT: orphan in a live folder that nothing owns.
+        // KEEP: no header, in a live folder.
         let deadOrphan = ContentKey(rawValue: "\(accountId):Archive:3702")
         try await seedBody(key: deadOrphan, html: "<p>dead</p>", ageHours: staleHours)
-        // EVICT: orphan whose folder does not exist at all — scope unresolvable.
+        // KEEP: no header, in a folder that does not exist at all.
         let ghostFolderOrphan = ContentKey(rawValue: "\(accountId):GhostFolder:3704")
         try await seedBody(key: ghostFolderOrphan, html: "<p>ghost</p>", ageHours: staleHours)
-        // KEEP: a body a live header still holds.
-        let liveHeader = try await seedHeader(
-            accountId: accountId, folderPath: "Archive", messageId: "3703")
-        let liveKey = ContentKey(rawValue: liveHeader.id)
-        try await seedBody(key: liveKey, html: "<p>live</p>", ageHours: staleHours)
+        // `recent + 1` live headers in Archive, newest first, one hour apart: the
+        // newest `recent` keep their stale bodies, the oldest loses its body.
+        var liveKeys: [ContentKey] = []
+        for index in 0...recent {
+            let date = Calendar.current.date(byAdding: .hour, value: -index, to: Date()) ?? Date()
+            let header = try await seedHeader(
+                accountId: accountId, folderPath: "Archive", messageId: "\(3_800 + index)", date: date)
+            let key = ContentKey(rawValue: header.id)
+            try await seedBody(key: key, html: "<p>live \(index)</p>", ageHours: staleHours)
+            liveKeys.append(key)
+        }
+        #expect(liveKeys.count == recent + 1)
+        guard liveKeys.count == recent + 1, let oldestKey = liveKeys.last else { return }
 
         let sweep = Task.detached(priority: .utility) {
             await SyncEngine.runEvictStaleBodies(
@@ -370,17 +380,24 @@ struct ContentOwnershipSweepTests {
         }
 
         #expect(await bodyHTML(quarantinedOrphan) == "<p>quarantined</p>",
-                "a quarantined folder's cached body must survive the TTL evictor's orphan leg")
-        #expect(await bodyHTML(liveKey) == "<p>live</p>",
-                "a body a live header still holds must not be evicted")
-        #expect(await bodyHTML(deadOrphan) == nil,
-                "an orphan nothing owns must STILL be reclaimed")
-        #expect(await bodyHTML(ghostFolderOrphan) == nil,
-                "an orphan whose folder is gone must still be reclaimed — otherwise it leaks forever")
+                "a quarantined folder's cached body no header holds must stay")
+        #expect(await bodyHTML(deadOrphan) == "<p>dead</p>",
+                "a body no header holds must stay (#1446): the evictor reads only headers")
+        #expect(await bodyHTML(ghostFolderOrphan) == "<p>ghost</p>",
+                "a body whose folder is gone must stay: the evictor reads only headers")
+        var keptLive: [ContentKey] = []
+        for key in liveKeys.dropLast() {
+            let html = await bodyHTML(key)
+            if html != nil { keptLive.append(key) }
+        }
+        #expect(keptLive == Array(liveKeys.dropLast()),
+                "the bodies of the folder's newest \(recent) messages must not be evicted")
+        #expect(await bodyHTML(oldestKey) == nil,
+                "the stale body of the folder's oldest message must STILL be evicted")
 
         await cleanup(
             accountId: accountId,
-            keys: [quarantinedOrphan, deadOrphan, ghostFolderOrphan, liveKey])
+            keys: [quarantinedOrphan, deadOrphan, ghostFolderOrphan] + liveKeys)
     }
 
     /// Part 3 of Stage D: `.body` is no longer implicit. With the FK cascade gone,

@@ -61,3 +61,21 @@ Maintenance; `PriorityGate.write`; pass-through write; `DatabaseWriteQueue`; tie
 
 **Amendment (2026-11-24, tabmail-ios #1437): census update; the storage prune is `async`.** `runPruneIfOverBudget` is `async` now: it awaits its storage check (`StorageEstimator.SpaceMeter`: the space Settings reports, walked once per run, less the email and search database files and their WAL files on disk at the run's start, plus the pages the two databases hold now less their empty pages) and each header batch's release. Its reads and writes stay the synchronous pass-through ones, through `passThroughRead` (new) and `passThroughWrite`, because from an `async` context Swift binds the `async` overloads, which enter `DatabaseWriteQueue`; so this row still covers them, bounded per batch as before (`SyncConfig.pruneChunkSize`). The header batch's write no longer checks storage: until #1437 it called `StorageEstimator.isOverBudget`, a walk of every file in Application Support, before each of its up to `pruneChunkSize` rows, INSIDE the write, so the writer was held across up to 50 walks; nothing is measured inside a write now. This row's predicate, re-run on the change: `rg -n 'dbPool\.write' TabMail/Services/Sync/SyncEngineMaintenance.swift` gives 7 hits (9 on the base): two doc comments, two `async` sites (`try? await dbPool.write` and the `AnalyzePlannerStatistics` labelled write), `passThroughWrite`'s own call, `runPurgeExpiredAICache`'s batch helper and `runReclaimRetiredCalendarOps`. The prune's two synchronous write sites (the body pass's page delete in `pruneFolderBodies` and the header batch) now call `passThroughWrite`, as `runEvictStaleBodies` has since #1354, so that predicate no longer finds them; `rg -n 'passThroughWrite\(dbPool' TabMail/Services/Sync/SyncEngineMaintenance.swift` does: three sites (the body pass, the header batch, the evict). The query fence registers each helper call as `NOT-A-QUERY`; the statements inside keep their verdicts.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Amendment 2026-11-24 (#1433): the evict reads only its candidates
+
+After #1354 each evict write was bounded, but every pass still walked every cached body older than
+the TTL and read each one's header, a page of `SyncConfig.pruneChunkSize` per write. Inbox bodies are
+always kept, so once past the TTL they were all visited again on every pass (#1427, simulator: at 105k
+headers 18,764 bodies, 65.8k pages read, 7.5 s and 377 writes per pass; at 525k about 93,000 bodies,
+33 to 37 s and 1,861 writes, single writes up to 715 ms). **Fix (ADR-IOS-119):** the header records
+when its HTML was cached (`messageHeader.htmlCachedAt`, kept exact by SQLite triggers), and each write's
+page is a keyset seek on `messageHeader_htmlCachedAt (isInInbox, htmlCachedAt)`, a partial index of the
+cached headers outside the inbox, for those cached before the cutoff (`HTMLCachePair.evictCandidatesPage`). Inbox bodies are not read at all;
+the page reads only candidates, the rules (undo set, a folder's newest) are unchanged, and the orphan
+leg is gone. The write stays the synchronous pass-through write through `passThroughWrite`, bounded per
+page as before, and the WAL checkpoint between pages is unchanged. The evict waits for
+`messageHeader_htmlCachedAt`, which the deferred index step builds after filling the column, as it
+waited for `messageBody_staleEvict`. **Census:** this row's predicate is unchanged by the change (no `dbPool.write` site added
+or removed). Old against new, with write costs: `StaleBodyEvictPairProofTests`.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->

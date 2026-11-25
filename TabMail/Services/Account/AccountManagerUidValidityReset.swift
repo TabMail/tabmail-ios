@@ -643,17 +643,40 @@ extension AccountManager {
     }
 
     /// Step 3 — ONE write transaction: (i) pre-delete capture, (ii) exact relational
-    /// deletion of the folder's `messageBody` and `chatIdMapping` sidecars, (iii)
-    /// `messageHeader` (explicit — there is no folder→header foreign key;
-    /// references/label associations cascade off the header), (iv) `pendingRender`,
-    /// (v) the folder's own sync-state reset.
+    /// deletion of the folder's `chatIdMapping` sidecar, (iii) `messageHeader`
+    /// (explicit — there is no folder→header foreign key; references/label
+    /// associations cascade off the header), then every `messageBody` in the folder's
+    /// id range, (iv) `pendingRender`, (v) the folder's own sync-state reset.
     ///
-    /// The sidecars are deleted BEFORE their owning headers, using the exact
-    /// `messageHeader.folderId` relation inside this same transaction. This avoids
-    /// both the colon-tail/child-folder ambiguity of a composite-id prefix and the
-    /// quarantine no-op that routing bodies through `MessageContentStore` would
-    /// create here. `ContentKey.forHeader` is byte-identical to `MessageHeader.id`
-    /// at the current stage; the later content-key mint owns revisiting this site.
+    /// `chatIdMapping` is deleted BEFORE its owning headers, using the exact
+    /// `messageHeader.folderId` relation inside this same transaction.
+    ///
+    /// The bodies are deleted by their id RANGE, not through the headers, so a body
+    /// left with no header (#1446) goes too. A UIDVALIDITY reset renumbers the
+    /// folder: a body left under an old `<account>:<folder>:<uid>` would otherwise be
+    /// adopted by the new message that later gets that UID, and shown as its HTML.
+    /// The range is `MessageIdentity.headerIdRange` with
+    /// `headerIdLikeNoDeeperColonSQLFragment`, so a folder whose path continues after
+    /// a `:` and a folder whose path merely starts with this one's are left alone. It
+    /// runs AFTER the header delete, so the HTML-cache pair's body-delete trigger
+    /// (`HTMLCachePair`, migration v116) finds none of the folder's own headers to
+    /// update. Two shapes of an optimistic move still in flight (a row keeps its
+    /// source id until the drain re-keys it, ADR-IOS-061) differ:
+    /// - a message moving OUT of this folder keeps its header (its `folderId` is the
+    ///   destination, so the header delete leaves it), but its id is in the range, so
+    ///   its HTML is deleted and the trigger clears its pair. Its address is in the
+    ///   renumbered space, so the cached HTML is no longer trusted (as for every id
+    ///   in the range);
+    /// - a message moving INTO this folder from another one loses its header (its
+    ///   `folderId` is this folder), but its id names the source folder, outside the
+    ///   range, so its HTML stays with no header. Only the same message, at the same
+    ///   source id under the source's unchanged numbering, can take it back; otherwise
+    ///   it is a harmless leftover like #1446's.
+    ///
+    /// Not routed through `MessageContentStore`, whose quarantine guard would make it a no-op
+    /// here. `ContentKey.forHeader` is byte-identical to `MessageHeader.id` at the
+    /// current stage; a content key `<account>:<folder>:<tail>` keeps the prefix, so
+    /// the later content-key mint stays inside the range.
     ///
     /// ⚑ The quarantine flag stays SET — this is not step 5.
     /// ⚑ `pendingOperation` and `outboxMessage` rows are NEVER touched (Law 5).
@@ -679,17 +702,9 @@ extension AccountManager {
                     MessageHeader.select(Column("messageId")).filter(Column("folderId") == folderId)
                 )
 
-                // (ii) Sidecars — exact relational ownership, while the owning
-                // headers still exist. The subqueries avoid a parameter-count cap.
-                // ⚑ NO REFERENCE — INVENTED: v2final has no explicit body delete
-                // (its FK cascaded) and prefix-deletes chat mappings instead.
-                try db.execute(
-                    sql: """
-                        DELETE FROM messageBody
-                        WHERE id IN (SELECT id FROM messageHeader WHERE folderId = ?)
-                        """,
-                    arguments: [folderId]
-                )
+                // (ii) Sidecar — exact relational ownership, while the owning
+                // headers still exist. The subquery avoids a parameter-count cap.
+                // ⚑ NO REFERENCE — INVENTED: v2final prefix-deletes chat mappings.
                 try db.execute(
                     sql: """
                         DELETE FROM chatIdMapping
@@ -700,6 +715,18 @@ extension AccountManager {
 
                 // (iii) messageHeader — explicit delete.
                 try MessageHeader.filter(Column("folderId") == folderId).deleteAll(db)
+
+                // Then every body in the folder's id range, with or without a
+                // header (see the doc above). A seek on messageBody's primary key.
+                let range = MessageIdentity.headerIdRange(accountId: accountId, folderPath: folderPath)
+                try db.execute(
+                    sql: """
+                        DELETE FROM messageBody
+                        WHERE id >= ? AND id < ?
+                          AND \(MessageIdentity.headerIdLikeNoDeeperColonSQLFragment(column: "id"))
+                        """,
+                    arguments: [range.lower, range.upper, range.lower]
+                )
 
                 // (iv) pendingRender.
                 try db.execute(

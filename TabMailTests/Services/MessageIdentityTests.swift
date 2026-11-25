@@ -76,6 +76,38 @@ struct MessageIdentityTests {
             accountId: "acct", folderPath: "INBOX", messageId: "m"
         ))
     }
+
+    /// #1433: the half-open range `[prefix, prefixUpperBound(prefix))` holds exactly
+    /// the strings that begin with `prefix`, under SQLite's BINARY order (Swift's
+    /// `String <` on these ASCII and BMP strings agrees with it).
+    @Test("prefixUpperBound bumps the last scalar, and its range holds exactly the prefixed strings")
+    func prefixUpperBoundIsTheExclusiveEndOfThePrefix() {
+        #expect(MessageIdentity.prefixUpperBound("acct:INBOX:") == "acct:INBOX;")
+        #expect(MessageIdentity.prefixUpperBound("ab/") == "ab0")
+        #expect(MessageIdentity.prefixUpperBound("") == nil)
+        let prefix = "acct:INBOX:"
+        let upper = MessageIdentity.prefixUpperBound(prefix) ?? ""
+        let inside = ["acct:INBOX:", "acct:INBOX:1", "acct:INBOX:sub:9", "acct:INBOX:\u{FFFF}"]
+        let outside = ["acct:INBOX", "acct:INBOX2:1", "acct:INBOX;", "acct:INBOX;1", "acct2:INBOX:1", "acct:INBOW:1"]
+        for value in inside {
+            let inRange = value >= prefix && value < upper
+            #expect(inRange && value.hasPrefix(prefix), "\(value) is in the range")
+        }
+        for value in outside {
+            let inRange = value >= prefix && value < upper
+            #expect(!inRange && !value.hasPrefix(prefix), "\(value) is outside the range")
+        }
+    }
+
+    @Test("headerIdRange is the folder's header-id prefix and its upper bound")
+    func headerIdRangeIsTheFolderPrefixRange() {
+        let range = MessageIdentity.headerIdRange(accountId: "acct", folderPath: "INBOX")
+        #expect(range.lower == MessageIdentity.headerIdPrefix(accountId: "acct", folderPath: "INBOX"))
+        #expect(range.upper == "acct:INBOX;")
+        let id = MessageIdentity.headerId(accountId: "acct", folderPath: "INBOX", messageId: "42")
+        let inRange = id >= range.lower && id < range.upper
+        #expect(inRange, "a header id of the folder lies in its range")
+    }
 }
 
 // MARK: - Content-key helper

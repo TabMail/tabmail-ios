@@ -546,7 +546,13 @@ actor SyncEngine {
     /// merge / a user action can't inherit a checkpoint stall (the ~1-2s "tic"). Hanging it
     /// off the constantly-running backfill — not just the sparse per-poll maintenance, which
     /// ran 0x in a 44-min capture — is what bounds the WAL reliably.
-    nonisolated static func checkpointWALThrottled(truncate: Bool = false) async {
+    ///
+    /// `pool` is `backgroundPool` for every caller in the app. The deferred index step
+    /// passes the pool it wrote to (`runRefreshPlannerStatisticsIfStale`), so a pass run
+    /// on another database (a test, the size proof) checkpoints that database.
+    nonisolated static func checkpointWALThrottled(
+        truncate: Bool = false, pool: PrioritizedDatabase = AppDatabase.backgroundPool
+    ) async {
         let now = CFAbsoluteTimeGetCurrent()
         let go = walCheckpointState.withLock { last -> Bool in
             guard now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
@@ -556,7 +562,7 @@ actor SyncEngine {
         guard go, !DatabaseSuspension.isSuspended else { return }
         let sql = truncate ? "PRAGMA wal_checkpoint(TRUNCATE)" : "PRAGMA wal_checkpoint(PASSIVE)"
         let t0 = CFAbsoluteTimeGetCurrent()
-        let frames = try? await AppDatabase.backgroundPool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
+        let frames = try? await pool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
             guard let row = try Row.fetchOne(db, sql: sql) else { return (-1, -1) }
             let log: Int = row[1] ?? -1
             let ckpt: Int = row[2] ?? -1

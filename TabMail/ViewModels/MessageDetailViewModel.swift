@@ -2195,7 +2195,7 @@ final class MessageDetailViewModel {
 
     /// Load body for a thread message on demand (when user expands a bubble)
     func loadThreadMessageBody(_ threadMsg: MessageHeader) async {
-        let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: threadMsg.id) }) != nil
+        let hasBody = (try? await dbPool.read { db in try HTMLCachePair.isCached(db, headerId: threadMsg.id) }) ?? false
         guard !hasBody else { return }
         do {
             try await fetchBodyWithRetry(for: threadMsg)

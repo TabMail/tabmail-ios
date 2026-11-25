@@ -18,6 +18,13 @@ struct BodyAssetPendingDeleteTriggerTests {
         "messageHeader_queueAssetRekey",
     ]
 
+    /// The other triggers on `messageHeader` at the end of the chain: v116's HTML-cache
+    /// pair (#1433), which writes only `messageHeader.htmlCachedAt` and never this list.
+    static let otherTriggerNames: Set<String> = [
+        "messageHeader_htmlCachedAtInsert",
+        "messageHeader_htmlCachedAtRekey",
+    ]
+
     static func pending(_ db: DatabaseQueue) throws -> [String] {
         try db.read { try String.fetchAll($0, sql: "SELECT contentKey FROM bodyAssetPendingDelete ORDER BY id") }
     }
@@ -42,7 +49,7 @@ struct BodyAssetPendingDeleteTriggerTests {
         let triggers = try db.read {
             try String.fetchAll($0, sql: "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'messageHeader'")
         }
-        #expect(Set(triggers) == Self.triggerNames)
+        #expect(Set(triggers) == Self.triggerNames.union(Self.otherTriggerNames))
         #expect(try Self.pending(db).isEmpty)
     }
 

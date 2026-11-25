@@ -265,4 +265,72 @@ struct InboxNotificationObserverTests {
         guard rec.calls.count == 1 else { return }
         #expect(rec.calls[0].1 == "1")
     }
+    // MARK: - HTML-cache pair writes (#1433)
+
+    /// Records the `messageHeader` events GRDB delivers to an observer whose
+    /// `observes(eventsOfKind:)` is `filter`, so a test sees which writes reach it.
+    private final class EventSpy: TransactionObserver, @unchecked Sendable {
+        private let filter: @Sendable (DatabaseEventKind) -> Bool
+        private let events = Mutex<[Int64]>([])
+        init(filter: @escaping @Sendable (DatabaseEventKind) -> Bool) { self.filter = filter }
+        var delivered: [Int64] { events.withLock { $0 } }
+        func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool { filter(eventKind) }
+        func databaseDidChange(with event: DatabaseEvent) {
+            guard event.tableName == MessageHeader.databaseTableName else { return }
+            let rowID = event.rowID
+            events.withLock { $0.append(rowID) }
+        }
+        func databaseDidCommit(_ db: Database) {}
+        func databaseDidRollback(_ db: Database) {}
+    }
+
+    /// The HTML-cache pair writes only `messageHeader.htmlCachedAt`: v116's triggers
+    /// on every body save and delete, and the deferred fill. None of them changes
+    /// inbox membership, so the observer skips them and those headers never reach
+    /// its post-commit read. A spy with the observer's own filter sees none of
+    /// their events, while a spy taking every `messageHeader` event sees them (so
+    /// the writes do reach observers), and a statement that also writes another
+    /// column is still delivered and clears its notification.
+    @Test func htmlCachePairWrites_areSkipped() async throws {
+        let (q, rec, observer) = try Self.makeWired()
+        try TestDatabase.insertFolder(q, name: "Archive", path: "Archive", role: .archive, accountId: "acc1")
+        let inboxId = try TestDatabase.insertMessageHeader(q, messageId: "1", isInInbox: true).id
+        let archivedId = try TestDatabase.insertMessageHeader(q, messageId: "2", folderId: "acc1:Archive",
+                                                              folderPath: "Archive", isInInbox: false).id
+        let skipping = EventSpy(filter: { observer.observes(eventsOfKind: $0) })
+        let everything = EventSpy(filter: { $0.tableName == MessageHeader.databaseTableName })
+        try await q.write { db in
+            db.add(transactionObserver: skipping)
+            db.add(transactionObserver: everything)
+        }
+        let ids = [inboxId, archivedId]
+        try await q.write { db in
+            for id in ids {
+                var body = MessageBody(contentKey: ContentKey(rawValue: id), htmlContent: "<p>cached</p>")
+                body.fetchedAt = Date().addingTimeInterval(-3_600)
+                try body.insert(db)
+            }
+        }
+        try await q.write { db in
+            try db.execute(sql: "UPDATE messageBody SET fetchedAt = ? WHERE id = ?", arguments: [Date(), archivedId])
+        }
+        // The bodies as a database upgraded with HTML already cached holds them, then the fill.
+        try await q.write { db in try db.execute(sql: "UPDATE messageHeader SET htmlCachedAt = NULL") }
+        try await q.write { db in try db.execute(sql: HTMLCachePair.fillSQL) }
+        try await q.write { db in _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: inboxId)) }
+        let skippedDelivered = skipping.delivered
+        let allDelivered = everything.delivered
+
+        try await q.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET isInInbox = 0, htmlCachedAt = NULL WHERE id = ?",
+                           arguments: [inboxId])
+        }
+        let afterExit = skipping.delivered
+        #expect(skippedDelivered.isEmpty, "the pair's writes reached the observer: rowids \(skippedDelivered)")
+        #expect(allDelivered.count >= 6, "setup: the pair's writes are messageHeader events: \(allDelivered.count)")
+        #expect(afterExit.count == 1, "a statement that also writes isInInbox is delivered: \(afterExit)")
+        #expect(rec.calls.count == 1, "and the exit clears its notification")
+        guard rec.calls.count == 1 else { return }
+        #expect(rec.calls[0].1 == "1")
+    }
 }

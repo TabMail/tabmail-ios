@@ -1740,8 +1740,9 @@ final class AppDatabase: Sendable {
             try db.create(index: "messageHeader_accountId_bodyComplete",
                           on: "messageHeader", columns: ["accountId", "bodyComplete"])
 
-            // P0: Reminder count — ChatPillState ValueObservation re-runs on EVERY
-            // messageHeader write. Without this index, each re-run does a full 250K scan.
+            // P0: Reminder count — ChatPillState ValueObservation re-runs on every
+            // messageHeader insert or delete and every update of a column it reads.
+            // Without this index, each re-run does a full 250K scan.
             // Also used by ReminderBuilder.collectMessageReminders().
             // Partial index: only rows with reminderContent (typically <100 rows).
             try db.execute(sql: """
@@ -4563,6 +4564,97 @@ final class AppDatabase: Sendable {
                     .references("userLabel", onDelete: .cascade)
                 t.column("lastUsedAt", .datetime).notNull()
             }
+        }
+
+        // #1433: the header records when its message's HTML was cached, so the
+        // body-cache evict reads only the bodies it may delete. Before this, the evict
+        // walked every cached body older than the TTL and read each one's header,
+        // keeping the inbox ones, on every maintenance pass (about 19,000 kept bodies
+        // and 7 s per pass at 105k headers).
+        //
+        // - `messageHeader.htmlCachedAt` is the `fetchedAt` of the message's
+        //   `messageBody` row, NULL when it has none: the pair of the HTML cache, as
+        //   `bodyComplete` is the pair of the search text (ADR-IOS-050). No existing
+        //   column says whether a header's HTML is cached.
+        // - SQLite keeps it exact, whatever code writes either table: a body insert,
+        //   a body update that changes `fetchedAt` or `id`, a body delete, a header
+        //   insert (a body written before its header, or a header deleted and inserted
+        //   again under a new id) and an update of a header's `id`. Each trigger writes
+        //   the state at the end of its own statement, so any order of header and body
+        //   writes ends exact. The column is not part of the `MessageHeader` record,
+        //   so a record `insert`/`update`/`save` never writes it; `HTMLCachePair` is
+        //   the only reader.
+        // - The triggers match a body to its header by id, which holds while
+        //   `ContentKey.forHeader` returns the header id. The change that makes
+        //   content keys differ from header ids must point these triggers at the
+        //   content key the header holds (`HTMLCachePairTests` fails that day).
+        // - This migration adds the column, empty, and the triggers: an `ALTER TABLE`
+        //   that adds a nullable column rewrites no row, and creating a trigger reads
+        //   no data, so it costs the same at any size on every launch path. The bodies
+        //   cached before it are recorded by the fill, and the evict's index
+        //   `messageHeader_htmlCachedAt` is built, in the deferred index step
+        //   (`SyncEngine.deferredIndexes`, `HTMLCachePair.fillSQL` and `.indexSQL`),
+        //   in one write with the `ANALYZE` that gives the index its statistics
+        //   (#1401, ADR-IOS-029). Until that write commits, those bodies read as not
+        //   cached and the evict waits (`HTMLCachePair`, "Before the deferred index
+        //   step").
+        // - Write cost: a body save or delete also rewrites its header row, and once
+        //   the index exists moves one index entry; a header insert or id change
+        //   probes `messageBody` by primary key and, when a body is there, reads its
+        //   `fetchedAt` through the body's pages (it is stored after the HTML). A
+        //   delete of many bodies fires the delete trigger once per body, one header
+        //   seek each.
+        // - A later migration that rebuilds `messageHeader` or `messageBody` drops
+        //   these triggers with the old table and must create them again
+        //   (`HTMLCachePairTests` checks the pair after the whole chain).
+        migrator.registerTimedMigration(
+            "v116_addMessageHeaderHTMLCachedAt", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: "ALTER TABLE messageHeader ADD COLUMN htmlCachedAt DATETIME")
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtInsert
+                AFTER INSERT ON messageBody
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NEW.fetchedAt WHERE id = NEW.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtUpdate
+                AFTER UPDATE OF id, fetchedAt ON messageBody
+                WHEN OLD.id IS NOT NEW.id OR OLD.fetchedAt IS NOT NEW.fetchedAt
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NULL
+                    WHERE id = OLD.id AND OLD.id IS NOT NEW.id;
+                    UPDATE messageHeader SET htmlCachedAt = NEW.fetchedAt WHERE id = NEW.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtDelete
+                AFTER DELETE ON messageBody
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NULL WHERE id = OLD.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_htmlCachedAtInsert
+                AFTER INSERT ON messageHeader
+                WHEN NEW.htmlCachedAt IS NOT (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                BEGIN
+                    UPDATE messageHeader
+                    SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                    WHERE rowid = NEW.rowid;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_htmlCachedAtRekey
+                AFTER UPDATE OF id ON messageHeader
+                WHEN OLD.id IS NOT NEW.id
+                BEGIN
+                    UPDATE messageHeader
+                    SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                    WHERE rowid = NEW.rowid;
+                END
+                """)
         }
     }
 

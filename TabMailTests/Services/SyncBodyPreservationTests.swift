@@ -685,8 +685,10 @@ struct ActiveBodyQueueRaceTests {
     /// a row addressed by a key no header holds is a legitimate resident of the
     /// table. Reclamation moved from the schema to the application —
     /// `runEvictStaleBodies`' orphan leg, gated by `MessageContentStore
-    /// .protectedKeys` — which is exactly the leg Stage D made reachable, and which
-    /// `SyncEngineMaintenanceTests` pins.
+    /// .protectedKeys` — which is exactly the leg Stage D made reachable. Since #1433
+    /// the evictor reads only bodies whose header exists, so such a row stays as a
+    /// harmless leftover (#1446; `ContentOwnershipSweepTests` and
+    /// `StaleBodyEvictRunTests` pin it).
     @Test("body write to a stale headerId now succeeds — the schema no longer vetoes it")
     func bodyWriteToStaleHeaderIdSucceeds() throws {
         let db = try TestDatabase.make()

@@ -858,22 +858,6 @@ enum BodyAssetStore {
         }
     }
 
-    /// The EXCLUSIVE upper bound of the half-open range that selects exactly the
-    /// strings beginning with `prefix`, under SQLite's default BINARY collation:
-    /// `prefix` with its final Unicode scalar incremented by one.
-    ///
-    /// Used so a prefix test can be an indexable range instead of
-    /// `substr(col, 1, n) = ?`, which hides the column inside a function and
-    /// forces a table/index SCAN. Blob ids are hex + `'/'`, so the scalar being
-    /// incremented is always ASCII and the `+ 1` cannot leave Unicode's range;
-    /// `nil` is returned only for an empty prefix, whose callers treat it as
-    /// "cannot decide" and keep whatever they were considering removing.
-    private static func prefixUpperBound(_ prefix: String) -> String? {
-        guard let last = prefix.unicodeScalars.last,
-              let bumped = UnicodeScalar(last.value + 1) else { return nil }
-        return String(String.UnicodeScalarView(prefix.unicodeScalars.dropLast())) + String(bumped)
-    }
-
     /// Reclaims `<store>/<headerHash>/` once it is provably idle.
     ///
     /// "Idle" is decided under the manifest's cross-process writer lock: no
@@ -890,7 +874,7 @@ enum BodyAssetStore {
     /// to someone, so this only ever removes an EMPTY directory.
     private static func removeHeaderDirectoryIfIdle(hashName: String) {
         guard let queue = manifestQueue(), let dir = storeDirectory(),
-              let hashUpperBound = prefixUpperBound(hashName) else { return }
+              let hashUpperBound = MessageIdentity.prefixUpperBound(hashName) else { return }
         let folderURL = dir.appendingPathComponent(hashName, isDirectory: true)
         do {
             try queue.write { db in
@@ -1329,7 +1313,7 @@ enum BodyAssetStore {
     static func deletePendingContentKey(_ contentKey: ContentKey) -> PendingDeleteOutcome {
         guard let queue = manifestQueue(), let dir = storeDirectory() else { return .failed }
         let hash = headerHash(contentKey)
-        guard let hashUpperBound = prefixUpperBound(hash) else { return .failed }
+        guard let hashUpperBound = MessageIdentity.prefixUpperBound(hash) else { return .failed }
         let result: (bytes: Int64, blobIds: [String])?
         do {
             result = try queue.write { db -> (bytes: Int64, blobIds: [String])? in
@@ -1646,7 +1630,7 @@ enum BodyAssetStore {
             if knownHeaderHashes.contains(name) {
                 // ⚑ HALF-OPEN PREFIX RANGE, NOT `substr(…) = ?` — the same rewrite,
                 // for the same reason, as `removeHeaderDirectoryIfIdle`'s idle check
-                // (see `prefixUpperBound` and the ⚑ comment there for the exactness
+                // (see `MessageIdentity.prefixUpperBound` and the ⚑ comment there for the exactness
                 // argument and its negative case). `substr(id, 1, n) = ?` wraps the
                 // indexed column in a function, so `sqlite_autoindex_bodyAsset_1`
                 // cannot seek it and this is a full SCAN. It runs once per known
@@ -1659,7 +1643,7 @@ enum BodyAssetStore {
                 // rows. A nil bound is unreachable for a 16-character name; if it ever
                 // happened, skipping the directory keeps every file in it — the same
                 // fail-closed answer the `catch` below gives.
-                guard let nameUpperBound = prefixUpperBound(name) else { continue }
+                guard let nameUpperBound = MessageIdentity.prefixUpperBound(name) else { continue }
                 do {
                     knownFileIds = try queue.read { db in
                         let rows = try String.fetchAll(
