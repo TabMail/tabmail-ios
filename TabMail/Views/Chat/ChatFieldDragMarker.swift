@@ -4,6 +4,7 @@
 
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 /// What a drag on the reply field did to the chat, as an accessibility-only marker for the chat
 /// swipe UI tests: XCUITest reads a frame only once the app is idle, well after the swell and its
@@ -42,7 +43,9 @@ import UIKit
 /// the first such call that scrolls it, how often the reply field's `inputField` was built while the
 /// finger was down (`pending` from a drag's start until its let-go) and from the let-go until the watch ended, and the text view's class; and `pop=<entry>,…|none`, the back swipe since it last began (`PopWatch`).
 /// `pan=<event>,…|none` (after `share`) holds `on:<state>`/`off:<state>` when the field's pan was
-/// turned on or off during the last drag, and `cancelled` when it was cancelled.
+/// turned on or off during the last drag, and `cancelled` when it was cancelled. Last,
+/// `touch=<view chain>|<recognizer>@<view>:<states>,…|none`: the last touch anywhere on screen,
+/// what it landed on and every gesture recognizer that received it (`TouchWatch`).
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -535,6 +538,7 @@ enum ChatFieldDragMarker {
         }
 
         func glassMoved(to minY: CGFloat) {
+            touchWatch.install()
             glassTop = minY
             guard dragging, let glassRest else { return }
             rise = max(rise, glassRest - minY)
@@ -598,8 +602,12 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(pastEnd.map { String(format: "%.1f", $0) } ?? "none") events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0) textAt=\(textAtLetGo ?? "none") textEnd=\(textAtWatchEnd ?? "none") textMove=\(textMoveAfterLetGo ?? "none")" + " " + handOffLabel + " " + callsLabel + " pop=\(popEntries.isEmpty ? "none" : popEntries.joined(separator: ","))"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(pastEnd.map { String(format: "%.1f", $0) } ?? "none") events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0) textAt=\(textAtLetGo ?? "none") textEnd=\(textAtWatchEnd ?? "none") textMove=\(textMoveAfterLetGo ?? "none")" + " " + handOffLabel + " " + callsLabel + " pop=\(popEntries.isEmpty ? "none" : popEntries.joined(separator: ",")) touch=\(lastTouch)"
         }
+
+        /// The last touch anywhere on screen (`TouchWatch`).
+        var lastTouch = "none"
+        private let touchWatch = TouchWatch()
 
         private var handOffLabel: String {
             let end = panTextEnd.map { String(format: "%.2f", $0) } ?? "none"
@@ -609,6 +617,88 @@ enum ChatFieldDragMarker {
 
         private var callsLabel: String {
             "calls=\(textCalls.isEmpty ? "none" : textCalls.joined(separator: ",")) callStack=\(textCallStack ?? "none") builds=\(downBuilds.map(String.init) ?? "pending"):\(inputFieldBuilds) textClass=\(textClass ?? "none")"
+        }
+    }
+
+    /// Every touch on the window, for the marker's `touch=`: the view it landed on and that view's
+    /// superviews, nearest first (`<class>>…`), then every gesture recognizer that received it, with
+    /// the view it is on and each state it moved through
+    /// (`|<recognizer>@<view>:<state>>…,…`), so a drag that did nothing names what took it. A
+    /// window recognizer that never recognizes, delays nothing and cancels nothing, so it changes
+    /// no touch's path. Names are cut to `nameLength` letters with no spaces or commas.
+    @MainActor
+    final class TouchWatch: UIGestureRecognizer, UIGestureRecognizerDelegate {
+        private static let nameLength = 40
+        private static let chainLength = 16
+        private var chain = ""
+        private var seen: [(recognizer: UIGestureRecognizer, states: [UIGestureRecognizer.State])] = []
+
+        init() {
+            super.init(target: nil, action: nil)
+            cancelsTouchesInView = false
+            delaysTouchesBegan = false
+            delaysTouchesEnded = false
+            delegate = self
+        }
+
+        /// Puts the watch on the key window, once.
+        func install() {
+            guard view == nil, let window = UIApplication.shared.connectedScenes
+                .compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first else { return }
+            window.addGestureRecognizer(self)
+        }
+
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+        private static func name(_ object: AnyObject) -> String {
+            String(String(describing: type(of: object)).filter { $0 != " " && $0 != "," && $0 != "|" }.prefix(nameLength))
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+            guard let touch = touches.first else { return }
+            var names: [String] = []
+            var view = touch.view
+            while let current = view, names.count < Self.chainLength {
+                names.append(Self.name(current))
+                view = current.superview
+            }
+            chain = names.joined(separator: ">")
+            seen = []
+            note(touch)
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+            if let touch = touches.first { note(touch) }
+        }
+
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+            finish(touches.first)
+        }
+
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+            finish(touches.first)
+        }
+
+        /// Each recognizer the touch reaches, and each new state it takes.
+        private func note(_ touch: UITouch) {
+            for recognizer in touch.gestureRecognizers ?? [] where recognizer !== self {
+                if let index = seen.firstIndex(where: { $0.recognizer === recognizer }) {
+                    if seen[index].states.last != recognizer.state { seen[index].states.append(recognizer.state) }
+                } else {
+                    seen.append((recognizer, [recognizer.state]))
+                }
+            }
+        }
+
+        private func finish(_ touch: UITouch?) {
+            if let touch { note(touch) }
+            let reached = seen.map { entry in
+                "\(Self.name(entry.recognizer))@\(entry.recognizer.view.map { Self.name($0) } ?? "none"):"
+                    + (entry.states + [entry.recognizer.state]).map(ChatFieldDragMarker.name(of:)).joined(separator: ">")
+            }
+            Probe.shared.lastTouch = chain + "|" + (reached.isEmpty ? "none" : reached.joined(separator: ","))
+            state = .failed
         }
     }
 

@@ -175,7 +175,15 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(close.exists, "the drag left the panel open")
         let after = newest.exists ? newest.frame : .null
         XCTAssertTrue(after.isNull || after.minY > before.minY + Self.panelScrollDrag / 2,
-                      "the history scrolled with the drag: the newest line was at \(before.minY), now \(after.isNull ? "gone below" : "\(after.minY)")")
+                      "the history scrolled with the drag: the newest line was at \(before.minY), now \(after.isNull ? "gone below" : "\(after.minY)"); \(lastTouch(in: app))")
+    }
+
+    /// The marker's record of the last touch (`ChatFieldDragMarker.TouchWatch`): what it landed on
+    /// and every gesture recognizer that received it.
+    private func lastTouch(in app: XCUIApplication) -> String {
+        let marker = app.descendants(matching: .any)["chatFieldDragMarker"].firstMatch
+        guard marker.exists else { return "touch=(no marker)" }
+        return marker.label.split(separator: " ").first { $0.hasPrefix("touch=") }.map(String.init) ?? "touch=(not recorded)"
     }
 
     /// The fixture's history size and line text (`ChatSwipeTestScene.panelHistoryLine`).
