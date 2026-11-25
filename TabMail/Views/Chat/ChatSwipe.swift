@@ -231,7 +231,7 @@ struct ChatSwipeReveal: ViewModifier {
     private static let iconSpring = Animation.spring(response: ChatViewLayout.swipeFullIconSpringResponse,
                                                      dampingFraction: ChatViewLayout.swipeFullIconSpringDamping)
     /// How far the grown edge icon reaches above and below its round button.
-    private static let iconRoom = ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2
+    nonisolated private static let iconRoom = ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2
 
     func body(content: Content) -> some View {
         content
