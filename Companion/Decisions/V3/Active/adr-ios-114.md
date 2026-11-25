@@ -2067,9 +2067,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    reopen route, the source wiring, including the camera's cover not closing the screen, which is
    checked only in the source: the simulator has no camera; since 2026-11-25 `fieldDragWiring`, the
    field's drag up, its freeze and the swap's wait for the panel, in the source because a hosted
-   test cannot move the pan), `ChatNewThreadScreenTests` (since 2026-11-25 `fieldOpensThePanel`, the
-   closed field's drag and VoiceOver's Show TabMail chat opening the panel and neither offered over
-   it, and `sentCopyWaitsForTheOpenPanel`, the swap to the thread waiting for the open panel; the whole
+   test can neither move the pan nor find it: SwiftUI keeps a representable's recognizer out of the
+   views' `gestureRecognizers`), `ChatNewThreadScreenTests` (since 2026-11-25 `fieldOpensThePanel`,
+   VoiceOver's Show TabMail chat, offered on the drag's condition, opening the panel and not offered
+   over it, and `sentCopyWaitsForTheOpenPanel`, the swap to the thread waiting for the open panel; the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
    row and the opens from Drafts, since 2026-11-22 a link's chat saving on background only once

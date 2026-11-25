@@ -840,7 +840,10 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("A new email's closed field opens the TabMail panel as a thread's does: it takes the drag up, and VoiceOver's Show TabMail chat opens the panel; over the open panel neither is offered")
+    /// The drag up itself is pinned in the source (`ChatNewThreadTests.fieldDragWiring`): a hosted test
+    /// can neither move the pan nor find it, since SwiftUI keeps a representable's recognizer out of
+    /// the views' `gestureRecognizers`. Show TabMail chat is offered on the same condition as the drag.
+    @Test("A new email's closed field opens the TabMail panel as a thread's does: VoiceOver's Show TabMail chat, the drag's equivalent, opens the panel and is not offered over it")
     func fieldOpensThePanel() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await fieldOpensThePanelBody() }
@@ -853,8 +856,6 @@ struct ChatNewThreadScreenTests {
         let name = ChatViewConfig.showChatActionName
         try await withScreen(model) { screen in
             #expect(!Self.panelOpen(screen), "control: the panel starts closed")
-            let closedPans = Self.fieldPans(in: screen.view).map(\.isEnabled)
-            #expect(closedPans.contains(true), "the closed field takes the drag up: pans \(closedPans)")
             let closedActions = HostedAccessibility.actionNames(in: screen.view)
             #expect(closedActions.contains(name), "VoiceOver offers the drag's equivalent: \(closedActions)")
 
@@ -865,8 +866,6 @@ struct ChatNewThreadScreenTests {
             try await Self.waitUntil { !HostedAccessibility.actionNames(in: screen.view).contains(name) }
             let openActions = HostedAccessibility.actionNames(in: screen.view)
             #expect(!openActions.contains(name), "not offered over the open panel")
-            let openPans = Self.fieldPans(in: screen.view).map(\.isEnabled)
-            #expect(!openPans.contains(true), "no drag starts over the open panel: pans \(openPans)")
             #expect(screen.stage.pushed === model, "control: the chat stays")
         }
     }
@@ -1379,12 +1378,6 @@ struct ChatNewThreadScreenTests {
     /// The TabMail panel is open over the chat: its close button shows.
     private static func panelOpen(_ screen: Screen) -> Bool {
         HostedAccessibility.identifiers(in: screen.view).contains("chatClose")
-    }
-
-    /// The field drags installed under `view` (`ChatFieldPan`), wherever SwiftUI put them.
-    private static func fieldPans(in view: UIView) -> [ChatFieldPan.Recognizer] {
-        (view.gestureRecognizers ?? []).compactMap { $0 as? ChatFieldPan.Recognizer }
-            + view.subviews.flatMap { fieldPans(in: $0) }
     }
 
     private static func topPresented(_ screen: Screen) -> UIViewController? {
