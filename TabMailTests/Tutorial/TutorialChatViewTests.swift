@@ -22,45 +22,58 @@ struct TutorialChatViewContentTests {
         .chatViewSwitch, .finished,
     ]
     private static let hosts: [TutorialCoachHost] = [
-        .inbox, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .message, .chat,
+        .inbox, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .chat, .chatPanel,
         .actionRules, .chatViewSwitch,
     ]
 
     private func card(
-        _ step: Step, _ lesson: TutorialLesson, _ host: TutorialCoachHost, teachesChat: Bool = true,
-        flightsAsked: Bool = false, replyEdited: Bool = false, isSending: Bool = false
+        _ step: Step, _ lesson: TutorialLesson, _ host: TutorialCoachHost,
+        flightsAsked: Bool = false, replyEdited: Bool = false, isSending: Bool = false, templateAsked: Bool = false
     ) -> TutorialCoachContent? {
         TutorialCoachContent.make(
             step: step, lesson: lesson, host: host, flightsAsked: flightsAsked, replyEdited: replyEdited,
-            isSending: isSending, teachesChat: teachesChat)
+            isSending: isSending, templateAsked: templateAsked)
     }
 
-    @Test("Today's run shows no chat or switch card; the chat view's run shows each where its step happens")
+    @Test("Each chat-view card shows where its step happens: part 2 in Priya's chat and its panel, part 3's answer in Jordan's chat, then the switch")
     func cardsWhereTheStepHappens() throws {
-        for lesson in TutorialLesson.allCases {
-            for step in Self.allSteps {
-                for flightsAsked in [false, true] {
-                    #expect(card(step, lesson, .chat, teachesChat: false, flightsAsked: flightsAsked) == nil, "\(step)")
-                    #expect(card(step, lesson, .chatViewSwitch, teachesChat: false, flightsAsked: flightsAsked) == nil)
-                }
-            }
-        }
-        // Part 2: open Priya's email, then the ready reply, the request, the saved template, in her chat.
+        // Part 2: open Priya's email, then the ready reply in her chat.
         let open = try #require(card(.replyToPriya, .reuseReply, .inbox))
         #expect(open.title.contains("Open Priya"))
         let ready = try #require(card(.replyToPriya, .reuseReply, .chat))
         #expect(ready.message.contains("Tap the AI Suggestion") && !ready.message.contains("Tap Send"))
-        let ask = try #require(card(.makeTemplate, .reuseReply, .chat))
-        #expect(ask.message.contains("tap Send"))
+        #expect(card(.replyToPriya, .reuseReply, .chatPanel) == nil, "the reply is written from the ghost, not the panel")
+        // Sent: the chat's card asks for the drag up; the field writes to Priya.
+        let drag = try #require(card(.makeTemplate, .reuseReply, .chat))
+        #expect(drag.title == "Sent. Now ask TabMail.")
+        #expect(drag.message.contains("drag the field up") && !drag.message.lowercased().contains("tap send"))
         #expect(card(.makeTemplate, .reuseReply, .inbox) != nil, "back in the inbox the card says where to go")
-        for host in [TutorialCoachHost.chat, .inbox] {
+        // The panel: the request, then Create on its answer.
+        let ask = try #require(card(.makeTemplate, .reuseReply, .chatPanel))
+        #expect(ask.title == "Ask TabMail to keep it.")
+        #expect(ask.message.contains("Tap Send"))
+        let create = try #require(card(.makeTemplate, .reuseReply, .chatPanel, templateAsked: true))
+        #expect(create.title == "Tap Create to keep it.")
+        #expect(create.message.contains("A template is a reply TabMail reuses"))
+        // Saved: the same card in the panel, the chat and the inbox, with See template and Next.
+        for host in [TutorialCoachHost.chatPanel, .chat, .inbox] {
             let saved = try #require(card(.reuseReplyDone, .reuseReply, host))
+            #expect(saved.title == "Template saved.")
+            #expect(saved.message.contains("Reply Templates"))
             #expect(saved.progressLine.hasSuffix("· done"))
             #expect(saved.buttons.map(\.action) == [.seeTemplate, .nextLesson])
         }
         // Part 3: the answer, in Jordan's chat, goes on to what else to ask.
         let answer = try #require(card(.askAnythingDone, .askAnything, .chat))
         #expect(answer.buttons.map(\.action) == [.showMoreToAsk])
+        // The panel holds part 2's cards only.
+        for lesson in TutorialLesson.allCases {
+            for step in Self.allSteps where ![.makeTemplate, .reuseReplyDone].contains(step) {
+                for flightsAsked in [false, true] {
+                    #expect(card(step, lesson, .chatPanel, flightsAsked: flightsAsked) == nil, "\(step)")
+                }
+            }
+        }
         // Last step: the switch, after the three parts, closes with Finish.
         let last = try #require(card(.chatViewSwitch, .askAnything, .chatViewSwitch))
         #expect(last.progressLine == "Last step")
@@ -68,9 +81,10 @@ struct TutorialChatViewContentTests {
         #expect(last.buttons.map(\.action) == [.finishChatViewSwitch])
         // Sending waits out in the chat as it does in the inbox.
         #expect(try #require(card(.replyToPriya, .reuseReply, .chat, isSending: true)).showsProgress)
+        #expect(try #require(card(.replyToPriya, .reuseReply, .inbox, isSending: true)).showsProgress)
     }
 
-    @Test("In the chat view, compose still asks for the Edit, then Use Suggestion, then Send")
+    @Test("In the chat view, compose asks for the Edit, then Use Suggestion, then Send")
     func composeInTheChatView() throws {
         let first = try #require(card(.replyToPriya, .reuseReply, .compose(showingSuggestion: true)))
         #expect(first.message.contains("Edit"))
@@ -80,29 +94,32 @@ struct TutorialChatViewContentTests {
         #expect(send.title.contains("Send"))
     }
 
-    @Test("Part 2 is \"Reply like a message\" in the chat view; every part card says n of 3 and none says lesson")
+    @Test("Part 2 is \"Reply like a message\"; every part card says n of 3 and none says lesson")
     func progressLines() {
-        #expect(TutorialLesson.reuseReply.title(teachesChat: true) == "Reply like a message")
-        #expect(TutorialLesson.reuseReply.title(teachesChat: false) == "Reuse a reply")
+        #expect(TutorialLesson.reuseReply.title == "Reply like a message")
         for lesson in TutorialLesson.allCases {
             for step in Self.allSteps where step != .chatViewSwitch {
                 for host in Self.hosts {
-                    guard let c = card(step, lesson, host) else { continue }
-                    #expect(c.progressLine.hasPrefix(
-                        "\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title(teachesChat: true))"))
-                    let text = ([c.progressLine, c.title, c.message] + c.buttons.map(\.label)).joined(separator: " ")
-                    #expect(!text.lowercased().contains("lesson"), "\(step) on \(host)")
+                    for templateAsked in [false, true] {
+                        guard let c = card(step, lesson, host, templateAsked: templateAsked) else { continue }
+                        #expect(c.progressLine.hasPrefix(
+                            "\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title)"))
+                        let text = ([c.progressLine, c.title, c.message] + c.buttons.map(\.label)).joined(separator: " ")
+                        #expect(!text.lowercased().contains("lesson"), "\(step) on \(host)")
+                    }
                 }
             }
         }
     }
 
-    @Test("A chat-view card asks for Send only on a screen that has a Send button")
+    /// The panel has a Send; the chat's own field sends nothing in the tutorial, and the inbox,
+    /// the rules sheet and the switch have none.
+    @Test("A card asks for Send only on a screen that has a Send button")
     func sendOnlyWhereItExists() {
         for lesson in TutorialLesson.allCases {
             for step in Self.allSteps {
                 for flightsAsked in [false, true] {
-                    for host in [TutorialCoachHost.inbox, .message, .actionRules, .chatViewSwitch] {
+                    for host in [TutorialCoachHost.inbox, .chat, .actionRules, .chatViewSwitch] {
                         guard let c = card(step, lesson, host, flightsAsked: flightsAsked) else { continue }
                         #expect(!(c.title + " " + c.message).lowercased().contains("tap send"), "\(step) on \(host)")
                     }
@@ -111,35 +128,52 @@ struct TutorialChatViewContentTests {
         }
     }
 
-    @Test("The reply field moves only in Priya's chat in the chat view: a tap on the AI Suggestion, then the request")
+    @Test("The reply field moves only in Priya's chat: a tap on the AI Suggestion, then a drag up")
     func fieldMoves() {
         typealias C = TutorialCoordinator
         for step in Self.allSteps.map(Optional.some) + [nil] {
             for practice in [false, true] {
-                for teachesChat in [false, true] {
-                    let move = C.fieldMove(for: step, inPracticeChat: practice, teachesChat: teachesChat)
-                    let expected: C.FieldMove?
-                    switch step {
-                    case .replyToPriya where practice && teachesChat: expected = .tapSuggestion
-                    case .makeTemplate where practice && teachesChat: expected = .ask(.saveReplyAsTemplate)
-                    default: expected = nil
-                    }
-                    #expect(move == expected, "\(String(describing: step)) practice=\(practice) chat=\(teachesChat)")
+                let move = C.fieldMove(for: step, inPracticeChat: practice)
+                let expected: C.FieldMove?
+                switch step {
+                case .replyToPriya where practice: expected = .tapSuggestion
+                case .makeTemplate where practice: expected = .dragUp
+                default: expected = nil
                 }
+                #expect(move == expected, "\(String(describing: step)) practice=\(practice)")
             }
         }
     }
 
-    @Test("In the chat view the template is asked for in the chat's field, never the inbox chat")
-    func inboxChatPrompts() {
+    @Test("The template is asked for in the panel of Priya's chat until it is sent, never in the inbox chat")
+    func panelAndInboxChatPrompts() {
         typealias C = TutorialCoordinator
-        #expect(C.chatPrompt(for: .makeTemplate, flightsAsked: false, teachesChat: true) == nil)
-        #expect(C.chatPrompt(for: .makeTemplate, flightsAsked: false, teachesChat: false) == .makeTemplate)
-        #expect(C.chatPrompt(for: .askFlights, flightsAsked: false, teachesChat: true) == .flights)
-        #expect(C.chatPrompt(for: .moreToAsk, flightsAsked: true, teachesChat: true) == .whatCanYouDo)
+        for step in Self.allSteps.map(Optional.some) + [nil] {
+            for practice in [false, true] {
+                for asked in [false, true] {
+                    let prompt = C.panelPrompt(for: step, inPracticeChat: practice, templateAsked: asked)
+                    let expected: C.ChatPrompt? = step == .makeTemplate && practice && !asked ? .saveReplyAsTemplate : nil
+                    #expect(prompt == expected, "\(String(describing: step)) practice=\(practice) asked=\(asked)")
+                }
+            }
+            #expect(C.chatPrompt(for: step, flightsAsked: false) != .saveReplyAsTemplate, "\(String(describing: step))")
+        }
+        #expect(C.ChatPrompt.saveReplyAsTemplate.rawValue == "Save this as my template.")
+        #expect(C.chatPrompt(for: .askFlights, flightsAsked: false) == .flights)
+        #expect(C.chatPrompt(for: .moreToAsk, flightsAsked: true) == .whatCanYouDo)
         #expect(C.ChatPrompt.saveReplyAsTemplate.workingStatus == "Saving template")
         for prompt in C.ChatPrompt.allCases where prompt != .saveReplyAsTemplate {
             #expect(prompt.workingStatus == nil)
+        }
+    }
+
+    @Test("The closed field holds the drag-up hint only at the drag-up step")
+    func dragHint() {
+        typealias C = TutorialCoordinator
+        let moves: [C.FieldMove?] = [nil, .tapSuggestion, .dragUp]
+        for move in moves {
+            let hint = DynamicIslandChat.tutorialDragHint(ChatReplyField(example: nil, tutorialMove: move))
+            #expect(hint == (move == .dragUp ? "Drag up to ask TabMail" : nil), "\(String(describing: move))")
         }
     }
 
@@ -148,17 +182,15 @@ struct TutorialChatViewContentTests {
         for step in Self.allSteps.map(Optional.some) + [nil] {
             for practice in [false, true] {
                 for source in [false, true] {
-                    for teachesChat in [false, true] {
-                        let shows = TutorialCoordinator.chatShowsCard(
-                            step: step, teachesChat: teachesChat, holdsPracticeEmail: practice, holdsSourceEmail: source)
-                        let expected: Bool
-                        switch step {
-                        case .replyToPriya, .makeTemplate, .reuseReplyDone: expected = teachesChat && practice
-                        case .askAnythingDone: expected = teachesChat && source
-                        default: expected = false
-                        }
-                        #expect(shows == expected, "\(String(describing: step)) p=\(practice) s=\(source) c=\(teachesChat)")
+                    let shows = TutorialCoordinator.chatShowsCard(
+                        step: step, holdsPracticeEmail: practice, holdsSourceEmail: source)
+                    let expected: Bool
+                    switch step {
+                    case .replyToPriya, .makeTemplate, .reuseReplyDone: expected = practice
+                    case .askAnythingDone: expected = source
+                    default: expected = false
                     }
+                    #expect(shows == expected, "\(String(describing: step)) p=\(practice) s=\(source)")
                 }
             }
         }
@@ -167,13 +199,22 @@ struct TutorialChatViewContentTests {
     /// The Sent bubble shows the AI Suggestion's text message, so the scripted edit must not
     /// turn the reply into something else.
     @MainActor
-    @Test("The chat view's edit keeps the reply a yes, as its Sent bubble says; today's edit declines")
+    @Test("The practice edit keeps the reply a yes, as its Sent bubble says")
     func editKeepsTheMeaning() {
         func plain(_ text: String) -> String { text.replacingOccurrences(of: "’", with: "'").lowercased() }
-        #expect(TutorialCoordinator.editPrompt(teachesChat: false) == TutorialCoordinator.editPrompt)
-        #expect(TutorialCoordinator.editPrompt(teachesChat: true) == TutorialCoordinator.chatViewEditPrompt)
-        #expect(TutorialChatScript.editedReply(teachesChat: false).body == TutorialChatScript.declinedReply)
-        #expect(plain(TutorialChatScript.editedReply(teachesChat: true).body).contains("i'm in"))
+        #expect(TutorialCoordinator.editPrompt == "Make it shorter")
+        #expect(TutorialChatScript.editedReply.body == TutorialChatScript.shorterReply)
+        #expect(plain(TutorialChatScript.editedReply.body).contains("i'm in"))
+    }
+
+    @Test("The welcome and the recap name the chat view's reply, its templates and its switch")
+    func welcomeAndRecap() {
+        #expect(TutorialFinishView.thingsToTry == [
+            "Tap a tag to act. Hold it to change.",
+            "Tap the AI Suggestion to reply.",
+            "Drag the field up to ask TabMail anything, like saving a reply as a template.",
+            "Turn Chat View on or off in TabMail Settings.",
+        ])
     }
 }
 
@@ -206,7 +247,7 @@ struct TutorialChatViewSeedTests {
         try #require(sink.delivered.count == 1)
         #expect(sink.delivered[0].action == .templateCreate)
         try #require(sink.delivered[0].templates.count == 1)
-        #expect(sink.delivered[0].templates[0].name == TutorialChatScript.chatViewTemplateName)
+        #expect(sink.delivered[0].templates[0].name == TutorialChatScript.templateName)
 
         let reply = "Count me in for the offsite."
         let sink2 = RecordingSink()
@@ -364,29 +405,27 @@ struct TutorialChatViewRunTests {
         try await body()
     }
 
-    @Test("With Chat View on, the run teaches in the chat view from its start to the switch, whatever the setting does meanwhile")
-    func chatViewRun() async throws {
+    @Test("With Chat View on or off, the run teaches in the chat view from its start to the switch, whatever the setting does meanwhile",
+          arguments: [true, false])
+    func chatViewRun(chatView: Bool) async throws {
         let fixture = try install()
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
-        try await withSettings(chatView: true) {
+        try await withSettings(chatView: chatView) {
             let coordinator = TutorialCoordinator.shared
             let pool = fixture.0
             try await whileRunning(.reuseReply) {
-                #expect(coordinator.teachesChat)
                 #expect(coordinator.step == .replyToPriya)
                 #expect(ChatViewConfig.opensInChat, "the run's chats open as chats")
-                // The setting changes mid-run: the run keeps what it started with.
-                UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
-                #expect(coordinator.teachesChat)
+                // The setting changes mid-run: the run still teaches in the chat view.
+                UserDefaults.standard.set(!chatView, forKey: ChatViewConfig.enabledKey)
                 #expect(ChatViewConfig.opensInChat)
-                #expect(!TutorialCoordinator.chatViewOnForTutorial, "the next run would not")
 
                 // Part 2: the AI Suggestion waits in Priya's chat; the inbox chat has nothing to send.
                 #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion)
                 #expect(coordinator.fieldMove(inPracticeChat: false) == nil)
                 #expect(coordinator.chatPrompt == nil)
                 // The edit keeps the reply a yes.
-                #expect(coordinator.composeEditPrompt == TutorialCoordinator.chatViewEditPrompt)
+                #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt)
                 var edited: ReplyResult?
                 await coordinator.runPracticeReplyEdit { edited = $0 }
                 #expect(edited?.body == TutorialChatScript.shorterReply)
@@ -442,9 +481,14 @@ struct TutorialChatViewRunTests {
                 #expect(bubble.isOwn)
                 #expect(bubble.textMessage == reply, "its own words, never Summarizing")
 
-                // The request in the same field, then Create.
-                #expect(coordinator.fieldMove(inPracticeChat: true) == .ask(.saveReplyAsTemplate))
-                #expect(coordinator.chatPrompt == nil, "the request is in Priya's field, not the inbox chat")
+                // The drag up opens the panel, which holds the request until it is sent; then Create.
+                #expect(coordinator.fieldMove(inPracticeChat: true) == .dragUp)
+                #expect(coordinator.panelPrompt(inPracticeChat: true) == .saveReplyAsTemplate)
+                #expect(coordinator.panelPrompt(inPracticeChat: false) == nil, "only Priya's panel asks")
+                #expect(coordinator.chatPrompt == nil, "the request is in the panel of Priya's chat, not the inbox chat")
+                coordinator.chatPromptSent(.saveReplyAsTemplate)
+                #expect(coordinator.templateAsked)
+                #expect(coordinator.panelPrompt(inPracticeChat: true) == nil, "the request is sent once")
                 #expect(coordinator.highlightsTemplateCreate)
                 _ = await TutorialChatScript.answer(
                     .saveReplyAsTemplate, practiceReply: coordinator.practiceReplyText,
@@ -452,9 +496,9 @@ struct TutorialChatViewRunTests {
                 try await waitFor(.reuseReplyDone)
                 let templateId = try #require(coordinator.savedTemplateId)
                 let template = try #require(PromptStore.shared.templates.first { $0.id == templateId })
-                #expect(template.name == TutorialChatScript.chatViewTemplateName)
+                #expect(template.name == TutorialChatScript.templateName)
                 #expect(template.exampleReply == reply)
-                #expect(coordinator.highlightsChatClose, "the chat's sheet closes onto the card")
+                #expect(!coordinator.highlightsChatClose, "the panel holds its own card, Next included")
 
                 // Part 3: the answer opens Jordan's chat at his email.
                 coordinator.nextLesson()
@@ -478,7 +522,7 @@ struct TutorialChatViewRunTests {
                 #expect(coordinator.step == .finished)
 
                 await coordinator.end()
-                #expect(!coordinator.teachesChat, "an ended run teaches nothing")
+                #expect(!coordinator.templateAsked, "an ended run keeps nothing of its own")
                 #expect(!coordinator.highlightsChatViewSwitch)
             }
         }
@@ -594,7 +638,7 @@ struct TutorialChatViewRunTests {
             let defaults = UserDefaults.standard
             #expect(AIService.isAIOff, "control: no AI choice yet, so AI is off")
             try await whileRunning(.reuseReply) {
-                #expect(coordinator.teachesChat, "control: the run teaches the chat view")
+                #expect(ChatViewConfig.opensInChat, "control: the run teaches in the chat view")
                 let (row, textMessage, snippet) = try await priyaRow(fixture.0)
                 try await HostedAccessibility.withAutomation {
                     let hosted = try HostedRowAndSwitch(row: row)
@@ -666,7 +710,7 @@ struct TutorialChatViewRunTests {
             let beforeRun = storedAIValues()
             #expect(beforeRun.isEmpty, "before the tour no AI value is stored: \(beforeRun)")
             try await whileRunning(.reuseReply) {
-                #expect(coordinator.teachesChat, "control: the run teaches the chat view")
+                #expect(ChatViewConfig.opensInChat, "control: the run teaches in the chat view")
                 let found = try await fixture.0.read { db in
                     try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
                         && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
@@ -732,51 +776,48 @@ struct TutorialChatViewRunTests {
         }
     }
 
-    // A run that teaches today's view (Chat View off when it started) keeps today's view on every
-    // surface until it ends, even when every live value says chat: Chat View turned on, the AI
-    // choice made with AI on, and a plan. The rows show the snippet and the switch stays grayed out
-    // through the run's last moment; once it ends, the same hosted views show the chat style (the
-    // control that the live values do say chat).
-    @Test("A run teaching today's view shows classic rows and a grayed-out switch until it ends, whatever the live setting says")
-    func classicRunStaysClassic() async throws {
+    // Every run teaches in the chat view, even with Chat View turned off: the rows show the text
+    // message and the switch works through the run's last moment, checked over a span, not once.
+    // Once the run ends, the same hosted views follow the app's own setting again: Chat View is off,
+    // so the rows show the snippet (the control that the live values do say today's view). The
+    // switch stays usable then too, since AI is on.
+    @Test("With Chat View off, a run shows chat-style rows and a working switch until it ends; then the rows follow the setting")
+    func runWithChatViewOffShowsTheChatView() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted row")
         let fixture = try install()
         defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
         try await withSettings(chatView: false) {
             let coordinator = TutorialCoordinator.shared
             try await whileRunning(.reuseReply) {
-                #expect(!coordinator.teachesChat, "control: the run teaches today's view")
                 let (row, textMessage, snippet) = try await priyaRow(fixture.0)
-                // Every live value says chat.
-                UserDefaults.standard.set(true, forKey: ChatViewConfig.enabledKey)
                 AISubscriptionGate.shared.openGate()
                 #expect(!AIService.isAIOff, "control: the AI choice is made and AI is on")
                 let liveSaysChat = ChatViewConfig.isActive
-                #expect(liveSaysChat, "control: the live chat view is on")
+                #expect(!liveSaysChat, "control: the live chat view is off")
                 try await HostedAccessibility.withAutomation {
                     let hosted = try HostedRowAndSwitch(row: row)
                     defer { hosted.close() }
-                    _ = await Self.waitUntil { hosted.theSwitch() != nil && hosted.rowShows(snippet) }
-                    // Through the run: today's view on both, checked over a span, not once.
+                    _ = await Self.waitUntil { hosted.theSwitch() != nil && hosted.rowShows(textMessage) }
+                    // Through the run: the chat view on the row, checked over a span, not once.
                     for _ in 0..<5 {
-                        let showsSnippet = hosted.rowShows(snippet)
                         let showsText = hosted.rowShows(textMessage)
+                        let showsSnippet = hosted.rowShows(snippet)
                         let enabled = hosted.theSwitch()?.isEnabled
                         let labels = hosted.rowLabels()
-                        #expect(showsSnippet, "the run's row shows the snippet: \(labels)")
-                        #expect(!showsText, "the run's row does not show the text message")
-                        #expect(enabled == false, "the run's switch is grayed out")
+                        #expect(showsText, "the run's row shows the text message: \(labels)")
+                        #expect(!showsSnippet, "the run's row does not show the snippet")
+                        #expect(enabled == true, "the run's switch can be used")
                         try await Task.sleep(for: .milliseconds(100))
                     }
                     #expect(coordinator.isRunning, "control: the run was live for every check above")
 
-                    // Once the run ends the same views follow the live values: the chat style.
+                    // Once the run ends the same views follow the live setting: today's view.
                     await coordinator.end()
-                    let chatRow = await Self.waitUntil { hosted.rowShows(textMessage) }
+                    let classicRow = await Self.waitUntil { hosted.rowShows(snippet) }
                     let afterLabels = hosted.rowLabels()
-                    #expect(chatRow, "after the run the row shows the text message: \(afterLabels)")
-                    let usable = await Self.waitUntil { hosted.theSwitch()?.isEnabled == true }
-                    #expect(usable, "after the run the switch can be used")
+                    #expect(classicRow, "after the run the row shows the snippet: \(afterLabels)")
+                    let afterShowsText = hosted.rowShows(textMessage)
+                    #expect(!afterShowsText, "after the run the row does not show the text message")
                 }
             }
         }
@@ -806,10 +847,10 @@ struct TutorialChatViewRunTests {
     }
 
     // The summary at Send follows the run, as the run's opens do: with its other inputs met (a
-    // session, consent, a plan, AI on), a chat-view run allows it with Chat View turned off live, and
-    // a run teaching today's view refuses it with Chat View turned on live. The run's own practice
-    // send is scripted: it is summarized on the device and sends no AI request.
-    @Test("The summary at Send follows the run whatever the live Chat View setting says; the run's practice send sends no AI request",
+    // session, consent, a plan, AI on), a run allows it whether Chat View was on or off when it
+    // started and whatever the live setting says meanwhile. The run's own practice send is
+    // scripted: it is summarized on the device and sends no AI request.
+    @Test("The summary at Send follows the run whatever the Chat View setting says; the run's practice send sends no AI request",
           arguments: [true, false])
     func summaryAtSendFollowsTheRun(chatViewRun: Bool) async throws {
         let fixture = try install()
@@ -818,16 +859,15 @@ struct TutorialChatViewRunTests {
             try await withSessionAndConsent {
                 let coordinator = TutorialCoordinator.shared
                 try await whileRunning(.reuseReply) {
-                    #expect(coordinator.teachesChat == chatViewRun, "control: the run kind")
-                    // The live toggle disagrees with the run; every other input is met.
+                    #expect(coordinator.isRunning, "control: the run is live")
+                    // The live toggle flips from what the run started with; every other input is met.
                     UserDefaults.standard.set(!chatViewRun, forKey: ChatViewConfig.enabledKey)
                     AISubscriptionGate.shared.openGate()
                     let liveActive = ChatViewConfig.isActive
-                    #expect(liveActive == !chatViewRun, "control: the live chat view disagrees with the run")
+                    #expect(liveActive == !chatViewRun, "control: the live chat view flipped")
                     #expect(TabMailAuthService.hasSession(), "control: signed in")
                     let mayRun = SentEmailSummary.mayRun()
-                    #expect(mayRun == chatViewRun, "the summary at Send follows the run, not the live setting")
-                    guard chatViewRun else { return }
+                    #expect(mayRun, "the summary at Send follows the run, not the live setting")
 
                     // The run's practice send, with a summary service that records every request.
                     let http = FakeHTTP.Scenario()
@@ -1006,24 +1046,24 @@ struct TutorialChatViewRunTests {
         return own + view.subviews.flatMap { scrollViews(in: $0) }
     }
 
-    @Test("With Chat View off, or AI opted out, the run is today's: no chat, and Finish goes straight to the recap")
-    func todaysRun() async throws {
+    @Test("With Chat View off, or AI opted out, the run still teaches in the chat view and its recap goes to the switch step")
+    func runWhateverTheSetting() async throws {
         for (chatView, optedOut) in [(false, false), (true, true)] {
             let fixture = try install()
             defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
             try await withSettings(chatView: chatView, optedOut: optedOut) {
                 let coordinator = TutorialCoordinator.shared
-                #expect(!TutorialCoordinator.chatViewOnForTutorial)
+                #expect(!ChatViewConfig.opensInChat, "control: outside a run, opens go to today's view")
                 try await whileRunning(.askAnything) {
-                    #expect(!coordinator.teachesChat)
-                    #expect(!ChatViewConfig.opensInChat, "the run's emails open in today's view")
-                    #expect(coordinator.fieldMove(inPracticeChat: true) == nil)
+                    #expect(ChatViewConfig.opensInChat, "the run's emails open as chats")
+                    #expect(coordinator.fieldMove(inPracticeChat: true) == nil, "part 3 has no move in Priya's field")
                     coordinator.chatPromptSent(.flights)
                     coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
                     coordinator.showMoreToAsk()
                     coordinator.showRecap()
-                    #expect(coordinator.step == .finished, "no switch step in today's run")
+                    #expect(coordinator.step == .chatViewSwitch, "every run ends at the switch step")
                 }
+                #expect(!ChatViewConfig.opensInChat, "after the run, opens follow the app's own setting again")
             }
         }
     }
@@ -1072,11 +1112,10 @@ extension TutorialChatViewRunTests {
                 #expect(after.cachedReply == TutorialChatScript.shorterReply)
                 #expect(ghost(after) != nil, "the edited reply still shows as the AI Suggestion")
                 #expect(TutorialCoordinator.chatShowsCard(
-                    step: coordinator.step, teachesChat: coordinator.teachesChat,
-                    holdsPracticeEmail: true, holdsSourceEmail: false))
+                    step: coordinator.step, holdsPracticeEmail: true, holdsSourceEmail: false))
                 let card = try #require(TutorialCoachContent.make(
                     step: .replyToPriya, lesson: .reuseReply, host: .chat, flightsAsked: false,
-                    replyEdited: coordinator.replyEdited, isSending: false, teachesChat: true))
+                    replyEdited: coordinator.replyEdited, isSending: false))
                 #expect(card.message.contains("Tap the AI Suggestion"))
                 #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion, "the tap the card asks for is the chat's move")
                 // The tap reopens the card, where Use Suggestion is now admitted, so the run goes on.
@@ -1137,8 +1176,9 @@ extension TutorialChatViewRunTests {
         }
     }
 
-    /// In Priya's chat at the template step: taps the step's Send and waits for the template's
-    /// Create card, which holds the request open until it is answered.
+    /// In Priya's chat at the template step: opens the panel as the field's drag up does (through
+    /// its VoiceOver action), taps the panel's Send and waits for the template's Create card, which
+    /// holds the request open until it is answered.
     private static func askForTheTemplateInPriyasChat(_ priya: MessageHeader) async throws {
         try await HostedAccessibility.withAutomation {
             let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
@@ -1151,19 +1191,27 @@ extension TutorialChatViewRunTests {
                 window.isHidden = true
                 window.rootViewController = nil
             }
-            // The field's own identifier ("chatReplyField") covers its parts, so its Send is
-            // found by that identifier and its label.
-            @MainActor func fieldSend() -> NSObject? {
-                HostedAccessibility.elements(under: controller.view).first {
-                    HostedAccessibility.identifier(of: $0) == "chatReplyField" && $0.accessibilityLabel == "Send"
-                }
-            }
-            for _ in 0..<80 where fieldSend() == nil {
+            @MainActor func labels() -> [String] { HostedAccessibility.labels(in: controller.view) }
+            for _ in 0..<80 where !labels().contains(DynamicIslandChat.tutorialDragHintText) {
                 try await Task.sleep(for: .milliseconds(100))
             }
+            let hint = labels().contains(DynamicIslandChat.tutorialDragHintText)
+            try #require(hint, "control: the closed field says to drag up; labels=\(labels().prefix(30))")
+            let actions = HostedAccessibility.actionNames(in: controller.view)
+            let opened = HostedAccessibility.perform(ChatViewConfig.showChatActionName, in: controller.view)
+            try #require(opened, "control: the field's drag up opens the panel; actions=\(actions)")
+            let prompt = TutorialCoordinator.ChatPrompt.saveReplyAsTemplate.rawValue
+            @MainActor func panelAsks() -> Bool {
+                HostedAccessibility.identifiers(in: controller.view).contains("tutorial-chat-send") && labels().contains(prompt)
+            }
+            for _ in 0..<80 where !panelAsks() {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let asks = panelAsks()
             let ids = HostedAccessibility.identifiers(in: controller.view)
-            let sent = fieldSend()?.accessibilityActivate() ?? false
-            try #require(sent, "control: the template step's Send is in Priya's chat; ids=\(ids)")
+            try #require(asks, "control: the panel holds the request and its Send; ids=\(ids)")
+            let sent = HostedAccessibility.activate("tutorial-chat-send", in: controller.view)
+            try #require(sent, "control: the panel's Send takes the tap; ids=\(ids)")
             @MainActor func cardWaits() -> Bool {
                 HostedAccessibility.labels(in: controller.view).contains("Create")
             }
@@ -1251,30 +1299,28 @@ extension TutorialChatViewContentTests {
         for replyEdited in [false, true] {
             let card = try #require(TutorialCoachContent.make(
                 step: .replyToPriya, lesson: .reuseReply, host: .chat, flightsAsked: false,
-                replyEdited: replyEdited, isSending: false, teachesChat: true))
+                replyEdited: replyEdited, isSending: false))
             #expect(card.message.contains("Tap the AI Suggestion"), "replyEdited=\(replyEdited)")
-            #expect(TutorialCoordinator.fieldMove(for: .replyToPriya, inPracticeChat: true, teachesChat: true)
+            #expect(TutorialCoordinator.fieldMove(for: .replyToPriya, inPracticeChat: true)
                     == .tapSuggestion, "replyEdited=\(replyEdited)")
         }
         // The card while sending asks for nothing.
         let sending = try #require(TutorialCoachContent.make(
             step: .replyToPriya, lesson: .reuseReply, host: .chat, flightsAsked: false,
-            replyEdited: true, isSending: true, teachesChat: true))
+            replyEdited: true, isSending: true))
         #expect(sending.showsProgress && sending.buttons.isEmpty)
-        // Both scripted edits are whole compose results: an email and its text version.
-        for teachesChat in [false, true] {
-            let edit = TutorialChatScript.editedReply(teachesChat: teachesChat)
-            #expect(!edit.body.isEmpty)
-            #expect(!(edit.textMessage ?? "").isEmpty, "teachesChat=\(teachesChat)")
-            let header = MessageHeader(
-                messageId: "1", subject: "Offsite", from: "Priya", fromAddress: "priya@company.com",
-                to: "me@example.com", date: Date(), snippet: "", folderId: "acc1:INBOX", accountId: "acc1",
-                folderPath: "INBOX", isInInbox: true)
-            var edited = header
-            edited.cachedReply = edit.body
-            edited.replyTextMessage = edit.textMessage
-            #expect(ChatReplyField.shown(newest: edited, usersTurn: false, onlyTo: nil)?.textMessage != nil)
-        }
+        // The scripted edit is a whole compose result: an email and its text version.
+        let edit = TutorialChatScript.editedReply
+        #expect(!edit.body.isEmpty)
+        #expect(!(edit.textMessage ?? "").isEmpty)
+        let header = MessageHeader(
+            messageId: "1", subject: "Offsite", from: "Priya", fromAddress: "priya@company.com",
+            to: "me@example.com", date: Date(), snippet: "", folderId: "acc1:INBOX", accountId: "acc1",
+            folderPath: "INBOX", isInInbox: true)
+        var edited = header
+        edited.cachedReply = edit.body
+        edited.replyTextMessage = edit.textMessage
+        #expect(ChatReplyField.shown(newest: edited, usersTurn: false, onlyTo: nil)?.textMessage != nil)
     }
 }
 
@@ -1297,30 +1343,30 @@ struct TutorialChatViewWiringTests {
         text.components(separatedBy: needle).count - 1
     }
 
-    @Test("The tutorial's field holds the request and nothing else: never the AI Suggestion")
-    func fieldText() {
-        let field = { (move: TutorialCoordinator.FieldMove?) in
-            ChatReplyField(example: nil, tutorialMove: move)
-        }
-        #expect(DynamicIslandChat.tutorialFieldText(field(.tapSuggestion)) == nil, "the move is a tap on the ghost")
-        #expect(DynamicIslandChat.tutorialFieldText(field(.ask(.saveReplyAsTemplate)))
-                == TutorialCoordinator.ChatPrompt.saveReplyAsTemplate.rawValue)
-        #expect(DynamicIslandChat.tutorialFieldText(field(nil)) == nil)
-    }
-
-    @Test("The ghost's tap opens compose in its step only; the field's Send takes the request to the scripted agent")
-    func fieldSendWiring() throws {
+    @Test("The ghost's tap opens compose in its step only; the field sends nothing and its drag up opens the panel, whose Send takes the request to the scripted agent")
+    func fieldAndPanelWiring() throws {
         let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
-        #expect(Self.count("TutorialChatInputBar( prompt: Self.tutorialFieldText(field), isWorking: isWorking, send: { sendTutorialField(field) })", in: field) == 1)
-        #expect(Self.count("case .tapSuggestion, nil: break", in: field) == 1, "the field's Send never opens compose")
-        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, suggestion: field.suggestion) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: field) == 1)
+        #expect(Self.count("TutorialChatInputBar( prompt: nil, isWorking: isWorking, dragHint: Self.tutorialDragHint(field), showChat: isExpanded ? nil : field.showChat, send: {})", in: field) == 1,
+                "in the tutorial the field sends nothing; its hint offers the drag's VoiceOver action")
+        #expect(Self.count("sendAgentChat(", in: field) == 0, "no field path into the agent")
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("if let status = script?.workingStatus { enqueueStatus(status) }", in: pill) == 1, "Saving template shows while it works")
-        #expect(Self.count("if (isInboxChat || replyField != nil) && TutorialCoordinator.shared.highlightsChatClose {", in: pill) == 1,
-                "the chat's sheet rings its close as the inbox chat's does")
+        #expect(Self.count("if isInboxChat && TutorialCoordinator.shared.highlightsChatClose {", in: pill) == 1,
+                "only the inbox chat rings its close; Priya's panel holds its own card")
+        #expect(Self.count("if TutorialCoordinator.shared.isRunning, let cardAction = replyField?.tutorialPanelCard {", in: pill) == 1)
+        #expect(Self.count("TutorialCoachView(host: .chatPanel, onAction: cardAction)", in: pill) == 1, "the open panel shows the step's card")
+        #expect(Self.count("if replyField?.tutorialPanelCard != nil { return TutorialCoordinator.shared.panelPrompt(inPracticeChat: true) }", in: pill) == 1,
+                "the panel of Priya's chat holds the step's request")
+        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) sendAgentChat(prompt.rawValue, script: prompt)", in: pill) == 1)
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(Self.count("TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)", in: chat) == 1)
-        #expect(Self.count("tutorialMove: tutorialMove(thread)", in: chat) == 1)
+        #expect(Self.count("let opensPanel = !chatExpanded && (!TutorialCoordinator.shared.isRunning || move == .dragUp)", in: chat) == 1,
+                "in the tutorial the field opens the panel only at the step that asks for it")
+        #expect(Self.count("showChat: opensPanel ? {", in: chat) == 1)
+        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: opensPanel,", in: chat) == 1)
+        #expect(Self.count("tutorialPanelCard: tutorialPanelCard(thread),", in: chat) == 1)
+        #expect(Self.count("guard action == .nextLesson else { return } withAnimation(Self.pillSpring) { chatExpanded = false } dismiss()", in: chat) == 1,
+                "the card's Next closes the panel and the chat")
         #expect(Self.count("ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) { if let shown { openSuggestion(shown, on: newest, tutorialMove: move) } }", in: chat) == 1)
         #expect(Self.count("if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion { _ = TutorialCoordinator.shared.admits(.other) return }", in: chat) == 1,
                 "in the tutorial only the step that asks for it opens the card")

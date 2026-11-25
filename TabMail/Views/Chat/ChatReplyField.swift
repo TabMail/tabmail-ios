@@ -19,14 +19,19 @@ struct ChatReplyField {
     let example: String?
     /// The reply goes only to these people; nil for Reply All.
     var onlyTo: [ChatThread.Person]? = nil
-    /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
+    /// In the tutorial, the step's move in the read-only field (part 2); nil, none.
     var tutorialMove: TutorialCoordinator.FieldMove? = nil
+    /// In the tutorial, in the chat that holds Priya's practice email (part 2): the open panel
+    /// shows the step's coach card above its input, and its input the step's request
+    /// (`TutorialCoordinator.panelPrompt`). The chat's own handling after a card button ran; nil
+    /// in any other chat.
+    var tutorialPanelCard: ((TutorialCoachContent.Action) -> Void)? = nil
     /// A drag up in flight, whose swell grows the field toward the panel (`ChatFieldDrag.Swell`);
     /// nil swells nothing.
     var drag: ChatFieldDrag.Model? = nil
     /// VoiceOver's "Show TabMail chat" (`ChatViewConfig.showChatActionName`), the drag up's
     /// equivalent, offered on the element VoiceOver focuses (`showChatAction`); nil offers nothing
-    /// (the panel open, the tutorial).
+    /// (the panel open, the tutorial except at its drag-up step).
     var showChat: (() -> Void)? = nil
     /// The full email of the AI Suggestion the chat shows now (`cachedReply`); nil when no ghost
     /// shows. A request sent while it shows is a compose edit of it (`ChatFieldReply.suggestion`).

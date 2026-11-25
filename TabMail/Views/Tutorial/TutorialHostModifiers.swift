@@ -4,31 +4,14 @@
 
 import SwiftUI
 
-/// Part 3's source email: reports the open to the tutorial and shows the
-/// "There's your answer" card above it. One modifier entry, because the
+/// Part 3's source email: reports the open to the tutorial. Its card shows in the chat at
+/// Jordan's email; this detail opens from a bubble inside it. One modifier entry, because the
 /// message view's modifier chain is type-checker-budget-sensitive.
 struct TutorialMessageHost: ViewModifier {
     let message: MessageHeader?
-    let dismiss: DismissAction
-
-    private var isTutorialSource: Bool {
-        message?.accountId == DemoSeed.demoAccountId
-            && message?.messageId == DemoSeed.TutorialFixture.jordanFlights
-    }
 
     func body(content: Content) -> some View {
         content
-            .safeAreaInset(edge: .top) {
-                // In the chat view the chat at Jordan's email shows the card, and this detail
-                // opens from a bubble inside it.
-                if TutorialCoordinator.shared.isRunning && !TutorialCoordinator.shared.teachesChat && isTutorialSource {
-                    TutorialCoachView(host: .message, onAction: { action in
-                        // "Next" continues in the inbox's chat.
-                        if action == .showMoreToAsk { dismiss() }
-                    })
-                    .padding(.vertical, 8)
-                }
-            }
             .task(id: message?.id) {
                 guard let message else { return }
                 TutorialCoordinator.shared.messageOpened(accountId: message.accountId, messageId: message.messageId)

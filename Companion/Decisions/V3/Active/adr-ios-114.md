@@ -451,8 +451,12 @@ same AI result, kept as long as the email itself is shown.
    agent about this chat, with no nudge. The placeholders say which: "Write your reply" in the closed
    field (`ChatReplyField.writePlaceholder`), "Ask TabMail" in the open panel
    (`ChatReplyField.panelPlaceholder`, `PillDictationMode.placeholder(isChatPanel:)`). The agent
-   request's field branches (`sendAgentChat(field:)`, and the recovery of a field request) remain
-   only for the tutorial's scripted field ask, until the tutorial moves that ask into the panel;
+   request's field branches (`sendAgentChat(field:)`, and the recovery of a field request) remained
+   only for the tutorial's scripted field ask until the tutorial moved that ask into the panel
+   (decision 13, amendment 2026-11-25); they are deleted: `sendAgentChat(_:script:)` takes no field,
+   a failed send holds only its text (`FailedSend`), a pending resume its request and origin
+   (`PendingResume`), `ChatMessage` has no `fieldSend`, and no path from the field reaches
+   `sendAgentChat` (`ChatReplyFieldRuntimeTests.agentSendsCarryNoField`);
    the field-reply logic of ADR-IOS-053 amendment 3 in `EmailReplyTool` (the shown row's check,
    who it goes to, the edit of the shown suggestion) is now reached from the field only through
    `composeFromField`, and the agent's requests from the panel carry no field. A new email's chat (amendment 24 and *Every new email*) sent its field's words to the agent with its own nudge (`ChatNewEmailField.agentMessage`) in the first round of its Send. Since 2026-11-25 its closed field composes the same way: the words are the request of the new email's compose edit (`EmailComposeTool.composeFromField`, the registry's tool, `composeWithRegisteredTool`; mode `edit_new`, Thunderbird's `runComposeEdit`) to the people picked, given as mailboxes under their names (`ChatNewDraft.toEntries`), never a turn for the agent; the card opens over the chat with the written email and its text version (`ChatNewThreadModel.card` passes `ComposeRequest.suggestion`), and its To is the chat's people, so recipients the edit would add or remove are not applied. With nobody picked, Send asks and stops, as before. A compose that writes nothing ends the send with the words kept in the field and a note (`DynamicIslandChat.newEmailNotWrittenNote`); the reply field and the new email share one runner (`runFieldCompose`). The nudge is deleted. Tests:
@@ -1030,6 +1034,35 @@ same AI result, kept as long as the email itself is shown.
    a run they follow the live setting. The tour never records an AI choice. Tests:
    `TutorialChatViewRunTests` (`runBeforeTheAIChoice`, `openBeforeTheAIChoice`,
    `classicRunStaysClassic`, `summaryAtSendFollowsTheRun`).
+   *Amended 2026-11-25 (one tutorial; the panel teaches the agent and templates):* there is one
+   tutorial, and it runs in the chat view whatever the Chat View setting or Opt Out of AI says;
+   today's tutorial is deleted (`teachesChat`, `chatViewOnForTutorial`, the `.message` card host and
+   the message view's card). `ChatViewConfig.followingTutorial(live, tutorialRunning:)` is
+   `tutorialRunning || live`, so during a run every open, the summary at Send, the inbox rows and the
+   switch follow the chat view, and outside a run the live setting. The welcome and the finish screen
+   are the chat view's only (the finish lists four things to try: a tag, the AI Suggestion, the drag
+   up to ask TabMail, the switch in Settings), and every run ends at the switch step. Part 2: the
+   practice reply is sent from compose after "Make it shorter" (`TutorialCoordinator.editPrompt`,
+   `TutorialChatScript.editedReply`), as before. Then, in Priya's chat, the card says the field writes
+   to Priya and the hint in the field says "Drag up to ask TabMail" (`FieldMove.dragUp`,
+   `DynamicIslandChat.tutorialDragHint`); the field holds no words and sends nothing in the tutorial,
+   and the drag (or VoiceOver's "Show TabMail chat") opens the panel only at that step. The open
+   panel shows the step's card above its input (`TutorialCoachHost.chatPanel`, `ChatReplyField.tutorialPanelCard`)
+   and the request "Save this as my template." in its input (`TutorialCoordinator.panelPrompt`,
+   `ChatPrompt.saveReplyAsTemplate`); its Send goes to the scripted agent as the inbox chat's prompts
+   do (`sendTutorialPrompt`, `sendAgentChat(_:script:)`), sets `templateAsked`, and shows the real
+   Create card; the panel's card then explains templates. After Create the card says where templates
+   live (TabMail Settings, Reply Templates) with See template and Next; Next closes the panel and the
+   chat. The inbox chat's close ring is the inbox chat's only. Why: the chat view's field writes the
+   reply and only the panel asks TabMail (decision 10, 2026-11-25), so the tutorial teaches that move
+   and that templates exist. The wording may still change at the simulator check. Tests:
+   `TutorialChatViewRunTests.chatViewRun` (with the setting on and off), `runWhateverTheSetting`
+   (with Chat View off or AI opted out, replacing the today's-run test),
+   `runWithChatViewOffShowsTheChatView` (replacing `classicRunStaysClassic`),
+   `summaryAtSendFollowsTheRun`, `replyIsReadyOnFirstRunAndRedo` (the panel opened by its VoiceOver
+   action, its Send tapped); `TutorialChatViewContentTests` (`fieldMoves`, `panelAndInboxChatPrompts`,
+   `dragHint`, `chatCards`, `welcomeAndRecap`); `TutorialChatViewWiringTests.fieldAndPanelWiring`;
+   `ChatReplyFieldTests` (the drag's `opensPanel`); `ChatThreadContextTests.opensInChat`.
 
 14. **One TabMail chat per thread (amendment 2026-11-16).** An email's TabMail chat belongs to its
    thread, with the chat view on or off. Decided 2026-11-16: "per-mail chat sessions now should be
@@ -1167,7 +1200,8 @@ prompts and working status, where a chat shows the card, the edit staying a yes)
 chats and inbox groups, every seeded email's text message); `TutorialChatViewRunTests` (a chat-view run
 from Part 2 to the switch with the setting flipped mid-run, and today's run with Chat View off or AI
 opted out); `ChatThreadContextTests.opensInChat`; the tutorial locks in the chat read from the source
-by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`.
+by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`. Since 2026-11-25
+(one tutorial, the panel step): the tests listed at the end of decision 13's amendment of that date.
 
 15. **Where the field and the header sit (amendment 2026-11-17).** The chat is laid out as Messages
    is. The reply field's bottom edge sits `ChatViewLayout.fieldBottomGap` (8 pt) above the bottom
@@ -1255,7 +1289,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (the card's body, Use Suggestion, the saved draft left in Drafts), `ChatThreadViewLifecycleTests.suggestionSitsAtTheSentPosition` and
    `sentReplyTakesTheTurn`, `ChatReplyFieldRuntimeTests.exampleLinePutsTheChange` and
    `suggestionNeverEntersTheField`, `ChatReplyFieldTests.suggestionText` and `exampleFromConfig`,
-   `TutorialChatViewTests.fieldText`.
+   `TutorialChatViewTests.fieldText` (since 2026-11-25 `TutorialChatViewContentTests.dragHint`: the
+   tutorial's field holds no words, only the drag-up hint at its step).
 
    **Amended 2026-11-20 (the working bubble):** while the suggestion is written its row is the
    working bubble, `ChatSuggestionWorkingBubble` (the ghost's dashed bubble with three pulsing dots,
@@ -1592,7 +1627,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    plus the cooldown."
    VoiceOver opens the panel with the named action "Show TabMail chat" on the element it focuses:
    the text field, the sent words while the agent works, the waveform while dictating
-   (`showChatAction`), only while the panel is closed. Not in the tutorial, whose steps open the chat themselves. The panel stays dimmed
+   (`showChatAction`), only while the panel is closed. Not in the tutorial, whose steps open the chat themselves
+   (*amended 2026-11-25:* in the tutorial only at part 2's drag-up step, `FieldMove.dragUp`, for the
+   drag and the action alike, `ChatThreadView` `opensPanel`). The panel stays dimmed
    with the rest of the chat as built (the ghost dims with it). Tests: `ChatFieldDragTests`,
    `ChatSwipeUITests.testDragUpOnTheReplyFieldOpensTheChatPanel`,
    `testShortDragUpOnTheReplyFieldSettlesBack` and `testDraggedOpenPanelClosesOnCloseAndOnTheDim`

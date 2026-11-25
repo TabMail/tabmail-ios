@@ -34,6 +34,12 @@ c4 TC1 TC2 TC3
 | `DynamicIslandChat.sendTutorialEdit` runs `runPracticeReplyEdit` and passes the edited reply to `onDraftUpdate` (`ComposeView.applyInlineEdit`) | The scripted edit does not reach the practice draft: part 2 waits at the edit, or the unedited reply is offered. The person taps Skip |
 | `TutorialMessageHost.body(content:)`: the message view's task calls `TutorialCoordinator.messageOpened(accountId:messageId:)` | Opening Jordan's flight email no longer finishes part 3: the card keeps asking for it and the person taps Skip |
 
+*2026-11-25 (one tutorial, in the chat view):* `sendTutorialPrompt` also sends part 2's template request from the
+panel of Priya's chat (`tutorialChatPrompt`, `panelPrompt`); that wiring, and the drag that opens the panel only at
+its step, are fenced from the source by `TutorialChatViewWiringTests.fieldAndPanelWiring`, and the hosted
+`TutorialChatViewRunTests.replyIsReadyOnFirstRunAndRedo` opens the panel and taps its Send. `TutorialMessageHost`
+keeps only the `messageOpened` task; its card is deleted with today's tutorial (ADR-IOS-114 decision 13).
+
 ## What is tested
 
 - The decisions behind each hook, at the coordinator and service: `TutorialChatScript.response(for:invocation:model:)`

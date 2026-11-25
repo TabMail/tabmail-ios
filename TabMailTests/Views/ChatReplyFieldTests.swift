@@ -1487,8 +1487,9 @@ struct ChatReplyFieldTests {
         // settle (a newer begin cancels it).
         #expect(Self.count("ChatSwipeHold.shared.release(Self.fieldDragHoldId, after: Self.fieldDragSettle + ChatViewLayout.freezeCooldown)", in: changed) == 1)
         #expect(Self.count("ChatSwipeHold.shared.releaseNow(Self.fieldDragHoldId)", in: chat) == 1, "and if the chat goes away")
-        // Never in the tutorial, whose steps open the chat themselves, nor over the open panel.
-        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning, cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))", in: chat) == 1)
+        // Never over the open panel, and in the tutorial only at the step whose move is the drag up.
+        #expect(Self.count("let opensPanel = !chatExpanded && (!TutorialCoordinator.shared.isRunning || move == .dragUp)", in: chat) == 1)
+        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: opensPanel, cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))", in: chat) == 1)
         #expect(Self.count("simultaneousGesture", in: chat) == 0)
         // One bridge for every chat pan: the field's drag reads the swipes' sample and outcome, with
         // no delivery of its own.
@@ -1507,7 +1508,7 @@ struct ChatReplyFieldTests {
         // VoiceOver opens the panel with a named action on the text field it focuses, offered only
         // while the panel is closed, never on the field's container.
         #expect(ChatViewConfig.showChatActionName == "Show TabMail chat")
-        #expect(Self.count("showChat: chatExpanded || TutorialCoordinator.shared.isRunning ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } }", in: chat) == 1)
+        #expect(Self.count("showChat: opensPanel ? { withAnimation(Self.pillSpring) { chatExpanded = true } } : nil", in: chat) == 1)
         #expect(Self.count("Button(ChatViewConfig.showChatActionName)", in: chat) == 0, "not on the container")
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         // One helper, only while the panel is closed.
@@ -1666,19 +1667,22 @@ struct ChatReplyFieldTests {
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("composeFromField(text, ChatFieldSend(message: message, onlyTo: field.onlyTo, suggestion: field.suggestion))", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
-        #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey, fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)", in: island) == 1,
-                "and travel with the request to the agent's tools")
-        // With the chat that asked, read as the send starts; the field's request belongs to the chat view.
-        // The pill's send and the closed field's compose both read it.
-        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)", in: island) == 2)
+        #expect(Self.count("runFieldCompose(fieldReply: send.fieldReply, fieldWordsKey: fieldWordsKey)", in: island) == 1)
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: capturedSessionKey, fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)", in: island) == 1,
+                "and travel with the request to the compose tool")
+        // With the chat that asked, read as the send starts: the closed field's compose belongs to the
+        // chat view, the pill's send to the screen that asked. No send to the agent carries a field's
+        // request (the field writes the email, ADR-IOS-114 decision 10).
+        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)", in: island) == 1)
+        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: nil)", in: island) == 1)
+        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, composeOrigin: origin)", in: island) == 2,
+                "the pill's send and its resume carry no field request")
         #expect(Self.count("return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen, fromAccountId: composeFromAccountId)", in: island) == 1)
         // A covered screen does not take: the pill takes only while its screen shows and nothing covers it.
         #expect(Self.count("let host = (composeHostShown ?? composeHostAppeared) && !composeHostCovered", in: island) == 1)
-        // A recovered send keeps them: the resume carries the cut-off send's request, the retry the
-        // failed send as it was sent (ChatReplyRecoveryTests sends both through the real chat).
-        #expect(Self.count("pendingResume = .init( request: resumable.resumeRequest, fieldReply: fieldReply, origin: origin, fieldWordsKey: fieldWordsKey)", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey, fieldReply: resume.fieldReply, composeOrigin: origin, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
+        // A recovered send keeps its origin: the resume carries the cut-off send's request and
+        // origin (ChatReplyRecoveryTests sends it through the real chat).
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, origin: origin)", in: island) == 1)
         // A resume continues its turn: the origin the turn started with, from any screen of the thread.
         #expect(Self.count("let origin = resume.origin", in: island) == 1)
         #expect(Self.count("composeOrigin(sessionKey: capturedSessionKey,", in: island) == 2,
@@ -1709,20 +1713,18 @@ struct ChatReplyFieldTests {
         let detailActions = try Self.source("TabMail/Views/Message/MessageDetailView+Actions.swift")
         #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } agentCompose = req", in: detailActions) == 1)
         #expect(Self.count("navigationStore.accounts.first { $0.id == req.fromAccountId }", in: detailActions) == 1)
-        #expect(Self.count("pendingResume = .init( request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
-        #expect(Self.count("lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)", in: island) == 1)
-        #expect(Self.count("sendAgentChat(failed.text, field: failed.field, ownsFieldWords: failed.ownsFieldWords)", in: island) == 1)
-        // Re-send of the last turn sends it with its email and choice: the bubble keeps the field's
-        // send and the menu passes it on (ChatComposeRoutingTests checks the bubble keeps it); it owns
-        // none of the field's words (ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField).
-        #expect(Self.count("chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date(), fieldSend: field))", in: island) == 1)
-        #expect(Self.count("resendLastUserMessage(text: msg.content, field: msg.fieldSend, afterIndex: index)", in: island) == 1)
+        #expect(Self.count("pendingResume = .init(request: resumable.resumeRequest, origin: resume.origin)", in: island) == 1)
+        #expect(Self.count("lastFailedSend = .init(text: text)", in: island) == 1)
+        #expect(Self.count("sendAgentChat(failed.text)", in: island) == 1)
+        // Re-send of the last turn sends its words again from the panel.
+        #expect(Self.count("chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date()))", in: island) == 1)
+        #expect(Self.count("resendLastUserMessage(text: msg.content, afterIndex: index)", in: island) == 1)
         // Rewind trims the later turns and sends the chosen turn again as a fresh turn, which names
         // the screen that asked (an earlier field turn's recipients choice is not kept with it).
         #expect(Self.count("rewindToMessage(text: msg.content, atIndex: index)", in: island) >= 1, "the menu's Rewind reaches the rewind")
         #expect(Self.count("private func rewindToMessage(text: String, atIndex index: Int) { trimForRewind(atIndex: index) lastFailedSend = nil sendAgentChat(text) }", in: island) == 1,
                 "Rewind sends the turn again through the send that names the screen")
-        #expect(Self.count("trimForResendLast(atIndex: index) lastFailedSend = nil sendAgentChat(text, field: field, ownsFieldWords: false)", in: island) == 1)
+        #expect(Self.count("trimForResendLast(atIndex: index) lastFailedSend = nil sendAgentChat(text)", in: island) == 1)
         #expect(Self.count("replyField?.onlyTo", in: island) == 0 && Self.count("replyField?.isNoReply", in: island) == 0,
                 "no send reads the field's choice later")
     }

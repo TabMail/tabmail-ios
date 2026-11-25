@@ -11,11 +11,10 @@ enum TutorialLesson: Int, CaseIterable, Sendable {
     case reuseReply = 2
     case askAnything = 3
 
-    /// Part 2 is "Reply like a message" when the run teaches in the chat view.
-    func title(teachesChat: Bool) -> String {
+    var title: String {
         switch self {
         case .actOnEmail: return "Act on email"
-        case .reuseReply: return teachesChat ? "Reply like a message" : "Reuse a reply"
+        case .reuseReply: return "Reply like a message"
         case .askAnything: return "Ask anything"
         }
     }

@@ -153,7 +153,7 @@ struct MessageDetailView: View {
 
     var body: some View {
         bodyContent
-            .modifier(TutorialMessageHost(message: viewModel.message, dismiss: dismiss))
+            .modifier(TutorialMessageHost(message: viewModel.message))
             .overlay {
                 if skeletonOverlayVisible && !viewModel.messageNotFound {
                     MessageDetailSkeleton()

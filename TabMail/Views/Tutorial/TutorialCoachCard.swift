@@ -21,7 +21,7 @@ struct TutorialCoachView: View {
             flightsAsked: tutorial.flightsAsked,
             replyEdited: tutorial.replyEdited,
             isSending: PendingSendService.shared.isSending,
-            teachesChat: tutorial.teachesChat) {
+            templateAsked: tutorial.templateAsked) {
             TutorialCoachCard(
                 content: content,
                 onAction: { action in

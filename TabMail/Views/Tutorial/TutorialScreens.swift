@@ -15,8 +15,6 @@ struct TutorialWelcomeView: View {
     var isReplay = false
 
     @State private var isStarting = false
-    /// The run this screen starts teaches in the chat view.
-    private var teachesChat: Bool { TutorialCoordinator.chatViewOnForTutorial }
 
     var body: some View {
         TutorialPage {
@@ -45,11 +43,8 @@ struct TutorialWelcomeView: View {
 
             VStack(alignment: .leading, spacing: 14) {
                 TutorialBenefit(symbol: "hand.tap", title: "Tap away your emails, your way", detail: "Tap tags to act, or hold to teach.")
-                if teachesChat {
-                    TutorialBenefit(symbol: "bubble.left.and.bubble.right", title: "Reply like a message", detail: "Every email reads like a text. Your reply is ready.")
-                } else {
-                    TutorialBenefit(symbol: "arrowshape.turn.up.left", title: "Reply in seconds, and reuse them", detail: "Pre-written replies. Turn any reply into a smart template.")
-                }
+                TutorialBenefit(symbol: "bubble.left.and.bubble.right", title: "Reply like a message",
+                                detail: "Every email reads like a text. Your reply is ready, and good ones become templates.")
                 TutorialBenefit(symbol: "magnifyingglass", title: "Ask anything", detail: "Find past emails and calendar events, schedule meetings, and more.")
             }
             .padding(.vertical, 8)
@@ -85,9 +80,15 @@ struct TutorialWelcomeView: View {
 /// then sign-in (new user) or the restored inbox opens.
 struct TutorialFinishView: View {
     let signedIn: Bool
-    /// The run taught in the chat view: the recap names its reply and its switch.
-    var teachesChat = false
     @State private var isEnding = false
+
+    /// What the recap suggests trying, one per part and the Chat View switch.
+    static let thingsToTry = [
+        "Tap a tag to act. Hold it to change.",
+        "Tap the AI Suggestion to reply.",
+        "Drag the field up to ask TabMail anything, like saving a reply as a template.",
+        "Turn Chat View on or off in TabMail Settings.",
+    ]
 
     var body: some View {
         TutorialPage {
@@ -100,21 +101,12 @@ struct TutorialFinishView: View {
                 .fontWeight(.bold)
                 .foregroundStyle(Theme.textPrimary)
 
-            Text(teachesChat ? "Four things to try in your own inbox:" : "Three things to try in your own inbox:")
+            Text("Four things to try in your own inbox:")
                 .font(.subheadline)
                 .foregroundStyle(Theme.textSecondary)
 
             VStack(alignment: .leading, spacing: 12) {
-                Label("Tap a tag to act. Hold it to change.", systemImage: "checkmark")
-                if teachesChat {
-                    Label("Tap the AI Suggestion, or say anything: a reply or a request.", systemImage: "checkmark")
-                } else {
-                    Label("Turn a good reply into a template.", systemImage: "checkmark")
-                }
-                Label("Ask TabMail anything.", systemImage: "checkmark")
-                if teachesChat {
-                    Label("Turn Chat View on or off in TabMail Settings.", systemImage: "checkmark")
-                }
+                ForEach(Self.thingsToTry, id: \.self) { Label($0, systemImage: "checkmark") }
             }
             .font(.subheadline)
             .fontWeight(.medium)

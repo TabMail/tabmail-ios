@@ -25,7 +25,7 @@ enum SentEmailSummary {
     /// Whether a send summarizes its email now: the chat view is on and AI may run. Read once, at
     /// the queue write.
     @MainActor static func mayRun() -> Bool {
-        // An open goes to the chat only with the chat view and AI on, or as a tutorial run teaches
+        // An open goes to the chat only with the chat view and AI on, or while a tutorial runs
         // (`ChatViewConfig.opensInChat`, through the tutorial-aware gate `followingTutorial`).
         ChatViewConfig.opensInChat
             && TabMailAuthService.hasSession()

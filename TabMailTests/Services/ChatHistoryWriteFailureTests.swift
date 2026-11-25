@@ -147,7 +147,7 @@ struct ChatHistoryWriteFailureTests {
         }
         session.chatMessages.append(ChatMessage(role: .user, content: "Hello", timestamp: Date()))
         await session.appendTurn(turn(), admission: nil)
-        session.lastFailedSend = .init(text: "Hello", field: nil)
+        session.lastFailedSend = .init(text: "Hello")
         session.chatMessages.append(ChatMessage(role: .agent, content: "Couldn't connect.", timestamp: Date()))
         #expect(warnings(session) == [ChatPillState.Session.historySaveFailedWarning])
 

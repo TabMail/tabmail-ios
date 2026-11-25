@@ -227,10 +227,8 @@ struct DynamicIslandChat: View {
         nonmutating set { session.lastFailedSend = newValue }
     }
     /// Saved checkpoint for a turn cut off in transit. Drives the "Connection
-    /// lost. Tap to retry." affordance and the field's Retry (`chatRetry`): on an
-    /// empty field, or in Send's place while the field still holds the unedited
-    /// sent words of this same request (its `fieldWordsKey` is the field's
-    /// `wordsKey`). Separate from `lastFailedSend`.
+    /// lost. Tap to retry." affordance and the input's Retry (`chatRetry`) on an
+    /// empty input. Separate from `lastFailedSend`.
     private var pendingResume: ChatPillState.Session.PendingResume? {
         get { session.pendingResume }
         nonmutating set { session.pendingResume = newValue }
@@ -417,8 +415,7 @@ struct DynamicIslandChat: View {
                         .overlay {
                             // Guided tutorial: the open chat covers the card, whose
                             // button is the next tap.
-                            // In the chat view, the chat's own sheet (part 2's template).
-                            if (isInboxChat || replyField != nil) && TutorialCoordinator.shared.highlightsChatClose {
+                            if isInboxChat && TutorialCoordinator.shared.highlightsChatClose {
                                 TutorialPulseRing(shape: Circle(), lineWidth: 2, outset: 3)
                             }
                         }
@@ -481,6 +478,12 @@ struct DynamicIslandChat: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 4)
+                if TutorialCoordinator.shared.isRunning, let cardAction = replyField?.tutorialPanelCard {
+                    // Part 2 in Priya's chat: the open panel covers the chat's own card.
+                    TutorialCoachView(host: .chatPanel, onAction: cardAction)
+                        .padding(.bottom, 6)
+                        .layoutPriority(1)
+                }
                 Divider()
                 if !hasTabMailSession {
                     signInBar
@@ -1053,10 +1056,9 @@ struct DynamicIslandChat: View {
                 .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .accessibilityLabel("Transcribing")
         } else if !isWorking && !dictation.isActive && (pendingResume != nil || lastFailedSend != nil) && isOnLiveSession
-                    && (inputText.trimmingCharacters(in: .whitespaces).isEmpty || (pendingResume?.fieldWordsKey == wordsKey && fieldFill.holdsSentWords)) {
-            // Retry button. Shown on an empty field, or on a field still holding the unchanged sent
-            // words of the field's own cut-off request (resuming it adds no user turn). Reverts to the send
-            // button as soon as the user types or edits. Routes to the right path:
+                    && inputText.trimmingCharacters(in: .whitespaces).isEmpty {
+            // Retry button. Shown on an empty input. Reverts to the send
+            // button as soon as the user types. Routes to the right path:
             // a connection-lost RESUMES from saved state; a plain failure re-sends.
             Button {
                 if pendingResume != nil {
@@ -1064,9 +1066,8 @@ struct DynamicIslandChat: View {
                     // of completed tools). Same action as the inline affordance.
                     resumeAgentChat()
                 } else if let failed = session.takeFailedSendForRetry() {
-                    // The failed send leaves the chat, then is sent again (matches TB retry),
-                    // as it was sent: from the field with its email and choice, or from the panel.
-                    sendAgentChat(failed.text, field: failed.field, ownsFieldWords: failed.ownsFieldWords)
+                    // The failed send leaves the chat, then is sent again (matches TB retry).
+                    sendAgentChat(failed.text)
                 }
             } label: {
                 Image(systemName: "arrow.clockwise.circle.fill")
@@ -1304,7 +1305,7 @@ struct DynamicIslandChat: View {
                                         }
                                     } else if !hasLaterUserMsg {
                                         Button("Re-send message", systemImage: "arrow.clockwise") {
-                                            resendLastUserMessage(text: msg.content, field: msg.fieldSend, afterIndex: index)
+                                            resendLastUserMessage(text: msg.content, afterIndex: index)
                                         }
                                     } else if message != nil {
                                         // Message-detail: rewind in-place (no session history)
@@ -1600,15 +1601,23 @@ struct DynamicIslandChat: View {
         isComposeMode && draftReplyToProviderMessageId == DemoSeed.TutorialFixture.priyaOffsite
     }
 
+    /// The tutorial's request in this chat's panel now, if any: the inbox chat's, or part 2's in the
+    /// panel of Priya's chat.
+    private var tutorialChatPrompt: TutorialCoordinator.ChatPrompt? {
+        if isInboxChat { return TutorialCoordinator.shared.chatPrompt }
+        if replyField?.tutorialPanelCard != nil { return TutorialCoordinator.shared.panelPrompt(inPracticeChat: true) }
+        return nil
+    }
+
     /// The tutorial's filled-in input in this chat now, if any.
     private var tutorialPromptText: String? {
-        if isInboxChat { return TutorialCoordinator.shared.chatPrompt?.rawValue }
+        if let prompt = tutorialChatPrompt { return prompt.rawValue }
         if isTutorialPracticeDraft { return TutorialCoordinator.shared.composeEditPrompt }
         return nil
     }
 
     private func sendTutorialInput() {
-        if isInboxChat, let prompt = TutorialCoordinator.shared.chatPrompt {
+        if let prompt = tutorialChatPrompt {
             sendTutorialPrompt(prompt)
         } else if isTutorialPracticeDraft, TutorialCoordinator.shared.composeEditPrompt != nil {
             sendTutorialEdit()
@@ -1617,7 +1626,7 @@ struct DynamicIslandChat: View {
 
     /// The practice reply's scripted edit, through the real edit path: the
     /// chat closes, the draft pulses as during an AI edit, then fades to the
-    /// declined reply.
+    /// edited reply.
     private func sendTutorialEdit() {
         isTextFieldFocused = false
         withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
@@ -2600,16 +2609,10 @@ struct DynamicIslandChat: View {
         return await ChatIdTranslator.shared.toNumericId(message.id)
     }
 
-    /// `script`: a guided-tutorial prompt, answered by `TutorialChatScript`
-    /// on the device instead of the AI.
-    /// `field`: the reply field's send as it started; nil for a send from the panel.
-    /// `ownsFieldWords`: the send is the field's open send, so its card, answer and sent compose
-    /// complete the field's words (`fieldWordsKey`). A sheet Re-send of an answered turn carries the
-    /// turn's `field` (its email and Reply to choice) but owns no words: its own send completed when
-    /// it was answered, and words open by then belong to a newer send.
-    func sendAgentChat(
-        _ text: String, script: TutorialCoordinator.ChatPrompt? = nil, field: ChatFieldSend? = nil, ownsFieldWords: Bool = true
-    ) {
+    /// A send to the agent, from the open panel (the chat view's closed field writes the email
+    /// instead, `composeFromField`). `script`: a guided-tutorial prompt, answered by
+    /// `TutorialChatScript` on the device instead of the AI.
+    func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil) {
         // If on the "new session" page in multi-session mode, start a fresh session
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
            loadedSessions[activeSessionIndex].id == "__new__" {
@@ -2703,7 +2706,7 @@ struct DynamicIslandChat: View {
         }
 
         // Show only the user's raw text in chat bubble (not the enriched prefix)
-        chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date(), fieldSend: field))
+        chatMessages.append(ChatMessage(role: .user, content: text, timestamp: Date()))
         isWorking = true
         ActiveAgentTracker.shared.setWorking(sessionKey)
         resetStatusQueue()
@@ -2717,13 +2720,8 @@ struct DynamicIslandChat: View {
         // Captured with the session id: a demo turn is written only while its demo runs.
         let admission = DemoModeStore.shared.chatAdmission
         let capturedSessionKey = sessionKey
-        // Sent from the reply field: the request carries the field's send as it started, and the
-        // chat key its words were sent under, where its card, answer and sent compose land
-        // (ADR-IOS-117), whichever chat this pill shows by then, and whether or not it still exists.
-        let fieldReply = field?.fieldReply
-        let fieldWordsKey = ownsFieldWords ? field.map { ChatFieldWords.key(for: $0.message) } : nil
         // The screen whose chat asked, where a compose card the turn asks for opens.
-        let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)
+        let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: nil)
 
         activeChatTask = Task {
             // Ensure email context is registered before building enrichedText.
@@ -2737,7 +2735,7 @@ struct DynamicIslandChat: View {
             // newest email changes while its pill stays mounted, so a number found for an earlier
             // email is never reused, and the send reads its own copy, which a late registration
             // from an earlier open cannot overwrite.
-            var contextNumericId = await Self.contextNumber(sendingAbout: field?.message ?? message, known: contextEmailNumericId)
+            var contextNumericId = await Self.contextNumber(sendingAbout: message, known: contextEmailNumericId)
             if message != nil {
                 contextEmailNumericId = contextNumericId
             } else if contextNumericId == nil, let sid = sid,
@@ -2816,8 +2814,7 @@ struct DynamicIslandChat: View {
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
                 let invocation = ToolInvocation(
-                    uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey,
-                    fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)
+                    uiSink: SessionUISink(session: session), sessionKey: sessionKey, composeOrigin: origin)
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
                     try await ChatPillState.shared.aiService.sendChatMessage(
@@ -2896,11 +2893,6 @@ struct DynamicIslandChat: View {
                     animate: true
                 ))
                 BackgroundSyncLogger.logDebug("[AIChatRender] chatMessages appended (count=\(chatMessages.count)), about to set isWorking=false")
-                // The agent answered the field's send: it completes on the send's own chat key.
-                if let fieldWordsKey {
-                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
-                    fieldSentText = nil
-                }
                 if !isExpanded {
                     if let onAgentReply {
                         // Parent view handles the toast (InboxView, ComposeView)
@@ -2926,15 +2918,13 @@ struct DynamicIslandChat: View {
                     // Cut off mid-turn. Arm the dedicated "tap to retry" affordance
                     // with the saved checkpoint — completed tool calls + prior thinking
                     // are preserved in its conversation_state. No hard error bubble, and
-                    // no `lastFailedSend` (that's the separate fork/resend pathway). The field's
-                    // request goes with it, for the resumed turn's tools.
+                    // no `lastFailedSend` (that's the separate fork/resend pathway).
                     BackgroundSyncLogger.logChatError("Connection lost (resumable): \(error.localizedDescription)", userMessage: text)
-                    pendingResume = .init(
-                        request: resumable.resumeRequest, fieldReply: fieldReply, origin: origin, fieldWordsKey: fieldWordsKey)
+                    pendingResume = .init(request: resumable.resumeRequest, origin: origin)
                 } else {
                     // Connection/server error — enable retry
                     BackgroundSyncLogger.logChatError("Chat error: \(error.localizedDescription)", userMessage: text)
-                    lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)
+                    lastFailedSend = .init(text: text)
                     chatMessages.append(ChatMessage(
                         role: .agent,
                         content: "Couldn't connect. (\(error.localizedDescription))",
@@ -2999,8 +2989,7 @@ struct DynamicIslandChat: View {
                     request: resume.request,
                     onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
                     invocation: ToolInvocation(
-                        uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey,
-                        fieldReply: resume.fieldReply, composeOrigin: origin, fieldWordsKey: resume.fieldWordsKey)
+                        uiSink: SessionUISink(session: session), sessionKey: sessionKey, composeOrigin: origin)
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
@@ -3044,10 +3033,6 @@ struct DynamicIslandChat: View {
                     timestamp: Date(),
                     animate: true
                 ))
-                if let fieldWordsKey = resume.fieldWordsKey {
-                    ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
-                    fieldSentText = nil
-                }
                 if !isExpanded {
                     if let onAgentReply {
                         onAgentReply(displayText)
@@ -3067,9 +3052,7 @@ struct DynamicIslandChat: View {
                 } else if let resumable = error as? ChatConnectionLostError {
                     // Cut off again — keep the affordance armed with the latest checkpoint.
                     BackgroundSyncLogger.logChatError("Connection lost again (resumable)", userMessage: "(resumed)")
-                    pendingResume = .init(
-                        request: resumable.resumeRequest, fieldReply: resume.fieldReply, origin: resume.origin,
-                        fieldWordsKey: resume.fieldWordsKey)
+                    pendingResume = .init(request: resumable.resumeRequest, origin: resume.origin)
                 } else {
                     // Non-transient failure — surface it; the user's message still has
                     // the fork/resend context menu for a fresh attempt.
@@ -3136,13 +3119,10 @@ struct DynamicIslandChat: View {
     }
 
     /// Re-send the last user message (same session). Removes the agent response/error below it.
-    /// Sent from the reply field, it is sent again with its email and who the user chose in Reply
-    /// to (`field`, read from its bubble before the trim), as Retry does, but it owns none of the
-    /// field's words (`ownsFieldWords`): the turn was answered, so its send is complete.
-    private func resendLastUserMessage(text: String, field: ChatFieldSend?, afterIndex index: Int) {
+    private func resendLastUserMessage(text: String, afterIndex index: Int) {
         trimForResendLast(atIndex: index)
         lastFailedSend = nil
-        sendAgentChat(text, field: field, ownsFieldWords: false)
+        sendAgentChat(text)
     }
 
     /// Rewind chat to an earlier user message (message-detail context).
