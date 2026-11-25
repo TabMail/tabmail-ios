@@ -101,6 +101,14 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
+> **Current tracker census (2026-11-25, #1479): unchanged at 6 `open` records.** Adds one
+> `accepted` record, `IOS-OUTBOX-012`: an original moved in another client while its reply or forward
+> is held, and stored by sync as a new row, is not found by the send (the Message-ID never selects it,
+> ADR-IOS-068 D4), so the completion queues no server mark and an Undo changes nothing. The same holds
+> for an original moved in TabMail without a re-key at landing (a Gmail move; an IMAP or Graph move
+> without proven destination evidence) once sync re-keys it, and an unsent removal then leaves Send's
+> arrow on it (#1500).
+
 > **Current tracker census (2026-11-25, #1492): unchanged at 6 `open` records.** Adds two
 > `accepted` records: `IOS-OUTBOX-008`, a forward from another app that names its original in
 > In-Reply-To marks it replied when its subject does not start with `Fwd:` or `Fw:` (an edited subject,
@@ -364,7 +372,7 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 | [IOS-CATCHUP-004](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-004.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — the IMAP older-mail check lists and loads nothing in a folder whose UIDVALIDITY is not known or whose reset is pending (C3: nothing is decided about an unproven numbering). The deleted date-based self-heal also repaired such folders; that is not replaced. The folder stays owed, and the next listing after a SELECT reports the epoch loads what is missing. |
 | [IOS-CATCHUP-005](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-005.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — on a nonconforming server whose SELECT omits UIDNEXT (RFC 3501 §6.3.1, RFC 9051 §6.3.2 require it), a listing of a folder with no bookmark and no stored top lists only up to the last local UID (flags and removals as before) and completes only as not clean: mail above it is not looked for, and an owed folder stays owed and is listed again at the daily check. A later range SELECT without UIDNEXT keeps the stored top. A SELECT that reports UIDNEXT resumes the full listing. |
 
-### OUTBOX (4)
+### OUTBOX (5)
 
 | ID | Class | Executive statement |
 |---|---|---|
@@ -372,6 +380,7 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 | [IOS-OUTBOX-009](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-009.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1492).** Not measured: whether Apple Mail and Outlook set In-Reply-To on a forward, and which prefix they write in each language. Only an In-Reply-To with a prefix outside `Fwd:`/`Fw:` gives a wrong mark (IOS-OUTBOX-008). |
 | [IOS-OUTBOX-010](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-010.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1490).** Send clears a reply's Reply tag at once and queues its local-only `setTag` only when the reply goes out. Where a provider reports tags (today only the demo account; no real provider does), a change pass during the hold writes the reported Reply tag back (its reply detection runs only when the server newly reports the message replied); the completion clears it again, and a full pass during the hold clears it before that. An Undo in that state keeps the Reply tag the user had before Send. Also: an AI tag written during the hold (`none`, since Send marked the original) stays after an Undo when the original had no Reply tag before Send; one gesture sets it. Rare; recovers by itself or with one gesture |
 | [IOS-OUTBOX-011](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-011.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1490).** Each unsent removal (Undo, Undo to Drafts, the Outbox discard) undoes exactly what its own Send recorded and reads no other outbox row, which keeps a scan out of the synchronous Undo write. With two replies to one original waiting to go out, the first marked it and cleared its Reply tag and the second recorded nothing, so undoing the first leaves the Reply tag and no reply arrow until the second is sent; its completion marks the original and clears the tag, and undoing the second instead leaves the original as it was before both. The other order is covered: a send that went out takes the same-kind changes off the other sends' records, and a reply from another client stored in Sent keeps the mark (not on Outlook, where Graph gives no In-Reply-To). Accepted as in 1.11.6: a forward sent from another client while TabMail's waited leaves no forwarded mark when TabMail's is removed unsent (on IMAP the server's `$Forwarded` comes back at the next full pass). Rare; recovers by itself |
+| [IOS-OUTBOX-012](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-012.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1479).** A queued reply or forward names its original by header id, and a move made in TabMail that is re-keyed when it lands (IMAP's `COPYUID`, the Graph move response) carries that name to the moved row (`MessageHeaderRekey.finishMove`), so the completion marks it at its new address and an Undo takes Send's marks back. A Gmail move, and an IMAP or Graph move without proven destination evidence, is followed only until sync re-keys the row (`canonicalizeLocalRows`, the UID remap, the body backfill's re-key); after that the completion queues no server mark and an unsent removal leaves Send's arrow on the row for good (#1500). An original moved in another client while the send is held, and stored by sync as a new row, is tied to the send only by its Message-ID, which never selects a message to change (ADR-IOS-068 D4, as in `IOS-GRAPH-006`): the completion writes no mark and queues no server mark, and an Undo changes nothing. A reply's local arrow comes back through the Sent copy's sync on Gmail and IMAP; the server's mark, Outlook's arrow and a forward's arrow stay unset. Rare (a move outside this app inside the hold, or a send that waits or failed past a listing of the destination); cosmetic |
 
 ### TEST (1)
 
