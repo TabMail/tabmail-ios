@@ -1102,6 +1102,7 @@ extension TutorialChatViewRunTests {
         let pool = fixture.0
         try await withSettings(chatView: true) {
             let coordinator = TutorialCoordinator.shared
+            let workingBefore = ActiveAgentTracker.shared.workingSessions
             for run in 1...2 {
                 try #require(!coordinator.isRunning, "control: no run is live before run \(run)")
                 // As the welcome's Start does: Part 1 first, then its Next.
@@ -1120,6 +1121,9 @@ extension TutorialChatViewRunTests {
                     if run == 1 {
                         try await sendPracticeReply(to: priya, pool: pool)
                         try await waitFor(.makeTemplate)
+                        // The template request is asked and its Create card waits: the run is
+                        // skipped while TabMail works on it.
+                        try await Self.askForTheTemplateInPriyasChat(priya)
                     }
                 } catch {
                     await coordinator.end()
@@ -1127,7 +1131,50 @@ extension TutorialChatViewRunTests {
                 }
                 // Skip tutorial.
                 await coordinator.end()
+                let stillWorking = ActiveAgentTracker.shared.workingSessions.subtracting(workingBefore)
+                #expect(stillWorking.isEmpty, "run \(run): once the run ends, no chat still shows TabMail working; \(stillWorking)")
             }
+        }
+    }
+
+    /// In Priya's chat at the template step: taps the step's Send and waits for the template's
+    /// Create card, which holds the request open until it is answered.
+    private static func askForTheTemplateInPriyasChat(_ priya: MessageHeader) async throws {
+        try await HostedAccessibility.withAutomation {
+            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let window = UIWindow(windowScene: scene)
+            let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) }
+                .environment(NavigationStore()))
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            // The field's own identifier ("chatReplyField") covers its parts, so its Send is
+            // found by that identifier and its label.
+            @MainActor func fieldSend() -> NSObject? {
+                HostedAccessibility.elements(under: controller.view).first {
+                    HostedAccessibility.identifier(of: $0) == "chatReplyField" && $0.accessibilityLabel == "Send"
+                }
+            }
+            for _ in 0..<80 where fieldSend() == nil {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let ids = HostedAccessibility.identifiers(in: controller.view)
+            let sent = fieldSend()?.accessibilityActivate() ?? false
+            try #require(sent, "control: the template step's Send is in Priya's chat; ids=\(ids)")
+            @MainActor func cardWaits() -> Bool {
+                HostedAccessibility.labels(in: controller.view).contains("Create")
+            }
+            for _ in 0..<80 where !cardWaits() {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let waits = cardWaits()
+            let labels = HostedAccessibility.labels(in: controller.view).prefix(30)
+            try #require(waits, "control: the template's Create card waits in Priya's chat; labels=\(labels)")
+            let working = !ActiveAgentTracker.shared.workingSessions.isEmpty
+            try #require(working, "control: TabMail is working on the request")
         }
     }
 
