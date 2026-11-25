@@ -915,6 +915,17 @@ extension AccountManager {
                 // rolled-back transaction leaves the bump in place, which only
                 // refuses more pre-reset work.
                 FolderResetGeneration.recordReset(folderId: folderId)
+                // The same moment ends every address link into or out of this
+                // folder (#1139): the resync can seat a different email at
+                // either end of one. Here rather than at the purge because a
+                // move retired before this write could still prove a
+                // destination under the old epoch (G2 compares against the
+                // folder's stored epoch, which changes only below); after it,
+                // G2 refuses one. Each earlier write published its links when
+                // it committed, before this write began. A rollback leaves
+                // them forgotten, which only drops a short-lived bridge.
+                MessageHeaderRekey.forgetAddressHandoffs(
+                    accountId: accountId, folderPath: folderPath)
                 folder.lastKnownUidValidity = Int(fresh)
                 folder.uidValidityResetPendingAt = nil
                 try folder.update(db)
