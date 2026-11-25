@@ -744,10 +744,15 @@ enum MessageHeaderRekey {
             // operations do (`readdressQueuedOperations`). Only this re-key
             // carries it: not the collision arm above (the row already at the new
             // id is not the row Send marked, and its numbering is unproven), and
-            // not `apply`'s other callers (sync's UID remap re-keys on Message-ID
-            // evidence, and the Message-ID never chooses a message to change,
-            // ADR-IOS-068 D4). An original moved in another client that sync
-            // stores as a new row is therefore not found (`IOS-OUTBOX-012`).
+            // not `apply`'s other callers. Sync re-keys a row in two places: its
+            // UID remap, on Message-ID evidence (the Message-ID never chooses a
+            // message to change, ADR-IOS-068 D4), and `canonicalizeLocalRows`, on
+            // the provider's stable id. So the send follows a move only when it is
+            // re-keyed here. A Gmail move is not (its address does not change on a
+            // move), nor is an IMAP or Graph move without proven destination
+            // evidence; sync re-keys those rows later, and from then on the send
+            // finds no original. Neither does one moved in another client, which
+            // sync stores as a new row (`IOS-OUTBOX-012`).
             // outboxMessage holds only unsent, failed and unfinalized sends.
             try db.execute(
                 sql: "UPDATE outboxMessage SET originalMessageHeaderId = ? WHERE originalMessageHeaderId = ?",
