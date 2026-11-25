@@ -314,11 +314,16 @@ struct ChatReplyAttachTests {
     /// then `openPendingAttachCard`, as a picker's pick and its `onDismiss` take them) and its one
     /// presenter, for picks a test cannot make in a real picker (a camera photo, a library photo).
     /// The real pickers, their closing and the card after them: `hostedFilesPicker`,
-    /// `hostedPickerClosedWithoutPick`.
-    private static func attach(_ pick: ComposeAttachmentPick, in chat: ChatReplyRecoveryTests.Chat) async throws -> UIView {
+    /// `hostedPickerClosedWithoutPick`. Returns once the card's `fields` all show addresses: a check
+    /// that reads a field passes it, since the card's rows join the accessibility tree one by one
+    /// (#1498).
+    private static func attach(
+        _ pick: ComposeAttachmentPick, in chat: ChatReplyRecoveryTests.Chat, showing fields: [String] = ["to"]
+    ) async throws -> UIView {
         NotificationCenter.default.post(name: .chatPaperclipPickForTesting, object: pick)
         try await ChatReplyRecoveryTests.waitUntil {
-            ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)["to"]?.isEmpty == false
+            let recipients = ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)
+            return fields.allSatisfy { recipients[$0]?.isEmpty == false }
         }
         return try #require(chat.controller.presentedViewController?.view, "the paperclip's card opened")
     }
@@ -344,7 +349,7 @@ struct ChatReplyAttachTests {
                         "control: the chat shows the AI Suggestion: \(ChatReplyRecoveryTests.ghosts(in: chat.view).map(\.text))")
                 #expect(HostedAccessibility.identifiers(in: chat.view).contains(ChatPaperclipButton.id),
                         "the reply field shows the paperclip: \(HostedAccessibility.identifiers(in: chat.view))")
-                let card = try await Self.attach(.camera(Self.photo()), in: chat)
+                let card = try await Self.attach(.camera(Self.photo()), in: chat, showing: ["to", "cc"])
                 let recipients = ChatReplyRecoveryTests.composeRecipients(card)
                 #expect(ChatReplyRecoveryTests.addresses(recipients["to"]).union(ChatReplyRecoveryTests.addresses(recipients["cc"]))
                             == ["alex@example.com", "david@example.com", "sam@example.com"],
@@ -448,8 +453,10 @@ struct ChatReplyAttachTests {
                     #expect(chat.controller.presentedViewController == nil, "control: nothing opened before the pick")
                     delegate.documentPicker?(picker, didPickDocumentsAt: [file])
                 }
+                // To and Cc both shown: the check below reads both (#1498).
                 try await ChatReplyRecoveryTests.waitUntil {
-                    ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)["to"]?.isEmpty == false
+                    let recipients = ChatReplyRecoveryTests.composeRecipients(chat.controller.presentedViewController?.view)
+                    return recipients["to"]?.isEmpty == false && recipients["cc"]?.isEmpty == false
                 }
                 let card = try #require(chat.controller.presentedViewController?.view, "the reply's card opened after the picker")
                 #expect(Self.presented(UIDocumentPickerViewController.self, over: chat) == nil, "the picker has closed")

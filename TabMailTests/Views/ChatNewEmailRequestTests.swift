@@ -719,7 +719,8 @@ struct ChatNewEmailRequestHostedTests {
             var fields: [String: String] = [:]
             try await ThreadChatTests.wait {
                 fields = screen.topPresented().map { Self.composeRecipients($0.view) } ?? [:]
-                return fields["to"]?.isEmpty == false
+                // Every field the checks below read, shown: the rows join the accessibility tree one by one (#1498).
+                return ["to", "cc", "bcc"].allSatisfy { fields[$0]?.isEmpty == false }
             }
             let presented = try #require(screen.topPresented(), "compose came up: \(fields)")
             #expect(Self.addresses(fields["to"]) == ["john@example.com"], "compose, filled: \(fields)")
@@ -1028,7 +1029,8 @@ struct ChatNewEmailRequestHostedTests {
             var fields: [String: String] = [:]
             try await ThreadChatTests.wait {
                 fields = Self.composeRecipients(screen.view)
-                return fields["to"]?.isEmpty == false
+                // Every field the checks below read, shown: the rows join the accessibility tree one by one (#1498).
+                return ["to", "cc", "bcc"].allSatisfy { fields[$0]?.isEmpty == false }
             }
             #expect(Self.addresses(fields["to"]) == ["john@example.com", "maria@example.com"], "compose, filled: \(fields)")
             #expect(Self.addresses(fields["cc"]) == ["sam@example.com"])
