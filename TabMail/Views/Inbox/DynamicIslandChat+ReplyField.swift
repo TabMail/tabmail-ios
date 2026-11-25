@@ -41,7 +41,7 @@ extension DynamicIslandChat {
             fieldSentText = prompt.rawValue
             onFieldSend?(prompt.rawValue)
             TutorialCoordinator.shared.chatPromptSent(prompt)
-            let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }
+            let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, suggestion: field.suggestion) }
             sendAgentChat(prompt.rawValue, script: prompt, field: send)
         case .tapSuggestion, nil:
             break
@@ -103,7 +103,7 @@ extension DynamicIslandChat {
     }
 
     private func replyInput(_ field: ChatReplyField) -> some View {
-        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply or ask",
+        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply",
                    showChat: field.showChat, focus: .replyField)
     }
 

@@ -482,6 +482,53 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(keyboardStaysDown(in: app), "the keyboard stays down")
     }
 
+    /// The closed field writes the reply and never asks TabMail; the open panel asks (ADR-IOS-114
+    /// decision 10, amended 2026-11-25). Each says so: the closed field "Write your reply", the
+    /// panel "Ask TabMail". Send in the closed field keeps the panel closed. The fixture has no
+    /// TabMail token, so the reply cannot be written: the toast says so and the words stay in the
+    /// field. A screenshot of each step is kept for a look.
+    func testClosedFieldSendWritesTheReplyAndNeverOpensThePanel() {
+        let app = launchIntoChat(signedIn: true)
+        var field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        keepScreenshot(of: app, named: "1 closed field")
+        dragUp(atY: field.frame.midY, in: app)
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "control: the drag opened the panel")
+        _ = replyField(in: app, placeholder: Self.panelPlaceholder)
+        keepScreenshot(of: app, named: "2 open panel")
+        app.buttons["chatClose"].tap()
+        XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "control: Close closed the panel")
+        field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.replyWords)
+        XCTAssertTrue(typedField(containing: Self.replyWords, in: app).waitForExistence(timeout: 5),
+                      "control: the words are in the field")
+        keepScreenshot(of: app, named: "3 words typed")
+        app.buttons["chatSend"].firstMatch.tap()
+        let toast = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", Self.notWrittenNote)).firstMatch
+        XCTAssertTrue(toast.waitForExistence(timeout: Self.composeFailureWait), "the toast says the reply was not written")
+        keepScreenshot(of: app, named: "4 after Send")
+        XCTAssertFalse(app.buttons["chatClose"].exists, "Send in the closed field never opened the panel")
+        XCTAssertTrue(typedField(containing: Self.replyWords, in: app).waitForExistence(timeout: 3),
+                      "the words are still in the field")
+    }
+
+    /// What the user asks the closed field to write.
+    private static let replyWords = "Tell them Friday works"
+    /// `DynamicIslandChatButton.notWrittenNote`, the toast when nothing was written.
+    private static let notWrittenNote = "Couldn't write your reply. Your words are still in the field."
+    /// How long the compose edit may take to fail without a token, on a loaded simulator.
+    private static let composeFailureWait: TimeInterval = 30
+
+    /// A screenshot kept in the results, pass or fail.
+    private func keepScreenshot(of app: XCUIApplication, named name: String) {
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = name
+        shot.lifetime = .keepAlways
+        add(shot)
+    }
+
     /// Whether no keyboard of a software keyboard's size is on screen at any read for
     /// `keyboardDownWindow` (a keyboard parked below the screen counts as down).
     private func keyboardStaysDown(in app: XCUIApplication) -> Bool {
@@ -499,10 +546,10 @@ final class ChatSwipeUITests: XCTestCase {
     /// How long a keyboard must stay off screen to count as down.
     private static let keyboardDownWindow: TimeInterval = 2
 
-    /// The signed-in field's hint (`ChatReplyField.placeholder`), the open panel's input's hint
-    /// (`PillDictationMode.placeholder`), and the open panel's sign-in bar.
-    private static let signedInPlaceholder = "Reply or ask anything"
-    private static let panelPlaceholder = "Type or speak..."
+    /// The signed-in field's hint (`ChatReplyField.writePlaceholder`), the open panel's input's hint
+    /// (`ChatReplyField.panelPlaceholder`), and the open panel's sign-in bar.
+    private static let signedInPlaceholder = "Write your reply"
+    private static let panelPlaceholder = "Ask TabMail"
     private static let signInBarText = "Sign in to TabMail for AI features and push notifications"
 
     /// With the first-time tip showing, as a new user sees it: the tip is on screen, and it takes
@@ -1648,7 +1695,7 @@ final class ChatSwipeUITests: XCTestCase {
     // MARK: - Helpers
 
     /// The reply field's placeholder in the fixture, which has no TabMail session.
-    private static let replyPlaceholder = "Sign in to reply or ask"
+    private static let replyPlaceholder = "Sign in to reply"
     /// How far the vertical drag goes, and how far the chat must have scrolled with it.
     private static let verticalDrag: CGFloat = 250
     private static let scrolledAtLeast: CGFloat = 60

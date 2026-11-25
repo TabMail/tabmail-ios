@@ -420,6 +420,46 @@ same AI result, kept as long as the email itself is shown.
    sheet and empties the field, except after a compose the request opened (the compose was the
    answer). Dictation in the field replaces an unchanged AI Reply rather than appending to it, and
    the field never starts dictation by itself.
+   **Superseded 2026-11-25: the UI state decides what the field's words mean, and no model guesses
+   it.** The routing above, where any other words went to the agent with a nudge
+   (`ChatReplyField.agentMessage`) and the agent chose between writing a reply and answering, is
+   kept here as history only. Decided 2026-11-25, in these words: "so the agentic replies ONLY ever
+   happen when the chat pill is open. In all other cases, this is directly the composition, so we
+   don't need that guessing part nor the directed system prompt, because the system prompt no
+   longer needs any edit other than any composition giving the text version and the summary giving
+   the text version. Because when the pill is closed and it's acting as just a text message box,
+   that's when we're doing the edit-based composition, right? So in that case, it's clear, and no
+   replies should be sent to the agent chat. And only when the agent chat is open, then that's when
+   the agent chat acts on that chat thread. [...] You should look into the architecture flow we had
+   already that assumes that our agent is gonna figure out whether it's an edit prompt or a chat
+   agent request, and then sever this, because the figuring that out is unreliable, and I think
+   it's almost impossible, so we're gonna split it explicitly." This deviates from the mock and the
+   original design. Now: with the TabMail panel closed, the field's Send never reaches the agent
+   (`DynamicIslandChat.composeFromField`). The words, typed or said, are the request of the reply's
+   compose edit, as compose's own field takes them (`EmailReplyTool.composeFromField`, through the
+   registry's tool, `composeWithRegisteredTool`; mode `edit_reply`, Thunderbird's
+   `runComposeEdit`): with the AI Suggestion showing they edit it (an edit that keeps its envelope
+   rewrites it in place, decision 17), otherwise they write the reply. The card opens for review
+   carrying the composition's whole result, its text version and change command included
+   (`ComposeRequest.suggestion`), so nothing has to summarize what was asked. The words pulse in the
+   field under "Writing your email" (`ChatReplyField.writingStatus`); a compose that writes nothing
+   ends the send with the words kept in the field and a note (`ChatFieldFill.Change.notWritten`,
+   `DynamicIslandChat.notWrittenNote`). A no-reply sender's field composes too, under its "Replies
+   won't be read" line. The field's compose skips the 120-second repeat check
+   (`RecentlyCompletedComposeCache`, `EmailReplyTool.openReplyCard(usesRecentSendCache:)`), which guards an agent turn sending the
+   same reply twice; each field Send is the user's own ask. With the panel open the words go to the
+   agent about this chat, with no nudge. The placeholders say which: "Write your reply" in the closed
+   field (`ChatReplyField.writePlaceholder`), "Ask TabMail" in the open panel
+   (`ChatReplyField.panelPlaceholder`, `PillDictationMode.placeholder(isChatPanel:)`). The agent
+   request's field branches (`sendAgentChat(field:)`, and the recovery of a field request) remain
+   only for the tutorial's scripted field ask, until the tutorial moves that ask into the panel;
+   the field-reply logic of ADR-IOS-053 amendment 3 in `EmailReplyTool` (the shown row's check,
+   who it goes to, the edit of the shown suggestion) is now reached from the field only through
+   `composeFromField`, and the agent's requests from the panel carry no field. A new email's chat (amendment 24 and *Every new email*) still sends its field's words to the agent with its own nudge (`ChatNewEmailField.agentMessage`), as the first round of its Send built it; moving it to a direct compose is the part of this decision still to do. Tests:
+   `ChatReplyFieldTests.fieldSendWiring` and `noAgentNudge`, `ChatComposeRoutingTests` (case 3: the
+   words reach only the compose edit; a failed compose keeps them), `ChatReplyRecoveryTests`
+   (an edit in place or on the field's own card asks the agent nothing),
+   `ChatFieldWordsRuntimeTests` (sections 9 and 10, the card's Send completes the words).
    **The AI Reply shows only while the field holds no words of the user's, and never on the user's
    turn (decided 2026-11-07):** `ChatFieldFill.offer`. An empty field, or the AI Reply the app itself
    put there, takes the ready reply whenever it arrives, collapsed or in the open sheet; typed or

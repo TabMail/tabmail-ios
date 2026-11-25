@@ -11,7 +11,7 @@ import XCTest
 final class SearchChatWordsUITests: XCTestCase {
     private static let subject = "Search words fixture picnic"
     private static let query = "picnic"
-    private static let replyPlaceholder = "Sign in to reply or ask"
+    private static let replyPlaceholder = "Sign in to reply"
     private static let words = "Count me in for Saturday"
 
     func testWordsTypedInAChatOpenedFromSearchSurviveClosingSearch() {

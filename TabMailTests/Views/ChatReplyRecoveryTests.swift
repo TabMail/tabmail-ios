@@ -10,23 +10,24 @@ import Testing
 import UIKit
 @testable import TabMail
 
-/// ADR-IOS-114 decision 11, after a failure: who gets a reply asked for in the chat's reply field
-/// when the request is recovered.
+/// The chat's reply field and its AI Suggestion through a real chat, and the recovery of the
+/// panel's requests.
 ///
-/// THE SYSTEM PROPERTY pinned here: a request sent from the reply field with people chosen in
-/// Reply to keeps that choice through its recovery. Whether the connection was lost and the turn is
-/// resumed, or the request failed and is sent again with Retry, the agent's reply goes to the people
-/// chosen when the request was first sent, as a plain reply with no Cc, whatever Reply to shows
-/// when the user recovers it; with nobody chosen, it stays a Reply All. A newer send from the field
-/// ends the earlier request's recovery.
+/// THE SYSTEM PROPERTIES pinned here:
+///  1. The closed field's Send is the reply's compose edit, never a turn for the agent (ADR-IOS-114
+///     decision 10, amended 2026-11-25): an edit of the AI Suggestion lands in place or opens the
+///     field's own card, and asks the agent nothing; a card closed unsent hands the words back
+///     (ADR-IOS-117); a compose cut off leaves nothing to resume and keeps the words.
+///  2. A request the open sheet sends, cut off, is recovered with no field words named, and the
+///     inbox pill's words typed after a cut-off offer Send.
+///  3. The ghost's card: its Recompute and its own pill's edits go to the chat's AI service.
 ///
-/// Each case opens the chat for real in a window with its requests going to a fake backend, picks
-/// "only David" in Reply to as the user does, sends from the field, fails the first request, changes
-/// Reply to, recovers with the field's Retry, and reads the reply the agent's `email_reply` opens.
+/// Until 2026-11-25 this suite pinned decision 11 after a failure: a field request sent to the
+/// agent kept its Reply to choice through its recovery. The closed field no longer sends to the
+/// agent, so those cases were deleted with the routing they tested.
 ///
-/// The field's words through the same real route (ADR-IOS-117): a field edit of the AI Suggestion
-/// whose card the agent's `email_reply` opens, closed unsent, hands the words back to the user.
-@Suite("Who gets the agent's reply after a recovered field request", .serialized, .processGlobalState)
+/// Each case opens the chat for real in a window with its requests going to a fake backend.
+@Suite("The reply field and the AI Suggestion through a real chat, and the panel's recovery", .serialized, .processGlobalState)
 @MainActor
 struct ChatReplyRecoveryTests {
     private static let account = "acc-chat-recovery"
@@ -68,13 +69,11 @@ struct ChatReplyRecoveryTests {
         }
         private let record = Record()
 
-        /// `editRequest`: the later request asks `email_reply` to edit the AI Suggestion shown with
-        /// these words, instead of writing a reply. `recompute`: a reply asked for by a card's
-        /// Recompute is answered with `recomputed`, held until the gate is released.
+        /// `recompute`: a reply asked for by a card's Recompute is answered with `recomputed`, held until the gate is released.
         /// `cardEdit`: the compose edit a card's own pill asks for is answered with this JSON.
         /// `holdFirst`: the first request is answered (as `failure`) only once it is signalled, so
         /// the agent keeps working until then.
-        init(failure: Failure?, asksForReply: Bool = true, editRequest: String? = nil, recompute: ReplyGate? = nil,
+        init(failure: Failure?, asksForReply: Bool = true, recompute: ReplyGate? = nil,
              cardEdit: String? = nil, holdFirst: DispatchSemaphore? = nil) {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 if let recompute, AITextMessageCallerTests.Backend.prompt(request.body) == "system_prompt_compose" {
@@ -107,8 +106,7 @@ struct ChatReplyRecoveryTests {
                     final = ["assistant": "Done"]
                 } else {
                     let number = Self.emailNumber(in: body) ?? 0
-                    let arguments: [String: Any] = editRequest.map { ["unique_id": number, "request": $0] }
-                        ?? ["unique_id": number, "body": "Friday works"]
+                    let arguments: [String: Any] = ["unique_id": number, "body": "Friday works"]
                     let argumentsText = String(decoding: try! JSONSerialization.data(withJSONObject: arguments), as: UTF8.self)
                     final = [
                         "assistant": "",
@@ -316,19 +314,6 @@ struct ChatReplyRecoveryTests {
         Set((field ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty })
     }
 
-    /// The chat's stored user turns.
-    private static func userTurns(in chat: Chat) async throws -> Int {
-        let session = ChatThreadKey.key(for: chat.email)
-        return try await chat.pool.read {
-            try ChatTurn.filter(Column("sessionId") == session && Column("role") == "user").fetchCount($0)
-        }
-    }
-
-    /// How many times `words` appear in `body`.
-    private static func occurrences(of words: String, in body: String?) -> Int {
-        (body ?? "").components(separatedBy: words).count - 1
-    }
-
     /// Polls `condition` for up to ten seconds; the caller asserts on it afterwards.
     static func waitUntil(_ condition: @MainActor () async throws -> Bool) async throws {
         for _ in 0..<100 {
@@ -337,191 +322,7 @@ struct ChatReplyRecoveryTests {
         }
     }
 
-    @Test("A field request for only David, recovered after a failure, replies only to David whatever Reply to shows when recovered",
-          arguments: Failure.allCases)
-    func recoveredFieldRequestKeepsItsChoice(failure: Failure) async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: failure)
-        try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: failure.rawValue) { chat in
-                let router = AgentToolRouter.shared
-                // Reply only to David, then ask in the field.
-                try await Self.toggle(["alex@example.com", "sam@example.com"], in: chat)
-                #expect(Self.replyingOnlyTo(in: chat.view) != nil, "control: the chat replies only to David: \(HostedAccessibility.labels(in: chat.view).prefix(16))")
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("Tell them Friday works", in: chat.view) }
-                #expect(Self.type("Tell them Friday works", in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
-                #expect(backend.bodies.first?.contains("a reply goes only to") == true,
-                        "control: the field's request named the people chosen")
-
-                // Reply to changes before the recovery: Alex is back.
-                try await Self.toggle(["alex@example.com"], in: chat)
-                #expect(Self.replyingOnlyTo(in: chat.view) != nil, "control: the chat now replies to Alex and David")
-
-                // The field's Retry recovers the request, its reply held behind a compose on screen.
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("", in: chat.view) }
-                #expect(Self.type("", in: chat.view), "control: the field is emptied")
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                router.composePresentationDidBegin()
-                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
-                        "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { router.composeQueueDepth == 1 }
-                #expect(router.composeQueueDepth == 1, "control: the recovered turn asked for a reply")
-                #expect(backend.bodies.count == 2, "control: one recovery request: \(backend.bodies.dropFirst().map { $0.suffix(600) })")
-                let request = try #require(router.firstQueuedRequestForTesting)
-                #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == ["david@example.com"],
-                        "the reply carries the choice made when the request was sent: \(String(describing: request.fieldReply))")
-                let chatOrigin = ComposeOrigin(sessionKey: ChatThreadKey.key(for: chat.email), screen: .chat, fromAccountId: Self.account)
-                #expect(request.origin == chatOrigin,
-                        "the recovered turn's card opens in the chat view that asked: \(request.origin)")
-                let reply = (isReplyAll: request.isReplyAll, to: request.to, cc: request.cc, bcc: request.bcc)
-                #expect(!reply.isReplyAll && reply.to == ["david@example.com"] && reply.cc.isEmpty && reply.bcc.isEmpty,
-                        "a plain reply to only David: \(reply)")
-
-                // The card the chat opens goes only to David.
-                router.composePresentationDidEnd()
-                var card: [String: String] = [:]
-                try await Self.waitUntil {
-                    card = Self.composeRecipients(chat.controller.presentedViewController?.view)
-                    return card["to"]?.isEmpty == false
-                }
-                #expect(Self.addresses(card["to"]) == ["david@example.com"], "only David: \(card)")
-                #expect(Self.addresses(card["cc"]).isEmpty && Self.addresses(card["bcc"]).isEmpty, "nobody else: \(card)")
-            }
-        }
-    }
-
-    /// The draft bodies the field request's compose edits were given.
-    final class EditedBodies: Sendable {
-        let all = Mutex<[String]>([])
-    }
-
-    @Test("A field edit request sent while Reply to hides the AI Suggestion carries none: recovered, it writes a fresh reply only to David, never the hidden Reply All")
-    func hiddenSuggestionFieldRequestKeepsItsChoice() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: .serverError, editRequest: "make it formal")
-        let edited = EditedBodies()
-        let composeEdit: EmailReplyTool.ComposeEdit = { _, _, body, _ in
-            edited.all.withLock { $0.append(body) }
-            return try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
-                response: "Done.", subject: "Re: Plans", body: "Hi David,\n\nFriday works.\n\nThanks",
-                textMessage: "Friday works", changeCommand: "")))
-        }
-        try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "hidden-ghost", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
-                let router = AgentToolRouter.shared
-                try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == Self.shownSuggestion.textMessage } }
-                #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
-                        "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
-                // Reply only to David: the Reply All suggestion steps aside.
-                try await Self.toggle(["alex@example.com", "sam@example.com"], in: chat)
-                #expect(Self.replyingOnlyTo(in: chat.view) != nil, "control: the chat replies only to David")
-                try await Self.waitUntil { Self.ghosts(in: chat.view).isEmpty }
-                #expect(Self.ghosts(in: chat.view).isEmpty,
-                        "control: the suggestion is hidden: \(Self.ghosts(in: chat.view).map(\.text))")
-
-                // The field asks for an edit; the first request fails, and Retry recovers it.
-                try await Self.waitUntil { Self.type("Make it formal", in: chat.view) }
-                #expect(Self.type("Make it formal", in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
-                // A field with words offers Send; emptied, it offers Retry for the failed request.
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("", in: chat.view) }
-                #expect(Self.type("", in: chat.view), "control: the field is emptied")
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                router.composePresentationDidBegin()
-                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
-                        "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { router.composeQueueDepth == 1 }
-                #expect(router.composeQueueDepth == 1, "control: the recovered turn opened a reply card")
-                #expect(backend.bodies.count == 2, "control: one recovery request: \(backend.bodies.dropFirst().map { $0.suffix(600) })")
-
-                let request = try #require(router.firstQueuedRequestForTesting)
-                #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == ["david@example.com"],
-                        "the request keeps the email shown and the choice made: \(String(describing: request.fieldReply))")
-                #expect(request.fieldReply?.suggestion == nil, "the hidden suggestion was not the field's")
-                let editedBodies = edited.all.withLock { $0 }
-                #expect(editedBodies == [""], "a fresh reply was written, not an edit of the hidden suggestion: \(editedBodies)")
-                let reply = (isReplyAll: request.isReplyAll, to: request.to, cc: request.cc, bcc: request.bcc)
-                #expect(!reply.isReplyAll && reply.to == ["david@example.com"] && reply.cc.isEmpty && reply.bcc.isEmpty,
-                        "a plain reply to only David: \(reply)")
-                let emailId = chat.email.id
-                let stored = try await chat.pool.read { try MessageHeader.fetchOne($0, key: emailId) }
-                #expect(stored?.suggestion == Self.shownSuggestion, "the stored suggestion is unchanged")
-
-                // The card the chat opens is left open; closing the chat ends its turn.
-                router.composePresentationDidEnd()
-                try await Self.waitUntil { chat.controller.presentedViewController != nil }
-            }
-        }
-    }
-
-    @Test("A field request with nobody chosen, recovered after a failure, replies to everyone whatever Reply to shows when recovered",
-          arguments: Failure.allCases)
-    func recoveredFieldRequestKeepsReplyAll(failure: Failure) async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: failure)
-        try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "all-\(failure.rawValue)") { chat in
-                let router = AgentToolRouter.shared
-                // Nobody chosen: the field's reply goes to everyone.
-                #expect(Self.replyingOnlyTo(in: chat.view) == nil, "control: nobody is chosen: \(HostedAccessibility.labels(in: chat.view).prefix(16))")
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("Tell them Friday works", in: chat.view) }
-                #expect(Self.type("Tell them Friday works", in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
-                #expect(backend.bodies.first?.contains("a reply goes only to") == false, "control: the request named nobody")
-
-                // Reply to changes before the recovery: only David.
-                try await Self.toggle(["alex@example.com", "sam@example.com"], in: chat)
-                #expect(Self.replyingOnlyTo(in: chat.view) != nil, "control: the chat now replies only to David")
-
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("", in: chat.view) }
-                #expect(Self.type("", in: chat.view), "control: the field is emptied")
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                router.composePresentationDidBegin()
-                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
-                        "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { router.composeQueueDepth == 1 }
-                #expect(router.composeQueueDepth == 1, "control: the recovered turn asked for a reply")
-                let request = try #require(router.firstQueuedRequestForTesting)
-                #expect(request.fieldReply?.email.id == chat.email.id && request.fieldReply?.onlyTo == nil,
-                        "the reply carries the choice made when the request was sent, nobody: \(String(describing: request.fieldReply))")
-                let chatOrigin = ComposeOrigin(sessionKey: ChatThreadKey.key(for: chat.email), screen: .chat, fromAccountId: Self.account)
-                #expect(request.origin == chatOrigin,
-                        "the recovered turn's card opens in the chat view that asked: \(request.origin)")
-                let reply = (isReplyAll: request.isReplyAll, to: request.to, cc: request.cc, bcc: request.bcc)
-                #expect(reply.isReplyAll, "a Reply All: \(reply)")
-
-                // The card the chat opens goes to everyone on the email.
-                router.composePresentationDidEnd()
-                var card: [String: String] = [:]
-                try await Self.waitUntil {
-                    card = Self.composeRecipients(chat.controller.presentedViewController?.view)
-                    return card["to"]?.isEmpty == false
-                }
-                #expect(Self.addresses(card["to"]).union(Self.addresses(card["cc"])) == ["alex@example.com", "david@example.com", "sam@example.com"],
-                        "everyone: \(card)")
-            }
-        }
-    }
-
-    @Test("While the agent works on a field request, VoiceOver's \"Show TabMail chat\" on the field's words still opens the panel")
+    @Test("While the field's reply is being written, VoiceOver's \"Show TabMail chat\" on the field's words still opens the panel")
     func showChatWhileTheAgentWorks() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
         let release = DispatchSemaphore(value: 0)
@@ -536,7 +337,7 @@ struct ChatReplyRecoveryTests {
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking,
-                        "control: the request is out and the agent is working")
+                        "control: the field's compose edit is out and the send is working")
                 @MainActor func carrier() -> NSObject? {
                     HostedAccessibility.elements(under: chat.view).first {
                         $0.isAccessibilityElement && HostedAccessibility.identifier(of: $0) != ChatThreadView.replyPillId
@@ -544,62 +345,13 @@ struct ChatReplyRecoveryTests {
                     }
                 }
                 try await Self.waitUntil { carrier() != nil }
-                let element = try #require(carrier(), "an element VoiceOver focuses carries the action while the agent works: \(HostedAccessibility.labels(in: chat.view).prefix(20))")
+                let element = try #require(carrier(), "an element VoiceOver focuses carries the action while the reply is written: \(HostedAccessibility.labels(in: chat.view).prefix(20))")
                 #expect(ActiveAgentTracker.shared.anyWorking, "control: still working")
                 let action = try #require(element.accessibilityCustomActions?.first { $0.name == name })
                 let handler = try #require(action.actionHandler, "control: a SwiftUI action has a handler")
                 #expect(handler(action), "the action runs")
                 try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatClose") }
                 #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatClose"), "the panel opened")
-            }
-        }
-    }
-
-    @Test("A newer send from the field ends an earlier failed request's recovery", arguments: Failure.allCases)
-    func newerSendEndsTheRecovery(failure: Failure) async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: failure, asksForReply: false)
-        try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "newer-\(failure.rawValue)") { chat in
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("Tell them Friday works", in: chat.view) }
-                #expect(Self.type("Tell them Friday works", in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                // With the unchanged sent words still in the field: Retry (a resume) only for a
-                // cut-off; a plain failure keeps Send until the field is empty.
-                let cutOff = failure == .connectionLost
-                try await Self.waitUntil {
-                    let ids = HostedAccessibility.identifiers(in: chat.view)
-                    return ids.contains("chatRetry") == cutOff && ids.contains("chatSend") == !cutOff
-                }
-                let held = HostedAccessibility.identifiers(in: chat.view)
-                #expect(held.contains("chatRetry") == cutOff && held.contains("chatSend") == !cutOff,
-                        "unchanged sent words after \(failure): \(held)")
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("", in: chat.view) }
-                #expect(Self.type("", in: chat.view), "control: the field is emptied")
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"), "control: the failed request can be recovered")
-
-                // A newer request from the field, which succeeds.
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("Thanks", in: chat.view) }
-                #expect(Self.type("Thanks", in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 2 && backend.bodies.last?.contains("Thanks") == true, "control: the newer request went out")
-
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("", in: chat.view) }
-                #expect(Self.type("", in: chat.view), "control: the field is emptied")
-                try await Task.sleep(for: .milliseconds(500))
-                #expect(!HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"),
-                        "the earlier request can no longer be recovered: \(HostedAccessibility.identifiers(in: chat.view))")
             }
         }
     }
@@ -668,14 +420,13 @@ struct ChatReplyRecoveryTests {
         try await waitUntil { chat.controller.presentedViewController === card }
     }
 
-    @Test("A field edit of the AI Suggestion, recovered after a failure and held, lands in place; the ghost's card is the exact Reply All",
-          arguments: Failure.allCases)
-    func heldFieldEditThroughTheGhostAndItsCard(failure: Failure) async throws {
+    @Test("A field edit of the AI Suggestion, held, lands in place and asks the agent nothing; the ghost's card is the exact Reply All")
+    func heldFieldEditThroughTheGhostAndItsCard() async throws {
         // The card's own debug log says what it was given (ComposeView.prepopulate).
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: failure, editRequest: "make it shorter")
+        let backend = Backend(failure: nil)
         let gate = EditGate()
         let edited = Self.editedSuggestion
         let composeEdit: EmailReplyTool.ComposeEdit = { _, subject, _, _ in
@@ -686,32 +437,21 @@ struct ChatReplyRecoveryTests {
         }
         defer { gate.release() }
         try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "edit-\(failure.rawValue)", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
+            try await withChat(backend, tag: "edit-in-place", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
                 let router = AgentToolRouter.shared
                 try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == Self.shownSuggestion.textMessage } }
                 #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
                         "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
 
-                // The field asks for an edit; the first request fails.
-                // The field can be replaced while the chat settles after a send; wait for it.
+                // The field asks for an edit; the edit its Send runs is held.
+                // The field can be replaced while the chat settles; wait for it.
                 try await Self.waitUntil { Self.type("Make it shorter", in: chat.view) }
                 #expect(Self.type("Make it shorter", in: chat.view), "control: the field takes words")
                 try await Task.sleep(for: .milliseconds(300))
                 #expect(HostedAccessibility.activate("chatSend", in: chat.view),
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
-
-                // Retry recovers it; the edit it asks for is held.
-                // The field can be replaced while the chat settles after a send; wait for it.
-                try await Self.waitUntil { Self.type("", in: chat.view) }
-                #expect(Self.type("", in: chat.view),
-                        "control: the field is emptied: working \(ActiveAgentTracker.shared.anyWorking), \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
-                        "control: the field offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { gate.entered == 1 }
-                #expect(gate.entered == 1, "control: the recovered turn asked for the edit: \(backend.bodies.count) requests")
+                #expect(gate.entered == 1, "control: the field's Send ran the edit: \(backend.bodies.count) requests")
                 // The ghost steps aside while the chat works and never shows the edit before it is stored.
                 #expect(!Self.ghosts(in: chat.view).contains { $0.text == edited.textMessage },
                         "while the edit is held the ghost never shows it: \(Self.ghosts(in: chat.view).map(\.text))")
@@ -727,6 +467,7 @@ struct ChatReplyRecoveryTests {
                 #expect(stored?.suggestion == edited, "the edit is stored whole, its command included")
                 #expect(router.composeQueueDepth == 0 && chat.controller.presentedViewController == nil,
                         "an edit in place opens no card")
+                #expect(backend.bodies.isEmpty, "the closed field asks the agent nothing: \(backend.bodies.count) requests")
 
                 // The ghost's card is the exact Reply All, with the edit.
                 try await Self.openGhostCard(try #require(stored?.suggestion), in: chat)
@@ -742,11 +483,11 @@ struct ChatReplyRecoveryTests {
         }
     }
 
-    @Test("A field edit of the AI Suggestion that changes its envelope opens the field's own card through the agent's email_reply; closed unsent, the answer hands the words back: in the field, on the device, and in the chat opened again after a relaunch")
+    @Test("A field edit of the AI Suggestion that changes its envelope opens the field's own card, with no agent; closed unsent, the words are handed back: in the field, on the device, and in the chat opened again after a relaunch")
     func fieldEditCardClosedUnsentKeepsTheWords() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
         let sent = "Make it formal"
-        let backend = Backend(failure: nil, editRequest: sent)
+        let backend = Backend(failure: nil)
         let edited = Self.editedSuggestion
         // The edit changes the envelope (a new subject), so it opens a card instead of landing in place.
         let composeEdit: EmailReplyTool.ComposeEdit = { _, _, _, _ in
@@ -762,7 +503,7 @@ struct ChatReplyRecoveryTests {
                 #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
                         "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
 
-                // The field asks for the edit; the card the agent's email_reply opens is held in the queue.
+                // The field asks for the edit; the card its compose opens is held in the queue.
                 try await Self.waitUntil { Self.type(sent, in: chat.view) }
                 #expect(Self.type(sent, in: chat.view), "control: the field takes words")
                 try await Task.sleep(for: .milliseconds(300))
@@ -771,17 +512,17 @@ struct ChatReplyRecoveryTests {
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { router.composeQueueDepth == 1 }
                 let request = try #require(router.firstQueuedRequestForTesting,
-                                           "control: the agent's email_reply opened a card: \(backend.bodies.count) requests")
+                                           "control: the field's compose opened a card: \(backend.bodies.count) requests")
                 let onOwnDraft = request.draftId != nil
                 #expect(onOwnDraft, "control: the card is the suggestion edit's own")
                 let composing = ChatFieldWords.shared.fill(for: key).composing
                 #expect(composing, "the field's own card owns the send")
 
-                // The user closes the card unsent; the agent then answers.
+                // The user closes the card unsent; the field's send ends there.
                 request.onOutcome(.cancelled)
                 router.composePresentationDidEnd()
-                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 2, "control: the tool's result went back and was answered")
+                try await Self.waitUntil { !ActiveAgentTracker.shared.anyWorking }
+                #expect(backend.bodies.isEmpty, "the closed field asks the agent nothing: \(backend.bodies.count) requests")
                 try await Task.sleep(for: .milliseconds(300))
                 let fill = ChatFieldWords.shared.fill(for: key)
                 #expect(fill.words == sent && fill.unsent == sent && !fill.composing, "the words are the user's again: \(fill)")
@@ -909,61 +650,12 @@ struct ChatReplyRecoveryTests {
         return ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
     }
 
-    @Test("A resumed field request's answer empties the unchanged sent words and leaves another chat's words")
-    func resumedFieldRequestCompletesTheFieldWords() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: .connectionLost, asksForReply: false)
-        try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "resume-words") { chat in
-                let key = ChatFieldWords.key(for: chat.email)
-                let sent = "Tell them Friday works"
-                // Another chat's words, which the resumed request must not touch.
-                let other = Self.groupEmail("resume-other")
-                let otherKey = ChatFieldWords.key(for: other)
-                #expect(otherKey != key, "control: two chats")
-                let otherWords = "Words on another chat"
-                ChatFieldWords.shared.apply(.put(otherWords), to: otherKey)
-
-                #expect(Self.type(sent, in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
-                #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words wait in the field")
-                #expect(ChatFieldWords.shared.fill(for: key).unsent == "", "control: sent words are not kept")
-
-                // The field still holds the sent words, unchanged: its Retry resumes the cut-off request.
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                #expect(!HostedAccessibility.identifiers(in: chat.view).contains("chatSend"),
-                        "the field offers Retry, not Send: \(HostedAccessibility.identifiers(in: chat.view))")
-                #expect(HostedAccessibility.activate("chatRetry", in: chat.view),
-                        "control: the field's Retry takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 2, "control: one resumed request")
-                // A resume carries the sent words once; a re-send would carry them twice (the
-                // unanswered turn in history, then the new message).
-                #expect(Self.occurrences(of: sent, in: backend.bodies.last) == 1,
-                        "the sent words go once in the resumed request: \(backend.bodies.last?.suffix(600) ?? "")")
-                try await Task.sleep(for: .milliseconds(300))
-                let turns = try await Self.userTurns(in: chat)
-                #expect(turns == 1, "the resume adds no user turn: \(turns)")
-
-                #expect(ChatFieldWords.shared.fill(for: key).words == "",
-                        "after the resumed answer: \(ChatFieldWords.shared.fill(for: key).words)")
-                #expect(ChatFieldWords.shared.fill(for: otherKey).words == otherWords, "another chat's words stay")
-                await ChatFieldWords.shared.written()
-                let stored = try await chat.pool.read { try ChatFieldWordsRecord.fetchAll($0) }
-                let byKey = Dictionary(uniqueKeysWithValues: stored.map { ($0.sessionId, $0.words) })
-                #expect(byKey == [otherKey: otherWords], "kept words: \(byKey)")
-            }
-        }
-    }
-
     /// A request the open sheet sends goes with no field (`sendAgentChat` without `field:`, the path
     /// the sheet's re-sends take, fenced in `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField`):
-    /// its recovery names no field key. The field's own request names its chat's.
-    @Test("A cut-off request's recovery names the field's words only when the field sent it",
+    /// its recovery names no field key. The closed field's Send is a compose edit, not an agent turn
+    /// (ADR-IOS-114 decision 10, amended 2026-11-25): cut off, it leaves no recovery, and its words
+    /// stay in the field.
+    @Test("A cut-off request from the sheet names no field words in its recovery; a cut-off compose from the field leaves none and keeps the words",
           arguments: [false, true])
     func cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest(fromField: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
@@ -986,116 +678,22 @@ struct ChatReplyRecoveryTests {
                         "control: Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
+                let compose = backend.bodies.first?.contains("system_prompt_compose_interactive") == true
+                #expect(compose == fromField, "the field's words go to the compose edit, the sheet's to the agent")
                 let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: chat.email))
-                try await Self.waitUntil { session.pendingResume != nil }
-                let resume = try #require(session.pendingResume, "control: the cut-off request can be resumed")
-                let expectedKey: String? = fromField ? key : nil
-                #expect(resume.fieldWordsKey == expectedKey,
-                        "the recovery names the field's words only for the field's own request: \(String(describing: resume.fieldWordsKey))")
-                // From the field the words wait in it; from the sheet they went with the request.
+                if fromField {
+                    try await Task.sleep(for: .milliseconds(500))
+                    #expect(session.pendingResume == nil, "a compose is no agent turn: nothing to resume")
+                } else {
+                    try await Self.waitUntil { session.pendingResume != nil }
+                    let resume = try #require(session.pendingResume, "control: the cut-off request can be resumed")
+                    #expect(resume.fieldWordsKey == nil,
+                            "the sheet's recovery names no field words: \(String(describing: resume.fieldWordsKey))")
+                }
+                // From the field the words stay in it; from the sheet they went with the request.
                 let expectedWords = fromField ? sent : ""
                 #expect(ChatFieldWords.shared.fill(for: key).words == expectedWords,
                         "the words: \(ChatFieldWords.shared.fill(for: key).words)")
-            }
-        }
-    }
-
-    /// The sheet's "Re-send message" and "Rewind and re-send" own none of the field's words (Rewind
-    /// sends with no field; Re-send carries its turn's email and Reply to choice but no words key,
-    /// `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField`), so they leave the field's sent words
-    /// in place; when that request is cut off, its recovery carries no field key
-    /// (`cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest`). The re-sends are reached only through a
-    /// bubble's long-press menu, so this test gives the field each recovery and checks its rule.
-    @Test("The field's unchanged sent words offer Send, not Retry, when the cut-off request is not the field's own",
-          arguments: Failure.allCases)
-    func otherRequestsCutOffLeavesTheFieldWordsOnSend(failure: Failure) async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: failure, asksForReply: false)
-        try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "other-cutoff-\(failure.rawValue)") { chat in
-                let sent = "Tell them Friday works"
-                let key = ChatFieldWords.key(for: chat.email)
-                #expect(Self.type(sent, in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 1, "control: the request went out once and failed")
-                #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words wait in the field")
-
-                // The recovery a sheet re-send records when it is cut off: no field key.
-                let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: chat.email))
-                session.lastFailedSend = nil
-                if session.pendingResume == nil {
-                    session.pendingResume = .init(
-                        request: CompletionsRequest(messages: [], client_timezone: "UTC", disable_tools: nil), fieldReply: nil,
-                        origin: nil)
-                }
-                session.pendingResume?.fieldWordsKey = nil
-                try await Self.waitUntil {
-                    let ids = HostedAccessibility.identifiers(in: chat.view)
-                    return ids.contains("chatSend") && !ids.contains("chatRetry")
-                }
-                let other = HostedAccessibility.identifiers(in: chat.view)
-                #expect(other.contains("chatSend") && !other.contains("chatRetry"),
-                        "another request's cut-off leaves the field's words on Send: \(other)")
-
-                // Control: the same recovery as the field's own request offers Retry.
-                session.pendingResume?.fieldWordsKey = key
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"),
-                        "control: the field's own cut-off offers Retry: \(HostedAccessibility.identifiers(in: chat.view))")
-
-                // Back to another request's cut-off: Send sends the words anew.
-                session.pendingResume?.fieldWordsKey = nil
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatSend") }
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 2, "Send makes a new request")
-                try await Task.sleep(for: .milliseconds(300))
-                let turns = try await Self.userTurns(in: chat)
-                #expect(turns == 2, "Send adds a new user turn: \(turns)")
-            }
-        }
-    }
-
-    @Test("Edited words in a cut-off request's field turn Retry back into Send, which sends the new words",
-          arguments: [false, true])
-    func editedFieldWordsSendAnew(sameText: Bool) async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: .connectionLost, asksForReply: false)
-        try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "edit-words-\(sameText)") { chat in
-                let sent = "Tell them Friday works"
-                let edited = sameText ? sent : "Tell them Monday works"
-                #expect(Self.type(sent, in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
-                try await Self.waitUntil { HostedAccessibility.identifiers(in: chat.view).contains("chatRetry") }
-                #expect(HostedAccessibility.identifiers(in: chat.view).contains("chatRetry"),
-                        "control: the unchanged sent words offer Retry")
-
-                // An edit (cleared and written again, even to the same text, is new words).
-                // Right after the request ends, Retry can show a moment before the field is mounted again.
-                try await Self.waitUntil { Self.type("", in: chat.view) }
-                #expect(Self.type("", in: chat.view))
-                try await Task.sleep(for: .milliseconds(200))
-                #expect(Self.type(edited, in: chat.view))
-                try await Task.sleep(for: .milliseconds(300))
-                let ids = HostedAccessibility.identifiers(in: chat.view)
-                #expect(ids.contains("chatSend") && !ids.contains("chatRetry"), "edited words offer Send: \(ids)")
-
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view),
-                        "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { backend.bodies.count == 2 && !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 2, "one new request")
-                #expect(backend.bodies.last?.contains(edited) == true, "control: Send sends the edited words")
-                try await Task.sleep(for: .milliseconds(300))
-                let turns = try await Self.userTurns(in: chat)
-                #expect(turns == 2, "Send adds a new user turn, not a resume: \(turns)")
             }
         }
     }
