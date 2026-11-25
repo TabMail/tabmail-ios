@@ -7,26 +7,43 @@ import GRDB
 import Testing
 @testable import TabMail
 
-/// One case of the opened email's witness without a Message-ID: the epoch it was
-/// read under, the epoch of the row now stored under its id, and whether the
-/// refresh may show the stored row.
-struct EpochRefreshCase: Sendable, CustomTestStringConvertible {
+/// The Message-ID of the row stored under the opened email's id.
+enum StoredMessageId: Sendable {
+    /// The opened email's own Message-ID.
+    case same
+    /// No Message-ID.
+    case missing
+}
+
+/// One case of the opened email's witness: whether the opened email has a
+/// Message-ID, the Message-ID and epoch of the row now stored under its id, the
+/// epoch the opened email was read under, and whether the refresh may show the
+/// stored row.
+struct WitnessRefreshCase: Sendable, CustomTestStringConvertible {
+    let heldHasMessageId: Bool
+    let storedMessageId: StoredMessageId
     let heldEpoch: Int?
     let storedEpoch: Int?
     let refreshLands: Bool
     var testDescription: String {
-        "held epoch \(heldEpoch.map(String.init) ?? "none"), stored epoch \(storedEpoch.map(String.init) ?? "none")"
+        "held Message-ID \(heldHasMessageId ? "yes" : "none"), stored Message-ID \(storedMessageId), "
+            + "held epoch \(heldEpoch.map(String.init) ?? "none"), stored epoch \(storedEpoch.map(String.init) ?? "none")"
     }
 }
 
-/// A different proven epoch is a reset and keeps the shown email. Without that
-/// proof the witness gives no verdict and the refresh lands, as before
-/// (IOS-IDENTITY-001: refusal is never broadened to rows it cannot tell apart).
-let epochRefreshCases: [EpochRefreshCase] = [
-    EpochRefreshCase(heldEpoch: 7, storedEpoch: 8, refreshLands: false),
-    EpochRefreshCase(heldEpoch: 7, storedEpoch: 7, refreshLands: true),
-    EpochRefreshCase(heldEpoch: 7, storedEpoch: nil, refreshLands: true),
-    EpochRefreshCase(heldEpoch: nil, storedEpoch: 8, refreshLands: true),
+/// Without a Message-ID, a different proven epoch is a reset and keeps the shown
+/// email; without that proof the witness gives no verdict and the refresh lands,
+/// as before (IOS-IDENTITY-001: refusal is never broadened to rows it cannot tell
+/// apart). With a Message-ID, the Message-ID alone decides: the same one lands
+/// whatever the epochs say, and one that went missing keeps the shown email, in
+/// the witness's documented direction.
+let witnessRefreshCases: [WitnessRefreshCase] = [
+    WitnessRefreshCase(heldHasMessageId: false, storedMessageId: .missing, heldEpoch: 7, storedEpoch: 8, refreshLands: false),
+    WitnessRefreshCase(heldHasMessageId: false, storedMessageId: .missing, heldEpoch: 7, storedEpoch: 7, refreshLands: true),
+    WitnessRefreshCase(heldHasMessageId: false, storedMessageId: .missing, heldEpoch: 7, storedEpoch: nil, refreshLands: true),
+    WitnessRefreshCase(heldHasMessageId: false, storedMessageId: .missing, heldEpoch: nil, storedEpoch: 8, refreshLands: true),
+    WitnessRefreshCase(heldHasMessageId: true, storedMessageId: .same, heldEpoch: 7, storedEpoch: 8, refreshLands: true),
+    WitnessRefreshCase(heldHasMessageId: true, storedMessageId: .missing, heldEpoch: nil, storedEpoch: nil, refreshLands: false),
 ]
 
 /// A per-row refresh never swaps a different email into a row the message screen
@@ -257,31 +274,37 @@ struct MessageDetailRefreshIdentityTests {
     }
 
     @MainActor
-    @Test("an opened email without a Message-ID is kept only on a proven different epoch", arguments: epochRefreshCases)
-    func openedEmailWithoutMessageIdUsesItsEpoch(_ testCase: EpochRefreshCase) async throws {
+    @Test("the opened email's witness: a different Message-ID or, without one, a proven different epoch keeps it", arguments: witnessRefreshCases)
+    func openedEmailWitnessDecidesTheRefresh(_ testCase: WitnessRefreshCase) async throws {
         let (pool, dir, previous) = try makePool()
         defer { cleanUp(pool, dir, previous) }
         let control = header("control", summary: "control summary")
         var opened = header("opened", summary: "opened summary", references: [control.rfc822MessageId!])
-        opened.rfc822MessageId = nil
+        if !testCase.heldHasMessageId { opened.rfc822MessageId = nil }
         opened.observedUidValidity = testCase.heldEpoch
         try insert(control, into: pool)
         try insert(opened, into: pool)
         let vm = try await openWithThread(opened, control: control, pool: pool)
 
+        let storedMessageId: String? = switch testCase.storedMessageId {
+        case .same: opened.rfc822MessageId
+        case .missing: nil
+        }
         let shown = Recorder(vm, .message) { vm.message?.subject }
-        try await storeOtherEmail(under: opened.id, rfc822MessageId: nil, epoch: testCase.storedEpoch, in: pool)
+        try await storeOtherEmail(under: opened.id, rfc822MessageId: storedMessageId, epoch: testCase.storedEpoch, in: pool)
         try await passControl(control, in: vm, pool: pool)
 
         #expect(vm.message?.id == opened.id)
         #expect(shown.isComplete)
         if testCase.refreshLands {
             #expect(vm.message?.subject == "Subject other")
+            #expect(vm.message?.rfc822MessageId == storedMessageId)
             #expect(vm.message?.observedUidValidity == testCase.storedEpoch)
         } else {
-            #expect(vm.message?.subject == "Subject opened")
-            #expect(vm.message?.observedUidValidity == testCase.heldEpoch)
             let shownSubjects = shown.values.map { $0 ?? "nil" }
+            #expect(vm.message?.subject == "Subject opened")
+            #expect(vm.message?.rfc822MessageId == opened.rfc822MessageId)
+            #expect(vm.message?.observedUidValidity == testCase.heldEpoch)
             #expect(!shownSubjects.contains("Subject other"), "shown: \(shownSubjects)")
         }
     }
