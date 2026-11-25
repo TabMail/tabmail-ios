@@ -199,15 +199,19 @@ struct ChatSwipeTestScene: View {
     }
 
     /// The newest email's chat gets `panelHistoryCount` messages, the user's and the agent's in
-    /// turn, a minute apart, in its in-process session (nothing is stored).
+    /// turn, a minute apart, in its in-process session (nothing is stored). The session is marked
+    /// active now, as a chat turn marks it, or opening the panel evicts it as idle
+    /// (`ChatPillState.evictIdleSessions`).
     private static func seedPanelHistory() async throws {
         let id = headerId(count - 1)
         guard let header = try await AppDatabase.dbPool.read({ try MessageHeader.fetchOne($0, key: id) }) else { return }
         let start = Date().addingTimeInterval(-TimeInterval(panelHistoryCount) * 60)
-        ChatPillState.shared.session(for: ChatThreadKey.key(for: header)).chatMessages = (0..<panelHistoryCount).map {
+        let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: header))
+        session.chatMessages = (0..<panelHistoryCount).map {
             ChatMessage(role: $0.isMultiple(of: 2) ? .user : .agent, content: panelHistoryLine($0),
                         timestamp: start.addingTimeInterval(TimeInterval($0) * 60))
         }
+        session.lastChatActivity = Date()
     }
 
     private func arm() {
