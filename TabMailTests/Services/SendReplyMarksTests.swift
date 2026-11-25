@@ -25,7 +25,8 @@ import Testing
 /// `isReplied`/`isForwarded`, so a mark nothing took back would outlive an undone
 /// send for good (#1468). An original re-keyed by a move while the send is held
 /// is found at its new address: the re-key carries the queued send's pointer
-/// (#1479).
+/// (#1479), and so does a listing's re-key on the provider's own id, which
+/// re-keys a Gmail original after an archive (#1500).
 ///
 /// The world tests drive the real queue, cancel and completion paths against the
 /// stateful Gmail, IMAP and Outlook fakes, and run the provider's passes while
@@ -1791,12 +1792,13 @@ struct SendReplyMarksTests {
         #expect(storedAfter == storedBefore, "the stored row is unchanged")
     }
 
-    /// Sync's own re-keys of a row go through `MessageHeaderRekey.apply` (the UID
-    /// remap, on Message-ID evidence; `canonicalizeLocalRows`, on the provider's
-    /// stable id) and do not carry the queued send's pointer. So the completion
-    /// finds no original and queues nothing, and an unsent removal finds none
-    /// either and leaves Send's marks on the re-keyed row (`IOS-OUTBOX-012`).
-    /// Only a landed move's proven re-key (`finishMove`) carries it.
+    /// Sync's re-keys of a row on Message-ID evidence (the UID remap, and the body
+    /// backfill's re-key) go through `MessageHeaderRekey.apply` and do not carry
+    /// the queued send's pointer. So the completion finds no original and queues
+    /// nothing, and an unsent removal finds none either and leaves Send's marks
+    /// on the re-keyed row (`IOS-OUTBOX-012`). Only a landed move's proven re-key
+    /// (`finishMove`) and a listing's re-key on the provider's own id
+    /// (`canonicalizeLocalRows`, below) carry it.
     @Test("Sync's own re-key of a held reply's original does not carry the send to it: the completion finds nothing, and an Undo leaves Send's marks",
           arguments: [Outcome.completed, .undone])
     func syncRekeyDoesNotCarryTheSend(outcome: Outcome) async throws {
@@ -1836,5 +1838,160 @@ struct SendReplyMarksTests {
         }
         let queuedTypes = try Self.markOps(pool).map(\.type.rawValue)
         #expect(queuedTypes.isEmpty, "nothing is queued for the re-keyed row: \(queuedTypes)")
+    }
+
+    // MARK: - Gmail: the All Mail listing re-keys the archived original
+
+    static let gmailMessageId = "18c0a1b2c3d4e5f6"
+    static let gmailOtherMessageId = "18c0a1b2c3d4e5f7"
+
+    /// A listing of `path` reports the message `messageId`, and sync
+    /// canonicalizes its local rows as `runSyncMessages` does on a stable-id
+    /// provider (no epoch). Returns the re-key it made, if any.
+    static func listingCanonicalizes(
+        _ pool: DatabasePool, accountId: String, path: String, messageId: String
+    ) async throws -> (oldId: String, newId: String)? {
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: path)
+        return try await pool.write { db in
+            try SyncEngine.canonicalizeLocalRows(
+                accountId: accountId, folderPath: path, folderId: folderId,
+                messageId: messageId, isInInbox: false, windowMode: .date,
+                sourceBoundEpoch: nil, incomingRfc822Identity: nil, db: db
+            ).ftsRekey
+        }
+    }
+
+    /// On Gmail an archive does not change the message's address, so the landed
+    /// move re-keys nothing and the row keeps its Inbox-shaped key until the next
+    /// listing of All Mail re-keys it on Gmail's own id
+    /// (`SyncEngine.canonicalizeLocalRows`). The provider's id proves that re-key
+    /// (the Message-ID plays no part), so the queued send follows its original
+    /// (#1500): the completion marks it at its All Mail address, and an unsent
+    /// removal takes Send's marks back from it. A send to another message keeps
+    /// its own original.
+    @Test("Gmail: an original archived while its reply or forward waits, then re-keyed by the All Mail listing: the send follows it, and an unsent removal takes Send's marks back",
+          arguments: [false, true], Outcome.allCases)
+    func gmailAllMailRekeyCarriesTheSend(isForward: Bool, outcome: Outcome) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-gmail-rekey", provider: .gmail)
+        let allMail = GmailProvider.archivePath
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: allMail, role: .archive, pool: pool)
+        let original = try Self.storedOriginal(
+            pool, accountId: accountId, rfc: "gmail-parent@example.com",
+            messageId: Self.gmailMessageId, observed: nil, tag: .reply)
+        let other = try Self.storedOriginal(
+            pool, accountId: accountId, rfc: "gmail-other@example.com",
+            messageId: Self.gmailOtherMessageId, observed: nil, tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
+        let otherBefore = try Self.marks(pool, headerId: other.id)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: isForward, before: before)
+        let bystander = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: other, isForward: false, before: otherBefore)
+        let outboxId = queued.outboxId
+
+        // The archive moves the row to All Mail and clears its tag; the row keeps its Inbox-shaped key.
+        let originalId = original.id
+        try await Self.moveLocally(pool, headerId: originalId, accountId: accountId, to: allMail)
+        let pointerAfterMove = try Self.pointer(pool, outboxId: outboxId)
+        #expect(pointerAfterMove == originalId, "precondition: the archive alone does not re-key the row")
+
+        // The All Mail listing reports the message under Gmail's id and re-keys the row.
+        let rekey = try await Self.listingCanonicalizes(
+            pool, accountId: accountId, path: allMail, messageId: Self.gmailMessageId)
+        let movedId = MessageIdentity.headerId(accountId: accountId, folderPath: allMail, messageId: Self.gmailMessageId)
+        let rekeyed = rekey.map { $0.oldId == originalId && $0.newId == movedId } ?? false
+        #expect(rekeyed, "precondition: the listing re-keyed the row: \(String(describing: rekey))")
+        let pointer = try Self.pointer(pool, outboxId: outboxId)
+        #expect(pointer == movedId, "the send follows its original to the All Mail key: \(pointer ?? "nil")")
+        let bystanderPointer = try Self.pointer(pool, outboxId: bystander.outboxId)
+        #expect(bystanderPointer == other.id, "a reply to another message keeps its original: \(bystanderPointer ?? "nil")")
+
+        let markType = isForward ? OperationType.markForwarded : OperationType.markReplied
+        switch outcome {
+        case .completed:
+            let disposition = try await Self.complete(pool: pool, outboxId: outboxId)
+            #expect(disposition.changedOriginalHeaderId == movedId, "the completion finds the re-keyed original")
+            let serverMarks = try Self.markOps(pool).filter { $0.type == markType }
+            #expect(serverMarks.count == 1, "the completed send queues the server's \(markType.rawValue)")
+            guard serverMarks.count == 1 else { return }
+            let markIds = serverMarks[0].messageIds
+            #expect(markIds == [Self.gmailMessageId], "the server's mark names the message's Gmail id: \(markIds)")
+            let markFolder = serverMarks[0].folderPath
+            #expect(markFolder == allMail, "the server's mark names All Mail: \(markFolder)")
+        case .undone, .discardedAfterFailure:
+            let cancelled = try await Self.cancel(
+                pool: pool, outboxId: outboxId, failedFirst: outcome == .discardedAfterFailure)
+            #expect(cancelled.revertedOriginalHeaderId == movedId, "the removal finds the re-keyed original")
+            let serverMarks = try Self.queuedCount(pool, markType)
+            #expect(serverMarks == 0, "no server mark for a send that never went out")
+        }
+        let tags = try Self.queuedTags(pool)
+        #expect(tags.isEmpty, "the archive cleared the tag, so there is no clear to queue and no Reply to restore: \(tags)")
+        let after = try Self.marks(pool, headerId: movedId)
+        var want = Self.expected(before: before, isForward: isForward, outcome: outcome)
+        want.actionTag = nil
+        #expect(after == want, "\(outcome.rawValue): \(after), want \(want)")
+
+        let bystanderCancelled = try await Self.cancel(pool: pool, outboxId: bystander.outboxId)
+        #expect(bystanderCancelled.revertedOriginalHeaderId == other.id, "the other reply's Undo finds its own original")
+        let otherAfter = try Self.marks(pool, headerId: other.id)
+        #expect(otherAfter == otherBefore, "the other original is as it was: \(otherAfter), want \(otherBefore)")
+    }
+
+    /// The listing skips the re-key when another row already holds the All Mail
+    /// key (a row moved out of All Mail keeps its key). The archived row then
+    /// keeps its own key, so the send must keep naming it: the Undo takes Send's
+    /// mark back from that row and leaves the row holding the key as it was.
+    @Test("Gmail: a listing that skips the re-key because another row holds the All Mail key leaves the send naming its original")
+    func gmailSkippedRekeyKeepsTheSend() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-gmail-skip", provider: .gmail)
+        let allMail = GmailProvider.archivePath
+        let trash = "TRASH"
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: allMail, role: .archive, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: trash, role: .trash, pool: pool)
+        let original = try Self.storedOriginal(
+            pool, accountId: accountId, rfc: "gmail-skip-parent@example.com",
+            messageId: Self.gmailMessageId, observed: nil, tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: false, before: before)
+        let outboxId = queued.outboxId
+
+        // A row in Trash holds the All Mail key: it was moved out of All Mail and kept its key.
+        let allMailKey = MessageIdentity.headerId(accountId: accountId, folderPath: allMail, messageId: Self.gmailMessageId)
+        try await pool.write { db in
+            var holder = MessageHeader(
+                messageId: Self.gmailMessageId, subject: "Original", from: "Sender",
+                fromAddress: "sender@example.com", to: "me@example.com", date: Date(),
+                snippet: "original",
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: trash),
+                accountId: accountId, folderPath: trash, isInInbox: false)
+            holder.id = allMailKey
+            holder.rfc822MessageId = "gmail-skip-parent@example.com"
+            holder.headerComplete = true
+            try holder.insert(db)
+        }
+        let holderBefore = try Self.rowSnapshot(pool, headerId: allMailKey)
+        #expect(!holderBefore.isEmpty, "precondition: the All Mail key is held")
+
+        let originalId = original.id
+        try await Self.moveLocally(pool, headerId: originalId, accountId: accountId, to: allMail)
+        let rekey = try await Self.listingCanonicalizes(
+            pool, accountId: accountId, path: allMail, messageId: Self.gmailMessageId)
+        #expect(rekey == nil, "precondition: the listing skipped the re-key: \(String(describing: rekey))")
+        let pointer = try Self.pointer(pool, outboxId: outboxId)
+        #expect(pointer == originalId, "the send keeps naming the row that kept its key: \(pointer ?? "nil")")
+
+        let cancelled = try await Self.cancel(pool: pool, outboxId: outboxId)
+        #expect(cancelled.revertedOriginalHeaderId == originalId, "the Undo finds the archived original")
+        let after = try Self.marks(pool, headerId: originalId)
+        let want = Marks(isReplied: false, isForwarded: false, actionTag: nil)
+        #expect(after == want, "the Undo takes Send's mark back; the archive cleared the tag: \(after), want \(want)")
+        let holderAfter = try Self.rowSnapshot(pool, headerId: allMailKey)
+        #expect(holderAfter == holderBefore, "the row holding the All Mail key is unchanged")
     }
 }
