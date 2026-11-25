@@ -47,8 +47,8 @@ import UIKit
 ///     compose it reopens keep the words typed since.
 ///  1h. The sent reply's text in the chat is the text version already in hand: the AI Suggestion's
 ///     card sent as written shows the suggestion's text version from the queue write, with no
-///     summary; words typed into its body make it summarized instead; undone and sent again with the
-///     body unchanged, it keeps the undone send's text version.
+///     summary; undone and sent again with the body unchanged, it keeps the undone send's text
+///     version; with words typed into the body it is summarized instead.
 ///  2. Drawn: the solid blue rises from the bottom edge, inside the bubble's shape; in light mode the
 ///     text is the pending text colour over the tint and white over the solid; under Reduce Motion
 ///     there is no rising fill; a mounted bubble drops its Undo when its deadline passes.
@@ -973,64 +973,72 @@ struct ChatUndoSendRoutingTests {
     /// Sent from the demo account, which makes no AI request at Send whatever the gate: an email
     /// sent without a text version is summarized on the device in its own words
     /// (`SentEmailSummary.summarizeLocally`), so the two are told apart with no backend.
-    @Test("The AI Suggestion's card sent as written shows the text version written with it from the queue write, with no summary; with words typed into its body it is summarized from the email as sent",
-          arguments: [false, true])
-    func sentReplyShowsItsTextVersion(typedInto: Bool) async throws {
+    /// Waits long enough for a summary at Send to have landed, then expects `row`'s text to be the
+    /// written suggestion's text version still.
+    private static func expectNoSummaryReplaces(_ row: OutboxMessage, _ fixture: Fixture) async throws {
+        try await Task.sleep(for: .seconds(1))
+        let later = try await Self.sentText(row, fixture)
+        #expect(later == Self.writtenSuggestion.textMessage, "no summary replaced it")
+    }
+
+    @Test("The AI Suggestion's card sent as written shows the text version written with it from the queue write, with no summary")
+    func sentReplyShowsItsTextVersion() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
         try await withSendEnvironment(accountId: DemoSeed.demoAccountId) { fixture, saved in
             saved.setChatView(on: true)
-            let hosted = try Self.host(Self.readyAIReply(fixture, suggestion: Self.writtenSuggestion), fixture: fixture)
-            defer { hosted.close() }
-            let view: UIView = hosted.controller.view
-            if typedInto {
-                // Use Suggestion puts the words in the body; the user then types after them.
-                @MainActor func useSuggestion() -> NSObject? {
-                    HostedAccessibility.elements(under: view).first { $0.accessibilityLabel == "Use Suggestion" }
-                }
-                for _ in 0..<50 where useSuggestion() == nil { try await Task.sleep(for: .milliseconds(100)) }
-                let tapped = useSuggestion()?.accessibilityActivate() ?? false
-                #expect(tapped, "the user takes the suggestion into the body")
-                @MainActor func editor() -> UITextView? { Self.firstView(UITextView.self, in: view) { $0.isEditable } }
-                for _ in 0..<50 where editor()?.text.isEmpty ?? true { try await Task.sleep(for: .milliseconds(100)) }
-                let body = try #require(editor(), "the body holds the suggestion's words")
-                body.selectedRange = NSRange(location: (body.text as NSString).length, length: 0)
-                body.insertText(" See you then.")
-            }
-            let row = try await Self.tapSend(in: hosted.controller, fixture: fixture)
+            let row = try await Self.send(Self.readyAIReply(fixture, suggestion: Self.writtenSuggestion), fixture: fixture)
             #expect(row.accountId == DemoSeed.demoAccountId, "control: sent from the demo account")
             // As the queue write left it: the bubble's first value.
             let atQueue = try await Self.sentText(row, fixture)
-            if typedInto {
-                var summarized = atQueue
-                for _ in 0..<50 where summarized == nil {
-                    try await Task.sleep(for: .milliseconds(100))
-                    summarized = try await Self.sentText(row, fixture)
-                }
-                #expect(summarized != Self.writtenSuggestion.textMessage, "a body edited by hand keeps no text version")
-                #expect(summarized?.contains("See you then.") == true, "it is summarized from the email as sent: \(summarized ?? "nil")")
-            } else {
-                #expect(atQueue == Self.writtenSuggestion.textMessage, "written with the queue write: never Summarizing")
-                let bubbles = try await fixture.pool.read { try ChatUnsentReply.fetch(answering: fixture.chatMessageIds, db: $0) }
-                let bubble = bubbles.first { $0.id == row.id }
-                #expect(bubble?.textMessage == Self.writtenSuggestion.textMessage, "the Sending bubble shows it")
-                // Long enough for a summary at Send to have landed.
-                try await Task.sleep(for: .seconds(1))
-                let later = try await Self.sentText(row, fixture)
-                #expect(later == Self.writtenSuggestion.textMessage, "no summary replaced it")
-            }
+            #expect(atQueue == Self.writtenSuggestion.textMessage, "written with the queue write: never Summarizing")
+            let bubbles = try await fixture.pool.read { try ChatUnsentReply.fetch(answering: fixture.chatMessageIds, db: $0) }
+            let bubble = bubbles.first { $0.id == row.id }
+            #expect(bubble?.textMessage == Self.writtenSuggestion.textMessage, "the Sending bubble shows it")
+            try await Self.expectNoSummaryReplaces(row, fixture)
         }
     }
 
-    @Test("A reply undone on its bubble and sent again with its body unchanged keeps the undone send's text version, with no summary")
-    func sendAgainAfterUndoKeepsTheTextVersion() async throws {
+    /// The compose an Undo reopens holds the undone send's body in its editor, with that send's text
+    /// version (`ReopenSnapshot.sentTextVersion`). The card's suggestion box cannot be tapped in a
+    /// hosted test (tabmail-ios#1124), so the words a user types into a body are typed here.
+    @Test("A reply undone on its bubble and sent again keeps the undone send's text version with its body unchanged, with no summary; with words typed into its body it is summarized from the email as sent",
+          arguments: [false, true])
+    func sendAgainAfterUndo(typedInto: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
         try await withSendEnvironment(accountId: DemoSeed.demoAccountId) { fixture, saved in
             saved.setChatView(on: true)
             let reopen = try await Self.sendFromTheChatAndUndoOnTheBubble(fixture, suggestion: Self.writtenSuggestion)
             #expect(reopen.sentTextVersion == Self.writtenSuggestion.textMessage, "the Undo carries the send's text version")
-            let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            let hosted = try Self.host(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            defer { hosted.close() }
+            if typedInto {
+                let view: UIView = hosted.controller.view
+                // Typed only once the reopened draft's words show, so its load does not replace them.
+                @MainActor func editor() -> UITextView? {
+                    Self.firstView(UITextView.self, in: view) { $0.isEditable && $0.text.contains(Self.writtenSuggestion.body) }
+                }
+                for _ in 0..<50 where editor() == nil { try await Task.sleep(for: .milliseconds(100)) }
+                let found = editor()
+                let body = try #require(found, "the reopened compose's body holds the undone send's words")
+                body.selectedRange = NSRange(location: (body.text as NSString).length, length: 0)
+                body.insertText(" See you then.")
+            }
+            let again = try await Self.tapSend(in: hosted.controller, fixture: fixture)
+            #expect(again.accountId == DemoSeed.demoAccountId, "control: sent from the demo account")
+            // As the queue write left it: the bubble's first value.
             let atQueue = try await Self.sentText(again, fixture)
-            #expect(atQueue == Self.writtenSuggestion.textMessage, "the send again writes it with its queue write")
+            if typedInto {
+                var summarized = atQueue
+                for _ in 0..<50 where summarized == nil {
+                    try await Task.sleep(for: .milliseconds(100))
+                    summarized = try await Self.sentText(again, fixture)
+                }
+                #expect(summarized != Self.writtenSuggestion.textMessage, "a body edited by hand keeps no text version")
+                #expect(summarized?.contains("See you then.") == true, "it is summarized from the email as sent: \(summarized ?? "nil")")
+            } else {
+                #expect(atQueue == Self.writtenSuggestion.textMessage, "the send again writes it with its queue write")
+                try await Self.expectNoSummaryReplaces(again, fixture)
+            }
         }
     }
 
