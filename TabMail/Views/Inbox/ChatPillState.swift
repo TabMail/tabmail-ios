@@ -39,7 +39,7 @@ final class ChatPillState {
 
     func session(for key: String) -> Session {
         if let existing = sessions[key] { return existing }
-        let new = Session()
+        let new = Session(storesTurns: !ChatNewEmailField.isSessionKey(key))
         sessions[key] = new
         return new
     }
@@ -113,6 +113,12 @@ final class ChatPillState {
 
     @MainActor @Observable
     final class Session {
+        /// Whether this chat's turns are stored (`appendTurn`). A new email's chat stores none: its
+        /// agent chat is in memory only (ADR-IOS-114 decision 24, ADR-004).
+        let storesTurns: Bool
+        init(storesTurns: Bool = true) {
+            self.storesTurns = storesTurns
+        }
         var chatMessages: [ChatMessage] = []
         var lastChatActivity: Date?
         /// The send that failed outright, for the retry button: its words, and the reply field's
@@ -237,6 +243,8 @@ final class ChatPillState {
         /// is not a failure: that history is discarded on purpose.
         @discardableResult
         func appendTurn(_ turn: ChatTurn, admission: DemoModeStore.Admission?) async -> [ChatTurn]? {
+            // Kept in memory only: nothing is written and nothing is evicted.
+            guard storesTurns else { return [] }
             do {
                 return try await ChatStore.shared.appendTurn(turn, admission: admission)
             } catch is ChatStore.DemoTurnRefused {

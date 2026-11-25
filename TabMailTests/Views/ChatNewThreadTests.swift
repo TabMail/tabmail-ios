@@ -140,6 +140,69 @@ struct ChatNewThreadTests {
         #expect(picked == .write(to: ["maria@example.com", "sam@example.com"]))
     }
 
+    @Test("Words sent with people picked go to the agent as a new email to them, under each one's name")
+    func newEmailAgentMessage() {
+        let message = ChatNewEmailField.agentMessage(to: [Self.maria, Self.sam], text: "invite them to lunch on Friday")
+        #expect(message.hasPrefix("New email to Maria <maria@example.com>, Sam <sam@example.com> ("))
+        #expect(message.contains("email_compose"), "it names the tool that writes a new email")
+        #expect(message.hasSuffix("): invite them to lunch on Friday"), "the words, as typed, close it")
+        // The field's words are always what to write: a question in them goes to the people, and
+        // the agent is never left to guess that the words were meant for it.
+        #expect(message.contains("my words are what to write to them"))
+        #expect(message.contains("a question in them is one to ask them"))
+        #expect(!message.contains("unless"), "no opening for the agent to take the words as its own")
+    }
+
+    @Test("Writing a new email's chat's email reads Writing your email, as a reply does")
+    func composeStatusLine() throws {
+        let composing = try #require(ToolRegistry.activityLabels["email_compose"])
+        #expect(ChatReplyField.statusLine(composing) == "Writing your email")
+    }
+
+    @Test("The card opens with the chat's people, Cc, Bcc and attachments; a carried subject wins over the agent's")
+    func cardFields() throws {
+        let request = MailtoRequest(to: ["Maria <maria@example.com>"], cc: ["lee@example.com"], bcc: ["sam@example.com"],
+                                    subject: "Lunch", body: "words")
+        let model = ChatNewThreadModel(account: nil, request: request)
+        let file = DraftAttachment(filename: "notes.txt", mimeType: "text/plain", data: Data("notes".utf8))
+        model.addAttachment(file)
+        let req = AgentToolRouter.ComposeRequest(
+            mode: .compose, replyTo: nil, to: ["someone@example.com"], cc: [], bcc: [], subject: "Agent's subject",
+            body: "The email.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat))
+        let card = model.card(for: req, account: nil) { _ in }
+        #expect(card.prefillTo == ["\"Maria\" <maria@example.com>"], "To is the chat's people, as a save writes them")
+        #expect(card.prefillCc == ["lee@example.com"])
+        #expect(card.prefillBcc == ["sam@example.com"])
+        #expect(card.prefillSubject == "Lunch", "the link's subject, not the agent's")
+        #expect(card.suggestedBody == "The email.")
+        #expect(card.prefillAttachments == [file])
+        let plain = ChatNewThreadModel(account: nil)
+        plain.setPeople([Self.maria])
+        #expect(plain.card(for: req, account: nil) { _ in }.prefillSubject == "Agent's subject",
+                "with no subject of its own, the agent's")
+    }
+
+    @Test("A new email's agent chat stores no turn; every other chat stores its turns")
+    func newEmailTurnsNotStored() async throws {
+        let key = ChatNewEmailField.newSessionKey()
+        #expect(ChatNewEmailField.isSessionKey(key))
+        #expect(!ChatNewEmailField.isSessionKey("inbox"))
+        #expect(!ChatNewEmailField.isSessionKey("thread:account:1"))
+        let session = ChatPillState.shared.session(for: key)
+        defer { ChatPillState.shared.removeSession(for: key) }
+        #expect(!session.storesTurns)
+        #expect(ChatPillState.Session().storesTurns, "a chat stores its turns unless it is a new email's")
+        let turn = ChatTurn(
+            id: ChatTurn.generateId(), timestamp: Date().timeIntervalSince1970 * 1000, role: "user",
+            content: "chat_converse", userMessage: "words", type: "normal", chars: 5, renderedContent: nil,
+            sessionId: key, remindersSnapshot: nil, emailContextJSON: nil, thinkingContent: nil)
+        let evicted = await session.appendTurn(turn, admission: nil)
+        #expect(evicted?.isEmpty == true, "kept in memory: nothing written, nothing evicted")
+        let pill = try Self.source("TabMail/Views/Inbox/ChatPillState.swift")
+        #expect(Self.count("func appendTurn(_ turn: ChatTurn, admission: DemoModeStore.Admission?) async -> [ChatTurn]? { // Kept in memory only: nothing is written and nothing is evicted. guard storesTurns else { return [] }", in: pill) == 1,
+                "the guard comes before any write")
+    }
+
     @Test("The chat's line names who the email is to, and is the hint before anyone is picked")
     func recipientsLine() {
         let none = ChatNewDraft.recipientsLine([])
@@ -522,9 +585,12 @@ struct ChatNewThreadTests {
         let inboxAt = try #require(pill.range(of: "return \"inbox\""))
         #expect(sessionAt.lowerBound < inboxAt.lowerBound, "its own session, before the inbox's")
         let send = try #require(pill.range(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {"))
-        let intercept = try #require(pill.range(of: "if let newEmail = field.newEmail { newEmail.send(text) return }", range: send.upperBound..<pill.endIndex))
+        let intercept = try #require(pill.range(of: "if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people }", range: send.upperBound..<pill.endIndex))
         let sent = try #require(pill.range(of: "fieldFill.apply(.sentFromField)", range: send.upperBound..<pill.endIndex))
         #expect(intercept.lowerBound < sent.lowerBound, "its Send is the chat's, before any agent send")
+        // With people picked, the words go to the agent as a reply's do, with the new email's nudge.
+        #expect(Self.count("sendAgentChat(text, field: send, newEmailTo: newEmailTo)", in: pill) == 1)
+        #expect(Self.count("} else if let newEmailTo { enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text) } else {", in: pill) == 1)
         #expect(Self.count(".task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }", in: pill) == 1)
         #expect(Self.count(".onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }", in: pill) == 1)
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
@@ -563,7 +629,7 @@ struct ChatNewThreadTests {
     private static func newEmailField() -> ChatNewEmailField {
         ChatNewEmailField(
             startWords: "", sessionKey: ChatNewEmailField.newSessionKey(),
-            wordsChanged: { _ in }, send: { _ in }, attach: { _ in })
+            wordsChanged: { _ in }, send: { _ in nil }, attach: { _ in })
     }
 
     private static func source(_ path: String) throws -> String {
