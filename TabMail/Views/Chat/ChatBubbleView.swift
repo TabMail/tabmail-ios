@@ -525,9 +525,12 @@ struct ChatSenderLine: View {
         .accessibilityHidden(true)
     }
 
+    /// The sender's name, a step larger than the "(replied only to …)" label after it.
+    static let nameFont = Font.footnote
+
     private var senderName: some View {
         Text(item.isOwn ? "You" : item.sender.name)
-            .font(.footnote)
+            .font(Self.nameFont)
             .fontWeight(.medium)
             .foregroundStyle(item.isOwn ? Theme.textSecondary : ChatAvatar.color(for: item.sender))
     }
