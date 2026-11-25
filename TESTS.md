@@ -1397,10 +1397,11 @@ reply-draft id with extra colons is refused only when its own folder was reset.
 `UndoProviderIdentitySafetyTests.undoCancelsOnlyTheSameEmailsWaitingDelete` and
 `undoCancelsAnUndosWaitingMoveOnlyForItsEmail` run an Undo against a move waiting behind an in-flight
 IMAP move at the same address: a Delete waiting behind a move back to Inbox, and an Undo waiting
-behind its own forward move. Each runs three ways: the Undo names a different email (another
-Message-ID), the same email, or an email with no Message-ID. A different email restores nothing and
-leaves the waiting move in place, and the waiting Delete is queued once the move ahead of it lands;
-the same email, or one with no Message-ID, cancels it as before, and nothing is queued.
+behind its own forward move. Each runs four ways: the Undo names a different email (another
+Message-ID), the same email, or an email with no Message-ID, or the waiting email has no Message-ID
+while the Undo names one. A different email, or a waiting email with no Message-ID, restores nothing
+and leaves the waiting move in place, and that move is queued once the move ahead of it lands; the
+same email, or an Undo with no Message-ID, cancels it as before, and nothing is queued.
 
 ## Database proof harness
 

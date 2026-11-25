@@ -52,17 +52,27 @@ enum DeferredUndoWitness: String, CaseIterable, Sendable {
     /// The Undo's email has no usable Message-ID: the address check alone
     /// decides, as before.
     case noWitness
+    /// The waiting email has no Message-ID while the Undo names one: nothing
+    /// shows the waiting move is the Undo's email, so it is not cancelled.
+    case waitingEmailHasNoId
 
     /// The Message-ID of the waiting email in both tests below.
     static let waitingRfc = "waiting@example.com"
 
+    var waitingRowRfc: String? {
+        self == .waitingEmailHasNoId ? nil : Self.waitingRfc
+    }
+
     var undoRfc: String? {
         switch self {
-        case .otherEmail: return "earlier@example.com"
+        case .otherEmail, .waitingEmailHasNoId: return "earlier@example.com"
         case .sameEmail: return Self.waitingRfc
         case .noWitness: return nil
         }
     }
+
+    /// Whether the Undo cancels the waiting move.
+    var cancels: Bool { self == .sameEmail || self == .noWitness }
 }
 
 // A3.4: `queuedInverseDiagnosticCorrelatesWithTheInsertedRow` below redirects
@@ -850,7 +860,7 @@ struct UndoProviderIdentitySafetyTests {
         // Inbox move is in flight, so its Delete waits behind that move (the
         // shape of the test above).
         var row = sourceHeader(
-            fixture, providerId: "901", rfc: DeferredUndoWitness.waitingRfc,
+            fixture, providerId: "901", rfc: witness.waitingRowRfc,
             sourcePath: "Trash", sourceEpoch: nil)
         row.folderId = MessageIdentity.folderId(
             accountId: fixture.accountId, folderPath: "INBOX")
@@ -876,13 +886,12 @@ struct UndoProviderIdentitySafetyTests {
         let pending = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
         #expect(pending.map(\.id) == [moveBack.id], "the Undo queued a move of its own")
         let remaining = await manager.deferredMoveSuccessorCountForTesting()
-        switch witness {
-        case .otherEmail:
-            #expect(restored.isEmpty, "an Undo for another email restored \(restored)")
-            #expect(remaining == 1, "an Undo for another email cancelled the waiting email's Delete")
-        case .sameEmail, .noWitness:
+        if witness.cancels {
             #expect(restored == [insertedRow.id])
             #expect(remaining == 0)
+        } else {
+            #expect(restored.isEmpty, "an Undo for another email restored \(restored)")
+            #expect(remaining == 1, "an Undo for another email cancelled the waiting email's Delete")
         }
 
         // Once the move ahead lands, the waiting email's Delete is queued
@@ -893,14 +902,14 @@ struct UndoProviderIdentitySafetyTests {
         await manager.materializeDeferredMoveSuccessors(after: moveBack, result: result)
         await manager.awaitWriteQueueDrain()
         let settled = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
-        if witness == .otherEmail {
+        if witness.cancels {
+            #expect(settled.isEmpty, "a cancelled Delete was queued")
+        } else {
             #expect(settled.count == 1, "the waiting email's Delete was not queued: \(settled.count) ops")
             guard settled.count == 1 else { return }
             #expect(settled[0].messageIds == ["102"])
             #expect(settled[0].folderPath == "INBOX")
             #expect(settled[0].destinationPath == "Trash")
-        } else {
-            #expect(settled.isEmpty, "a cancelled Delete was queued")
         }
         await manager.clearDeferredMoveSuccessorsForTesting()
     }
@@ -918,7 +927,7 @@ struct UndoProviderIdentitySafetyTests {
         await manager.clearDeferredMoveSuccessorsForTesting()
 
         let original = sourceHeader(
-            fixture, providerId: "101", rfc: DeferredUndoWitness.waitingRfc)
+            fixture, providerId: "101", rfc: witness.waitingRowRfc)
         try installOptimisticallyMoved(original, pool: fixture.pool)
         let forward = try await insertInFlightMove(
             fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
@@ -943,16 +952,34 @@ struct UndoProviderIdentitySafetyTests {
             members: [UndoMember(header: undone)])
 
         let remaining = await manager.deferredMoveSuccessorCountForTesting()
-        switch witness {
-        case .otherEmail:
-            #expect(secondUndo.isEmpty, "an Undo for another email restored \(secondUndo)")
-            #expect(remaining == 1, "an Undo for another email cancelled this email's waiting move")
-        case .sameEmail, .noWitness:
+        if witness.cancels {
             #expect(secondUndo == [original.id])
             #expect(remaining == 0)
+        } else {
+            #expect(secondUndo.isEmpty, "an Undo for another email restored \(secondUndo)")
+            #expect(remaining == 1, "an Undo for another email cancelled this email's waiting move")
         }
         let pending = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
         #expect(pending.map(\.id) == [forward.id], "the second Undo queued a move of its own")
+
+        // Once the forward move lands, the waiting move back to Inbox is
+        // queued exactly when it was not cancelled (the shape of
+        // `copyUidMaterializesDeferredInverse`).
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "101",
+            destinationId: "901", destinationEpoch: 52)
+        await manager.materializeDeferredMoveSuccessors(after: forward, result: result)
+        await manager.awaitWriteQueueDrain()
+        let settled = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        if witness.cancels {
+            #expect(settled.isEmpty, "a cancelled move back was queued")
+        } else {
+            #expect(settled.count == 1, "the waiting move back was not queued: \(settled.count) ops")
+            guard settled.count == 1 else { return }
+            #expect(settled[0].messageIds == ["901"])
+            #expect(settled[0].folderPath == "Archive")
+            #expect(settled[0].destinationPath == "INBOX")
+        }
         await manager.clearDeferredMoveSuccessorsForTesting()
     }
 
