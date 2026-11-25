@@ -140,12 +140,16 @@ enum FolderEpochTestFixture {
 
     /// Real `DatabasePool`-backed `AppDatabase` (runs all migrations) swapped into
     /// the shared slot so `SyncEngine.dbPool` / `AppDatabase.dbPool` hit the test DB.
-    /// Idiom copied from the sibling `StaleProtectionTests.makeAppDB`.
-    static func makeAppDB() throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
+    /// Idiom copied from the sibling `StaleProtectionTests.makeAppDB`. With `trace`, every
+    /// connection hands it each statement it runs, its SQL as written (`Database.trace`).
+    static func makeAppDB(trace: (@Sendable (String) -> Void)? = nil) throws -> (pool: DatabasePool, dir: URL, previous: AppDatabase?) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var config = Configuration()
         config.foreignKeysEnabled = true
+        if let trace {
+            config.prepareDatabase { db in db.trace(options: .statement) { trace($0.description) } }
+        }
         let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
         let appDb = try AppDatabase(dbPool: pool)
         let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
