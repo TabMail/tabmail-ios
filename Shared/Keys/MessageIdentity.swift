@@ -112,6 +112,9 @@ public enum MessageIdentity {
     ///   entirely by this guard.
     /// * `AccountManager.purgeBodyAssetsForFolder` — the
     ///   `BodyAssetStore` manifest, matched entirely by this guard.
+    /// * `AccountManager.uidValidityResetPurgeTxn`'s `messageBody` delete — matched
+    ///   by this guard, and the bodies of the folder's own headers whose tail holds
+    ///   a `:` are then deleted by key, their ids read through the folder relation.
     /// * `SearchIndex.removeMessagesForFolder`'s **H-2 orphan sweep** of
     ///   `message_ids` — but NOT that function's primary delete.
     /// * The in-memory queue filters in `ActiveBodyQueue` / `BackfillBodyQueue` and

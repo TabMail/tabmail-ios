@@ -237,9 +237,11 @@ struct DraftPlaceholderFolderPurgeTests {
         #expect(replyDraftId.contains(":"), "fixture precondition: a reply draft key is colon-joined")
 
         // 2. OVER-REFUSAL CONTROL A — a NORMAL (new) compose. ComposeView seeds
-        //    `draftId` with a bare UUID, so its placeholder tail is colon-free and
-        //    it was purged correctly even BEFORE the fix. If this goes red the
-        //    purge itself broke.
+        //    `draftId` with a bare UUID, so its draft KEY is colon-free. Its
+        //    placeholder still ends in `:<epoch>:<count>`
+        //    (`PendingOperation.draftPlaceholderMessageId`), so its header id tail
+        //    holds a `:` like the reply draft's, and its body goes by the same
+        //    key delete. If this goes red the purge itself broke.
         let plainDraftId = UUID().uuidString
         #expect(!plainDraftId.contains(":"), "fixture precondition: a new-compose draft key is colon-free")
 
@@ -304,6 +306,8 @@ struct DraftPlaceholderFolderPurgeTests {
         #expect(try await chatMappingExists(pool, realId: siblingHeaderId))
         #expect(try await messageBodyExists(pool, contentKey: replyHeaderId),
                 "precondition: the reply draft body must exist")
+        #expect(try await messageBodyExists(pool, contentKey: plainHeaderId),
+                "precondition: the new-compose draft body must exist")
 
         let scopedBefore = try await SearchIndex.shared.keywordSearch(
             query: "zanzibarquixotic",
@@ -338,6 +342,8 @@ struct DraftPlaceholderFolderPurgeTests {
                 "over-refusal control: a normal draft must still be purged")
         #expect(try await chatMappingExists(pool, realId: plainHeaderId) == false,
                 "over-refusal control: a normal draft's chat mapping must still be purged")
+        #expect(try await messageBodyExists(pool, contentKey: plainHeaderId) == false,
+                "a new-compose draft's body must not survive its folder's purge")
         #expect(try await isInFTS(syncedHeaderId) == false,
                 "over-refusal control: an ordinary synced message must still be purged")
 

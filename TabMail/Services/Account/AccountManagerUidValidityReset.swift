@@ -670,10 +670,10 @@ extension AccountManager {
     /// move still in flight (a row keeps its source id until the drain re-keys it,
     /// ADR-IOS-061) differ:
     /// - a message moving OUT of this folder keeps its header (its `folderId` is the
-    ///   destination, so the header delete leaves it), but its id is in the range, so
-    ///   its HTML is deleted and the trigger clears its pair. Its address is in the
-    ///   renumbered space, so the cached HTML is no longer trusted (as for every id
-    ///   in the range);
+    ///   destination, so the header delete leaves it), but its id is in the range (when
+    ///   its tail holds no `:`), so its HTML is deleted and the trigger clears its
+    ///   pair. Its address is in the renumbered space, so the cached HTML is no longer
+    ///   trusted (as for every id in the range);
     /// - a message moving INTO this folder from another one loses its header (its
     ///   `folderId` is this folder), but its id names the source folder, outside the
     ///   range, so its HTML stays with no header. Only the same message, at the same
