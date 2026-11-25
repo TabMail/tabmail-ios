@@ -111,6 +111,15 @@ enum ChatViewLayout {
     static let swipeCircleSize: CGFloat = 44
     /// A swipe past this share of the width runs the edge button (a full swipe archives).
     static let swipeFullFraction: CGFloat = 0.6
+    /// While a drag is past the full-swipe point the edge button's round icon grows to this scale,
+    /// the hint that letting go runs it.
+    static let swipeFullIconScale: CGFloat = 1.3
+    /// The response of the spring the edge button's icon grows and shrinks with, in seconds, and its
+    /// damping (under 1, so the icon pops a little as it grows).
+    static let swipeFullIconSpringResponse: Double = 0.25
+    static let swipeFullIconSpringDamping: Double = 0.6
+    /// A swipe button's label stays on one line, shrinking down to this scale before it truncates.
+    static let swipeLabelMinScale: CGFloat = 0.7
     /// A let-go faster than this (points a second) opens or closes the swipe whatever its distance.
     static let swipeFlickVelocity: CGFloat = 600
     /// How long a let-go swipe keeps holding data that lands (`ChatSwipeHold`): the swipe's spring
