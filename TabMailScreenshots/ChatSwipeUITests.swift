@@ -6,7 +6,7 @@ import UIKit
 import XCTest
 
 /// Real drags on a real chat (ADR-IOS-114 decision 12), as Mail does it:
-///  - A rightward drag that starts on a bubble never goes back.
+///  - A rightward drag that starts on a bubble never goes back; a full one runs its read action.
 ///  - With nothing open, a drag from the screen's left edge goes back.
 ///  - While a bubble's actions or the chat's buttons are open, only that reveal takes sideways
 ///    drags; any drag or tap anywhere else (another bubble, the reply field, the header, the
@@ -33,12 +33,17 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertFalse(app.buttons["Sheet Grabber"].exists, "the swipe opened no card")
     }
 
+    /// The open bubble takes the drag, never the back swipe: from open, the drag carries it past the
+    /// full-swipe point, so it runs its edge button, Unread from here, and closes.
     func testOwnActionsOpenRightDragStaysInTheChat() {
         let app = launchIntoChat()
+        XCTAssertFalse(unreadLine(in: app).exists, "control: every email is read, so no Unread line")
         openBubble(2, in: app)
         dragRight(on: bubble(2, in: app), in: app)
         XCTAssertTrue(isInChat(app), "the chat stays")
-        XCTAssertTrue(bubbleActionsShow(app), "the open bubble followed the drag and stays open")
+        XCTAssertTrue(unreadLine(in: app).waitForExistence(timeout: 3),
+                      "the open bubble followed the drag past its full-swipe point: Unread from here ran")
+        XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "and it closed")
     }
 
     func testOwnActionsOpenShortDragBackStaysOpen() {
@@ -58,6 +63,21 @@ final class ChatSwipeUITests: XCTestCase {
         openBubble(2, in: app)
         app.buttons["Move"].tap()
         XCTAssertTrue(app.navigationBars["Move to"].waitForExistence(timeout: 5), "the open bubble's Move runs")
+    }
+
+    /// A full right swipe on a read bubble runs its edge button, Unread from here, as a full left
+    /// swipe archives: the Unread line shows above it, and nothing stays open.
+    func testFullRightSwipeOnABubbleRunsUnreadFromHere() {
+        let app = launchIntoChat()
+        let unread = unreadLine(in: app)
+        XCTAssertFalse(unread.exists, "control: every email is read, so no Unread line")
+        let dy = bubble(2, in: app).frame.midY / app.frame.height
+        // From just past the back swipe's edge zone to the far side: past the full-swipe point.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: dy))
+            .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: dy)))
+        XCTAssertTrue(isInChat(app), "the chat stays")
+        XCTAssertTrue(unread.waitForExistence(timeout: 3), "the full swipe ran Unread from here")
+        XCTAssertTrue(app.buttons["Move"].waitForNonExistence(timeout: 3), "and nothing stays open")
     }
 
     func testOtherBubbleOpenRightDragOnlyCloses() {
@@ -2034,6 +2054,11 @@ final class ChatSwipeUITests: XCTestCase {
 
     private func bubbleActionsShow(_ app: XCUIApplication) -> Bool {
         app.buttons["Move"].waitForExistence(timeout: 3)
+    }
+
+    /// The chat's "Unread" line, which shows once a bubble's email is unread.
+    private func unreadLine(in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Unread")).firstMatch
     }
 
     private func openBubble(_ index: Int, in app: XCUIApplication) {

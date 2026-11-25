@@ -153,7 +153,7 @@ struct ChatSwipeTests {
         #expect(Self.settle(-(half + 1)) == .open)
         #expect(Self.settle(-(full - 1)) == .open)
         #expect(Self.settle(-(full + 1)) == .full)
-        #expect(Self.settle(-(full + 1), allowsFull: false) == .open, "a bubble has no full swipe")
+        #expect(Self.settle(-(full + 1), allowsFull: false) == .open, "with no full swipe (a chat with no Inbox copy) it only opens")
         #expect(Self.settle(full + 1, sign: 1) == .full, "a right swipe opens the other way")
         #expect(Self.settle(full + 1) == .closed, "the wrong way never opens")
     }
@@ -191,6 +191,33 @@ struct ChatSwipeTests {
         #expect(ChatSwipe.clamp(50, sign: -1, revealWidth: Self.reveal, width: Self.width, allowsFull: true) == 0)
         #expect(ChatSwipe.clamp(-40, sign: -1, revealWidth: Self.reveal, width: Self.width, allowsFull: true) == -40)
         #expect(ChatSwipe.clamp(40, sign: 1, revealWidth: Self.reveal, width: Self.width, allowsFull: false) == 40)
+        // A right swipe with a full swipe (a bubble's) runs on to the width, past the buttons.
+        #expect(ChatSwipe.clamp(1000, sign: 1, revealWidth: Self.reveal, width: Self.width, allowsFull: true) == Self.width)
+    }
+
+    @Test("The full-swipe hint shows exactly while a finished let-go would run the edge button, at any speed, both ways")
+    func fullSwipeHintMatchesTheLetGo() {
+        let full = Self.width * ChatViewLayout.swipeFullFraction
+        let flick = ChatViewLayout.swipeFlickVelocity + 1
+        #expect(!ChatSwipe.isPastFull(offset: -full, sign: -1, width: Self.width, allowsFull: true), "at the point: not yet")
+        #expect(ChatSwipe.isPastFull(offset: -(full + 1), sign: -1, width: Self.width, allowsFull: true))
+        #expect(ChatSwipe.isPastFull(offset: full + 1, sign: 1, width: Self.width, allowsFull: true), "a right swipe the other way")
+        #expect(!ChatSwipe.isPastFull(offset: full + 1, sign: -1, width: Self.width, allowsFull: true), "the wrong way never")
+        #expect(!ChatSwipe.isPastFull(offset: -Self.width, sign: -1, width: Self.width, allowsFull: false), "no full swipe, no hint")
+        #expect(!ChatSwipe.isPastFull(offset: -1, sign: -1, width: 0, allowsFull: true), "before the width is known, no hint")
+        for sign in [CGFloat(-1), 1] {
+            for allowsFull in [true, false] {
+                for step in 0...40 {
+                    let offset = sign * Self.width * CGFloat(step) / 40
+                    for velocity in [-flick, 0, flick] {
+                        let runs = ChatSwipe.settle(offset: offset, velocity: velocity, sign: sign, revealWidth: Self.reveal,
+                                                    width: Self.width, allowsFull: allowsFull, finished: true) == .full
+                        #expect(ChatSwipe.isPastFull(offset: offset, sign: sign, width: Self.width, allowsFull: allowsFull) == runs,
+                                "offset \(offset), sign \(sign), velocity \(velocity), allowsFull \(allowsFull)")
+                    }
+                }
+            }
+        }
     }
 
     /// A pan whose event the test sets: UIKit's own recognizer type, as the swipe receives it.
@@ -285,6 +312,33 @@ struct ChatSwipeTests {
                 "a reveal torn down mid-drag lets go of the id it held")
     }
 
+    @Test("Past the full-swipe point the edge button's icon grows and a haptic marks the crossing; a full swipe's run has its own haptic; labels stay on one line")
+    func fullSwipeFeelWiring() throws {
+        let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
+        #expect(text.contains("private var isPastFull: Bool { ChatSwipe.isPastFull(offset: drag.offset, sign: sign, width: width, allowsFull: allowsFullSwipe) }"),
+                "the hint reads the same rule as the let-go")
+        #expect(text.contains(".sensoryFeedback(.impact(weight: .medium), trigger: isPastFull) { _, past in past }"),
+                "one haptic as the drag crosses into the full swipe, none on the way back")
+        #expect(text.contains(".sensoryFeedback(.success, trigger: fullSwipes)"))
+        let ended = try Self.body(of: "private func ended(_ velocity: CGFloat, finished: Bool) {", in: text)
+        #expect(ended.contains("case .full: close() fullSwipes += 1 edgeButton?.action()"), "the run's haptic goes with the full swipe only")
+        #expect(Self.count("fullSwipes += 1", in: text) == 1)
+        #expect(text.contains(".scaleEffect(button.id == edgeButton?.id && isPastFull ? ChatViewLayout.swipeFullIconScale : 1)"),
+                "only the edge button's icon grows, and only past the point")
+        #expect(text.contains("HStack(alignment: .top, spacing: 0) { ForEach(buttons) { button in buttonView(button) } }"),
+                "the round buttons sit in one row")
+        #expect(text.contains(".padding(.vertical, ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2) .frame(width: abs(drag.offset), alignment: edge == .trailing ? .leading : .trailing) .clipped()"),
+                "the clip leaves room for the grown icon above and below, never flattening it")
+        #expect(text.contains(".lineLimit(1) .minimumScaleFactor(ChatViewLayout.swipeLabelMinScale)"), "a label never wraps")
+        #expect(!text.contains(".lineLimit(2)"))
+        #expect(ChatViewLayout.swipeFullIconScale > 1)
+        #expect(ChatViewLayout.swipeLabelMinScale > 0 && ChatViewLayout.swipeLabelMinScale < 1)
+    }
+
+    private static func count(_ needle: String, in text: String) -> Int {
+        text.components(separatedBy: needle).count - 1
+    }
+
     @Test("The chat slides left for Trash then Archive, with a full swipe, acting on the whole chat; with no Inbox copy, Trash only and no full swipe")
     func chatSwipeWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
@@ -298,8 +352,8 @@ struct ChatSwipeTests {
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
         // A prefix: the bubble's own actions may follow (the avatar's "Copy Address", CopyAddressTests).
         #expect(bubble.contains(".accessibilityAddTraits(.isButton) .accessibilityActions { ForEach(actions) { action in Button(action.title, action: action.action) }"))
-        #expect(text.contains("allowsFullSwipe: false, open: swipeOpen)) .id(item.id)"), "control: the bubble's row, as the next check reads it")
-        #expect(!text.contains("allowsFullSwipe: false, open: swipeOpen)) .accessibilityActions"), "no actions on the whole row")
+        #expect(text.contains("allowsFullSwipe: true, open: swipeOpen)) .id(item.id)"), "control: the bubble's row, as the next check reads it")
+        #expect(!text.contains("allowsFullSwipe: true, open: swipeOpen)) .accessibilityActions"), "no actions on the whole row")
         let swipe = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
         #expect(!swipe.contains(".accessibilityActions"), "the reveal names no actions on what it slides")
         let buttons = try Self.body(of: "private func chatSwipeButtons(offersArchive: Bool) -> [ChatSwipeButton] {", in: text)
@@ -325,8 +379,13 @@ struct ChatSwipeTests {
     @Test("A bubble slides right for its read action and Move, and the read action moves the Unread line")
     func bubbleSwipeWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
-        #expect(text.contains("id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread), allowsFullSwipe: false, open: swipeOpen))"))
+        #expect(text.contains("id: item.id, edge: .leading, buttons: bubbleSwipeButtons(item, thread: thread), allowsFullSwipe: true, open: swipeOpen))"),
+                "a full right swipe runs the bubble's edge button, as a full left swipe archives")
         let buttons = try Self.body(of: "private func bubbleSwipeButtons(_ item: ChatThread.Item, thread: ChatThread) -> [ChatSwipeButton] {", in: text)
+        // A right swipe's edge is its first button: the read action, so the full swipe runs it.
+        let readButton = try #require(buttons.range(of: "setRead(action, at: item, thread: thread)"))
+        let moveButton = try #require(buttons.range(of: "title: \"Move\""))
+        #expect(readButton.lowerBound < moveButton.lowerBound, "the read action sits at the edge, Move after it")
         #expect(buttons.contains("let action = ChatSwipe.ReadAction(for: item.header)"))
         #expect(buttons.contains("setRead(action, at: item, thread: thread)"))
         #expect(buttons.contains("title: \"Move\""))
