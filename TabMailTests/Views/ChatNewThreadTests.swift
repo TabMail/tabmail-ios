@@ -170,7 +170,7 @@ struct ChatNewThreadTests {
             mode: .compose, replyTo: nil, to: ["someone@example.com"], cc: [], bcc: [], subject: "Agent's subject",
             body: "The email.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat))
         let card = model.card(for: req, account: nil) { _ in }
-        #expect(card.prefillTo == ["Maria <maria@example.com>"], "To is the chat's people, as a save writes them")
+        #expect(card.prefillTo == ["\"Maria\" <maria@example.com>"], "To is the chat's people, as a save writes them")
         #expect(card.prefillCc == ["lee@example.com"])
         #expect(card.prefillBcc == ["sam@example.com"])
         #expect(card.prefillSubject == "Lunch", "the link's subject, not the agent's")
