@@ -150,7 +150,8 @@ struct GmailReplyDraftThreadTests {
         try await withInstalledPool { pool in
             let parent = try await pool.write { try Self.insertParent($0) }
             let sendBinding = ThreadUtils.outgoingThreadHeaders(
-                replyTo: parent, sendAccountId: Self.accountId, sendSubject: subject, providerKind: .gmail)
+                replyTo: parent, isForward: false, sendAccountId: Self.accountId, sendSubject: subject,
+                providerKind: .gmail)
             if subject.hasSuffix(Self.parentSubject) {
                 #expect(sendBinding.threadId == Self.parentThreadId, "fixture: Send threads this reply")
             } else {
@@ -188,7 +189,8 @@ struct GmailReplyDraftThreadTests {
             }
             let subject = "Re: \(Self.parentSubject)"
             let sendBinding = ThreadUtils.outgoingThreadHeaders(
-                replyTo: parent, sendAccountId: otherAccountId, sendSubject: subject, providerKind: .gmail)
+                replyTo: parent, isForward: false, sendAccountId: otherAccountId, sendSubject: subject,
+                providerKind: .gmail)
             #expect(sendBinding.threadId == nil, "fixture: Send from the other account binds no thread")
 
             let uploads = try await Self.createThenUpdate(

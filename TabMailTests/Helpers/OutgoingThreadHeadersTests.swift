@@ -23,7 +23,8 @@ struct OutgoingThreadHeadersTests {
         parentSubject: String = "Project update",
         sendAccountId: String = "acct-1",
         sendSubject: String = "Re: Project update",
-        provider: AccountProvider = .gmail
+        provider: AccountProvider = .gmail,
+        isForward: Bool = false
     ) -> ThreadUtils.OutgoingThreadHeaders {
         ThreadUtils.outgoingThreadHeaders(
             parentRfc822MessageId: parentRfc822,
@@ -31,6 +32,7 @@ struct OutgoingThreadHeadersTests {
             parentThreadId: parentThreadId,
             parentAccountId: parentAccountId,
             parentSubject: parentSubject,
+            isForward: isForward,
             sendAccountId: sendAccountId,
             sendSubject: sendSubject,
             providerKind: provider
@@ -42,7 +44,7 @@ struct OutgoingThreadHeadersTests {
     @Test("nil replyTo (new compose) → empty headers")
     func newCompose() {
         let h = ThreadUtils.outgoingThreadHeaders(
-            replyTo: nil, sendAccountId: "acct-1", sendSubject: "Hello", providerKind: .gmail)
+            replyTo: nil, isForward: false, sendAccountId: "acct-1", sendSubject: "Hello", providerKind: .gmail)
         #expect(h == .none)
         #expect(h.inReplyTo == nil)
         #expect(h.references.isEmpty)
@@ -131,21 +133,69 @@ struct OutgoingThreadHeadersTests {
         #expect(headers(parentRfc822: "<>").inReplyTo == nil)
     }
 
-    // MARK: - Forward derives the SAME headers as reply (Gmail convention, D2)
+    // MARK: - Forward: same References + threadId as a reply, NO In-Reply-To (#1483)
 
-    @Test("Forward (Fwd: subject) derives identical headers to reply, incl. threadId")
-    func forwardSameAsReply() {
+    @Test("Forward (Fwd: subject) keeps the reply's References and threadId but carries no In-Reply-To")
+    func forwardHasNoInReplyTo() {
         let reply = headers(sendSubject: "Re: Project update")
-        let forward = headers(sendSubject: "Fwd: Project update")
-        #expect(forward == reply)
+        let forward = headers(sendSubject: "Fwd: Project update", isForward: true)
+        #expect(forward.inReplyTo == nil)
+        #expect(forward.references == reply.references)
+        #expect(forward.threadId == reply.threadId)
         #expect(forward.threadId == "thread-123")
-        #expect(forward.inReplyTo == "parent@example.com")
         #expect(forward.references == ["parent@example.com"])
+    }
+
+    @Test("Forward mid-thread: References = parent chain ++ original id, original LAST")
+    func forwardMidThreadOriginalLast() {
+        let h = headers(
+            parentRfc822: "msg3@example.com",
+            parentRefs: ["msg1@example.com", "msg2@example.com"],
+            sendSubject: "Fwd: Project update",
+            isForward: true
+        )
+        #expect(h.inReplyTo == nil)
+        #expect(h.references == ["msg1@example.com", "msg2@example.com", "msg3@example.com"])
+    }
+
+    @Test("Forward of a parent whose own chain lists its id early still ends with that id; a reply keeps today's chain")
+    func forwardMovesOriginalIdLast() {
+        let parentRefs = ["msg2@example.com", "msg1@example.com"]
+        let reply = headers(parentRfc822: "msg2@example.com", parentRefs: parentRefs)
+        let forward = headers(
+            parentRfc822: "msg2@example.com", parentRefs: parentRefs,
+            sendSubject: "Fwd: Project update", isForward: true)
+        // A reply's chain is byte-for-byte today's: the parent id was already
+        // listed, so nothing is appended.
+        #expect(reply.inReplyTo == "msg2@example.com")
+        #expect(reply.references == ["msg2@example.com", "msg1@example.com"])
+        // A forward names its original only through References: it must be last.
+        #expect(forward.inReplyTo == nil)
+        #expect(forward.references == ["msg1@example.com", "msg2@example.com"])
+    }
+
+    @Test("Forward of a parent without a Message-ID: no In-Reply-To, References = parent chain only")
+    func forwardParentNoId() {
+        let h = headers(
+            parentRfc822: nil, parentRefs: ["msg1@example.com"],
+            sendSubject: "Fwd: Project update", isForward: true)
+        #expect(h.inReplyTo == nil)
+        #expect(h.references == ["msg1@example.com"])
+    }
+
+    @Test("Forward carries no In-Reply-To on every provider")
+    func forwardNoInReplyToEveryProvider() {
+        for provider in [AccountProvider.gmail, .imap, .outlook] {
+            let h = headers(sendSubject: "Fwd: Project update", provider: provider, isForward: true)
+            #expect(h.inReplyTo == nil, "provider \(provider) forward must not carry In-Reply-To")
+            #expect(h.references == ["parent@example.com"])
+        }
     }
 
     @Test("Forward of an Fw: prefixed parent still matches via normalization")
     func forwardPrefixNormalization() {
-        let h = headers(parentSubject: "Re: Project update", sendSubject: "Fwd: Project update")
+        let h = headers(
+            parentSubject: "Re: Project update", sendSubject: "Fwd: Project update", isForward: true)
         #expect(h.threadId == "thread-123")
     }
 
@@ -212,6 +262,7 @@ struct OutgoingThreadHeadersTests {
 
         let viaAdapter = ThreadUtils.outgoingThreadHeaders(
             replyTo: parent,
+            isForward: false,
             sendAccountId: "acct-1",
             sendSubject: "Re: Project update",
             providerKind: .gmail
@@ -222,6 +273,7 @@ struct OutgoingThreadHeadersTests {
             parentThreadId: "thread-123",
             parentAccountId: "acct-1",
             parentSubject: "Project update",
+            isForward: false,
             sendAccountId: "acct-1",
             sendSubject: "Re: Project update",
             providerKind: .gmail
@@ -230,5 +282,17 @@ struct OutgoingThreadHeadersTests {
         #expect(viaAdapter.inReplyTo == "parent@example.com")
         #expect(viaAdapter.references == ["msg1@example.com", "parent@example.com"])
         #expect(viaAdapter.threadId == "thread-123")
+
+        // The adapter passes the forward flag through to the core.
+        let forwardViaAdapter = ThreadUtils.outgoingThreadHeaders(
+            replyTo: parent,
+            isForward: true,
+            sendAccountId: "acct-1",
+            sendSubject: "Fwd: Project update",
+            providerKind: .gmail
+        )
+        #expect(forwardViaAdapter.inReplyTo == nil)
+        #expect(forwardViaAdapter.references == ["msg1@example.com", "parent@example.com"])
+        #expect(forwardViaAdapter.threadId == "thread-123")
     }
 }

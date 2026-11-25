@@ -37,15 +37,21 @@ struct GmailSendBodyTests {
         #expect(body["raw"] as? String != nil)
     }
 
-    @Test("Forward with a threadId also carries it (forward threads like reply)")
+    /// A forward carries the original only in References, no In-Reply-To
+    /// (#1483); with its threadId and "Fwd:" subject Gmail files it in the
+    /// original's conversation (checked live on a Workspace account, 2026-11-25).
+    @Test("Forward with a threadId also carries it (forward threads like reply), and its raw has References but no In-Reply-To")
     func forwardIncludesThreadId() {
         let draft = DraftMessage(
             to: ["bob@example.com"], subject: "Fwd: Hello", body: "FYI",
-            inReplyTo: "parent@example.com", references: ["parent@example.com"],
+            references: ["parent@example.com"],
             threadId: "gmail-thread-xyz"
         )
         let body = makeProvider().buildSendBody(draft: draft)
         #expect(body["threadId"] as? String == "gmail-thread-xyz")
+        let mime = decodeRaw(body["raw"] as? String ?? "")
+        #expect(mime.contains("References: <parent@example.com>"))
+        #expect(!mime.contains("In-Reply-To:"))
     }
 
     @Test("New compose (no threadId) omits the threadId key entirely")

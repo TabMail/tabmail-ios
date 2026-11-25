@@ -227,6 +227,10 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// server does; CREATE is then the only way to make one. Off for every
         /// pre-existing test, where any name SELECTs and APPEND makes it.
         var requireExistingMailboxes = false
+        /// When set, ENVELOPE carries the message's own In-Reply-To (RFC 3501
+        /// §7.4.2), read from its stored header, as a real server reports it. Off
+        /// for every pre-existing test, whose envelopes carry NIL there.
+        var envelopeCarriesInReplyTo = false
         /// Per-mailbox UIDVALIDITY reported by SELECT/EXAMINE (RFC 3501
         /// §2.3.1.1). Missing entry defaults to 1 — every pre-existing test
         /// relies on that fixed value, so this is purely additive. ADR-IOS-060
@@ -1382,6 +1386,12 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// real server does, so only CREATE can bring one into being.
     func requireExistingMailboxes() {
         withState { $0.requireExistingMailboxes = true }
+    }
+
+    /// ENVELOPE carries each message's In-Reply-To from its stored header, as a
+    /// real server's does, so a synced copy names the message it replies to.
+    func reportInReplyToInEnvelopes() {
+        withState { $0.envelopeCarriesInReplyTo = true }
     }
 
     /// Whether `mailbox` exists: it has an entry (possibly empty) and was not
@@ -3698,7 +3708,8 @@ final class FakeIMAPServer: @unchecked Sendable {
                 internalDateSuppressed: state.fetchInternalDateSuppressedByMailbox[mailbox] ?? [],
                 recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? [],
                 conflicting: state.conflictingFetchRecordByMailbox[mailbox],
-                unsolicited: state.unsolicitedFetchByMailbox.removeValue(forKey: mailbox) ?? [:]
+                unsolicited: state.unsolicitedFetchByMailbox.removeValue(forKey: mailbox) ?? [:],
+                envelopeInReplyTo: state.envelopeCarriesInReplyTo
             )
         }
         passHeldGate(Self.snapshotGateKey(mailbox))
@@ -3752,7 +3763,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 fetchItems.append("MODSEQ (\(modSeq))")
             }
             if itemsStr.contains("ENVELOPE") {
-                fetchItems.append("ENVELOPE \(buildEnvelope(msg))")
+                fetchItems.append("ENVELOPE \(buildEnvelope(msg, inReplyTo: snapshot.envelopeInReplyTo))")
             }
             // `suppressFetchInternalDate(in:uids:)` — the record still arrives, and
             // every other item is unchanged; only the server's delivery timestamp
@@ -3845,14 +3856,32 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     // MARK: - Response Builders
 
-    private func buildEnvelope(_ msg: Message) -> String {
+    private func buildEnvelope(_ msg: Message, inReplyTo: Bool) -> String {
         if let envelope = msg.customEnvelope { return envelope }
         let date = quote(msg.date)
         let subject = quote(msg.subject)
         let fromAddr = buildAddrList(msg.from)
         let toAddr = buildAddrList(msg.to)
         let msgID = quote(msg.messageID)
-        return "(\(date) \(subject) \(fromAddr) \(fromAddr) \(fromAddr) \(toAddr) NIL NIL NIL \(msgID))"
+        let inReplyToField = inReplyTo
+            ? (Self.unfoldedHeaderValue("In-Reply-To", in: msg.headerData).map(quote) ?? "NIL")
+            : "NIL"
+        return "(\(date) \(subject) \(fromAddr) \(fromAddr) \(fromAddr) \(toAddr) NIL NIL \(inReplyToField) \(msgID))"
+    }
+
+    /// The unfolded value (RFC 5322 §2.2.3) of the first `name` field in a CRLF
+    /// header block, or nil when it is absent or empty.
+    static func unfoldedHeaderValue(_ name: String, in headerData: Data) -> String? {
+        let unfolded = String(decoding: headerData, as: UTF8.self)
+            .replacingOccurrences(of: "\r\n ", with: " ")
+            .replacingOccurrences(of: "\r\n\t", with: " ")
+        for line in unfolded.components(separatedBy: "\r\n") {
+            guard let colon = line.firstIndex(of: ":"),
+                  line[..<colon].caseInsensitiveCompare(name) == .orderedSame else { continue }
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
+        }
+        return nil
     }
 
     private func buildAddrList(_ header: String) -> String {

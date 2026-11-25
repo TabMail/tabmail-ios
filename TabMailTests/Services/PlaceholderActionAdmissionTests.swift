@@ -273,7 +273,9 @@ struct PlaceholderActionAdmissionTests {
                 draft: DraftMessage(
                     to: ["sender@example.com"],
                     subject: "\(isForward ? "Fwd" : "Re"): \(header.subject)", body: "reply",
-                    inReplyTo: "<\(header.rfc822MessageId ?? "")>"),
+                    // A forward names its original only as its last References id (#1483).
+                    inReplyTo: isForward ? nil : "<\(header.rfc822MessageId ?? "")>",
+                    references: isForward ? [header.rfc822MessageId ?? ""] : []),
                 originalMessageHeaderId: header.id,
                 isForward: isForward)
             outbox.status = OutboxStatus.sending.rawValue

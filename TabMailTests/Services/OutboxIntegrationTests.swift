@@ -651,6 +651,9 @@ struct OutboxCompletionMarksOriginalTests {
 
     /// Seeds a sent, Sent-appended outbox row naming `originalId` and runs the
     /// completion step on it, as the drain and the foreground reconcile do.
+    /// `inReplyTo` is the original's Message-ID as the send carries it: a reply's
+    /// In-Reply-To, a forward's last References id (a forward has no In-Reply-To,
+    /// #1483).
     static func complete(
         _ db: DatabaseQueue, originalId: String?, inReplyTo: String?, isForward: Bool
     ) throws -> CompletedSendCleanupDisposition {
@@ -658,7 +661,8 @@ struct OutboxCompletionMarksOriginalTests {
             accountId: "acc1",
             draft: DraftMessage(
                 to: ["to@example.com"], subject: isForward ? "Fwd: Test" : "Re: Test",
-                inReplyTo: inReplyTo),
+                inReplyTo: isForward ? nil : inReplyTo,
+                references: isForward ? (inReplyTo.map { [$0] } ?? []) : []),
             originalMessageHeaderId: originalId,
             isForward: isForward)
         outbox.status = OutboxStatus.sending.rawValue
@@ -729,6 +733,115 @@ struct OutboxCompletionMarksOriginalTests {
         #expect(markForwardedOps == 1)
         let setTagOps = try Self.opCount(db, .setTag)
         #expect(setTagOps == 0)
+        #expect(disposition.changedOriginalHeaderId == header.id)
+    }
+
+    /// A forward still in the Outbox when the app updates was queued with the
+    /// original in BOTH In-Reply-To and References (the builder before #1483
+    /// appended the original's id to References last, as it still does). The
+    /// completion reads a forward's original from References, so it is still
+    /// marked forwarded, never replied.
+    @Test("A forward queued before forwards dropped In-Reply-To still marks its original forwarded")
+    func forwardQueuedWithInReplyToStillMarksForwarded() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "210", rfc822MessageId: "<old-fwd@example.com>", actionTag: .reply)
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: "Fwd: Test",
+                inReplyTo: "old-fwd@example.com",
+                references: ["root@example.com", "old-fwd@example.com"]),
+            originalMessageHeaderId: header.id,
+            isForward: true)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        let disposition = try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
+        }
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(updated?.isForwarded == true)
+        #expect(updated?.isReplied == false)
+        #expect(updated?.actionTag == .reply, "a forward is not a reply; the Reply tag stays")
+        let markForwardedOps = try Self.opCount(db, .markForwarded)
+        #expect(markForwardedOps == 1)
+        #expect(disposition.changedOriginalHeaderId == header.id)
+    }
+
+    /// A forward names its original only as its LAST References id. A queued
+    /// forward whose References ends with another message's id names no
+    /// original the completion can prove, so it fails closed: nothing is marked.
+    @Test("A forward whose last References id is not the original marks nothing")
+    func forwardWhoseLastReferenceIsNotTheOriginalMarksNothing() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "220", rfc822MessageId: "<fwd-target@example.com>", actionTag: .reply)
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: "Fwd: Test",
+                references: ["fwd-target@example.com", "other@example.com"]),
+            originalMessageHeaderId: header.id,
+            isForward: true)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        let disposition = try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
+        }
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(updated?.isForwarded == false)
+        #expect(updated?.isReplied == false)
+        #expect(updated?.actionTag == .reply)
+        let markForwardedOps = try Self.opCount(db, .markForwarded)
+        #expect(markForwardedOps == 0)
+        #expect(disposition.changedOriginalHeaderId == nil)
+    }
+
+    /// A reply names its original by In-Reply-To, not by its last References id.
+    /// The two differ when the original's own References already listed another
+    /// message after its id, so a reply read from References would miss it.
+    @Test("A reply whose last References id is not the original still marks the original replied")
+    func replyWhoseLastReferenceIsNotTheOriginalMarksReplied() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "230", rfc822MessageId: "<reply-target@example.com>", actionTag: .reply)
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: "Re: Test",
+                inReplyTo: "reply-target@example.com",
+                references: ["reply-target@example.com", "other@example.com"]),
+            originalMessageHeaderId: header.id,
+            isForward: false)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        let disposition = try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
+        }
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(updated?.isReplied == true)
+        #expect(updated?.isForwarded == false)
+        #expect(updated?.actionTag == ActionTag.none)
+        let markRepliedOps = try Self.opCount(db, .markReplied)
+        #expect(markRepliedOps == 1)
         #expect(disposition.changedOriginalHeaderId == header.id)
     }
 

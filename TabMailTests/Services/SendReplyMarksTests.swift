@@ -115,12 +115,12 @@ struct SendReplyMarksTests {
     ) async throws -> Queued {
         let draftId = "\(isForward ? "forward" : "reply"):\(accountId):\(original.stableId)"
         let originalId = original.id
-        let subject = original.subject
+        let sendSubject = "\(isForward ? "Fwd" : "Re"): \(original.subject)"
         try await pool.write { db in
             var draft = Draft(
                 id: draftId, accountId: accountId,
                 toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
-                subject: "Re: \(subject)", body: "Answer", replyToId: originalId,
+                subject: sendSubject, body: "Answer", replyToId: originalId,
                 isForward: isForward, editHistoryJSON: nil,
                 createdAt: Date().timeIntervalSince1970,
                 updatedAt: Date().timeIntervalSince1970)
@@ -131,9 +131,18 @@ struct SendReplyMarksTests {
         #expect(!rowBefore.isEmpty, "precondition: the original is stored")
         let operationsBefore = try Self.operationCount(pool)
 
-        var message = DraftMessage(to: ["sender@example.com"], subject: "Re: \(subject)", body: "Answer")
-        let rfc = try #require(original.rfc822MessageId)
-        message.inReplyTo = "<\(rfc)>"
+        // The thread headers exactly as Send derives them (ComposeView): a reply
+        // names the original in In-Reply-To, a forward only as its last
+        // References id (#1483).
+        #expect(original.rfc822MessageId != nil, "precondition: the original has a Message-ID")
+        let stored = try await pool.read { db in try Account.fetchOne(db, key: accountId) }
+        let account = try #require(stored, "precondition: the account is stored")
+        let thread = ThreadUtils.outgoingThreadHeaders(
+            replyTo: original, isForward: isForward, sendAccountId: accountId,
+            sendSubject: sendSubject, providerKind: account.provider)
+        let message = DraftMessage(
+            to: ["sender@example.com"], subject: sendSubject, body: "Answer",
+            inReplyTo: thread.inReplyTo, references: thread.references, threadId: thread.threadId)
         let queued = try await AccountManager.persistQueuedSend(
             draft: message, accountId: accountId, replyToHeaderId: originalId,
             isForward: isForward, serverDraftId: nil,
@@ -463,7 +472,10 @@ struct SendReplyMarksTests {
             accountId: accountId,
             draft: DraftMessage(
                 to: ["sender@example.com"], subject: isForward ? "Fwd: Original" : "Re: Original",
-                body: "text", inReplyTo: "<\(parentRfc)>"),
+                body: "text",
+                // A forward names its original only as its last References id (#1483).
+                inReplyTo: isForward ? nil : "<\(parentRfc)>",
+                references: isForward ? [parentRfc] : []),
             originalMessageHeaderId: parent.id,
             isForward: isForward)
         sent.isReplyAll = change == .replyAll
