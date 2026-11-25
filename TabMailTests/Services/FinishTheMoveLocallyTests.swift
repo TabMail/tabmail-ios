@@ -296,32 +296,47 @@ struct FinishTheMoveLocallyTests {
 
     // MARK: - A lost reply, a sync, then the retry
 
-    /// Drain once, so the move's first attempt runs and fails, leaving the op
-    /// queued.
+    /// The move's first attempt only, which fails and leaves the op queued.
+    /// `move` starts its own drain, and a second drain request made while that
+    /// one runs is merged into a redrain that retries at once, so this asks for
+    /// no drain: it waits until the move's own drain has tried the op and let
+    /// it go.
     @MainActor
-    private func drainOnceExpectingTheOpKept(_ fixture: Fixture) async throws {
-        await AccountManager.shared.drainPendingQueue()
-        for _ in 0..<300 where !(await AccountManager.shared.pendingQueueIsQuiescentForTesting()) {
+    private func waitForTheFailedFirstAttempt(_ fixture: Fixture) async throws {
+        for _ in 0..<300 {
+            let op = try await fixture.pool.read { db in try PendingOperation.fetchOne(db) }
+            let quiescent = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+            guard let op else { break }
+            if op.everAttempted && op.status == PendingStatus.queued.rawValue && quiescent { break }
             try await Task.sleep(for: .milliseconds(10))
         }
-        let kept = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
-        #expect(kept == 1, "precondition: the first attempt's reply was lost, so the op must still be queued")
+        let kept = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        let keptAfterOneAttempt = kept.count == 1 && kept.allSatisfy(\.everAttempted)
+        #expect(keptAfterOneAttempt,
+                "precondition: the first attempt's reply was lost, so the op must still be queued: \(kept.map { ($0.id, $0.everAttempted, $0.status) })")
     }
 
     /// The catch-up run the normal sync path makes after the drain. The drop's
     /// write owed both folders a listing (ADR-IOS-111 item 11); this is the
     /// listing that loads a copy the window does not reach. The completed
-    /// move's 30 s protection has lapsed by then, as in production.
+    /// move's 30 s protection has lapsed by then, as in production. The run
+    /// needs the account registered with the engine that makes it (it returns
+    /// at once for an account it has no work queue for), so it runs on an
+    /// engine of its own, as `IMAPMoveIntoTrackedFolderTests` does.
     @MainActor
-    private func runOwedCatchUp(_ fixture: Fixture) async throws {
+    private func runOwedCatchUp(_ fixture: Fixture, provider: IMAPProvider) async throws {
         await AccountManager.shared.clearRecentlyCompletedForTesting()
         let account = try await fixture.pool.read { db in try Account.fetchOne(db, key: fixture.accountId) }
         guard let account else {
             Issue.record("the fixture's account is missing")
             return
         }
-        _ = await AccountManager.shared.syncEngine.runCatchUpRun(
+        let engine = SyncEngine()
+        await engine.register(accountId: fixture.accountId, provider: provider,
+                              workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
+        let ran = await engine.runCatchUpRun(
             account: account, run: .snapshot(deadline: Date().addingTimeInterval(30)))
+        #expect(ran, "precondition: the catch-up run made no progress, so it loaded nothing")
     }
 
     /// The moved messages not yet stored in local Archive.
@@ -381,7 +396,7 @@ struct FinishTheMoveLocallyTests {
         }
 
         await AccountManager.shared.move(seeded, to: "Archive")
-        try await drainOnceExpectingTheOpKept(f)
+        try await waitForTheFailedFirstAttempt(f)
         // NON-VACUITY: attempt 1 committed every copy on the server.
         #expect(server.messageIDs(in: "Archive").count == movedCount + residentUids.count)
 
@@ -393,7 +408,7 @@ struct FinishTheMoveLocallyTests {
         // NON-VACUITY: the window alone does not reach every copy.
         #expect(!(try missingFromArchive(f, targets)).isEmpty,
                 "precondition: every copy is stored before the catch-up, so it is not exercised")
-        try await runOwedCatchUp(f)
+        try await runOwedCatchUp(f, provider: provider)
 
         // THE PROPERTY: local Archive is the server's Archive.
         let serverArchive = Set(server.snapshotMessagesWithFlags(in: "Archive").map {
@@ -446,7 +461,7 @@ struct FinishTheMoveLocallyTests {
         try await f.pool.write { db in try summarized.update(db) }
 
         await AccountManager.shared.move([summarized], to: "Archive")
-        try await drainOnceExpectingTheOpKept(f)
+        try await waitForTheFailedFirstAttempt(f)
         try await syncArchive(f, provider: provider)
         // NON-VACUITY: the sync stored the copy before the retry, beside the
         // optimistic row, and with no AI content (the cache held none yet), so
@@ -592,7 +607,7 @@ struct FinishTheMoveLocallyTests {
         // NON-VACUITY: the window alone does not reach every moved message.
         #expect(!(try missingFromArchive(f, targets)).isEmpty,
                 "precondition: every moved message is stored before the catch-up, so it is not exercised")
-        try await runOwedCatchUp(f)
+        try await runOwedCatchUp(f, provider: provider)
 
         // THE PROPERTY: local Archive is the server's Archive — every moved
         // message present at its real address with its epoch read.
@@ -738,6 +753,10 @@ struct FinishTheMoveLocallyTests {
 
     /// The copy (UID 5) is deleted by another client and Archive syncs, so the
     /// only stored message with the moved message's Message-ID is NOT the copy.
+    /// A later message arrives at UID 6 as well: without its QRESYNC model the
+    /// fake reports UIDNEXT as its highest live UID plus one, so deleting the
+    /// top message would lower UIDNEXT below the copy, which no real server
+    /// does, and the sync rightly never judges a UID at or above UIDNEXT.
     @MainActor
     private func leaveOnlyTheSameIdNonCopy(
         _ fixture: Fixture, server: FakeIMAPServer, provider: IMAPProvider, target: String, oldId: String
@@ -748,8 +767,10 @@ struct FinishTheMoveLocallyTests {
         #expect(archiveUids == [4, 5], "the move did not land beside the same-id message: \(archiveUids)")
         let remnantKept = try rows(fixture).contains { $0.id == oldId }
         #expect(!remnantKept, "the remnant row was not dropped")
+        let laterArrival = Self.message(uid: 6, id: "pill-later-arrival@example.com")
         server.setMessages(
-            server.snapshotMessagesWithFlags(in: "Archive").map(\.message).filter { $0.uid != 5 }, in: "Archive")
+            server.snapshotMessagesWithFlags(in: "Archive").map(\.message).filter { $0.uid != 5 } + [laterArrival],
+            in: "Archive")
         try await syncArchive(fixture, provider: provider)
         let sameId = try rows(fixture).filter { $0.rfc822MessageId == target }.map(\.messageId)
         #expect(sameId == ["4"], "the only same-id row left should be the non-copy at UID 4: \(sameId)")

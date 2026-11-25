@@ -500,7 +500,10 @@ struct MergeFromIsolatedTests {
 
 // MARK: - remapRealId Tests
 
-@Suite("ChatIdTranslator remapRealId")
+/// A remap moves a pill only while its stored mapping still names the old id,
+/// so the suite takes the process-global lock that the suites which clear the
+/// shared `chatIdMapping` table hold.
+@Suite("ChatIdTranslator remapRealId", .processGlobalState)
 struct RemapRealIdTests {
 
     @Test("remap updates mapping from old to new realId")
