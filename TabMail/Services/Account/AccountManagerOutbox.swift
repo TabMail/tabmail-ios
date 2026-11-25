@@ -1231,20 +1231,25 @@ extension AccountManager {
             }
             // This send has gone out, so no other unsent send of the same kind
             // to this original may take back what it stands for (#1490). A
-            // reply (a forward) that marked the original at its Send and is
+            // reply (a forward) that changed the original at its Send and is
             // removed unsent later (a failed row the user discards after
-            // sending again) must leave the mark, and a reply's cleared Reply
-            // tag, as this completion leaves them. So their records lose those
-            // changes here. Only when this completion admits the original: the
-            // mark and its server op share one fate (above). A reply never
-            // speaks for a forward's mark, nor a forward for a reply's. This
-            // row matches too and is deleted below; a row already sent cannot
-            // be removed unsent, and its own completion finds nothing left to
-            // queue for a clear this send now stands for. outboxMessage holds
-            // only unsent, failed and unfinalized sends.
-            if flagAdmission != nil {
-                var released: OutboxMessage.QueuedOriginalChanges = [.setMark]
-                if !outbox.isForward { released.insert(.clearedReplyTag) }
+            // sending again, a held row undone) must leave the original as
+            // this completion leaves it. So their records lose those changes
+            // here, each on the terms this completion applied it: the mark
+            // only when it admits the original (the mark and its server op
+            // share one fate, above), a reply's cleared Reply tag always (the
+            // clear above is local and runs whatever the admission). A reply
+            // never speaks for a forward's mark, nor a forward for a reply's.
+            // This row matches too and is deleted below; a row already sent
+            // cannot be removed unsent. A released tag clear gets no `.setTag`
+            // op: this completion did not make that clear, and the other row's
+            // completion no longer finds it in its record. The op is local-only
+            // (ADR-IOS-036), so only the demo account's shield against a tag
+            // write-back (IOS-OUTBOX-010) is missing for it. outboxMessage
+            // holds only unsent, failed and unfinalized sends.
+            var released: OutboxMessage.QueuedOriginalChanges = flagAdmission != nil ? [.setMark] : []
+            if !outbox.isForward { released.insert(.clearedReplyTag) }
+            if !released.isEmpty {
                 try db.execute(
                     sql: """
                         UPDATE outboxMessage
@@ -1518,14 +1523,15 @@ extension AccountManager {
     /// A reply the user has sent since keeps both. One this device sent has
     /// already taken them off this row's record at its completion
     /// (`deleteCompletedSendAtomic`). One sent from another client is found by
-    /// its copy in Sent (`ReplyParentResolver.hasStoredReply`), asked only by a
-    /// reply that set the mark: its original was unreplied at Send, so a stored
-    /// reply is news. A reply that found the original already replied gives back
-    /// the Reply tag the user had.
+    /// its copy in Sent (`ReplyParentResolver.hasStoredReply`; not on Outlook,
+    /// where Graph gives no In-Reply-To), asked only by a reply that set the
+    /// mark: its original was unreplied at Send, so a stored reply is news. A
+    /// reply that found the original already replied gives back the Reply tag
+    /// the user had.
     ///
-    /// Kept to primary-key reads, that one indexed point read, one update and at
-    /// most one op insert: Undo runs this synchronously inside the hold's
-    /// deadline.
+    /// Kept to primary-key reads, that one indexed read (it visits only the
+    /// stored replies to one Message-ID), one update and at most one op insert:
+    /// Undo runs this synchronously inside the hold's deadline.
     ///
     /// Returns the original's id when its row changed.
     nonisolated static func revertQueuedOriginalChanges(

@@ -221,8 +221,13 @@ enum ReplyParentResolver {
     /// replied. It only ever stops a change, so a Message-ID shared by several
     /// messages never chooses one to change (ADR-IOS-068 D4).
     ///
-    /// One point read, forced onto `messageHeader_inReplyTo`. Both bracket forms
-    /// are matched: providers store the header as they received it.
+    /// Forced onto `messageHeader_inReplyTo`, it visits only the stored rows
+    /// replying to this one Message-ID (that message's replies, in any account
+    /// or folder: a number that does not grow with the mailbox) and stops at the
+    /// first one in this account's Sent. Every writer stores In-Reply-To
+    /// normalized (`MessageMetadata.inReplyTo`, the optimistic Sent copy), so the
+    /// bare form is the only one matched, as `markInsertedParentsOfStoredReplies`
+    /// matches it.
     static func hasStoredReply(
         toRfc822MessageId rfc822MessageId: String?,
         accountId: String,
@@ -235,9 +240,9 @@ enum ReplyParentResolver {
                 SELECT 1
                 FROM messageHeader r INDEXED BY messageHeader_inReplyTo
                 JOIN folder f ON f.id = r.folderId
-                WHERE r.inReplyTo IN (?, ?) AND r.accountId = ? AND f.role = ?
+                WHERE r.inReplyTo = ? AND r.accountId = ? AND f.role = ?
             )
-            """, arguments: [normalized, "<\(normalized)>", accountId, FolderRole.sent.rawValue]) ?? false
+            """, arguments: [normalized, accountId, FolderRole.sent.rawValue]) ?? false
     }
 
     /// The set lookup executed by `markParentsReplied`, named so plan coverage

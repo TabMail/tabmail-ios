@@ -27,15 +27,17 @@ would put a scan in the synchronous Undo write, which runs inside the hold's dea
 
 The other order is not a gap. A send of the same kind that went out (the user replies again after a
 reply failed, and discards the failed one afterwards) stands for the mark: its completion
-(`deleteCompletedSendAtomic`), when it admits the original, takes `setMark` and, for a reply,
-`clearedReplyTag` off every other same-kind send's record for that original, so the discard leaves the
-original replied with its tag cleared.
+(`deleteCompletedSendAtomic`) takes off every other same-kind send's record for that original what it
+applied itself: a reply's `clearedReplyTag` always, and `setMark` when it admits the original. So the
+discard, or the Undo of a send still held, leaves the original as the completion left it: replied, its
+tag cleared.
 
 A reply the user sends from another client while TabMail's reply waits is not one either. The revert of
 a reply that set the mark asks whether a reply to the original is stored in a Sent folder of the account
 (`ReplyParentResolver.hasStoredReply`) and keeps the mark and the cleared tag when it is. If the
 removal comes before that copy syncs, `ReplyParentResolver` marks the original and clears the tag when
-it does.
+it does. Graph stores no In-Reply-To, so on Outlook neither step finds the reply; there a reply from
+another client reaches the original only through the server's last-verb properties (memory 151).
 
 **Accepted, as in 1.11.6:** a forward sent from another client while TabMail's forward waits leaves the
 original with no forwarded mark when TabMail's is removed unsent. No other client's forward is visible

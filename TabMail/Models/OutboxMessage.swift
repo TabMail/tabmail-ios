@@ -141,8 +141,9 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     /// (`AccountManager.persistQueuedSend`, #1490). They are the row's own record
     /// of the user's gesture and leave with the row. The one other writer only
     /// removes changes: when another send of the same kind to the same original
-    /// completes, it takes them off this record, since that send now stands for
-    /// them (`AccountManager.deleteCompletedSendAtomic`).
+    /// completes, it takes off this record what it applied itself (a reply's tag
+    /// clear always, the mark when it can address the original), since that
+    /// send now stands for them (`AccountManager.deleteCompletedSendAtomic`).
     struct QueuedOriginalChanges: OptionSet, Sendable {
         let rawValue: Int
         /// This send set the original's replied mark (a forward: forwarded).
