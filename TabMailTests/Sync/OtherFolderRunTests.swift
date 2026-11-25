@@ -720,6 +720,44 @@ struct OtherFolderIMAPTests {
         }
     }
 
+    @Test("A folder a slice never reached because a read before it timed out and ended the session is read by the run's next slice, and its new mail arrives; the folder whose read timed out is left out of the rest of the run")
+    func aFolderLeftUnreachedBySessionEndIsReadNextSlice() async throws {
+        try await Self.withWorld("session-ended", .plain) { w in
+            let server = w.server
+            let uids = Self.others.map { w.nextUid(in: $0) }
+            for (path, uid) in zip(Self.others, uids) { w.deliver(uid, to: path) }
+            // The run's first slice: the server answers its first folder's STATUS
+            // only after the read's request limit, so that read times out and ends
+            // the session before the slice reaches the second folder.
+            let first = OtherFolderShared<String?>(nil)
+            await w.watchSlices { folderIds in
+                guard first.get == nil, folderIds.count == Self.others.count else { return }
+                let path = w.path(ofId: folderIds[0])
+                first.set(path)
+                for fragment in Self.statusFragments(path) {
+                    server.stallNextCommand(containing: fragment, seconds: SyncConfig.changeReadRequestTimeoutSeconds + 1)
+                }
+            }
+            try await w.runOnce()
+            await w.watchSlices()
+
+            let firstAsked = first.get
+            let held = try #require(firstAsked, "precondition: the run's first slice asked both folders")
+            let otherPath = Self.others.first { $0 != held }
+            let other = try #require(otherPath)
+            let heldUid = uids[Self.others.firstIndex(of: held) ?? 0]
+            let otherUid = uids[Self.others.firstIndex(of: other) ?? 0]
+            let otherArrived = try w.holds(otherUid, in: other)
+            let heldArrived = try w.holds(heldUid, in: held)
+            let heldReads = w.statusCount(held)
+            let asked = w.runSlices.map(\.folderIds)
+            #expect(otherArrived, "the run's next slice read \(other), which the first slice never reached, and its new mail arrived")
+            #expect(asked == [[w.id(held), w.id(other)], [w.id(other)]],
+                    "a slice for both folders, then one for the folder the first never reached: \(asked)")
+            #expect(heldReads == 1 && !heldArrived, "\(held), whose read timed out, was not asked again in the run")
+        }
+    }
+
     @Test("With no change tracking, a run lists a changed folder and runs no deletion check after it: the check's walk could outlast the slice, and the weekly whole-folder check removes what it would")
     func aRunsListingRunsNoDeletionCheck() async throws {
         try await Self.withWorld("no-deletion-check", .plain) { w in
@@ -1480,6 +1518,88 @@ struct OtherFolderIMAPTests {
 
             #expect(!heldBefore, "the listing given up wrote nothing")
             #expect(heldFolder.lastKnownUidNext == OtherFolderIMAPTests.held.count + 1, "and \(heldPath)'s counters stayed as they were, so it stayed changed")
+            #expect(otherArrived == true, "the run still listed the other folder, and its new mail arrived")
+            #expect(relisted, "a later run listed \(heldPath), and its new mail arrived")
+        }
+    }
+
+    @Test("With no change tracking, a run's listing of a folder that holds rows under no known UIDVALIDITY bounds its epoch check's sample read as one of its requests: while the server holds that read's answer, the run ends within the request limit and still lists the other folder, and a later run lists the folder")
+    func aListingsEpochCheckIsWithinItsBound() async throws {
+        #expect(Self.shortRequestSeconds < SyncConfig.catchUpRequestTimeoutSeconds,
+                "precondition: a listing bounded by its own limit is told apart from one bounded by the default")
+        try await Self.withWorld("listing-epoch-check", .plain) { w in
+            let server = w.server
+            let pool = w.pool
+            let uids = Self.others.map { w.nextUid(in: $0) }
+            for (path, uid) in zip(Self.others, uids) { w.deliver(uid, to: path) }
+            let account = try w.account()
+            let engine = w.engine
+            let streaks = otherFolderSkipStreaks(try Self.others.map { try w.folder($0).id })
+            defer { restoreOtherFolderSkipStreaks(streaks) }
+            // Inside the run's first slice, before its provider work: the first
+            // changed folder's UIDVALIDITY becomes unknown on the device while its
+            // rows stay, so its listing checks the epoch with a sample read first,
+            // and the server will hold that read's answer.
+            let held = OtherFolderShared<String?>(nil)
+            let listingMayStart = OtherFolderShared<Date?>(nil)
+            await w.watchSlices { folderIds in
+                guard held.get == nil, folderIds.count == Self.others.count else { return }
+                let folderId = folderIds[0]
+                let path = w.path(ofId: folderId)
+                held.set(path)
+                try? await pool.write { db in
+                    try db.execute(sql: "UPDATE folder SET lastKnownUidValidity = NULL WHERE id = ?", arguments: [folderId])
+                }
+                server.holdNextFetchAfterSnapshot(in: path)
+                listingMayStart.set(Date())
+            }
+            var run = SyncEngine.CatchUpRun(
+                storageLimitInForce: false, deadline: nil, sliceSeconds: SyncConfig.catchUpSliceSeconds,
+                intervalSeconds: 0, clock: { Date() })
+            run.workSeconds = SyncConfig.otherFolderRunSeconds
+            run.readsOtherFolders = true
+            run.requestTimeoutSeconds = Self.shortRequestSeconds
+            let theRun = run
+            let runEnded = OtherFolderShared<Bool>(false)
+            let runTask = Task {
+                _ = await engine.runCatchUpRun(account: account, run: theRun)
+                runEnded.set(true)
+            }
+            func holdingSample() -> Bool {
+                guard let path = held.get else { return false }
+                return server.isHoldingFetchAfterSnapshot(in: path)
+            }
+            // Every exit lets the held read go before it joins the run.
+            func releaseAndEnd() async {
+                await w.watchSlices()
+                if let path = held.get { server.releaseFetchAfterSnapshot(in: path) }
+                await runTask.value
+            }
+            guard await OneSyncAtATimeTests.eventually({ holdingSample() }),
+                  let heldPath = held.get, let mayStart = listingMayStart.get else {
+                Issue.record("precondition: the run's listing sent its epoch check's sample read, and the server holds it")
+                return await releaseAndEnd()
+            }
+            let epochBefore = try w.folder(heldPath).lastKnownUidValidity
+            #expect(epochBefore == nil, "precondition: \(heldPath)'s UIDVALIDITY is unknown while its sample read is held")
+
+            // The sample read stays held until the test lets it go, so a run that
+            // only the default limit, or none, could end would still be running
+            // `catchUpRequestTimeoutSeconds` after the listing could start.
+            let room = SyncConfig.catchUpRequestTimeoutSeconds - Date().timeIntervalSince(mayStart)
+            let ended = await OneSyncAtATimeTests.eventually(seconds: room) { runEnded.get }
+            let stillHeld = holdingSample()
+            #expect(ended, "the run ended within the listing's request limit, not the default one")
+            #expect(stillHeld, "while the epoch check's sample read of \(heldPath) was still held")
+            guard ended else { return await releaseAndEnd() }
+
+            let heldUid = uids[Self.others.firstIndex(of: heldPath) ?? 0]
+            let otherPath = Self.others.first { $0 != heldPath }
+            let otherArrived = try otherPath.map { try w.holds(uids[Self.others.firstIndex(of: $0) ?? 0], in: $0) }
+            await releaseAndEnd()
+            _ = await engine.runCatchUpRun(account: account, run: theRun)
+            let relisted = try w.holds(heldUid, in: heldPath)
+
             #expect(otherArrived == true, "the run still listed the other folder, and its new mail arrived")
             #expect(relisted, "a later run listed \(heldPath), and its new mail arrived")
         }
