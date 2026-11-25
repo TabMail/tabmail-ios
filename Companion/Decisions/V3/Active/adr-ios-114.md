@@ -1082,6 +1082,18 @@ same AI result, kept as long as the email itself is shown.
    `dragHint`, `chatCards`, `welcomeAndRecap`); `TutorialChatViewWiringTests.fieldAndPanelWiring`;
    `ChatReplyFieldTests` (the drag's `opensPanel`); `ChatThreadContextTests.opensInChat`.
 
+   *Amended 2026-11-25 (simulator check of the whole branch):* the panel's card is no longer above its
+   input. It sits at the panel's top, directly under the email card ("Re: ... / sender"), so it never
+   covers the conversation or the Create card's buttons; this holds for both panel cards (the request,
+   then Create). And compose's practice reply has a new stage after "Make it shorter": the card says
+   that Send sends the AI Suggestion as it is and asks for a tap on Send, which in the tutorial sends
+   nothing, opens no undo window and turns the page (`TutorialCoordinator.practiceSendIsNoOp`,
+   `sendAsIsTapped`); the next card asks for Use Suggestion, an edit by hand if wanted, then Send, the
+   practice send as before. Use Suggestion is locked until that tap. Part 2 stays "2 of 3"; Skip works
+   from every stage. Detail in ADR-IOS-038's amendment of the same day. Tests:
+   `TutorialTests.composeFollowsTheSuggestion` (the stage order), `skipFromTheSendAsIsStageResetsIt`,
+   `TutorialChatViewWiringTests.composeSendAsIsWiring` and the placement check in `fieldAndPanelWiring`.
+
 14. **One TabMail chat per thread (amendment 2026-11-16).** An email's TabMail chat belongs to its
    thread, with the chat view on or off. Decided 2026-11-16: "per-mail chat sessions now should be
    per-thread chat sessions, which is fine even when chat view is off", with "a simple migration +
