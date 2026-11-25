@@ -154,6 +154,41 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(isInChat(app), "the chat stays")
     }
 
+    /// A drag inside the open panel's history scrolls it: the fixture's history is taller than the
+    /// panel, the panel opens at its newest line, and a drag down inside it brings older lines into
+    /// view (the newest line moves down with the content).
+    func testDragInsideTheOpenPanelsHistoryScrollsIt() throws {
+        let app = launchIntoChat(panelHistory: true)
+        dragFieldOpen(in: app)
+        let close = app.buttons["chatClose"]
+        let newest = panelLine(Self.panelHistoryCount - 1, in: app)
+        XCTAssertTrue(newest.waitForExistence(timeout: 5), "control: the panel shows its newest history line")
+        let oldest = panelLine(0, in: app)
+        let before = newest.frame
+        XCTAssertGreaterThan(before.minY, close.frame.maxY, "control: the newest line is inside the panel, below Close")
+        XCTAssertFalse(oldest.exists && oldest.frame.minY > close.frame.maxY,
+                       "control: the oldest line is scrolled out of the panel (\(oldest.exists ? "\(oldest.frame)" : "none"))")
+        // From inside the history, above the newest line, a slow drag down.
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: (before.minY - Self.panelDragInset) / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: Self.panelScrollDrag)),
+                    withVelocity: .slow, thenHoldForDuration: 0.1)
+        XCTAssertTrue(close.exists, "the drag left the panel open")
+        let after = newest.exists ? newest.frame : .null
+        XCTAssertTrue(after.isNull || after.minY > before.minY + Self.panelScrollDrag / 2,
+                      "the history scrolled with the drag: the newest line was at \(before.minY), now \(after.isNull ? "gone below" : "\(after.minY)")")
+    }
+
+    /// The fixture's history size and line text (`ChatSwipeTestScene.panelHistoryLine`).
+    private static let panelHistoryCount = 30
+    /// How far above the newest line the drag in the panel starts, and how far it moves.
+    private static let panelDragInset: CGFloat = 60
+    private static let panelScrollDrag: CGFloat = 200
+
+    private func panelLine(_ index: Int, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", "History line \(index) of \(Self.panelHistoryCount)")).firstMatch
+    }
+
     /// How far from the navigation bar and the panel a dim tap must land to be the dim's. The open
     /// panel leaves about 17 points of dim below the bar on an iPhone, so the midpoint tap has
     /// about 8 on each side.
@@ -1573,7 +1608,8 @@ final class ChatSwipeUITests: XCTestCase {
                                 suggestionOnJump: Bool = false, writing: Bool = false,
                                 readyAtOpen: Bool = false, fieldDragTip: Bool = false,
                                 textSize: String? = nil, signedIn: Bool = false,
-                                openPanelUnderDrag: Bool = false, tipStore: TipStore? = nil) -> XCUIApplication {
+                                openPanelUnderDrag: Bool = false, panelHistory: Bool = false,
+                                tipStore: TipStore? = nil) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -1590,6 +1626,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (textSize.map { ["-UIPreferredContentSizeCategoryName", $0] } ?? [])
             + (signedIn ? ["--chat-swipe-signed-in"] : [])
             + (openPanelUnderDrag ? ["--chat-swipe-open-panel-under-drag"] : [])
+            + (panelHistory ? ["--chat-swipe-panel-history"] : [])
         if let tipStore {
             app.launchArguments += ["--chat-field-drag-tip-store"] + Self.noticeAlreadyShown
             if tipStore == .fresh { app.launchArguments.append("--chat-field-drag-tip-fresh") }
