@@ -1054,6 +1054,24 @@ extension SyncEngine {
                 removedIds.append(oldId)
                 return (try MessageHeader.fetchOne(db, key: canonicalId), removedIds, nil, true)
             }
+            // A reply or forward still in the Outbox names its original by header
+            // id (#1479), and its completion and an unsent removal's revert read
+            // the original by that key. This re-key is proven by the provider's
+            // own id (the row owns the address this listing reported,
+            // `providerAddressOwnershipProven`), never by Message-ID evidence, so
+            // the send follows its original here, in this write, as it does
+            // through a landed move (`MessageHeaderRekey.finishMove`). An original
+            // archived on Gmail keeps its Inbox-shaped key until this listing
+            // re-keys it, and a reply then discarded unsent must still find it to
+            // take Send's mark back (#1500). Not carried by the skip above: the row
+            // keeps its key there, so the send still finds it. The UID remap and
+            // the body backfill's re-key, on Message-ID evidence, never carry it
+            // (ADR-IOS-068 D4, `IOS-OUTBOX-012`).
+            // outboxMessage holds only unsent, failed and unfinalized sends, and
+            // this arm runs only when a row is re-keyed, never on the fast path.
+            try db.execute(
+                sql: "UPDATE outboxMessage SET originalMessageHeaderId = ? WHERE originalMessageHeaderId = ?",
+                arguments: [canonicalId, oldId])
             survivor = migrated
             ftsRekey = (oldId: oldId, newId: canonicalId)
             if DebugModeManager.isLoggingEnabled() {
