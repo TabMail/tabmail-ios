@@ -316,16 +316,13 @@ struct ChatThreadContextTests {
 
     // MARK: - 3 and 4. Opening and the inbox row
 
-    @Test("A thread opens as a chat with the chat view on outside the demo's AI-off mode; a tutorial run follows what it teaches")
+    @Test("A thread opens as a chat with the chat view on outside the demo's AI-off mode, and always while a tutorial runs")
     func opensInChat() {
         for active in [false, true] {
             for demo in [false, true] {
                 for tutorial in [false, true] {
-                    for teachesChat in [false, true] {
-                        #expect(ChatViewConfig.opensInChat(
-                            active: active, demoHidesAI: demo, tutorialRunning: tutorial, tutorialTeachesChat: teachesChat)
-                            == (tutorial ? teachesChat : active && !demo))
-                    }
+                    #expect(ChatViewConfig.opensInChat(active: active, demoHidesAI: demo, tutorialRunning: tutorial)
+                            == (tutorial || (active && !demo)))
                 }
             }
         }

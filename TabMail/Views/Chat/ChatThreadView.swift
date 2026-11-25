@@ -23,34 +23,31 @@ extension Notification.Name {
 
 extension ChatViewConfig {
     /// Whether an open goes to the chat now. Demo mode with AI declined counts as AI off. A
-    /// tutorial run follows what it teaches (`followingTutorial`).
+    /// tutorial run always opens in the chat (`followingTutorial`).
     @MainActor static var opensInChat: Bool {
-        let tutorial = TutorialCoordinator.shared
-        return opensInChat(active: isActive,
-                           demoHidesAI: DemoModeStore.shared.hidesAIContent,
-                           tutorialRunning: tutorial.isRunning,
-                           tutorialTeachesChat: tutorial.teachesChat)
+        opensInChat(active: isActive,
+                    demoHidesAI: DemoModeStore.shared.hidesAIContent,
+                    tutorialRunning: TutorialCoordinator.shared.isRunning)
     }
 
-    static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
-        followingTutorial(active && !demoHidesAI, tutorialRunning: tutorialRunning, tutorialTeachesChat: tutorialTeachesChat)
+    static func opensInChat(active: Bool, demoHidesAI: Bool, tutorialRunning: Bool) -> Bool {
+        followingTutorial(active && !demoHidesAI, tutorialRunning: tutorialRunning)
     }
 
-    /// The chat view's one tutorial-aware gate: while a tutorial runs, what the run teaches
-    /// (`TutorialCoordinator.teachesChat`, decided when it started); otherwise `live`, the app's own
-    /// value. Opens (`opensInChat`, and `SentEmailSummary.mayRun` through it), the inbox rows' chat
-    /// preview and the Enable Chat View switch all go through it, so a run shows one view
-    /// everywhere, before the AI choice too.
+    /// The chat view's one tutorial-aware gate: on while a tutorial runs, since the tutorial
+    /// teaches in the chat view whatever the setting; otherwise `live`, the app's own value. Opens
+    /// (`opensInChat`, and `SentEmailSummary.mayRun` through it), the inbox rows' chat preview and
+    /// the Enable Chat View switch all go through it, so a run shows one view everywhere, before
+    /// the AI choice too.
     ///
-    /// Read in a view's body, it observes the run (`TutorialCoordinator` is `@Observable`; both
-    /// `isRunning` and `teachesChat` are read), so the view repaints when a run starts or ends.
+    /// Read in a view's body, it observes the run (`TutorialCoordinator` is `@Observable` and
+    /// `isRunning` is read), so the view repaints when a run starts or ends.
     @MainActor static func followingTutorial(_ live: Bool) -> Bool {
-        let tutorial = TutorialCoordinator.shared
-        return followingTutorial(live, tutorialRunning: tutorial.isRunning, tutorialTeachesChat: tutorial.teachesChat)
+        followingTutorial(live, tutorialRunning: TutorialCoordinator.shared.isRunning)
     }
 
-    static func followingTutorial(_ live: Bool, tutorialRunning: Bool, tutorialTeachesChat: Bool) -> Bool {
-        tutorialRunning ? tutorialTeachesChat : live
+    static func followingTutorial(_ live: Bool, tutorialRunning: Bool) -> Bool {
+        tutorialRunning || live
     }
 }
 
@@ -857,8 +854,7 @@ struct ChatThreadView: View {
         let holds = holdsTutorialEmail(thread)
         if tutorial.isRunning,
            TutorialCoordinator.chatShowsCard(
-            step: tutorial.step, teachesChat: tutorial.teachesChat,
-            holdsPracticeEmail: holds.practice, holdsSourceEmail: holds.source) {
+            step: tutorial.step, holdsPracticeEmail: holds.practice, holdsSourceEmail: holds.source) {
             TutorialCoachView(host: .chat, onAction: { action in
                 // Next goes on in the inbox: part 3 starts there, and so does what else to ask.
                 if action == .nextLesson || action == .showMoreToAsk { dismiss() }
@@ -1023,6 +1019,17 @@ struct ChatThreadView: View {
         TutorialCoordinator.shared.fieldMove(inPracticeChat: holdsTutorialEmail(thread).practice)
     }
 
+    /// Part 2's panel card, in the chat that holds the practice email while the tutorial runs. Next
+    /// closes the panel and goes on in the inbox, where part 3 starts.
+    private func tutorialPanelCard(_ thread: ChatThread) -> ((TutorialCoachContent.Action) -> Void)? {
+        guard TutorialCoordinator.shared.isRunning, holdsTutorialEmail(thread).practice else { return nil }
+        return { action in
+            guard action == .nextLesson else { return }
+            withAnimation(Self.pillSpring) { chatExpanded = false }
+            dismiss()
+        }
+    }
+
     /// Debug-gated: each build of the ready card's content, with the draft it names.
     static func logReadyCard(_ ready: ChatReadyReply) {
         if DebugModeManager.isLoggingEnabled() {
@@ -1057,6 +1064,9 @@ struct ChatThreadView: View {
         // account read (`isLoaded` alone is also set when the context read failed).
         let knowsAudience = viewModel.hasLoadedThread && context.isLoaded
             && context.accounts.contains(where: { $0.id == newest.accountId })
+        let move = tutorialMove(thread)
+        // In the tutorial the field opens the panel only at the step that asks for it.
+        let opensPanel = !chatExpanded && (!TutorialCoordinator.shared.isRunning || move == .dragUp)
         return VStack(spacing: 8) {
             if let only = replyTarget.only, !chatExpanded {
                 replyingOnlyTo(only)
@@ -1081,12 +1091,12 @@ struct ChatThreadView: View {
                 replyField: ChatReplyField(
                     example: ChatReplyField.example(shown: shown, configured: example),
                     onlyTo: replyTarget.only,
-                    tutorialMove: tutorialMove(thread),
+                    tutorialMove: move,
+                    tutorialPanelCard: tutorialPanelCard(thread),
                     drag: fieldDrag,
                     // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named
-                    // action), on the text field VoiceOver focuses; not over the panel or the tutorial.
-                    showChat: chatExpanded || TutorialCoordinator.shared.isRunning
-                        ? nil : { withAnimation(Self.pillSpring) { chatExpanded = true } },
+                    // action), on the text field VoiceOver focuses; not over the panel.
+                    showChat: opensPanel ? { withAnimation(Self.pillSpring) { chatExpanded = true } } : nil,
                     suggestion: shown,
                     // A closure, as `showChat`'s: the method itself is MainActor-isolated.
                     attach: knowsAudience ? { attachFromField($0) } : nil),
@@ -1107,9 +1117,8 @@ struct ChatThreadView: View {
             .modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))
             // Drag the field up: it swells under the finger and opens the TabMail chat panel. A
             // UIKit pan, so once it starts the field's text view loses the touch and a drag never
-            // focuses the field (`ChatFieldPan`). Not in the tutorial, whose steps open the chat
-            // themselves.
-            .gesture(ChatFieldPan(isEnabled: !chatExpanded && !TutorialCoordinator.shared.isRunning,
+            // focuses the field (`ChatFieldPan`). In the tutorial only at its drag-up step.
+            .gesture(ChatFieldPan(isEnabled: opensPanel,
                                   cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))
             .modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })
             // Debug UI tests only: what the drag did to the chat (`ChatFieldDragMarker`).

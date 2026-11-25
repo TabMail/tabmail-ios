@@ -10,43 +10,32 @@ extension DynamicIslandChat {
     /// Empty, the field shows its hint and, under it, the "e.g." line (`ChatReplyField.example`);
     /// while the agent works, the words pulse, and the screen shows what it is doing in a line above
     /// the field (`ChatFieldStatusLine`).
-    /// In the tutorial the field is filled in and read-only, as the inbox chat's input is.
+    /// In the tutorial the field is read-only and sends nothing: its words go to the people, and
+    /// the tutorial's requests to TabMail are made in the panel. At part 2's drag-up step it says
+    /// so (`tutorialDragHint`), and its drag up, or VoiceOver's "Show TabMail chat", opens the panel.
     @ViewBuilder
     func replyFieldBar(_ field: ChatReplyField) -> some View {
-        if TutorialCoordinator.shared.isRunning && !(isWorking && fieldSentText != nil) {
+        if TutorialCoordinator.shared.isRunning {
             TutorialChatInputBar(
-                prompt: Self.tutorialFieldText(field),
+                prompt: nil,
                 isWorking: isWorking,
-                send: { sendTutorialField(field) })
+                dragHint: Self.tutorialDragHint(field),
+                showChat: isExpanded ? nil : field.showChat,
+                send: {})
             .accessibilityIdentifier("chatReplyField")
         } else {
             liveReplyFieldBar(field)
         }
     }
 
-    /// The tutorial's filled-in words in the chat's field: the request. While the move is a tap on
-    /// the AI Suggestion, the field holds nothing (the suggestion is the ghost in the chat).
-    static func tutorialFieldText(_ field: ChatReplyField) -> String? {
-        switch field.tutorialMove {
-        case .ask(let prompt): return prompt.rawValue
-        case .tapSuggestion, nil: return nil
-        }
+    /// The tutorial's hint in the chat's field: at part 2's drag-up step, how to ask TabMail;
+    /// nil otherwise (while the move is a tap on the AI Suggestion, the suggestion is the ghost in
+    /// the chat).
+    static func tutorialDragHint(_ field: ChatReplyField) -> String? {
+        field.tutorialMove == .dragUp ? tutorialDragHintText : nil
     }
 
-    /// Send in the tutorial's field: the request goes to the script, pulsing in the field as a
-    /// real request does.
-    private func sendTutorialField(_ field: ChatReplyField) {
-        switch field.tutorialMove {
-        case .ask(let prompt):
-            fieldSentText = prompt.rawValue
-            onFieldSend?(prompt.rawValue)
-            TutorialCoordinator.shared.chatPromptSent(prompt)
-            let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, suggestion: field.suggestion) }
-            sendAgentChat(prompt.rawValue, script: prompt, field: send)
-        case .tapSuggestion, nil:
-            break
-        }
-    }
+    static let tutorialDragHintText = "Drag up to ask TabMail"
 
     private func liveReplyFieldBar(_ field: ChatReplyField) -> some View {
         ChatFieldBarRow {

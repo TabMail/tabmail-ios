@@ -359,8 +359,8 @@ struct ChatReplyFieldRuntimeTests {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         let start = try #require(text.range(of: "func sendAgentChat("))
         let send = String(text[start.upperBound...])
-        // A field send, or its retry, names the email the field's send started on.
-        #expect(send.contains("var contextNumericId = await Self.contextNumber(sendingAbout: field?.message ?? message, known: contextEmailNumericId)"))
+        // A send, or its retry, names the pill's email as the send starts.
+        #expect(send.contains("var contextNumericId = await Self.contextNumber(sendingAbout: message, known: contextEmailNumericId)"))
     }
 
     /// The text from `start` to the next `private func`.
@@ -370,52 +370,40 @@ struct ChatReplyFieldRuntimeTests {
         return String(rest[..<(rest.range(of: "private func ")?.lowerBound ?? rest.endIndex)])
     }
 
-    @Test("The sheet's re-sends own none of the field's words: Rewind sends with no field, Re-send with its turn's field send and no words key")
-    func sheetResendsSendWithNoField() throws {
+    /// The reply field writes the email (`composeFromField`); only the open panel talks to the
+    /// agent. So no send to the agent, its retry, re-send, rewind and resume included, carries the
+    /// field's request or its words: a grep of the send finds no field path into it.
+    @Test("No send to the agent carries the reply field: its retry, re-send, rewind and resume name no field request or words")
+    func agentSendsCarryNoField() throws {
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        let rewind = try Self.function("private func rewindToMessage(", in: island)
-        #expect(rewind.contains("sendAgentChat(text)") && !rewind.contains("field:"), "Rewind sends with no field: \(rewind)")
-        // Re-send of the last turn carries the field send its bubble recorded (the menu passes
-        // `msg.fieldSend`): its email and who was chosen in Reply to. The turn was answered, so its
-        // own send is complete, and words open in the field by then belong to a newer send: the
-        // re-send owns none, so its answer, cards and sent compose leave them alone.
-        let resend = try Self.function("private func resendLastUserMessage(", in: island)
-        #expect(resend.contains("sendAgentChat(text, field: field, ownsFieldWords: false)") && !resend.contains("replyField"),
-                "Re-send sends with its turn's own field send and owns no words: \(resend)")
-        // A send names the field's words only from the send's own field, and only when it owns them,
-        // never from what the field holds: the re-sends are reached only through a bubble's context
-        // menu, which takes no activation in a hosted test, so the one place a send's field key is
-        // decided is fenced.
+        #expect(island.contains("func sendAgentChat(_ text: String, script: TutorialCoordinator.ChatPrompt? = nil) {"),
+                "a send takes its words and a tutorial script only")
         let send = try Self.function("func sendAgentChat(", in: island)
-        #expect(send.components(separatedBy: "fieldWordsKey = ").count == 2
-                    && send.contains("let fieldWordsKey = ownsFieldWords ? field.map { ChatFieldWords.key(for: $0.message) } : nil"),
-                "a send's field key comes from its field alone, and only for the field's own send")
-        #expect(!send.contains("holdsSentWords"), "what the field holds never names a send's field key")
-        // The key is derived in that one place, every request part takes that key as it is, and the
-        // send's own transition of the words is its answer on that key: a send that owns no words
-        // has no other way to reach them.
-        #expect(send.components(separatedBy: "ChatFieldWords.key(for:").count == 2, "one field key derivation in a send")
-        #expect(send.components(separatedBy: "fieldWordsKey: ").count == send.components(separatedBy: "fieldWordsKey: fieldWordsKey").count,
-                "every part of the request takes the send's own field key")
-        #expect(send.components(separatedBy: "ChatFieldWords.shared.apply(").count == 2
-                    && send.contains("ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)"),
-                "the send's only transition of the words is its answer, on its own field key")
-        // A failed re-send's Retry keeps the rule: the failure records whether the send owned words.
-        #expect(send.contains("lastFailedSend = .init(text: text, field: field, ownsFieldWords: fieldWordsKey != nil)"),
-                "a failed send records whether it owned the field's words")
-        #expect(island.contains("sendAgentChat(failed.text, field: failed.field, ownsFieldWords: failed.ownsFieldWords)"),
-                "Retry sends with the failed send's own ownership")
+        let resume = try Self.function("private func resumeAgentChat(", in: island)
+        for (name, body) in [("send", send), ("resume", resume)] {
+            for needle in ["field:", "fieldReply: fieldReply", "fieldReply: resume", "fieldWordsKey", "ChatFieldWords", "ChatFieldSend", "fieldSentText"] {
+                #expect(!body.contains(needle), "the \(name) names no field part (\(needle))")
+            }
+        }
+        // Every call of the send, the tutorial's prompt, Retry, Re-send and Rewind included, passes
+        // words and at most a script.
+        let calls = island.components(separatedBy: "sendAgentChat(").dropFirst().map { $0.prefix(while: { $0 != ")" }) }
+        #expect(calls.count == 6, "the declaration and five calls: \(calls)")
+        #expect(calls.allSatisfy { !$0.contains("field") }, "no call passes a field: \(calls)")
+        let rewind = try Self.function("private func rewindToMessage(", in: island)
+        let resend = try Self.function("private func resendLastUserMessage(", in: island)
+        #expect(rewind.contains("sendAgentChat(text)") && resend.contains("sendAgentChat(text)"))
     }
 
-    @Test("A sent compose card and an agent answer from the field complete on the request's own chat key, never the view's")
+    @Test("A sent compose card and an email written from the field complete on the request's own chat key, never the view's")
     func clearWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(!text.contains("fieldClearCount"), "no view counter carries a completion")
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(!island.contains("fieldFill.apply(.completed)") && !island.contains("fieldFill.apply(.confirmationCard)"),
                 "the pill never applies a request's transition to the chat it shows")
-        #expect(island.components(separatedBy: "ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)").count == 4,
-                "a send's, a resume's and the closed field's compose's answer complete on the key captured at send")
+        #expect(island.components(separatedBy: "ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)").count == 2,
+                "the closed field's written email completes on the key captured at send")
         let router = try Self.source("TabMail/Services/AI/AgentToolRouter.swift")
         #expect(router.contains("if case .sent = outcome, let fieldWordsKey { ChatFieldWords.shared.apply(.completed, to: fieldWordsKey) }"))
         let sink = try Self.source("TabMail/Services/AI/Tools/ToolInvocation.swift")

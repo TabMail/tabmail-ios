@@ -279,7 +279,7 @@ struct ChatSwipeTestScene: View {
         await coordinator.start(.reuseReply, hasTabMailSession: false)
         try await DemoModeService.shared.completeSetup()
         coordinator.seedingFinished()
-        guard coordinator.teachesChat, coordinator.step == .replyToPriya else {
+        guard coordinator.step == .replyToPriya else {
             status = "Fixture setup failed"
             return
         }

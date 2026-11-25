@@ -102,7 +102,7 @@ struct TutorialCoachContentTests {
     typealias Step = TutorialCoordinator.Step
 
     private static let hosts: [TutorialCoachHost] = [
-        .inbox, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .message, .actionRules,
+        .inbox, .compose(showingSuggestion: true), .compose(showingSuggestion: false), .chat, .chatPanel, .actionRules,
     ]
 
     private static let allSteps: [Step] = [
@@ -172,12 +172,12 @@ struct TutorialCoachContentTests {
     @Test("The chat input is filled in only at the chat steps, and the flight question only until it was asked")
     func chatPrompts() {
         typealias C = TutorialCoordinator
-        #expect(C.chatPrompt(for: .makeTemplate, flightsAsked: false) == .makeTemplate)
+        #expect(C.chatPrompt(for: .makeTemplate, flightsAsked: false) == nil, "part 2 asks in the panel of Priya's chat")
         #expect(C.chatPrompt(for: .askFlights, flightsAsked: false) == .flights)
         #expect(C.chatPrompt(for: .askFlights, flightsAsked: true) == nil)
         #expect(C.chatPrompt(for: .moreToAsk, flightsAsked: true) == .whatCanYouDo)
         #expect(C.chatPrompt(for: .moreToAsk, flightsAsked: true, whatCanYouDoAsked: true) == nil)
-        let withPrompt: Set<Step> = [.makeTemplate, .askFlights, .moreToAsk]
+        let withPrompt: Set<Step> = [.askFlights, .moreToAsk]
         for step in Self.allSteps where !withPrompt.contains(step) {
             #expect(C.chatPrompt(for: step, flightsAsked: false) == nil, "\(step) has nothing to send")
         }
@@ -201,7 +201,7 @@ struct TutorialCoachContentTests {
         for lesson in TutorialLesson.allCases {
             for step in Self.allSteps {
                 for flightsAsked in [false, true] {
-                    for host in [TutorialCoachHost.inbox, .message, .actionRules] {
+                    for host in [TutorialCoachHost.inbox, .chat, .actionRules] {
                         guard let card = TutorialCoachContent.make(
                             step: step, lesson: lesson, host: host, flightsAsked: flightsAsked) else { continue }
                         #expect(!(card.title + " " + card.message).contains("Tap Send"), "\(step) on \(host)")
@@ -268,7 +268,7 @@ struct TutorialCoachContentTests {
             for step in Self.allSteps {
                 for flightsAsked in [false, true] {
                     for card in cards(step, lesson, flightsAsked: flightsAsked) {
-                        #expect(card.progressLine.hasPrefix("\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title(teachesChat: false))"))
+                        #expect(card.progressLine.hasPrefix("\(lesson.rawValue) of \(TutorialLesson.allCases.count) · \(lesson.title)"))
                         let text = ([card.progressLine, card.title, card.message] + card.examples + card.buttons.map(\.label))
                             .joined(separator: " ").lowercased()
                         #expect(!text.contains("lesson"), "\(step): \(text)")
@@ -300,7 +300,7 @@ struct TutorialPracticeTests {
         let sink = RecordingSink()
         let reply = "Count me in, see you at the offsite."
         let answer = await TutorialChatScript.answer(
-            .makeTemplate, practiceReply: reply, invocation: ToolInvocation(uiSink: sink))
+            .saveReplyAsTemplate, practiceReply: reply, invocation: ToolInvocation(uiSink: sink))
         try #require(sink.delivered.count == 1)
         let card = sink.delivered[0]
         #expect(card.action == .templateCreate)
@@ -778,7 +778,7 @@ struct TutorialLifecycleTests {
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
         var edited: ReplyResult?
         await coordinator.runPracticeReplyEdit { edited = $0 }
-        #expect(edited?.body == TutorialChatScript.declinedReply, "the draft receives the declined reply")
+        #expect(edited?.body == TutorialChatScript.shorterReply, "the draft receives the shorter reply")
         #expect(coordinator.replyEdited)
         #expect(coordinator.composeEditPrompt == nil, "the edit is not offered again")
         #expect(coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
@@ -807,7 +807,7 @@ struct TutorialLifecycleTests {
         try await waitFor(.makeTemplate)
         #expect(coordinator.highlightsTemplateCreate, "the proposal's Create is the next tap")
         _ = await TutorialChatScript.answer(
-            .makeTemplate, practiceReply: coordinator.practiceReplyText,
+            .saveReplyAsTemplate, practiceReply: coordinator.practiceReplyText,
             invocation: ToolInvocation(uiSink: AcceptingSink()))
         try await waitFor(.reuseReplyDone)
         #expect(!coordinator.highlightsTemplateCreate, "the template is saved")
@@ -817,7 +817,7 @@ struct TutorialLifecycleTests {
         #expect(template.exampleReply == reply, "the template is made from the reply just sent")
 
         // Part 3: ask about the flights, then open the cited email.
-        #expect(coordinator.highlightsChatClose, "the open chat covers the card with Next")
+        #expect(!coordinator.highlightsChatClose, "part 2's panel holds its own card, Next included")
         coordinator.messageOpened(accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.jordanFlights)
         #expect(coordinator.step == .reuseReplyDone, "opening Jordan's email counts only in part 3")
         coordinator.nextLesson()
@@ -846,6 +846,8 @@ struct TutorialLifecycleTests {
         #expect(coordinator.chatPrompt == nil, "the question is not offered again")
         #expect(coordinator.highlightsChatClose, "Finish is on the card under the chat")
         coordinator.showRecap()
+        #expect(coordinator.step == .chatViewSwitch, "the Chat View switch, then the recap")
+        coordinator.finishChatViewSwitch()
         #expect(coordinator.step == .finished)
 
         // End: the demo is gone and the backend is no longer refused.
@@ -924,8 +926,7 @@ struct TutorialLifecycleTests {
 
         #expect(edited == nil, "the ended run's edit must not reach a draft")
         #expect(!coordinator.replyEdited, "the new run's reply is not edited")
-        #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt(teachesChat: coordinator.teachesChat),
-                "the new run still offers its edit")
+        #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt, "the new run still offers its edit")
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
         await coordinator.end()
     }

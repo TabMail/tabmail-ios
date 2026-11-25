@@ -12,10 +12,6 @@ struct ChatMessage: Identifiable {
     var animate: Bool = false
     /// Non-nil when this message is a confirmation card (archive/delete).
     var actionConfirmation: AgentToolRouter.ActionConfirmation?
-    /// The user's words sent from the chat's reply field: the field's send as it started (the
-    /// email and who the user chose in Reply to), so Re-send sends it again as it was sent, as
-    /// Retry does. Live state only; a turn read back from storage has none.
-    var fieldSend: ChatFieldSend? = nil
 
     enum Role {
         case user

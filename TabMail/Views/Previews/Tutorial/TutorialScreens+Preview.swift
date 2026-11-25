@@ -18,7 +18,7 @@ import SwiftUI
 }
 
 #Preview("Finish, chat view") {
-    TutorialFinishView(signedIn: false, teachesChat: true)
+    TutorialFinishView(signedIn: false)
 }
 
 #Preview("Sidebar row") {

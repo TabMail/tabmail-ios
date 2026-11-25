@@ -10,37 +10,23 @@ import Foundation
 /// flight one cites Jordan's seeded email so its pill opens the original.
 @MainActor
 enum TutorialChatScript {
-    static let templateName = "Polite decline"
+    /// The template made from the practice reply, which said yes.
+    static let templateName = "Event RSVP: yes"
     static let templateInstructions = [
-        "Thank them for the invitation.",
-        "Say you can’t make it.",
-        "Keep it to one or two sentences.",
-    ]
-    /// The chat view's template: the reply said yes.
-    static let chatViewTemplateName = "Event RSVP: yes"
-    static let chatViewTemplateInstructions = [
         "Thank them for the invite.",
         "Say you’re in.",
         "Offer to help on the day.",
     ]
 
-    /// The practice reply after its draft-chat edit ("Say I can’t make it").
-    static let declinedReply = "Thanks for organizing, Priya. I can’t make the offsite this time. "
-        + "Could you share the agenda notes afterward?"
-    /// The chat view's practice reply after its edit ("Make it shorter"): still a yes, as its
+    /// The practice reply after its draft-chat edit ("Make it shorter"): still a yes, as its
     /// Sent bubble says.
     static let shorterReply = "Thanks, Priya. I’m in, and happy to say a few words on day one."
-    /// The edited replies' text versions. Every compose edit returns its email with its text
+    /// The edited reply's text version. Every compose edit returns its email with its text
     /// version, and the scripted edit stands in for one: the chat's AI Suggestion shows this
     /// text, so the edited reply stays tappable in the chat after the card closes.
-    static let declinedTextMessage = "Can’t make the offsite this time, could you share the agenda notes after?"
     static let shorterTextMessage = "I’m in, happy to say a few words on day one."
 
-    static func editedReply(teachesChat: Bool) -> ReplyResult {
-        teachesChat
-            ? ReplyResult(body: shorterReply, textMessage: shorterTextMessage)
-            : ReplyResult(body: declinedReply, textMessage: declinedTextMessage)
-    }
+    static let editedReply = ReplyResult(body: shorterReply, textMessage: shorterTextMessage)
     /// How long the draft pulses before the edit lands: long enough to see
     /// that something is happening, short enough not to feel slow.
     static let editDuration: Duration = .milliseconds(1400)
@@ -66,34 +52,26 @@ enum TutorialChatScript {
         _ prompt: TutorialCoordinator.ChatPrompt, practiceReply: String?, invocation: ToolInvocation
     ) async -> String {
         switch prompt {
-        case .makeTemplate:
-            return await makeTemplate(
-                name: templateName, instructions: templateInstructions, example: practiceReply ?? "",
-                purpose: "when you turn down similar invitations", invocation: invocation)
         case .saveReplyAsTemplate:
-            // A moment of "Saving template" above the field before the card.
+            // A moment of "Saving template" above the panel's input before the card.
             try? await Task.sleep(for: editDuration)
-            return await makeTemplate(
-                name: chatViewTemplateName, instructions: chatViewTemplateInstructions, example: practiceReply ?? "",
-                purpose: "when you accept similar invitations", invocation: invocation)
+            return await makeTemplate(example: practiceReply ?? "", invocation: invocation)
         case .flights: return await flights()
         case .whatCanYouDo: return capabilities
         }
     }
 
-    private static func makeTemplate(
-        name: String, instructions: [String], example: String, purpose: String, invocation: ToolInvocation
-    ) async -> String {
+    private static func makeTemplate(example: String, invocation: ToolInvocation) async -> String {
         do {
             _ = try await TemplateCreateTool().execute(
                 arguments: [
-                    "name": .string(name),
-                    "instructions": .array(instructions.map { .string($0) }),
+                    "name": .string(templateName),
+                    "instructions": .array(templateInstructions.map { .string($0) }),
                     "example_reply": .string(example),
                 ],
                 invocation: invocation)
-            return "Saved. The template \"\(name)\" follows the reply you just sent, "
-                + "so it can be used \(purpose)."
+            return "Saved. The template \"\(templateName)\" follows the reply you just sent, "
+                + "so it can be used when you accept similar invitations."
         } catch {
             return "No template made. Tap Send to try again."
         }

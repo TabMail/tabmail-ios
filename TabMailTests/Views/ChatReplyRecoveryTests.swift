@@ -652,12 +652,12 @@ struct ChatReplyRecoveryTests {
         return ((view as? UITextView).map { [$0] } ?? []) + view.subviews.flatMap { textViews($0) }
     }
 
-    /// A request the open sheet sends goes with no field (`sendAgentChat` without `field:`, the path
-    /// the sheet's re-sends take, fenced in `ChatReplyFieldRuntimeTests.sheetResendsSendWithNoField`):
-    /// its recovery names no field key. The closed field's Send is a compose edit, not an agent turn
-    /// (ADR-IOS-114 decision 10, amended 2026-11-25): cut off, it leaves no recovery, and its words
-    /// stay in the field.
-    @Test("A cut-off request from the sheet names no field words in its recovery; a cut-off compose from the field leaves none and keeps the words",
+    /// A request the open sheet sends goes with no field (`sendAgentChat` takes none, fenced in
+    /// `ChatReplyFieldRuntimeTests.agentSendsCarryNoField`), and its words went with it: cut off, it
+    /// can be resumed. The closed field's Send is a compose edit, not an agent turn (ADR-IOS-114
+    /// decision 10, amended 2026-11-25): cut off, it leaves no recovery, and its words stay in the
+    /// field.
+    @Test("A cut-off request from the sheet can be resumed and its words went with it; a cut-off compose from the field leaves no recovery and keeps the words",
           arguments: [false, true])
     func cutOffRecoveryNamesTheFieldOnlyForItsOwnRequest(fromField: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
@@ -688,9 +688,7 @@ struct ChatReplyRecoveryTests {
                     #expect(session.pendingResume == nil, "a compose is no agent turn: nothing to resume")
                 } else {
                     try await Self.waitUntil { session.pendingResume != nil }
-                    let resume = try #require(session.pendingResume, "control: the cut-off request can be resumed")
-                    #expect(resume.fieldWordsKey == nil,
-                            "the sheet's recovery names no field words: \(String(describing: resume.fieldWordsKey))")
+                    #expect(session.pendingResume != nil, "the cut-off request can be resumed")
                 }
                 // From the field the words stay in it; from the sheet they went with the request.
                 let expectedWords = fromField ? sent : ""

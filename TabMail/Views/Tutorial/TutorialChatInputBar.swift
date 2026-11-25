@@ -13,6 +13,11 @@ struct TutorialChatInputBar: View {
     /// The filled-in text, or nil when this step has nothing to send here.
     let prompt: String?
     let isWorking: Bool
+    /// With no prompt: the step's move is a drag up on this bar (the chat view's reply field, part
+    /// 2), said in its place with an arrow rising; nil shows the dimmed bar.
+    var dragHint: String? = nil
+    /// The drag's VoiceOver equivalent, "Show TabMail chat" (`showChatAction`), on the hint.
+    var showChat: (() -> Void)? = nil
     let send: () -> Void
 
     /// The prompt whose tooltip was closed (by sending it or tapping it), so
@@ -50,10 +55,26 @@ struct TutorialChatInputBar: View {
                 .accessibilityHidden(true)
         } text: {
             VStack(alignment: .leading, spacing: 2) {
-                Text(prompt ?? "Chat follows the tutorial steps")
-                    .foregroundStyle(prompt == nil ? Theme.textSecondary : Theme.textPrimary)
-                    .lineLimit(1...6)
+                if prompt == nil, let dragHint {
+                    HStack(spacing: 6) {
+                        Image(systemName: "arrow.up")
+                            .fontWeight(.semibold)
+                            .foregroundStyle(Theme.accent)
+                            .symbolEffect(.bounce.up, options: .repeat(.continuous))
+                            .accessibilityHidden(true)
+                        Text(dragHint)
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1...6)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .showChatAction(showChat, isExpanded: false)
                     .accessibilityIdentifier("tutorial-chat-input")
+                } else {
+                    Text(prompt ?? "Chat follows the tutorial steps")
+                        .foregroundStyle(prompt == nil ? Theme.textSecondary : Theme.textPrimary)
+                        .lineLimit(1...6)
+                        .accessibilityIdentifier("tutorial-chat-input")
+                }
             }
         } send: {
             Button {

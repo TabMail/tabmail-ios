@@ -28,7 +28,7 @@ private func previewCard(
 #Preview("Chat: filled-in input") {
     VStack(spacing: 12) {
         Spacer()
-        TutorialChatInputBar(prompt: TutorialCoordinator.ChatPrompt.makeTemplate.rawValue, isWorking: false) {}
+        TutorialChatInputBar(prompt: TutorialCoordinator.ChatPrompt.saveReplyAsTemplate.rawValue, isWorking: false) {}
     }
     .padding(.vertical)
 }

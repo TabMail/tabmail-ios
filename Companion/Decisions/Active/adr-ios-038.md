@@ -573,3 +573,14 @@ answered. A real account cannot be added on a device with no mail account before
 first. Signing in with mail accounts on the device, updating the app, and refreshing a session keep the answer.
 Demo setup opens the subscription gate when the device's AI is on, or in the tutorial. The debug-menu demo and a
 tutorial replay write no session and use the device's setting as it is.
+
+---
+
+**Amendment 2026-11-25: one tutorial, in the chat view.** The guided tutorial has one version, the chat view's,
+and it runs in the chat view whatever the Chat View setting or Opt Out of AI says (`ChatViewConfig.followingTutorial`
+is `tutorialRunning || live`); the today's-view version, its message-view card and its welcome and finish texts are
+deleted. It stays scripted with no AI call. Part 2's template request moves from the chat's reply field to the
+TabMail panel: the field's hint says to drag it up, the panel opens only at that step, shows the step's card and
+the filled-in request "Save this as my template.", and its Send runs `TutorialChatScript` inside
+`sendAgentChat(_:script:)` as the inbox chat's prompts do. The reply field holds no words and sends nothing in the
+tutorial. Detail, wording and tests: ADR-IOS-114, decision 13, amendment 2026-11-25.
