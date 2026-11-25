@@ -61,9 +61,10 @@ enum OnDeviceReadiness: Equatable {
 
 extension PillDictationMode {
     /// The input field's placeholder: why the mic is off comes first, in the compose bar too; else
-    /// the bar's own hint.
-    static func placeholder(isCompose: Bool, offNote: String?) -> String {
-        offNote ?? (isCompose ? "Describe your edit..." : "Type or speak...")
+    /// the bar's own hint. `isChatPanel`: the TabMail panel of the chat view, whose words go to
+    /// TabMail (`ChatReplyField.panelPlaceholder`).
+    static func placeholder(isCompose: Bool, isChatPanel: Bool, offNote: String?) -> String {
+        offNote ?? (isCompose ? "Describe your edit..." : isChatPanel ? ChatReplyField.panelPlaceholder : "Type or speak...")
     }
 }
 

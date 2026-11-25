@@ -10,7 +10,8 @@ import GRDB
 /// On iOS, this queues a `ComposeRequest` for the chat that asked (`ComposeOrigin`),
 /// whose screen presents ComposeView with `replyTo:` (ADR-IOS-053 Phase 2).
 struct EmailReplyTool: AgentTool, Sendable {
-    let name = "email_reply"
+    static let registeredName = "email_reply"
+    let name = Self.registeredName
     private let ctx: ToolContext
     /// The compose edit a request runs: the draft's subject and body with the request, in the
     /// context the card would send (`ComposeEditContext.make`), as Thunderbird's `runComposeEdit`.
@@ -47,6 +48,67 @@ struct EmailReplyTool: AgentTool, Sendable {
         try await execute(arguments: arguments, invocation: .noninteractive)
     }
 
+    /// What a reply request came to: the text the agent is told (`text`), and whether anything was
+    /// written. The chat's closed reply field has no agent to tell, so when nothing was written it
+    /// keeps the user's words (`DynamicIslandChat.composeFromField`).
+    enum Written: Equatable {
+        /// A compose card opened (sent or closed), the AI Suggestion changed, or a reply to the email
+        /// was sent moments ago.
+        case done(String)
+        /// Nothing was written: no card opened and nothing was stored.
+        case nothing(String)
+
+        var text: String {
+            switch self {
+            case .done(let text), .nothing(let text): text
+            }
+        }
+
+        /// Nothing written, for `reason`, as the agent is told it.
+        static func failed(_ reason: String) -> Written {
+            .nothing(ComposeOutcome.failed(reason).describeForLLM)
+        }
+
+        /// The compose card's outcome: nothing written only when the card never opened.
+        static func card(_ outcome: ComposeOutcome) -> Written {
+            if case .failed = outcome { return .nothing(outcome.describeForLLM) }
+            return .done(outcome.describeForLLM)
+        }
+    }
+
+    /// Send in the chat's reply field with the TabMail panel closed (ADR-IOS-114 decision 10,
+    /// amended 2026-11-25): the words, typed or said, are the request of the reply's compose edit,
+    /// as compose's own field takes them, and never reach the agent. The field's send
+    /// (`invocation.fieldReply`) names the email as the field showed it and who the reply goes to;
+    /// with its AI Suggestion showing the words edit it, otherwise they write the reply, and the
+    /// compose card opens with the email written and its text version. Every request is the
+    /// user's own ask, so a reply sent moments ago never stops it, and a compose edit that fails
+    /// opens nothing rather than a card without the user's words.
+    func composeFromField(_ words: String, invocation: ToolInvocation) async -> Written {
+        guard let field = invocation.fieldReply else { return .failed("no reply field sent this request") }
+        do {
+            guard let header = try await ctx.db.read({ db in try MessageHeader.fetchOne(db, key: field.email.id) }) else {
+                return .failed("the email is no longer here; nothing was done")
+            }
+            return try await reply(
+                to: header, arguments: ["request": .string(words)], invocation: invocation,
+                rewritesInPlace: ChatSuggestionConfig.fieldEditRewritesInPlace, fromField: true)
+        } catch {
+            return .failed("the email could not be read; nothing was done")
+        }
+    }
+
+    /// `composeFromField` on the reply tool the agent runs (the registry's), so the field's compose
+    /// and the agent's replies read one database through one compose edit.
+    static func composeWithRegisteredTool(_ words: String, invocation: ToolInvocation) async -> Written {
+        let registry = ToolRegistry.shared
+        await registry.ensureDefaultToolsRegistered()
+        guard let tool = await registry.tool(named: registeredName) as? EmailReplyTool else {
+            return .failed("the reply writer is not available; nothing was done")
+        }
+        return await tool.composeFromField(words, invocation: invocation)
+    }
+
     /// The registry's entry (`AgentTool`), with the one choice of what a field edit of the AI
     /// Suggestion does (`ChatSuggestionConfig.fieldEditRewritesInPlace`).
     func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
@@ -54,8 +116,9 @@ struct EmailReplyTool: AgentTool, Sendable {
                       rewritesInPlace: ChatSuggestionConfig.fieldEditRewritesInPlace)
     }
 
-    /// `invocation.fieldReply`: the request was sent from the chat's reply field. A reply to the
-    /// email that field showed, any copy of it in the same account, carries it, so its compose goes
+    /// `invocation.fieldReply`: the request was sent from the chat's closed reply field
+    /// (`composeFromField`); the agent's own requests come from the open TabMail panel and carry
+    /// none (ADR-IOS-114 decision 10, amended 2026-11-25). A reply to the email that field showed, any copy of it in the same account, carries it, so its compose goes
     /// to the people chosen then, and its words are written for them; a reply to another account's copy, or another email, keeps its
     /// own recipients (ADR-IOS-114 decision 11). The field's AI Suggestion belongs to the row it
     /// showed alone, and only while that row is still the same email.
@@ -100,6 +163,18 @@ struct EmailReplyTool: AgentTool, Sendable {
             return ComposeOutcome.failed("Email not found for unique_id \(numericId)").describeForLLM
         }
 
+        BackgroundSyncLogger.logDebug("[EmailReplyTool] Opening reply: numericId=\(numericId) subject=\(header.subject.prefix(40))")
+        return try await reply(
+            to: header, arguments: arguments, invocation: invocation, rewritesInPlace: rewritesInPlace, fromField: false
+        ).text
+    }
+
+    /// The reply to `header` a request asks for, from the agent (`run`) or the chat's closed field
+    /// (`composeFromField`, `fromField`).
+    private func reply(
+        to header: MessageHeader, arguments: [String: JSONValue], invocation: ToolInvocation,
+        rewritesInPlace: Bool, fromField: Bool
+    ) async throws -> Written {
         // Parse delta-shaped overrides: per-field add/remove lists applied on top of reply-all
         // defaults. See email_reply-v1.5.16.json. Absent key = no delta (empty).
         let addTo = EmailComposeTool.parseStringArray(arguments["add_recipients"]) ?? []
@@ -112,7 +187,7 @@ struct EmailReplyTool: AgentTool, Sendable {
         let accounts: [Account] = (try? await ctx.db.read { db in try Account.fetchAll(db) }) ?? []
 
         guard let origin = invocation.composeOrigin else {
-            return ComposeOutcome.failed(ComposeOrigin.noScreenReason).describeForLLM
+            return .failed(ComposeOrigin.noScreenReason)
         }
 
         // Parse optional request (compose instruction) and body separately.
@@ -131,15 +206,14 @@ struct EmailReplyTool: AgentTool, Sendable {
             explicitBody = nil
         }
 
-        BackgroundSyncLogger.logDebug("[EmailReplyTool] Opening reply: numericId=\(numericId) subject=\(header.subject.prefix(40)) request=\(composeRequest != nil) bodyLen=\(explicitBody?.count ?? 0)")
+        BackgroundSyncLogger.logDebug("[EmailReplyTool] Reply request: fromField=\(fromField) request=\(composeRequest != nil) bodyLen=\(explicitBody?.count ?? 0)")
 
         // The row the field showed is bound to the email it showed, checked before anything is
         // decided or read: a UIDVALIDITY reset can seat another email at its address, and the
         // request is then refused, never turned into a reply to that other email.
         let fieldRow = invocation.fieldReply.flatMap { $0.email.id == header.id ? $0.email : nil }
         if let fieldRow, try await !ctx.db.read({ db in try AIWriteTarget.stillHolds(fieldRow, db: db) }) {
-            return ComposeOutcome.failed(
-                "the email changed since the request was sent; nothing was done, and the AI Suggestion is unchanged").describeForLLM
+            return .failed("the email changed since the request was sent; nothing was done, and the AI Suggestion is unchanged")
         }
 
         // The field's request, as it was when sent. Its audience (who was chosen in Reply to)
@@ -170,8 +244,7 @@ struct EmailReplyTool: AgentTool, Sendable {
         // An edit of the shown suggestion: the draft is that envelope and the suggestion's body.
         if let shownSuggestion, let composeRequest {
             guard let bodyText = try await relatedBody(of: header, boundTo: fieldRow) else {
-                return ComposeOutcome.failed(
-                    "the email changed since the request was sent; the AI Suggestion is unchanged").describeForLLM
+                return .failed("the email changed since the request was sent; the AI Suggestion is unchanged")
             }
             let context = await Self.editContext(
                 recipients: start.recipients, account: account, related: header, relatedBodyText: bodyText)
@@ -180,17 +253,17 @@ struct EmailReplyTool: AgentTool, Sendable {
                 result = try await composeEdit(context, start.subject, shownSuggestion.body, composeRequest)
             } catch {
                 BackgroundSyncLogger.logDebug("[EmailReplyTool] suggestion edit failed: \(error)")
-                return ComposeOutcome.failed("the AI Suggestion could not be changed; it is unchanged").describeForLLM
+                return .failed("the AI Suggestion could not be changed; it is unchanged")
             }
             return await Self.finishSuggestionEdit(
                 result, shown: shownSuggestion, start: start,
                 suggestionEnvelope: suggestionEnvelope, email: header, rewritesInPlace: rewritesInPlace,
                 store: storeSuggestionEdit,
-                openCard: { envelope, body in
+                openCard: { envelope, edited in
                     await openReplyCard(
-                        header: header, envelope: envelope, body: body, fieldReply: fieldReply,
+                        header: header, envelope: envelope, body: edited.body, suggestion: edited, fieldReply: fieldReply,
                         draftId: Draft.separateReplyKey(replyTo: "\(header.accountId):\(header.stableId)"),
-                        origin: origin, invocation: invocation)
+                        origin: origin, invocation: invocation, usesRecentSendCache: !fromField)
                 })
         }
 
@@ -215,9 +288,13 @@ struct EmailReplyTool: AgentTool, Sendable {
         }
         var envelope = start
         var generatedBody: String? = explicitBody
+        // The email the request's compose edit wrote, whole: its body with the text version and
+        // change command the edit returned. The closed field's card carries it
+        // (`ComposeRequest.suggestion`); an agent's card opens on the body alone, as before.
+        var written: ReplyResult?
         if let request {
             guard let bodyText = try await relatedBody(of: header, boundTo: fieldRow) else {
-                return ComposeOutcome.failed("the email changed since the request was sent; nothing was done").describeForLLM
+                return .failed("the email changed since the request was sent; nothing was done")
             }
             let context = await Self.editContext(
                 recipients: start.recipients, account: account, related: header, relatedBodyText: bodyText)
@@ -226,8 +303,12 @@ struct EmailReplyTool: AgentTool, Sendable {
                 // A subject the edit writes replaces the start's; with none the start's stays.
                 if let subject = result.subject { envelope = start.with(subject: subject) }
                 generatedBody = result.body ?? generatedBody
+                written = result.body.map { ReplyResult(body: $0, textMessage: result.textMessage, changeCommand: result.changeCommand) }
                 BackgroundSyncLogger.logDebug("[EmailReplyTool] AI generated: subject=\(result.subject?.prefix(60) ?? "nil") bodyLen=\(generatedBody?.count ?? 0)")
             } catch {
+                // The field's words are the request itself: a card without them is not what was
+                // asked, so nothing opens and the field keeps them.
+                if fromField { return .failed("the reply could not be written; nothing was done") }
                 BackgroundSyncLogger.logDebug("[EmailReplyTool] performInlineEdit failed: \(error) — opening reply with the AI Suggestion or empty content")
             }
         }
@@ -238,6 +319,8 @@ struct EmailReplyTool: AgentTool, Sendable {
         // reply only to the people chosen: its card opens with the words written for them, or
         // empty when writing them failed.
         let storedSuggestion = generatedBody == nil && !onlyToChosen ? header.suggestion : nil
+        // An edit that wrote no email (only an answer) never opens the field's card on another one.
+        if fromField, written == nil { return .failed("the reply could not be written; nothing was done") }
         // A reply to only the people chosen in Reply to saves to a draft of its own, as the AI
         // Suggestion's card does: a reply draft already saved for this email (a Reply All, say)
         // neither sets the card's recipients nor is saved over. Otherwise the reply's usual draft.
@@ -245,8 +328,10 @@ struct EmailReplyTool: AgentTool, Sendable {
             : Draft.separateReplyKey(replyTo: "\(header.accountId):\(header.stableId)")
 
         return await openReplyCard(
-            header: header, envelope: envelope, body: generatedBody, suggestion: storedSuggestion,
-            fieldReply: fieldReply, draftId: draftId, origin: origin, invocation: invocation)
+            header: header, envelope: envelope, body: generatedBody,
+            suggestion: (fromField ? written : nil) ?? storedSuggestion,
+            fieldReply: fieldReply, draftId: draftId, origin: origin, invocation: invocation,
+            usesRecentSendCache: !fromField)
     }
 
     /// The email's body for a compose edit's context (`ComposeEditContext.relatedBodyText`, the one
@@ -283,11 +368,15 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// only in the same account); whether the card is the field's own reply is read from the
     /// whole request (`invocation`), any copy of the email in any account
     /// (`ChatFieldReply.isOwnReply`), once, onto the request (`ComposeRequest.isFieldsOwnReply`).
-    /// `origin`: the chat that asked, where the card opens.
+    /// `origin`: the chat that asked, where the card opens. `usesRecentSendCache`: an agent's request
+    /// (a retried turn re-emits its tool call) opens nothing for a reply sent moments ago. The
+    /// field's Send is always a new action of the user's: it always opens its card, and it neither
+    /// reads nor records `recentlySentCompose`.
     private func openReplyCard(
         header: MessageHeader, envelope: ChatReplyCompose, body: String?, suggestion: ReplyResult? = nil,
-        fieldReply: ChatFieldReply?, draftId: String?, origin: ComposeOrigin, invocation: ToolInvocation
-    ) async -> String {
+        fieldReply: ChatFieldReply?, draftId: String?, origin: ComposeOrigin, invocation: ToolInvocation,
+        usesRecentSendCache: Bool
+    ) async -> Written {
         // Short-circuit duplicate retries: if we just sent a reply to this
         // same email within the TTL, don't re-prompt the user. Round 2 HTTP
         // failures trigger a chat-turn retry that re-emits this tool_call;
@@ -298,9 +387,9 @@ struct EmailReplyTool: AgentTool, Sendable {
             stableId: header.stableId,
             mode: .reply
         )
-        if await MainActor.run(body: { ctx.router.recentlySentCompose.isRecentlySent(cacheKey) }) {
+        if usesRecentSendCache, await MainActor.run(body: { ctx.router.recentlySentCompose.isRecentlySent(cacheKey) }) {
             BackgroundSyncLogger.logDebug("[EmailReplyTool] Skipping duplicate reply for \(header.accountId):\(header.stableId) — recently sent")
-            return "Reply to this email was already sent moments ago. No further action needed."
+            return .done("Reply to this email was already sent moments ago. No further action needed.")
         }
 
         // Suspend until the user sends, dismisses, or Stop cancels the task.
@@ -329,12 +418,12 @@ struct EmailReplyTool: AgentTool, Sendable {
                 outcomeState: state
             )
         }
-        if case .sent = outcome {
+        if usesRecentSendCache, case .sent = outcome {
             await MainActor.run {
                 ctx.router.recentlySentCompose.markSent(cacheKey)
             }
         }
-        return outcome.describeForLLM
+        return .card(outcome)
     }
 
     /// The end of a compose edit of the AI Suggestion the field showed (`shown`), from the draft
@@ -347,34 +436,34 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// suggestion edited (a newer one stored meanwhile wins), and the ghost shows them; no card
     /// opens. Otherwise (not in place, or a draft the suggestion cannot hold: another subject,
     /// sender or audience) the compose card opens with exactly the edited draft and the
-    /// suggestion is unchanged. The outcome says which happened, so the agent tells the user what
-    /// they see.
+    /// suggestion is unchanged; the card carries the edit whole, its text version included. The
+    /// outcome says which happened, so the agent tells the user what they see.
     static func finishSuggestionEdit(
         _ result: InlineEditResult, shown: ReplyResult, start: ChatReplyCompose,
         suggestionEnvelope: ChatReplyCompose, email: MessageHeader, rewritesInPlace: Bool,
-        store: StoreSuggestionEdit, openCard: (ChatReplyCompose, String) async -> String
-    ) async -> String {
+        store: StoreSuggestionEdit, openCard: (ChatReplyCompose, ReplyResult) async -> Written
+    ) async -> Written {
         guard let body = result.body, let textMessage = result.textMessage else {
-            return ComposeOutcome.failed(
-                "the AI Suggestion could not be changed (\(result.response ?? "no edit")); it is unchanged").describeForLLM
+            return .failed("the AI Suggestion could not be changed (\(result.response ?? "no edit")); it is unchanged")
         }
         let subject = result.subject ?? start.subject
         let recipients = start.recipients.applying(to: result.toDelta, cc: result.ccDelta, bcc: result.bccDelta)
         let staysTheSuggestion = suggestionEnvelope.holds(
             recipients: recipients, subject: subject, accountId: email.accountId, of: email)
+        let edit = ReplyResult(body: body, textMessage: textMessage, changeCommand: result.changeCommand)
         guard rewritesInPlace, staysTheSuggestion else {
             let why = staysTheSuggestion ? ""
                 : "the edited email has another subject or other recipients, which the AI Suggestion cannot hold; "
-            let outcome = await openCard(suggestionEnvelope.with(recipients: recipients, subject: subject), body)
-            return "The edited email goes to the reply card, not the AI Suggestion (\(why)the AI Suggestion is unchanged). "
-                + "The reply card's outcome: \(outcome)"
+            let outcome = await openCard(suggestionEnvelope.with(recipients: recipients, subject: subject), edit)
+            let text = "The edited email goes to the reply card, not the AI Suggestion (\(why)the AI Suggestion is unchanged). "
+                + "The reply card's outcome: \(outcome.text)"
+            if case .nothing = outcome { return .nothing(text) }
+            return .done(text)
         }
-        let edit = ReplyResult(body: body, textMessage: textMessage, changeCommand: result.changeCommand)
         guard await store(edit, shown, email) == .written else {
-            return ComposeOutcome.failed(
-                "the AI Suggestion could not be stored (it changed meanwhile, or the save failed); this edit was not kept").describeForLLM
+            return .failed("the AI Suggestion could not be stored (it changed meanwhile, or the save failed); this edit was not kept")
         }
-        return "Changed the AI Suggestion in place (no card opened); it now reads: \(textMessage). "
-            + "Nothing was sent: the user taps the suggestion to review and send it."
+        return .done("Changed the AI Suggestion in place (no card opened); it now reads: \(textMessage). "
+            + "Nothing was sent: the user taps the suggestion to review and send it.")
     }
 }

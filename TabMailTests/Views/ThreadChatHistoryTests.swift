@@ -113,7 +113,10 @@ extension ThreadChatTests {
 
         let backend = Backend()
         try await Self.withBackend(backend, chatView: true) {
-            try await Self.withPill(newer, inChatView: true) { _, view in
+            try await Self.withPill(newer, inChatView: true) { host, view in
+                // Asked in the open TabMail panel, where the words go to the agent.
+                host.expanded = true
+                try await Task.sleep(for: .milliseconds(600))
                 try await Self.ask("Which day works", in: view, backend: backend)
             }
         }

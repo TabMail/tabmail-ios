@@ -342,8 +342,11 @@ final class AgentToolRouter {
         /// showing that chat takes the request (`takeCompose(for:)`), so the card opens
         /// on the screen that asked, built by that screen.
         let origin: ComposeOrigin
-        /// A `.reply` opened on the stored AI Suggestion: the whole stored value, so an edit in the
-        /// card compares against exactly what is stored. Nil when the card opens on `body`.
+        /// A `.reply`'s written email as one value: the stored AI Suggestion it opened on (the whole
+        /// stored value, so an edit in the card compares against exactly what is stored), or the
+        /// email the chat's closed reply field had written, with the text version and change
+        /// command its compose edit returned (`EmailReplyTool.composeFromField`). Nil when the card
+        /// opens on `body` alone.
         let suggestion: ReplyResult?
         /// A `.reply` built from the reply-all recipient set (the AI reply
         /// tool). Carried into ComposeView so the send records reply-all on
