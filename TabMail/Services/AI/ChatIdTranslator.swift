@@ -1359,7 +1359,6 @@ actor ChatIdTranslator {
 
     // MARK: - Clear
 
-    /// Clear all mappings (called when chat history is cleared).
     #if DEBUG
     /// Test seam: forget the in-memory maps (not the stored ones), as a fresh
     /// process would, so the next call reloads from GRDB.
@@ -1375,6 +1374,7 @@ actor ChatIdTranslator {
     }
     #endif
 
+    /// Clear all mappings (called when chat history is cleared).
     func clearAll() {
         idMap.removeAll()
         reverseMap.removeAll()

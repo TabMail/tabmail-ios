@@ -565,6 +565,18 @@ enum MessageHeaderRekey {
         return true
     }
 
+    /// The copies of a dropped row's message that a sync already stored in its
+    /// folder. Hinted, like `MessageContentStore.ownersSQL` and
+    /// `ChatStore.findByStableIdSQL`: without the hint SQLite picks
+    /// `messageHeader_folderId_uidInt (folderId=?)` while the table has no
+    /// statistics (a fresh install, or after a migration until the background
+    /// `ANALYZE`) and walks the whole folder inside the retiring write. Named
+    /// so the plan fence checks production's own statement.
+    static let storedCopiesSQL = """
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND folderId = ? AND id != ?
+        """
+
     /// FINISH THE MOVE LOCALLY: re-key each member for which the provider
     /// returned one unambiguous destination address, from its source address to
     /// the destination address the server itself assigned.
@@ -826,15 +838,13 @@ enum MessageHeaderRekey {
                     // a sync, then the retry) was inserted before the cache held
                     // this row's AI state, so no insert will restore it: fill it
                     // here, in the same write, from the entry just written. The
-                    // lookup rides `messageHeader_rfc822MessageId`; the restore
-                    // keeps first-compute-wins, so a field the copy already has
-                    // is never overwritten.
+                    // lookup is hinted onto `messageHeader_rfc822MessageId`
+                    // (`storedCopiesSQL`); the restore keeps first-compute-wins,
+                    // so a field the copy already has is never overwritten.
                     if let rfc822 = row.rfc822MessageId, !rfc822.isEmpty {
-                        let storedCopies = try MessageHeader
-                            .filter(Column("rfc822MessageId") == rfc822
-                                    && Column("folderId") == row.folderId
-                                    && Column("id") != oldId)
-                            .fetchAll(db)
+                        let storedCopies = try MessageHeader.fetchAll(
+                            db, sql: storedCopiesSQL,
+                            arguments: [rfc822, row.folderId, oldId])
                         for original in storedCopies {
                             var copy = original
                             try MessageAICache.restoreIfCached(

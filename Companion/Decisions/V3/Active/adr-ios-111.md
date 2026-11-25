@@ -1813,7 +1813,10 @@ epoch (a moved copy takes a UID at or above the destination's UIDNEXT). A copy t
 loaded by the owed catch-up listing (#1062 amendment: every missing UID at or above the load floor). All
 sync insert paths restore the AI fields from the cache. Accepted: the copy is missing from its folder until that
 listing (no Message-ID matching, #963); a copy given the same UID it had in the source stays hidden until
-the 30-second store expires (#964).
+the 30-second store expires (#964); after a MOVE that failed part-way
+(`moveFailedAfterPartialCompletion`) on such a server, a member the server did not actually move is dropped
+too and stays hidden in its source until the 30-second store expires and the source's listing stores it
+again (its AI content is recomputed when needed).
 
 Tests: `FinishTheMoveLocallyTests` (no remnant row, the lost-reply retry and the large move after the
 catch-up, AI content kept and filled, the inbox AI enqueue, a refused move, the five pill tests),

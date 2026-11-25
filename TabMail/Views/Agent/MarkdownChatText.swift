@@ -369,18 +369,6 @@ struct MarkdownChatText: View {
     nonisolated private static let sentinelClose: Character = "\u{E001}"
     nonisolated(unsafe) private static let sentinelPattern = /\u{E000}(\d+)\u{E001}/
 
-    /// Pre-pass over the rendered LLM response: scan for `[label](tabmail://type/N)`
-    /// markdown links produced by `ChatIdTranslator.processResponseForDisplay`,
-    /// replace each with `\u{E000}<index>\u{E001}`, and return the table of
-    /// `PillRef`s in occurrence order. Runs BEFORE line classification so pills
-    /// inside any block context (header/blockquote/list/table cell) are extracted
-    /// uniformly — the line classifier never sees a tabmail:// link.
-    ///
-    /// Match strategy: anchor on the URL suffix `](tabmail://type/N)`, then walk
-    /// backward tracking bracket depth to find the opening `[`. A naive
-    /// `\[([^\]]+)\]\(...\)` regex stops at the first inner `]` and misses pills
-    /// whose label has nested brackets (e.g. Korean banking subjects like
-    /// `[NH농협카드]표준 …`).
     /// A pill is unavailable (greyed, tap does nothing) in history, or when
     /// its mapping was retired by a move whose destination is unproven.
     nonisolated static func pillIsUnavailable(isHistory: Bool, isRetired: Bool) -> Bool {
@@ -395,6 +383,18 @@ struct MarkdownChatText: View {
         return await translator.isRetiredPill(numericId)
     }
 
+    /// Pre-pass over the rendered LLM response: scan for `[label](tabmail://type/N)`
+    /// markdown links produced by `ChatIdTranslator.processResponseForDisplay`,
+    /// replace each with `\u{E000}<index>\u{E001}`, and return the table of
+    /// `PillRef`s in occurrence order. Runs BEFORE line classification so pills
+    /// inside any block context (header/blockquote/list/table cell) are extracted
+    /// uniformly — the line classifier never sees a tabmail:// link.
+    ///
+    /// Match strategy: anchor on the URL suffix `](tabmail://type/N)`, then walk
+    /// backward tracking bracket depth to find the opening `[`. A naive
+    /// `\[([^\]]+)\]\(...\)` regex stops at the first inner `]` and misses pills
+    /// whose label has nested brackets (e.g. Korean banking subjects like
+    /// `[NH농협카드]표준 …`).
     nonisolated static func extractPills(_ text: String) -> (text: String, pills: [PillRef]) {
         var pills: [PillRef] = []
         var result = ""

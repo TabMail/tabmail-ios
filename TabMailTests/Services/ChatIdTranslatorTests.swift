@@ -827,7 +827,7 @@ struct TemplateDetailResolutionTests {
 
 // MARK: - Event pill re-link (compare-and-swap normal case)
 
-@Suite("ChatIdTranslator event pill re-link")
+@Suite("ChatIdTranslator event pill re-link", .processGlobalState)
 struct EventPillRelinkTests {
 
     /// **THE PROPERTY: the guarded re-link still moves an event pill in the
@@ -871,7 +871,7 @@ struct EventPillRelinkTests {
 
 // MARK: - Compare-and-swap miss with no stored row
 
-@Suite("ChatIdTranslator remap with no stored row")
+@Suite("ChatIdTranslator remap with no stored row", .processGlobalState)
 struct RemapWithNoStoredRowTests {
 
     /// **THE PROPERTY: a remap whose stored mapping is gone moves nothing and
@@ -903,7 +903,7 @@ struct RemapWithNoStoredRowTests {
 
 // MARK: - Re-link onto an email another pill already names
 
-@Suite("ChatIdTranslator re-link collision")
+@Suite("ChatIdTranslator re-link collision", .processGlobalState)
 struct RelinkCollisionTests {
 
     /// **THE PROPERTY: a pill whose re-link is refused because another pill
@@ -943,7 +943,7 @@ struct RelinkCollisionTests {
 
 // MARK: - Retired pill availability
 
-@Suite("ChatIdTranslator retired pill availability")
+@Suite("ChatIdTranslator retired pill availability", .processGlobalState)
 struct RetiredPillAvailabilityTests {
 
     /// **THE PROPERTY: a pill whose mapping a move retired renders as

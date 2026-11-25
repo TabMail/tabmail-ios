@@ -363,7 +363,6 @@ struct FinishTheMoveLocallyTests {
         server.withholdMoveCOPYUID(forSourceUIDs: Set(sourceUids))
         server.disconnectAfterNextUIDMoveCommit()
         server.expectMutations(targets)
-        server.honorSearchUIDSetCriterion()
         try server.start()
         defer { server.stop() }
 
@@ -449,6 +448,16 @@ struct FinishTheMoveLocallyTests {
         await AccountManager.shared.move([summarized], to: "Archive")
         try await drainOnceExpectingTheOpKept(f)
         try await syncArchive(f, provider: provider)
+        // NON-VACUITY: the sync stored the copy before the retry, beside the
+        // optimistic row, and with no AI content (the cache held none yet), so
+        // only the drop's own write can fill it.
+        let storedBefore = try rows(f).filter {
+            $0.folderPath == "Archive" && $0.rfc822MessageId == target && $0.id != summarized.id
+        }
+        let storedWithoutAI = storedBefore.count == 1
+            && storedBefore.allSatisfy { $0.summaryBlurb == nil && $0.cachedReply == nil }
+        #expect(storedWithoutAI,
+                "precondition: the copy is not stored exactly once without AI content before the retry: \(storedBefore.map(\.id))")
         try await drainToQuiescence(f)
         try await syncArchive(f, provider: provider)
 
@@ -556,9 +565,6 @@ struct FinishTheMoveLocallyTests {
         server.withholdCopyUID(forSourceUIDs: Set(sourceUids))
         server.withholdMoveCOPYUID(forSourceUIDs: Set(sourceUids))
         for target in targets { server.expectMutation(rfc822MessageId: target) }
-        // A walk's UID-range SEARCH must return only that range, as a real
-        // server's does, or a resumed low cursor would still see every UID.
-        server.honorSearchUIDSetCriterion()
         try server.start()
         defer { server.stop() }
 

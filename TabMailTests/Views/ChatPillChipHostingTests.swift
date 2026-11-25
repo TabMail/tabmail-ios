@@ -13,7 +13,7 @@ import UIKit
 /// mapping is retired. The test never registers the chips' observers or
 /// binds their popovers itself: the chip's own `.task` and `.popover` do, so
 /// removing either from the chip fails here.
-@Suite("Chat pill chip, hosted", .serialized)
+@Suite("Chat pill chip, hosted", .serialized, .processGlobalState)
 @MainActor
 struct ChatPillChipHostingTests {
 
