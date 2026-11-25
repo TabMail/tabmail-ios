@@ -396,10 +396,9 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("With someone picked, Send asks nothing and keeps the words, saving nothing; the words go to the agent as a new email to the picked people")
+    @Test("With someone picked, Send asks nothing and saves nothing; the words are the request of the email's compose edit to the picked people, never a turn for the agent, and the card opens over the chat with the email written; closed unsent, the words are still in the field")
     func sendWithPeoplePicked() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
-        // AI on: with AI off (no choice made, as in a fresh test host) the agent is never asked.
         try await HostedAccessibility.withAutomation {
             try await Self.withChatView(true) { try await sendWithPeoplePickedBody() }
         }
@@ -408,8 +407,8 @@ struct ChatNewThreadScreenTests {
     private func sendWithPeoplePickedBody() async throws {
         let fixture = try fixture()
         defer { finish(fixture) }
-        // A fake agent that answers "Done": the test reads what Send asked it, on no real network.
-        let backend = ChatComposeRoutingTests.Backend(asksForReply: false)
+        // A fake backend that writes the email the words ask for (the compose edit), on no real network.
+        let backend = ChatComposeRoutingTests.Backend()
         ChatPillState.shared.aiService = backend.service
         defer {
             ChatPillState.shared.aiService = .shared
@@ -419,22 +418,81 @@ struct ChatNewThreadScreenTests {
         let recorder = QueueRecorder()
         let model = ChatNewThreadModel(account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
         model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
+        let words = "Lunch on Friday?"
         try await withScreen(model) { screen in
-            #expect(ThreadChatTests.type("Lunch on Friday?", in: screen.view))
-            try await Self.waitUntil { model.words == "Lunch on Friday?" }
+            #expect(ThreadChatTests.type(words, in: screen.view))
+            try await Self.waitUntil { model.words == words }
             try await Self.settle()
             #expect(HostedAccessibility.activate("chatSend", in: screen.view), "Send takes a tap")
-            try await Self.settle()
-            #expect(Self.topPresented(screen) == nil, "with someone picked, Send asks nothing")
-            #expect(model.words == "Lunch on Friday?", "the words stay")
+            try await Self.waitUntil { Self.topPresented(screen) != nil }
+            let card = try #require(Self.topPresented(screen), "the card opens over the chat")
+            #expect(HostedAccessibility.identifiers(in: card.view).contains(ComposeView.sendButtonId),
+                    "a compose: \(HostedAccessibility.identifiers(in: card.view).prefix(12))")
+            #expect(backend.chatTurns.isEmpty, "the agent is asked nothing: \(backend.chatTurns.map { $0.suffix(200) })")
+            #expect(backend.bodies.count == 1, "one compose edit wrote the email")
+            let asked = backend.bodies.first ?? ""
+            #expect(asked.contains(words) && asked.contains("maria@example.com") && asked.contains("Maria"),
+                    "the words are its request, to the picked people under their names: \(asked.prefix(400))")
+            @MainActor func shown() -> [String] {
+                HostedAccessibility.labels(in: card.view) + ChatFieldWordsRuntimeTests.fieldTexts(card.view)
+            }
+            try await Self.waitUntil { shown().contains { $0.contains("Friday works for us.") } }
+            let seen = shown()
+            #expect(seen.contains { $0.contains("Friday works for us.") }, "the card holds the email written: \(seen.prefix(20))")
+            #expect(model.words == words, "the words stay")
             #expect(recorder.calls.isEmpty, "Send saves nothing")
             let rows = try await rowCount(fixture)
             #expect(rows == 0, "and writes no draft")
-            try await Self.waitUntil { !backend.bodies.isEmpty && !ActiveAgentTracker.shared.anyWorking }
-            #expect(backend.bodies.count == 1, "control: the agent was asked once and answered")
-            let asked = backend.bodies.first ?? ""
-            #expect(asked.contains("New email to Maria <maria@example.com>") && asked.contains("Lunch on Friday?"),
-                    "the words go to the agent as a new email to the picked people: \(asked.prefix(400))")
+
+            // Closed unsent: the words are still in the field, and the agent was never asked.
+            card.presentingViewController?.dismiss(animated: false)
+            try await Self.waitUntil { Self.topPresented(screen) == nil && !ActiveAgentTracker.shared.anyWorking }
+            try await Self.waitUntil { Self.fieldText(in: screen.view) == words }
+            #expect(Self.topPresented(screen) == nil, "the card has closed")
+            #expect(Self.fieldText(in: screen.view) == words, "the words are in the field")
+            #expect(model.words == words, "and still the email's")
+            #expect(backend.chatTurns.isEmpty && backend.bodies.count == 1, "nothing more was asked")
+        }
+    }
+
+    @Test("With someone picked, a Send whose compose edit fails opens no card and asks the agent nothing; the words stay in the field and a note says the email couldn't be written")
+    func failedSendKeepsTheWords() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) { try await failedSendKeepsTheWordsBody() }
+        }
+    }
+
+    private func failedSendKeepsTheWordsBody() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let backend = ChatComposeRoutingTests.Backend(failsFirst: .serverError)
+        ChatPillState.shared.aiService = backend.service
+        defer {
+            ChatPillState.shared.aiService = .shared
+            backend.http.close()
+            AgentToolRouter.shared.resetComposeQueueForTesting()
+        }
+        let model = ChatNewThreadModel(account: fixture.account)
+        model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
+        let words = "Lunch on Friday?"
+        try await withScreen(model) { screen in
+            #expect(ThreadChatTests.type(words, in: screen.view))
+            try await Self.waitUntil { model.words == words }
+            try await Self.settle()
+            #expect(HostedAccessibility.activate("chatSend", in: screen.view), "Send takes a tap")
+            try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
+            @MainActor func noteShown() -> Bool {
+                HostedAccessibility.labels(in: screen.view).contains { $0.contains(DynamicIslandChat.newEmailNotWrittenNote) }
+            }
+            try await Self.waitUntil { noteShown() }
+            #expect(noteShown(),
+                    "the note says so: \(HostedAccessibility.labels(in: screen.view).suffix(12))")
+            #expect(backend.bodies.count == 1 && backend.chatTurns.isEmpty,
+                    "one compose edit, which failed, and no turn for the agent: \(backend.bodies.map { $0.suffix(200) })")
+            #expect(Self.topPresented(screen) == nil && AgentToolRouter.shared.composeQueueDepth == 0, "no card opens")
+            #expect(Self.fieldText(in: screen.view) == words, "the words stay in the field")
+            #expect(model.words == words, "and are still the email's")
         }
     }
 
@@ -520,8 +578,8 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    /// The new email's chat, to Maria, with a fake agent that writes the email the field's words
-    /// ask for (`email_compose`) on no real network, the account's Sent and Drafts folders, and the
+    /// The new email's chat, to Maria, with a fake backend that writes the email the field's words
+    /// ask for (the field's compose edit) on no real network, the account's Sent and Drafts folders, and the
     /// consent held off so no send reaches a real summary call (`SentEmailSummary.mayRun`).
     private func withCardSend(_ body: @MainActor (Fixture, ChatNewThreadModel, Screen) async throws -> Void) async throws {
         let fixture = try fixture()
@@ -531,7 +589,7 @@ struct ChatNewThreadScreenTests {
         let standard = UserDefaults.standard
         let consentBefore = standard.object(forKey: AgeAndTermsConsent.completedKey)
         standard.set(false, forKey: AgeAndTermsConsent.completedKey)
-        let backend = ChatComposeRoutingTests.Backend(asksForNewEmail: true)
+        let backend = ChatComposeRoutingTests.Backend()
         ChatPillState.shared.aiService = backend.service
         let service = PendingSendService.shared
         defer {
@@ -552,7 +610,7 @@ struct ChatNewThreadScreenTests {
         try await withScreen(model) { screen in try await body(fixture, model, screen) }
     }
 
-    /// Types `words` and sends them; the agent's card opens over the chat, and its Send is tapped
+    /// Types `words` and sends them; the card with the email written opens over the chat, and its Send is tapped
     /// until it has queued the email (a compose still binding its draft ignores a tap). Returns the
     /// send's outbox row once the card has gone, its hold moved an hour on, so the test, not the
     /// clock, ends its Undo window.
@@ -562,7 +620,7 @@ struct ChatNewThreadScreenTests {
         try await settle()
         #expect(HostedAccessibility.activate("chatSend", in: screen.view), "the field's Send takes a tap")
         try await waitUntil { topPresented(screen) != nil }
-        let card = try #require(topPresented(screen), "the agent's card opens over the chat")
+        let card = try #require(topPresented(screen), "the card opens over the chat")
         func sendEnabled() -> Bool {
             HostedAccessibility.elements(under: card.view).contains {
                 HostedAccessibility.identifier(of: $0) == ComposeView.sendButtonId && !$0.accessibilityTraits.contains(.notEnabled)

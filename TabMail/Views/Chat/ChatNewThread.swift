@@ -448,11 +448,13 @@ final class ChatNewThreadModel: Hashable {
         addAttachment(attachment)
     }
 
-    /// The compose card for the new email the agent wrote from the field's words (`email_compose`):
-    /// today's compose, with the agent's subject and email, this chat's people as To (as a save
-    /// writes them, `toEntries`), the subject, Cc and Bcc it carries (a link's or a reopened
-    /// draft's subject wins over the agent's), the attachments waiting above the field, and From
-    /// `account`, changeable on the card as compose's From is. Only the card's Send sends.
+    /// The compose card for the new email written from the field's words (the field's compose
+    /// edit, `EmailComposeTool.composeFromField`): today's compose, with the written subject and
+    /// email and its text version (`ComposeRequest.suggestion`, as the reply field's card carries
+    /// it), this chat's people as To (as a save writes them, `toEntries`), the subject, Cc and Bcc
+    /// it carries (a link's or a reopened draft's subject wins over the written one), the
+    /// attachments waiting above the field, and From `account`, changeable on the card as
+    /// compose's From is. Only the card's Send sends.
     ///
     /// `draftId` is the card's own draft, new for each card (`newCardDraftId`): no row has it yet,
     /// so compose starts from these fields as any new email does, and its send's outbox row
@@ -464,7 +466,7 @@ final class ChatNewThreadModel: Hashable {
         onOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
         ComposeView(
-            suggestedBody: req.body, account: account,
+            suggestedBody: req.body, suggestion: req.suggestion, account: account,
             prefillTo: content.recipients, prefillCc: carried.cc, prefillBcc: carried.bcc,
             prefillSubject: carried.shownSubject ?? req.subject,
             prefillAttachments: attachments, prefillDraftId: draftId, openedOn: .newEmailChat,

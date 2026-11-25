@@ -328,12 +328,9 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ChatReplyField.agentMessage", in: island + field) == 0, "the reply field's nudge is gone")
         #expect(Self.count("agentMessage(emailNumericId", in: island + field) == 0)
         #expect(Self.count("typed in its reply field", in: island + field) == 0)
-        // A new email's chat still sends its words to the agent with its own nudge, until it
-        // composes directly too (ADR-IOS-114 decision 10).
-        #expect(Self.count("static func agentMessage(", in: field) == 1, "only the new email's")
-        #expect(Self.count("static func agentMessage(to people: [ChatThread.Person], text: String) -> String {", in: field) == 1)
-        #expect(Self.count("agentMessage(", in: island) == 1)
-        #expect(Self.count("enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text)", in: island) == 1)
+        // A new email's chat composes directly too (ADR-IOS-114 decision 10), so its nudge is gone.
+        #expect(Self.count("agentMessage(", in: island + field) == 0, "no field's words reach the agent with a nudge")
+        #expect(Self.count("newEmailTo:", in: island) == 0, "and no agent request names a new email's people")
     }
 
     // MARK: - 4. The status line
@@ -736,15 +733,24 @@ struct ChatReplyFieldTests {
         #expect(Self.count("return", in: send) == 2, "every other send from the field writes the reply")
         #expect(Self.count("onSendReadyReply", in: text) == 0 && Self.count("ChatReplyField.route", in: text) == 0)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
-        // ADR-IOS-114 decision 10 (amended 2026-11-25): the UI state decides, never the agent. Only
-        // a new email's chat still sends its words to the agent, with its own nudge (ChatNewThreadTests).
-        #expect(Self.count("sendAgentChat", in: send) == 1, "only a new email's chat reaches the agent")
-        #expect(Self.count("if let newEmailTo { Task { @MainActor in MessageChatCollapseTip.hasStartedMessageChat = true sendAgentChat(text, newEmailTo: newEmailTo) } } else if let message {", in: send) == 1)
+        // ADR-IOS-114 decision 10 (amended 2026-11-25): the UI state decides, never the agent. The
+        // field's Send never reaches the agent: a reply's words write the reply, and a new email's
+        // chat's words write the new email (ChatNewThreadTests).
+        #expect(Self.count("sendAgentChat", in: send) == 0, "no Send from the field reaches the agent")
+        #expect(Self.count("if let newEmailTo { composeNewEmailFromField(text, to: newEmailTo) } else if let message {", in: send) == 1)
         #expect(Self.count("composeFromField(text, ChatFieldSend(message: message, onlyTo: field.onlyTo, suggestion: field.suggestion))", in: send) == 1)
         let compose = try Self.body(of: "private func composeFromField(_ text: String, _ send: ChatFieldSend) {", in: text)
         #expect(Self.count("sendAgentChat", in: compose) == 0 && Self.count("sendChatMessage", in: compose) == 0)
-        #expect(Self.count("let written = await EmailReplyTool.composeWithRegisteredTool(text, invocation: invocation)", in: compose) == 1)
-        #expect(Self.count("enqueueStatus(ChatReplyField.writingStatus)", in: compose) == 1)
+        #expect(Self.count("runFieldCompose(fieldReply: send.fieldReply, fieldWordsKey: fieldWordsKey) { invocation in await EmailReplyTool.composeWithRegisteredTool(text, invocation: invocation) }", in: compose) == 1)
+        let newEmail = try Self.body(of: "private func composeNewEmailFromField(_ text: String, to people: [ChatThread.Person]) {", in: text)
+        #expect(Self.count("sendAgentChat", in: newEmail) == 0 && Self.count("sendChatMessage", in: newEmail) == 0)
+        // Both run in the one field compose: "Writing your email" above the field, and its task
+        // the one Stop cancels.
+        let run = try Self.body(of: "private func runFieldCompose(", in: text)
+        #expect(Self.count("sendAgentChat", in: run) == 0 && Self.count("sendChatMessage", in: run) == 0)
+        #expect(Self.count("enqueueStatus(ChatReplyField.writingStatus)", in: run) == 1)
+        #expect(Self.count("let written = await compose(invocation)", in: run) == 1)
+        #expect(Self.count("runFieldCompose(", in: text) == 3, "a reply's and a new email's, and its own")
         #expect(Self.count("sendFromReplyField(", in: text) == 2, "Send reaches it")
         #expect(Self.count("enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)", in: text) == 1)
     }

@@ -140,19 +140,6 @@ struct ChatNewThreadTests {
         #expect(picked == .write(to: ["maria@example.com", "sam@example.com"]))
     }
 
-    @Test("Words sent with people picked go to the agent as a new email to them, under each one's name")
-    func newEmailAgentMessage() {
-        let message = ChatNewEmailField.agentMessage(to: [Self.maria, Self.sam], text: "invite them to lunch on Friday")
-        #expect(message.hasPrefix("New email to Maria <maria@example.com>, Sam <sam@example.com> ("))
-        #expect(message.contains("email_compose"), "it names the tool that writes a new email")
-        #expect(message.hasSuffix("): invite them to lunch on Friday"), "the words, as typed, close it")
-        // The field's words are always what to write: a question in them goes to the people, and
-        // the agent is never left to guess that the words were meant for it.
-        #expect(message.contains("my words are what to write to them"))
-        #expect(message.contains("a question in them is one to ask them"))
-        #expect(!message.contains("unless"), "no opening for the agent to take the words as its own")
-    }
-
     @Test("Writing a new email's chat's email reads Writing your email, as a reply does")
     func composeStatusLine() throws {
         let composing = try #require(ToolRegistry.activityLabels["email_compose"])
@@ -587,10 +574,15 @@ struct ChatNewThreadTests {
         let intercept = try #require(pill.range(of: "if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people }", range: send.upperBound..<pill.endIndex))
         let sent = try #require(pill.range(of: "fieldFill.apply(.sentFromField)", range: send.upperBound..<pill.endIndex))
         #expect(intercept.lowerBound < sent.lowerBound, "its Send is the chat's, before any agent send")
-        // With people picked, the words go to the agent with the new email's nudge. A new email's
-        // chat has no email to reply to, so its send carries no reply field.
-        #expect(Self.count("sendAgentChat(text, newEmailTo: newEmailTo)", in: pill) == 1)
-        #expect(Self.count("} else if let newEmailTo { enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text) } else {", in: pill) == 1)
+        // With people picked, the words are the request of the new email's compose edit, and never
+        // reach the agent (ADR-IOS-114 decision 10, amended 2026-11-25); the nudge that once sent
+        // them to the agent is gone. A new email's chat has no email to reply to, so its send
+        // carries no reply field and keeps its words itself.
+        #expect(Self.count("if let newEmailTo { composeNewEmailFromField(text, to: newEmailTo) } else if let message {", in: pill) == 1)
+        #expect(Self.count("private func composeNewEmailFromField(_ text: String, to people: [ChatThread.Person]) { // As mailboxes with their names, so the email written can greet them by name. let to = ChatNewDraft.toEntries(people: people, authored: [], leftovers: []) runFieldCompose(fieldReply: nil, fieldWordsKey: nil) { invocation in await EmailComposeTool.composeWithRegisteredTool(text, to: to, invocation: invocation) }", in: pill) == 1)
+        #expect(Self.count("EmailComposeTool.composeWithRegisteredTool(", in: pill) == 1)
+        #expect(Self.count("newEmailTo", in: pill) == 4, "only the field's own Send names the people")
+        #expect(Self.count("agentMessage", in: pill) == 0)
         #expect(Self.count(".task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }", in: pill) == 1)
         #expect(Self.count(".onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }", in: pill) == 1)
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
