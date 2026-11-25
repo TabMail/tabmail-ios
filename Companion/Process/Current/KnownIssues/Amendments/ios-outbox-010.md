@@ -10,6 +10,21 @@
 server's Reply tag back onto the original until the reply goes out. Recoverable by itself; registered
 rather than mechanised.
 
+⚠️ **Corrected 2026-11-25 (review of #1490): reachable only where a provider reports a tag, today the
+demo account.** No real provider reports an action tag: `IMAPProvider.mapMessageInfo` sets none, and the
+Gmail and Exchange parses pass `actionTag: nil`. `SyncEngineChangesApply` writes a tag only when the
+change record carries one (`record.serverTag`), so the write-back below happens only with
+`DemoProvider`. The `.setTag` ops the completion and an Undo queue are the op every tag change queues:
+action tags are local-only (ADR-IOS-036), their drain applies nothing on a server
+(`AccountOperationExecutor`), and until it runs the op shields the row from the server's read and flag
+state. Where the text below says the server is told or cleared, read: the op is queued.
+
+**Also recorded here: an AI tag written during the hold.** The AI's action write (`ActiveAIQueue`)
+during the hold sees Send's replied mark and assigns `none`. When the original had no Reply tag before
+Send, Send recorded no tag change, so an Undo leaves that `none` on an original that is no longer
+replied. Rare (the AI runs when a message arrives, before the user replies to it), and one gesture sets
+the tag.
+
 ## The behaviour
 
 Send clears a reply's `reply` action tag on this device at once (`AccountManager.markOriginalAtQueue`,
@@ -45,4 +60,4 @@ until the send goes out.
 Outbox; reply; Reply tag; `actionTag`; `markOriginalAtQueue`; `revertQueuedOriginalChanges`;
 `isStillQueuedTagClear`; `originalChangesAtQueue`; `clearedReplyTag`; `actionTagSetAt`;
 `SyncEngineChangesApply`; `SyncEngineFullSync`; ReplyDetect; reply detection; server tag written back
-during the hold; `setTag(none)`; undo window; held send; `IOS-OUTBOX-003`; #1490.
+during the hold; `setTag(none)`; undo window; held send; `serverTag`; `DemoProvider`; demo account; local-only tag; ADR-IOS-036; `ActiveAIQueue`; AI tag during the hold; `IOS-OUTBOX-003`; #1490.

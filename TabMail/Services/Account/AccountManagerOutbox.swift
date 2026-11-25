@@ -1215,10 +1215,11 @@ extension AccountManager {
                     try setTagOp.insert(db)
                     changedOriginalHeaderId = originalId
                 } else if Self.isStillQueuedTagClear(of: outbox, on: original) {
-                    // Queuing cleared the tag on this device only (#1490): the
-                    // server learns it now that the reply has gone out. A tag set
-                    // since (the user's, or the server's Reply written back by a
-                    // pass) is left alone; the server's Reply is cleared above.
+                    // Queuing cleared the tag (#1490) and queued no op for it.
+                    // Now that the reply has gone out, the clear gets the
+                    // `.setTag` op every tag change queues (local-only, as
+                    // above). A tag set since is left alone; a Reply tag is
+                    // cleared by the branch above.
                     var setTagOp = PendingOperation(
                         type: .setTag,
                         messageIds: [original.stableId],
@@ -1227,6 +1228,30 @@ extension AccountManager {
                         tagValue: ActionTag.none.rawValue)
                     try setTagOp.insert(db)
                 }
+            }
+            // This send has gone out, so no other unsent send of the same kind
+            // to this original may take back what it stands for (#1490). A
+            // reply (a forward) that marked the original at its Send and is
+            // removed unsent later (a failed row the user discards after
+            // sending again) must leave the mark, and a reply's cleared Reply
+            // tag, as this completion leaves them. So their records lose those
+            // changes here. Only when this completion admits the original: the
+            // mark and its server op share one fate (above). A reply never
+            // speaks for a forward's mark, nor a forward for a reply's. This
+            // row matches too and is deleted below; a row already sent cannot
+            // be removed unsent, and its own completion finds nothing left to
+            // queue for a clear this send now stands for. outboxMessage holds
+            // only unsent, failed and unfinalized sends.
+            if flagAdmission != nil {
+                var released: OutboxMessage.QueuedOriginalChanges = [.setMark]
+                if !outbox.isForward { released.insert(.clearedReplyTag) }
+                try db.execute(
+                    sql: """
+                        UPDATE outboxMessage
+                        SET originalChangesAtQueue = originalChangesAtQueue & ~?
+                        WHERE originalMessageHeaderId = ? AND isForward = ?
+                        """,
+                    arguments: [released.rawValue, originalId, outbox.isForward])
             }
             try original.update(db)
         }
@@ -1433,8 +1458,9 @@ extension AccountManager {
     /// server cannot be sent. A reply's Reply tag goes to none, stamped with the
     /// row's `createdAt` so an unsent removal can tell the tap's own value from a
     /// later one; it is local-only, so it is cleared whatever the admission. No
-    /// server op is queued here: the completion queues them once the send has
-    /// gone out, and an unsent removal has nothing to take back on the server.
+    /// op is queued here: the completion queues the server's mark (and the tag
+    /// clear's local-only `.setTag`) once the send has gone out, so an unsent
+    /// removal has nothing to take back on the server.
     ///
     /// Returns the original's id when its row changed.
     nonisolated static func markOriginalAtQueue(
@@ -1486,9 +1512,20 @@ extension AccountManager {
     ///
     /// The mark goes back to unset. The tag goes back to Reply only while it is
     /// still the tap's none (same stamp); any later tag wins. The restored Reply
-    /// is queued to the server, after any clear a pass queued during the hold.
-    /// Kept to primary-key reads, one update and at most one op insert: Undo runs
-    /// this synchronously inside the hold's deadline.
+    /// gets the `.setTag` op every tag change queues (action tags are
+    /// local-only, ADR-IOS-036), after any clear a pass queued during the hold.
+    ///
+    /// A reply the user has sent since keeps both. One this device sent has
+    /// already taken them off this row's record at its completion
+    /// (`deleteCompletedSendAtomic`). One sent from another client is found by
+    /// its copy in Sent (`ReplyParentResolver.hasStoredReply`), asked only by a
+    /// reply that set the mark: its original was unreplied at Send, so a stored
+    /// reply is news. A reply that found the original already replied gives back
+    /// the Reply tag the user had.
+    ///
+    /// Kept to primary-key reads, that one indexed point read, one update and at
+    /// most one op insert: Undo runs this synchronously inside the hold's
+    /// deadline.
     ///
     /// Returns the original's id when its row changed.
     nonisolated static func revertQueuedOriginalChanges(
@@ -1503,6 +1540,15 @@ extension AccountManager {
                   accountId: outbox.accountId,
                   db: db
               ) else {
+            return nil
+        }
+        // The Message-ID here only stops a change; the original is the row the
+        // send names by primary key (ADR-IOS-068 D4).
+        if !outbox.isForward, changes.contains(.setMark),
+           try ReplyParentResolver.hasStoredReply(
+               toRfc822MessageId: original.rfc822MessageId,
+               accountId: original.accountId,
+               db: db) {
             return nil
         }
         var changed = false

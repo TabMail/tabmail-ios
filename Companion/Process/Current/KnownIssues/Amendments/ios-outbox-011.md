@@ -23,6 +23,25 @@ The removal deliberately reads no other outbox row: a check for "another live re
 would put a scan in the synchronous Undo write, which runs inside the hold's deadline
 (`discardOutboxMessageConfirmed`, IOS-OUTBOX-006).
 
+## Other sends to the same original (2026-11-25, review of #1490)
+
+The other order is not a gap. A send of the same kind that went out (the user replies again after a
+reply failed, and discards the failed one afterwards) stands for the mark: its completion
+(`deleteCompletedSendAtomic`), when it admits the original, takes `setMark` and, for a reply,
+`clearedReplyTag` off every other same-kind send's record for that original, so the discard leaves the
+original replied with its tag cleared.
+
+A reply the user sends from another client while TabMail's reply waits is not one either. The revert of
+a reply that set the mark asks whether a reply to the original is stored in a Sent folder of the account
+(`ReplyParentResolver.hasStoredReply`) and keeps the mark and the cleared tag when it is. If the
+removal comes before that copy syncs, `ReplyParentResolver` marks the original and clears the tag when
+it does.
+
+**Accepted, as in 1.11.6:** a forward sent from another client while TabMail's forward waits leaves the
+original with no forwarded mark when TabMail's is removed unsent. No other client's forward is visible
+on Gmail, which 1.11.6 showed the same way; on IMAP the server's `$Forwarded`, when the other client
+set it, comes back at the next full pass (`SyncEngineFullSync` merges it).
+
 ## When it happens
 
 Rare: two replies (separate drafts) to the same original queued inside one undo window, or while
@@ -39,4 +58,4 @@ leaves the original exactly as it was before both. Nothing is lost.
 Outbox; reply; two pending replies; second reply; undo; Undo to Drafts; Outbox discard;
 `cancelHeldOutboxRow`; `revertQueuedOriginalChanges`; `markOriginalAtQueue`; `originalChangesAtQueue`;
 `setMark`; reply arrow missing; `isReplied`; `deleteCompletedSendAtomic`; `IOS-OUTBOX-003`;
-IOS-OUTBOX-006; #1490.
+IOS-OUTBOX-006; failed send discarded after a re-send; reply from another client; Gmail web reply; `ReplyParentResolver.hasStoredReply`; `messageHeader_inReplyTo`; forward from another client; `$Forwarded`; #1490.

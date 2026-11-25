@@ -213,6 +213,33 @@ enum ReplyParentResolver {
         return try markParentsReplied(sentCopies: copies, folderRole: .sent, accountId: accountId, db: db)
     }
 
+    /// Whether a reply to the message whose Message-ID is `rfc822MessageId` is
+    /// stored in a Sent folder of `accountId`: the evidence the two functions
+    /// above mark a parent replied by. The unsent-removal revert asks it
+    /// (`AccountManager.revertQueuedOriginalChanges`, #1490) so a reply the user
+    /// sent from another client while TabMail's reply waited keeps the original
+    /// replied. It only ever stops a change, so a Message-ID shared by several
+    /// messages never chooses one to change (ADR-IOS-068 D4).
+    ///
+    /// One point read, forced onto `messageHeader_inReplyTo`. Both bracket forms
+    /// are matched: providers store the header as they received it.
+    static func hasStoredReply(
+        toRfc822MessageId rfc822MessageId: String?,
+        accountId: String,
+        db: Database
+    ) throws -> Bool {
+        let normalized = rfc822MessageId.map(EmailFilter.normalizeMessageId) ?? ""
+        guard !normalized.isEmpty else { return false }
+        return try Bool.fetchOne(db, sql: """
+            SELECT EXISTS (
+                SELECT 1
+                FROM messageHeader r INDEXED BY messageHeader_inReplyTo
+                JOIN folder f ON f.id = r.folderId
+                WHERE r.inReplyTo IN (?, ?) AND r.accountId = ? AND f.role = ?
+            )
+            """, arguments: [normalized, "<\(normalized)>", accountId, FolderRole.sent.rawValue]) ?? false
+    }
+
     /// The set lookup executed by `markParentsReplied`, named so plan coverage
     /// cannot drift from production's predicates or projection.
     static func parentLookupSQL(count: Int) -> String {

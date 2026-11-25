@@ -132,14 +132,17 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     var draftId: String?
     /// What queuing this send changed on its original (`QueuedOriginalChanges`
     /// raw value, v117, #1490), written in the same transaction as the row. An
-    /// unsent removal undoes exactly these changes, and the completion sends the
-    /// cleared Reply tag to the server. NULL for a row queued before v117, which
-    /// changed nothing at queue time.
+    /// unsent removal undoes exactly these changes, and the completion queues
+    /// the `.setTag` op for a Reply tag clear that still stands. NULL for a row
+    /// queued before v117, which changed nothing at queue time.
     var originalChangesAtQueue: Int?
 
     /// The changes queuing a reply or forward made to its original
     /// (`AccountManager.persistQueuedSend`, #1490). They are the row's own record
-    /// of the user's gesture: nothing else writes them and they leave with the row.
+    /// of the user's gesture and leave with the row. The one other writer only
+    /// removes changes: when another send of the same kind to the same original
+    /// completes, it takes them off this record, since that send now stands for
+    /// them (`AccountManager.deleteCompletedSendAtomic`).
     struct QueuedOriginalChanges: OptionSet, Sendable {
         let rawValue: Int
         /// This send set the original's replied mark (a forward: forwarded).
