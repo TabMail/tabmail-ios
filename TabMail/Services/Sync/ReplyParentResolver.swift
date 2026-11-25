@@ -58,10 +58,11 @@ enum ReplyParentResolver {
         guard folderRole == .sent else { return [] }
         guard !sentCopies.isEmpty else { return [] }
 
-        // Normalize defensively. IMAPProvider normalizes at the boundary
-        // (`IMAPProvider.mapMessageInfo`) but Gmail/Exchange providers pass raw
-        // metadata through — `normalizeMessageId` is idempotent so this costs
-        // nothing when the value was already normalized.
+        // Normalize defensively. Every provider already hands In-Reply-To over
+        // bare (IMAP's `IMAPProvider.mapMessageInfo` through `normalizeMessageId`,
+        // Gmail and RFC 822 parsing through `extractFirstMessageId`; Graph gives
+        // none), and `normalizeMessageId` is idempotent, so this costs nothing
+        // when the value was already normalized.
         var replied = Set<String>()
         var forwarded = Set<String>()
         for copy in sentCopies {
