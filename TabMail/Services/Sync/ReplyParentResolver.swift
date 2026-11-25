@@ -225,9 +225,11 @@ enum ReplyParentResolver {
     /// replying to this one Message-ID (that message's replies, in any account
     /// or folder: a number that does not grow with the mailbox) and stops at the
     /// first one in this account's Sent. Every writer stores In-Reply-To
-    /// normalized (`MessageMetadata.inReplyTo`, the optimistic Sent copy), so the
-    /// bare form is the only one matched, as `markInsertedParentsOfStoredReplies`
-    /// matches it.
+    /// normalized (Gmail and RFC 822 parsing through
+    /// `EmailFilter.extractFirstMessageId`; IMAP's envelope mapping and the
+    /// extension's `IMAPFetchMapping` through `EmailFilter.normalizeMessageId`;
+    /// the optimistic Sent copy; Graph stores none), so the bare form is the only
+    /// one matched, as `markInsertedParentsOfStoredReplies` matches it.
     static func hasStoredReply(
         toRfc822MessageId rfc822MessageId: String?,
         accountId: String,
