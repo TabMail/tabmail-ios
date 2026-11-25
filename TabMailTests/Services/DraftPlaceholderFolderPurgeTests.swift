@@ -237,9 +237,11 @@ struct DraftPlaceholderFolderPurgeTests {
         #expect(replyDraftId.contains(":"), "fixture precondition: a reply draft key is colon-joined")
 
         // 2. OVER-REFUSAL CONTROL A — a NORMAL (new) compose. ComposeView seeds
-        //    `draftId` with a bare UUID, so its placeholder tail is colon-free and
-        //    it was purged correctly even BEFORE the fix. If this goes red the
-        //    purge itself broke.
+        //    `draftId` with a bare UUID, so its draft KEY is colon-free. Its
+        //    placeholder still ends in `:<epoch>:<count>`
+        //    (`PendingOperation.draftPlaceholderMessageId`), so its header id tail
+        //    holds a `:` like the reply draft's, and its body goes by the same
+        //    key delete. If this goes red the purge itself broke.
         let plainDraftId = UUID().uuidString
         #expect(!plainDraftId.contains(":"), "fixture precondition: a new-compose draft key is colon-free")
 
@@ -304,6 +306,8 @@ struct DraftPlaceholderFolderPurgeTests {
         #expect(try await chatMappingExists(pool, realId: siblingHeaderId))
         #expect(try await messageBodyExists(pool, contentKey: replyHeaderId),
                 "precondition: the reply draft body must exist")
+        #expect(try await messageBodyExists(pool, contentKey: plainHeaderId),
+                "precondition: the new-compose draft body must exist")
 
         let scopedBefore = try await SearchIndex.shared.keywordSearch(
             query: "zanzibarquixotic",
@@ -338,6 +342,8 @@ struct DraftPlaceholderFolderPurgeTests {
                 "over-refusal control: a normal draft must still be purged")
         #expect(try await chatMappingExists(pool, realId: plainHeaderId) == false,
                 "over-refusal control: a normal draft's chat mapping must still be purged")
+        #expect(try await messageBodyExists(pool, contentKey: plainHeaderId) == false,
+                "a new-compose draft's body must not survive its folder's purge")
         #expect(try await isInFTS(syncedHeaderId) == false,
                 "over-refusal control: an ordinary synced message must still be purged")
 
@@ -370,6 +376,13 @@ struct DraftPlaceholderFolderPurgeTests {
             accountId: accountId, folderPath: Self.draftsPath)
         let childFolderId = MessageIdentity.folderId(
             accountId: accountId, folderPath: Self.siblingPath)
+        // A draft save's placeholder in the CHILD folder: its messageId holds a ':'
+        // (the epoch arm), so its id is inside the parent's id range and its tail after
+        // the parent's prefix holds a ':' too. The parent's purge deletes its own such
+        // bodies by key (#1495) and must still leave this one.
+        let childPlaceholderMessageId = "draft-child-\(UUID().uuidString):1:1"
+        let childPlaceholderHeaderId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: Self.siblingPath, messageId: childPlaceholderMessageId)
 
         // PORT adaptation of the reference purge fixture's real ownership shape:
         // sidecars belong to MessageHeader rows in the exact parent/child folder.
@@ -379,6 +392,7 @@ struct DraftPlaceholderFolderPurgeTests {
             for (messageId, folderPath, folderId, headerId) in [
                 ("10", Self.draftsPath, parentFolderId, parentHeaderId),
                 ("20", Self.siblingPath, childFolderId, childHeaderId),
+                (childPlaceholderMessageId, Self.siblingPath, childFolderId, childPlaceholderHeaderId),
             ] {
                 var header = MessageHeader(
                     messageId: messageId, subject: "nested purge control",
@@ -411,6 +425,9 @@ struct DraftPlaceholderFolderPurgeTests {
         #expect(try await isInFTS(childHeaderId))
         #expect(try await messageBodyExists(pool, contentKey: parentHeaderId))
         #expect(try await messageBodyExists(pool, contentKey: childHeaderId))
+        #expect(try await messageBodyExists(pool, contentKey: childPlaceholderHeaderId))
+        #expect(childPlaceholderHeaderId.hasPrefix(MessageIdentity.headerIdPrefix(accountId: accountId, folderPath: Self.draftsPath)),
+                "reachability: the child's placeholder id is inside the parent's id range")
 
         try await SearchIndex.shared.removeMessagesForFolder(
             accountId: accountId, folderPath: Self.draftsPath)
@@ -425,6 +442,8 @@ struct DraftPlaceholderFolderPurgeTests {
         #expect(try await messageBodyExists(pool, contentKey: parentHeaderId) == false)
         #expect(try await messageBodyExists(pool, contentKey: childHeaderId),
                 "a ':'-delimited CHILD folder's body must NOT be swept by its parent's purge")
+        #expect(try await messageBodyExists(pool, contentKey: childPlaceholderHeaderId),
+                "a CHILD folder's draft placeholder body must NOT be swept by its parent's purge")
         #expect(try await chatMappingExists(pool, realId: parentHeaderId) == false)
         #expect(try await chatMappingExists(pool, realId: childHeaderId),
                 "a ':'-delimited CHILD folder's chat mapping must NOT be swept by its parent's purge")

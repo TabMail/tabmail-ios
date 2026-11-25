@@ -45,7 +45,7 @@ struct HTMLCachePairFenceTests {
         "TabMail/Services/Account/AccountManagerSetup.swift\tAccountManager.removeAccountRowsTxn":
             Allowed(count: 2, reason: "account removal: " + deletesHTML),
         "TabMail/Services/Account/AccountManagerUidValidityReset.swift\tAccountManager.uidValidityResetPurgeTxn":
-            Allowed(count: 2, reason: "UIDVALIDITY reset: deletes every body in the folder's id range, with or without a header"),
+            Allowed(count: 3, reason: "UIDVALIDITY reset: deletes every body in the folder's id range, with or without a header, and by key the bodies of its own headers whose id tail holds a ':'"),
         "TabMail/Services/AI/Tools/AttachmentReadPdfTool.swift\tAttachmentReadPdfTool.readBody": Allowed(count: 1, reason: readsHTML),
         "TabMail/Services/AI/Tools/EmailForwardTool.swift\tEmailForwardTool.execute": Allowed(count: 1, reason: readsHTML),
         "TabMail/Services/AI/Tools/EmailReadTool.swift\tEmailReadTool.execute": Allowed(count: 1, reason: readsHTML),
