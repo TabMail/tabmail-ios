@@ -272,9 +272,9 @@ struct ChatNewThreadView: View {
     }
 
     /// Send: with nobody to send to, ask, and the words stay. With people picked, the people the
-    /// field's words go to the agent for: it writes the email to them and opens the compose card
-    /// (`openAgentCompose`), as a reply sent from a chat's field does. The words and attachments
-    /// stay until the card's Send.
+    /// field's words write the email to: they are the request of its compose edit, never a turn
+    /// for the agent, and the compose card opens with the email written (`openAgentCompose`), as a
+    /// reply sent from a chat's field does. The words and attachments stay until the card's Send.
     private func send() -> [ChatThread.Person]? {
         switch model.sendAction {
         case .askForRecipient:
@@ -285,7 +285,8 @@ struct ChatNewThreadView: View {
         }
     }
 
-    /// The compose card this chat's agent asked for, taken by this chat's pill (ADR-IOS-053 Phase
+    /// The compose card this chat's field (or, with the panel open, its agent) asked for, taken by
+    /// this chat's pill (ADR-IOS-053 Phase
     /// 2). A new email opens from the account bound when its turn started; when that account is
     /// gone the request ends and nothing opens.
     private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
@@ -294,8 +295,8 @@ struct ChatNewThreadView: View {
         agentCompose = AgentCard(request: req)
     }
 
-    /// The card, as the chat's reply cards open: today's compose. The new email the agent wrote
-    /// goes to this chat's people, with its Cc, Bcc, subject and attachments, in the card's own
+    /// The card, as the chat's reply cards open: today's compose. The new email written goes to
+    /// this chat's people, with its Cc, Bcc, subject and attachments, in the card's own
     /// draft (`ChatNewThreadModel.card`), and its Send is this chat's send. A card the agent opens
     /// for another email (a reply or a forward) is the agent's presenter's, and its send is not
     /// this chat's.

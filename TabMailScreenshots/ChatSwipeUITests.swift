@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import UIKit
 import XCTest
 
 /// Real drags on a real chat (ADR-IOS-114 decision 12), as Mail does it:
@@ -403,6 +404,11 @@ final class ChatSwipeUITests: XCTestCase {
         let toast = app.descendants(matching: .any)
             .matching(NSPredicate(format: "label CONTAINS %@", Self.notWrittenNote)).firstMatch
         XCTAssertTrue(toast.waitForExistence(timeout: Self.composeFailureWait), "the toast says the reply was not written")
+        // The whole note shows: it needs two lines, so the toast is two lines tall. Cut to one line
+        // it is one line plus its padding.
+        let line = UIFont.preferredFont(forTextStyle: .subheadline).lineHeight
+        XCTAssertGreaterThanOrEqual(toast.frame.height, 2 * Self.toastVerticalPadding + 1.5 * line,
+                                    "the toast takes the note's two lines: \(toast.frame), one line \(line)")
         keepScreenshot(of: app, named: "4 after Send")
         XCTAssertFalse(app.buttons["chatClose"].exists, "Send in the closed field never opened the panel")
         XCTAssertTrue(typedField(containing: Self.replyWords, in: app).waitForExistence(timeout: 3),
@@ -413,6 +419,8 @@ final class ChatSwipeUITests: XCTestCase {
     private static let replyWords = "Tell them Friday works"
     /// `DynamicIslandChatButton.notWrittenNote`, the toast when nothing was written.
     private static let notWrittenNote = "Couldn't write your reply. Your words are still in the field."
+    /// The toast's padding above and below its text (`DynamicIslandChat`'s toast, `.padding(.vertical, 12)`).
+    private static let toastVerticalPadding: CGFloat = 12
     /// How long the compose edit may take to fail without a token, on a loaded simulator.
     private static let composeFailureWait: TimeInterval = 30
 

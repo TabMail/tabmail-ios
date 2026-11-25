@@ -17,6 +17,8 @@ import UniformTypeIdentifiers
 @MainActor
 struct ChatNewThreadTests {
     private static let maria = ChatThread.Person(address: "maria@example.com", name: "Maria")
+    /// An email the field's compose edit wrote, with its text version and change command.
+    private static let written = ReplyResult(body: "The email.", textMessage: "Short.", changeCommand: "make it shorter")
     private static let sam = ChatThread.Person(address: "sam@example.com", name: "Sam")
     private static let lee = ChatThread.Person(address: "lee@example.com", name: "Lee")
 
@@ -140,26 +142,13 @@ struct ChatNewThreadTests {
         #expect(picked == .write(to: ["maria@example.com", "sam@example.com"]))
     }
 
-    @Test("Words sent with people picked go to the agent as a new email to them, under each one's name")
-    func newEmailAgentMessage() {
-        let message = ChatNewEmailField.agentMessage(to: [Self.maria, Self.sam], text: "invite them to lunch on Friday")
-        #expect(message.hasPrefix("New email to Maria <maria@example.com>, Sam <sam@example.com> ("))
-        #expect(message.contains("email_compose"), "it names the tool that writes a new email")
-        #expect(message.hasSuffix("): invite them to lunch on Friday"), "the words, as typed, close it")
-        // The field's words are always what to write: a question in them goes to the people, and
-        // the agent is never left to guess that the words were meant for it.
-        #expect(message.contains("my words are what to write to them"))
-        #expect(message.contains("a question in them is one to ask them"))
-        #expect(!message.contains("unless"), "no opening for the agent to take the words as its own")
-    }
-
     @Test("Writing a new email's chat's email reads Writing your email, as a reply does")
     func composeStatusLine() throws {
         let composing = try #require(ToolRegistry.activityLabels["email_compose"])
         #expect(ChatReplyField.statusLine(composing) == "Writing your email")
     }
 
-    @Test("The card opens with the chat's people, Cc, Bcc and attachments; a carried subject wins over the agent's")
+    @Test("The card opens with the chat's people, Cc, Bcc and attachments, and the email written with its text version; a carried subject wins over the written one")
     func cardFields() throws {
         let request = MailtoRequest(to: ["Maria <maria@example.com>"], cc: ["lee@example.com"], bcc: ["sam@example.com"],
                                     subject: "Lunch", body: "words")
@@ -168,7 +157,7 @@ struct ChatNewThreadTests {
         model.addAttachment(file)
         let req = AgentToolRouter.ComposeRequest(
             mode: .compose, replyTo: nil, to: ["someone@example.com"], cc: [], bcc: [], subject: "Agent's subject",
-            body: "The email.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat))
+            body: "The email.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat), suggestion: Self.written)
         let draftId = ChatNewThreadModel.newCardDraftId()
         let card = model.card(for: req, account: nil, draftId: draftId) { _ in }
         #expect(card.prefillDraftId == draftId, "the card writes under the draft id the chat gave it, which finds its send")
@@ -177,6 +166,7 @@ struct ChatNewThreadTests {
         #expect(card.prefillBcc == ["sam@example.com"])
         #expect(card.prefillSubject == "Lunch", "the link's subject, not the agent's")
         #expect(card.suggestedBody == "The email.")
+        #expect(card.suggestion == Self.written, "the email written, with its text version and change command")
         #expect(card.prefillAttachments == [file])
         let plain = ChatNewThreadModel(account: nil)
         plain.setPeople([Self.maria])
@@ -587,10 +577,15 @@ struct ChatNewThreadTests {
         let intercept = try #require(pill.range(of: "if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people }", range: send.upperBound..<pill.endIndex))
         let sent = try #require(pill.range(of: "fieldFill.apply(.sentFromField)", range: send.upperBound..<pill.endIndex))
         #expect(intercept.lowerBound < sent.lowerBound, "its Send is the chat's, before any agent send")
-        // With people picked, the words go to the agent with the new email's nudge. A new email's
-        // chat has no email to reply to, so its send carries no reply field.
-        #expect(Self.count("sendAgentChat(text, newEmailTo: newEmailTo)", in: pill) == 1)
-        #expect(Self.count("} else if let newEmailTo { enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text) } else {", in: pill) == 1)
+        // With people picked, the words are the request of the new email's compose edit, and never
+        // reach the agent (ADR-IOS-114 decision 10, amended 2026-11-25); the nudge that once sent
+        // them to the agent is gone. A new email's chat has no email to reply to, so its send
+        // carries no reply field and keeps its words itself.
+        #expect(Self.count("if let newEmailTo { composeNewEmailFromField(text, to: newEmailTo) } else if let message {", in: pill) == 1)
+        #expect(Self.count("private func composeNewEmailFromField(_ text: String, to people: [ChatThread.Person]) { // As mailboxes with their names, so the email written can greet them by name. let to = ChatNewDraft.toEntries(people: people, authored: [], leftovers: []) runFieldCompose(fieldReply: nil, fieldWordsKey: nil) { invocation in await EmailComposeTool.composeWithRegisteredTool(text, to: to, invocation: invocation) }", in: pill) == 1)
+        #expect(Self.count("EmailComposeTool.composeWithRegisteredTool(", in: pill) == 1)
+        #expect(Self.count("newEmailTo", in: pill) == 4, "only the field's own Send names the people")
+        #expect(Self.count("agentMessage", in: pill) == 0)
         #expect(Self.count(".task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }", in: pill) == 1)
         #expect(Self.count(".onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }", in: pill) == 1)
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")

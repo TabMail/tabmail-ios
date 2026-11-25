@@ -455,7 +455,9 @@ same AI result, kept as long as the email itself is shown.
    only for the tutorial's scripted field ask, until the tutorial moves that ask into the panel;
    the field-reply logic of ADR-IOS-053 amendment 3 in `EmailReplyTool` (the shown row's check,
    who it goes to, the edit of the shown suggestion) is now reached from the field only through
-   `composeFromField`, and the agent's requests from the panel carry no field. A new email's chat (amendment 24 and *Every new email*) still sends its field's words to the agent with its own nudge (`ChatNewEmailField.agentMessage`), as the first round of its Send built it; moving it to a direct compose is the part of this decision still to do. Tests:
+   `composeFromField`, and the agent's requests from the panel carry no field. A new email's chat (amendment 24 and *Every new email*) sent its field's words to the agent with its own nudge (`ChatNewEmailField.agentMessage`) in the first round of its Send. Since 2026-11-25 its closed field composes the same way: the words are the request of the new email's compose edit (`EmailComposeTool.composeFromField`, the registry's tool, `composeWithRegisteredTool`; mode `edit_new`, Thunderbird's `runComposeEdit`) to the people picked, given as mailboxes under their names (`ChatNewDraft.toEntries`), never a turn for the agent; the card opens over the chat with the written email and its text version (`ChatNewThreadModel.card` passes `ComposeRequest.suggestion`), and its To is the chat's people, so recipients the edit would add or remove are not applied. With nobody picked, Send asks and stops, as before. A compose that writes nothing ends the send with the words kept in the field and a note (`DynamicIslandChat.newEmailNotWrittenNote`); the reply field and the new email share one runner (`runFieldCompose`). The nudge is deleted. Tests:
+   `EmailComposeToolOutcomeTests.fieldComposeOpensTheWrittenEmail`, `ChatNewThreadScreenTests.sendWithPeoplePicked` and
+   `failedSendKeepsTheWords`, `ChatNewThreadTests` (the new email's field Send),
    `ChatReplyFieldTests.fieldSendWiring` and `noAgentNudge`, `ChatComposeRoutingTests` (case 3: the
    words reach only the compose edit; a failed compose keeps them), `ChatReplyRecoveryTests`
    (an edit in place or on the field's own card asks the agent nothing),
@@ -1929,7 +1931,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    - *The compose card and its Send (built 2026-11-24, #978).* Send with people picked sends the
      field's words to the agent as a new email to them; the agent's `email_compose` card opens over
      the chat (`openAgentCompose`) with the chat's people, Cc, Bcc, subject and attachments and the
-     agent's words, on a draft of its own that the chat names (`ChatNewThreadModel.card`,
+     agent's words, on a draft of its own (since 2026-11-25 the words are the request of the new
+     email's compose edit, not an agent turn, and the card carries the written email and its text
+     version, decision 10) that the chat names (`ChatNewThreadModel.card`,
      `newCardDraftId`: a plain id, so a card closed with Save is an ordinary draft, which reopens in
      compose). A card the agent opens for another email (a reply or a forward) opens through the
      agent's one presenter (`composeView(account:onOutcome:)`), and its send is not this chat's.
