@@ -1311,11 +1311,14 @@ struct SuggestionSinglePathFenceTests {
         #expect(tool.components(separatedBy: "ChatReplyCompose.suggestionEnvelope(for: header").count - 1 == 1, "one start derivation")
         #expect(!tool.contains("buildReplyAllRecipients"), "the reply tool's own Reply All arithmetic")
         #expect(try Self.lines(matching: #"agentReply\(|applyRecipientDelta"#, in: files).isEmpty, "a second envelope derivation")
-        // Every host opens the agent's card through the one presenter.
+        // Every host opens the agent's card through the one presenter. A new email's chat is a
+        // host too: its own new email's card is built by its model (`ChatNewThreadModel.card`,
+        // with the chat's people, Cc, Bcc and attachments), and any other card its agent asks for
+        // opens through this same presenter.
         let presenters = try Self.lines(matching: #"req\.composeView\(account:"#, in: files)
         #expect(Set(presenters.map { String($0.prefix { $0 != ":" }) }) == [
             "TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Inbox/InboxView.swift",
-            "TabMail/Views/Message/MessageDetailView.swift",
+            "TabMail/Views/Message/MessageDetailView.swift", "TabMail/Views/Chat/ChatNewThreadView.swift",
         ])
         #expect(try Self.lines(matching: #"composeViewForAgentRequest"#, in: files).isEmpty)
     }
