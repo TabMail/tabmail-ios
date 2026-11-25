@@ -287,7 +287,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(markerReads(focused: false, in: app), "the short drag left the field unfocused")
         XCTAssertEqual(marker.newestMinY, rest.newestMinY, accuracy: 1, "control: the marker's newest row is the row read at rest")
         // The glass rose under the held finger (read by the app while the finger was down)...
-        XCTAssertGreaterThan(marker.rise, Self.shortDragTravel / 2, "the field's glass swelled under the finger: \(marker.rise)")
+        XCTAssertGreaterThan(marker.rise, Self.shortDragTravel / 2, "the field's glass swelled under the finger: \(marker.rise); \(dragMarkerLabel(afterDrags: 0, in: app))")
         XCTAssertLessThanOrEqual(marker.rise, Self.shortDragTravel + 1, "no further than the finger went")
         // ...and is back at its resting top once settled.
         XCTAssertEqual(marker.fieldTop ?? -1, restingGlass, accuracy: 1, "the swell settled back")
@@ -381,7 +381,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertGreaterThan(start.screenPoint.x, field.frame.minX, "control: the drag starts on the field's text")
         XCTAssertGreaterThan(start.screenPoint.x, Self.backSwipeEdge, "control: outside the screen edge's own back swipe")
         start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: Self.longBackSwipeEnd, dy: y)))
-        XCTAssertTrue(wentBack(app), "a right drag from the field goes back")
+        XCTAssertTrue(wentBack(app), "a right drag from the field goes back; \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// A right drag across most of the screen, and the screen edge's own back-swipe zone
@@ -394,7 +394,7 @@ final class ChatSwipeUITests: XCTestCase {
     func testNothingOpenEdgeDragOnTheReplyFieldGoesBack() {
         let app = launchIntoChat()
         dragFromEdge(atY: replyField(in: app).frame.midY, in: app)
-        XCTAssertTrue(wentBack(app), "an edge drag at the field goes back")
+        XCTAssertTrue(wentBack(app), "an edge drag at the field goes back; \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// Starts on the field's glass itself, where it overlaps the back swipe's zone at the screen's
@@ -412,7 +412,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertLessThan(x, Self.backSwipeEdgeWidth, "control: and inside the back swipe's zone")
         let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: x, dy: y))
         start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: y / app.frame.height)))
-        XCTAssertTrue(wentBack(app), "an edge drag that starts on the field goes back")
+        XCTAssertTrue(wentBack(app), "an edge drag that starts on the field goes back; \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// `ChatViewLayout.backSwipeEdgeWidth`, the back swipe's zone at the left edge, and how far into
@@ -682,7 +682,7 @@ final class ChatSwipeUITests: XCTestCase {
     private func assertTipStaysGoneOnTheNextPresentations(of app: XCUIApplication,
                                                           file: StaticString = #filePath, line: UInt = #line) {
         dragFromEdge(atY: bubble(3, in: app).frame.midY, in: app)
-        XCTAssertTrue(wentBack(app), "control: back at the list", file: file, line: line)
+        XCTAssertTrue(wentBack(app), "control: back at the list; \(dragMarkerLabel(afterDrags: 0, in: app))", file: file, line: line)
         app.buttons["Open chat"].tap()
         XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10), "control: the chat is open again", file: file, line: line)
         XCTAssertFalse(app.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: Self.tipStaysGoneWait),
@@ -787,7 +787,7 @@ final class ChatSwipeUITests: XCTestCase {
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
         start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.shortFlick)),
                     withVelocity: .fast, thenHoldForDuration: 0)
-        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the flick opened the panel")
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the flick opened the panel; \(dragMarkerLabel(afterDrags: 0, in: app))")
         XCTAssertTrue(isInChat(app), "the chat stays")
     }
 
