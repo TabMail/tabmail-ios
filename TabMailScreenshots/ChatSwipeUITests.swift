@@ -69,6 +69,9 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertGreaterThan(y, subject(in: app).frame.maxY, "control: the tap lands below the header")
         tap(atY: y, dx: move.frame.midX / app.frame.width, in: app)
         XCTAssertTrue(move.waitForNonExistence(timeout: 3), "the tap only closed the open actions")
+        // A tap the open bubble took as its own would have run the button under it instead.
+        XCTAssertFalse(app.navigationBars["Move to"].waitForExistence(timeout: 2), "and ran no Move")
+        XCTAssertFalse(unreadLine(in: app).exists, "and ran no Unread from here")
         XCTAssertFalse(app.buttons["Sheet Grabber"].waitForExistence(timeout: 2), "and opened no card")
         XCTAssertTrue(isInChat(app), "the chat stays")
     }
