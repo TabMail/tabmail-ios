@@ -624,6 +624,52 @@ struct ChatNewThreadTests {
         #expect(registry.contains("(5 production files:"), "the registry's census names the chat as a producer")
     }
 
+    /// The new email's field takes a thread's drag up (`ChatReplyFieldTests.fieldDragWiring` pins the
+    /// thread's). A hosted test cannot move the pan (memory 128), so its wiring is pinned here; the
+    /// open, the VoiceOver action and the swap's wait are pinned on screen in
+    /// `ChatNewThreadScreenTests`.
+    @Test("A new email's field drags up to open the TabMail panel as a thread's does: the swell, the open at let-go, the freeze held once per drag, and the swap to the thread waiting for the panel")
+    func fieldDragWiring() throws {
+        let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
+        #expect(Self.count("@State private var fieldDrag = ChatFieldDrag.Model()", in: view) == 1)
+        #expect(Self.count("@State private var fieldPanCut = ChatFieldPan.Cut()", in: view) == 1)
+        // The drag's progress is written by the pan's two calls and read only inside modifiers, so a
+        // moving finger never rebuilds the screen's body or the field.
+        #expect(Self.count("fieldDrag.progress", in: view) == 2, "only the two writes below")
+        #expect(Self.count("drag: fieldDrag,", in: view) == 1, "the field gets the model, so its glass swells")
+        #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))", in: view) == 1,
+                "the swell taken back out of the layout, so nothing above moves under the drag")
+        // Never over the open panel, by drag or by VoiceOver.
+        #expect(Self.count("let opensPanel = !chatExpanded", in: view) == 1)
+        #expect(Self.count(".gesture(ChatFieldPan(isEnabled: opensPanel, cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))", in: view) == 1)
+        #expect(Self.count("showChat: opensPanel ? { withAnimation(.spring(ChatThreadView.pillSpringModel)) { chatExpanded = true } } : nil,", in: view) == 1)
+        let moved = try Self.body(of: "private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {", in: view)
+        #expect(Self.count("fieldDrag.progress = ChatFieldDrag.progress(translation: drag.travel) }", in: moved) == 1)
+        #expect(Self.count("chatExpanded", in: moved) == 0, "a move only swells the field")
+        // A cancelled drag resets too, so the field never stays swollen; a finished drag that reaches
+        // the open distance opens the panel, in the same spring.
+        let ended = try Self.body(of: "private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {", in: view)
+        #expect(Self.count("let opens = finished && ChatFieldDrag.opens(letGo: drag)", in: ended) == 1)
+        #expect(Self.count("withAnimation(.spring(ChatThreadView.pillSpringModel)) { fieldDrag.progress = ChatFieldDrag.Progress() if opens { chatExpanded = true } }", in: ended) == 1,
+                "the let-go opens the panel")
+        // The freeze, from the gesture state, so a cancelled drag releases: held from the drag's start,
+        // released after the settle and the freeze rule's cooldown, and at once if the field goes.
+        #expect(Self.count(".modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })", in: view) == 1)
+        let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: view)
+        #expect(Self.count("ChatSwipeHold.shared.begin(ChatThreadView.fieldDragHoldId)", in: changed) == 1)
+        #expect(Self.count("ChatSwipeHold.shared.release( ChatThreadView.fieldDragHoldId, after: ChatThreadView.fieldDragSettle + ChatViewLayout.freezeCooldown)", in: changed) == 1)
+        #expect(Self.count(".onDisappear { ChatSwipeHold.shared.releaseNow(ChatThreadView.fieldDragHoldId) }", in: view) == 1,
+                "the field gone mid-drag ends its freeze")
+        #expect(Self.count("ChatThreadView.fieldDragHoldId", in: view) == 3, "begin, release and releaseNow: nothing else holds it")
+        // The panel opening under a held drag (the agent answering) cuts that drag off.
+        #expect(Self.count(".onChange(of: chatExpanded) { _, expanded in if expanded { fieldPanCut() } }", in: view) == 1)
+        // The swap to the sent email's thread waits while the panel is open and runs as it closes;
+        // the panel stays out of `newEmailCovered`, which also decides whether a compose card presents.
+        #expect(Self.count("guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return }", in: view) == 1)
+        #expect(Self.count(".onChange(of: chatExpanded) { _, open in if !open { swapToThread() } }", in: view) == 1)
+        #expect(Self.count("showsAddRecipient || showsCamera || showsPhotoPicker || showsFilePicker || agentCompose != nil }", in: view) == 1)
+    }
+
     // MARK: - Helpers
 
     private static func newEmailField() -> ChatNewEmailField {
@@ -641,6 +687,13 @@ struct ChatNewThreadTests {
 
     private static func count(_ needle: String, in text: String) -> Int {
         text.components(separatedBy: needle).count - 1
+    }
+
+    /// The text from `signature` to the next `private` declaration in `text` (from `source`).
+    private static func body(of signature: String, in text: String) throws -> String {
+        let start = try #require(text.range(of: signature))
+        let end = try #require(text[start.upperBound...].range(of: " private "))
+        return String(text[start.upperBound..<end.lowerBound])
     }
 }
 

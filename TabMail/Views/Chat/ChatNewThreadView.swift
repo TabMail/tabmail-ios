@@ -138,6 +138,8 @@ struct ChatNewThreadView: View {
         .undoOutcomesPresented(by: modalId)
         .task(id: sendKey) { await followSend() }
         .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
+        // The TabMail panel closing lets a waiting swap to the sent email's thread happen.
+        .onChange(of: chatExpanded) { _, open in if !open { swapToThread() } }
         .onAppear { opened() }
         // The camera's cover hides this screen without closing it.
         .onDisappear { if !showsCamera { closed() } }
@@ -417,10 +419,11 @@ struct ChatNewThreadView: View {
     }
 
     /// The sent email's copy is in the Sent folder: the chat becomes its thread for good, once
-    /// nothing is open over the new email (a card, a picker or "Add recipient"), which the change
-    /// would take down.
+    /// nothing is open over the new email (a card, a picker, "Add recipient" or the TabMail panel,
+    /// which the field's drag opens at will), which the change would take down. The panel is kept
+    /// out of `newEmailCovered`, which also decides whether a compose card may present.
     private func swapToThread() {
-        guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered else { return }
+        guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return }
         threadId = copy
     }
 
