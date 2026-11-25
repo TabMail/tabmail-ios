@@ -736,8 +736,14 @@ struct SuggestionRewriteRouteTests {
     func unchangedRowEdits() async throws {
         let fixture = try await fixture()
         let calls = Calls()
-        _ = try await tool(fixture, calls: calls, answer: Self.edit()).run(
-            arguments: request, invocation: invocation(fixture.header), rewritesInPlace: true)
+        let tool = tool(fixture, calls: calls, answer: Self.edit())
+        let invocation = invocation(fixture.header)
+        let request = request
+        // Bounded: the edit stored in place opens its card, which is closed here, never awaited forever.
+        let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true) }
+        let card = await waitForCard(fixture.router)
+        card?.onOutcome(.cancelled)
+        _ = try await task.value
         #expect(calls.all.count == 1)
     }
 
@@ -757,8 +763,14 @@ struct SuggestionRewriteRouteTests {
         #expect(card.prefillCc == ["pat@example.com"], "the outside Cc stays in Cc")
         // The field's edit of that suggestion starts from the same envelope.
         let calls = Calls()
-        _ = try await tool(fixture, calls: calls, answer: Self.edit()).run(
-            arguments: request, invocation: invocation(email), rewritesInPlace: true)
+        let tool = tool(fixture, calls: calls, answer: Self.edit())
+        let invocation = invocation(email)
+        let request = request
+        // Bounded: the edit stored in place opens its card, which is closed here, never awaited forever.
+        let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true) }
+        let opened = await waitForCard(fixture.router)
+        opened?.onOutcome(.cancelled)
+        _ = try await task.value
         let call = try #require(calls.all.first)
         #expect(call.context.toRecipients.isEmpty && call.context.ccRecipients == ["pat@example.com"])
     }
