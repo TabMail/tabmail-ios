@@ -38,6 +38,8 @@ struct ChatHeaderView: View {
                 ForEach(Array(people.prefix(ChatViewLayout.headerNameCount + 1).enumerated()), id: \.offset) { _, person in
                     ChatAvatar(person: person, size: ChatViewLayout.headerAvatarSize)
                         .overlay(Circle().stroke(Palette.previewPaneBg, lineWidth: 2))
+                        .contentShape(.contextMenuPreview, Circle())
+                        .copyAddressMenu(AddressCopy.person(person))
                 }
             }
             if let title = people.isEmpty ? emptyTitle : ChatThread.headerTitle(people) {

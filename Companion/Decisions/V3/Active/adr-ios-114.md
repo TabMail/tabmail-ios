@@ -392,6 +392,16 @@ same AI result, kept as long as the email itself is shown.
    releasable while the chat view was built in parts. It was decided that the whole chat view is
    tested, merged and released at once, so that reason is gone and the switch, the override and the
    two Settings positions went with it.
+   *Amended 2026-11-24 (#1447):* a long press on a person copies their bare address, never the name
+   (`AddressCopy`, `copyAddressMenu`): the header's avatars, the avatar beside a bubble, and each
+   person and searched contact of the "Reply to" / "Add recipient" sheet open the standard menu with
+   "Copy Address" (an avatar's preview keeps its circle). VoiceOver does not reach the bubble's
+   avatar, so while the bubble shows its sender it offers the same copy as a named action, "Copy
+   <name>'s Address". A person kept as written (`support team <support@localhost>`) copies the
+   address it names. The email view's sender and recipient lines and compose's chips offer it too.
+   Every place reads the address with the same parser, so a stored sender holding more than the
+   address (`ann@example.com (Ann Lee)`) copies the address alone. Tests: `CopyAddressTests`, and
+   `ChatBubbleActionTests` for the VoiceOver action through the real clipboard.
 
 10. **The reply field (amendment 2026-11-05).** In the chat, today's
    pill on the newest email is shown as a reply field, [mic] [field] [Send]: `DynamicIslandChat`

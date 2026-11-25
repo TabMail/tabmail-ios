@@ -228,11 +228,13 @@ struct MessageCardView: View {
             VStack(alignment: .leading, spacing: 4) {
                 // Sender + date + chevron
                 HStack(alignment: .top) {
-                    Text(message.from)
-                        .font(.subheadline)
-                        .fontWeight(message.isRead ? .regular : .semibold)
-                        .foregroundStyle(Theme.textPrimary)
-                        .lineLimit(1)
+                    CopyAddressMenu(entries: Self.copyEntries(.sender, of: message), primaryAction: { toggleExpanded() }) {
+                        Text(message.from)
+                            .font(.subheadline)
+                            .fontWeight(message.isRead ? .regular : .semibold)
+                            .foregroundStyle(Theme.textPrimary)
+                            .lineLimit(1)
+                    }
                     Spacer()
                     Text(MessageViewHelpers.formatShortDate(message.date))
                         .font(.caption)
@@ -250,7 +252,7 @@ struct MessageCardView: View {
                 }
 
                 // To + tag
-                tagRow
+                tagRow(onTap: { toggleExpanded() })
 
                 // Snippet preview
                 Text(message.snippet.isEmpty ? message.subject : message.snippet)
@@ -335,7 +337,7 @@ struct MessageCardView: View {
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                headerExpanded.toggle()
+                toggleHeader()
             }
             .padding(.leading, 3)
 
@@ -407,11 +409,13 @@ struct MessageCardView: View {
         VStack(alignment: .leading, spacing: 4) {
             // Sender + date
             HStack(alignment: .top) {
-                Text(message.from)
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                    .foregroundStyle(Theme.textPrimary)
-                    .lineLimit(1)
+                CopyAddressMenu(entries: Self.copyEntries(.sender, of: message), primaryAction: { toggleHeader() }) {
+                    Text(message.from)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundStyle(Theme.textPrimary)
+                        .lineLimit(1)
+                }
                 Spacer()
                 Text(MessageViewHelpers.formatShortDate(message.date))
                     .font(.caption)
@@ -425,7 +429,7 @@ struct MessageCardView: View {
             }
 
             // To + tag
-            tagRow
+            tagRow(onTap: { toggleHeader() })
         }
     }
 
@@ -435,10 +439,12 @@ struct MessageCardView: View {
         VStack(alignment: .leading, spacing: 4) {
             // Sender + tag + flag (top row)
             HStack(alignment: .top) {
-                Text(message.from)
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                    .foregroundStyle(Theme.textPrimary)
+                CopyAddressMenu(entries: Self.copyEntries(.sender, of: message), primaryAction: { toggleHeader() }) {
+                    Text(message.from)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundStyle(Theme.textPrimary)
+                }
                 Spacer()
                 // Tag in top-right (inbox only)
                 if message.isInInbox {
@@ -458,32 +464,40 @@ struct MessageCardView: View {
                 }
             }
 
-            Text(message.fromAddress)
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Text(MessageViewHelpers.formatExpandedDate(message.date))
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
-
-            Text("To: \(message.to)")
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            if !message.cc.isEmpty {
-                Text("Cc: \(message.cc)")
+            CopyAddressMenu(entries: Self.copyEntries(.sender, of: message), primaryAction: { toggleHeader() }) {
+                Text(message.fromAddress)
                     .font(.caption)
                     .foregroundStyle(Theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            if !message.bcc.isEmpty {
-                Text("Bcc: \(message.bcc)")
+            Text(MessageViewHelpers.formatExpandedDate(message.date))
+                .font(.caption)
+                .foregroundStyle(Theme.textSecondary)
+
+            CopyAddressMenu(entries: Self.copyEntries(.to, of: message), primaryAction: { toggleHeader() }) {
+                Text("To: \(message.to)")
                     .font(.caption)
                     .foregroundStyle(Theme.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if !message.cc.isEmpty {
+                CopyAddressMenu(entries: Self.copyEntries(.cc, of: message), primaryAction: { toggleHeader() }) {
+                    Text("Cc: \(message.cc)")
+                        .font(.caption)
+                        .foregroundStyle(Theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if !message.bcc.isEmpty {
+                CopyAddressMenu(entries: Self.copyEntries(.bcc, of: message), primaryAction: { toggleHeader() }) {
+                    Text("Bcc: \(message.bcc)")
+                        .font(.caption)
+                        .foregroundStyle(Theme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             if let replyTo = message.replyTo,
@@ -532,12 +546,39 @@ struct MessageCardView: View {
         return "\(prefix) \(names)"
     }
 
-    private var tagRow: some View {
+    /// A header line whose long press offers "Copy Address" for its people.
+    enum HeaderLine {
+        case sender, to, cc, bcc
+        /// The short line's To, Cc and Bcc people (`compressedRecipientLabel`).
+        case recipients
+    }
+
+    /// The people a header line's "Copy Address" offers, each with the address it copies.
+    static func copyEntries(_ line: HeaderLine, of message: MessageHeader) -> [AddressCopy.Entry] {
+        switch line {
+        case .sender: AddressCopy.named(message.from, address: message.fromAddress)
+        case .to: AddressCopy.entries(in: [message.to])
+        case .cc: AddressCopy.entries(in: [message.cc])
+        case .bcc: AddressCopy.entries(in: [message.bcc])
+        case .recipients: AddressCopy.entries(in: [message.to, message.cc, message.bcc])
+        }
+    }
+
+    /// A tap on the header's details shows more or fewer of them.
+    private func toggleHeader() {
+        headerExpanded.toggle()
+    }
+
+    /// The short recipient line and the tag. `onTap` is what a tap on the recipients does: the
+    /// line opens a "Copy Address" menu on a long press, so it takes the tap from the view around it.
+    private func tagRow(onTap: @escaping @MainActor () -> Void) -> some View {
         HStack(alignment: .center) {
-            Text(compressedRecipientLabel)
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
-                .lineLimit(1)
+            CopyAddressMenu(entries: Self.copyEntries(.recipients, of: message), primaryAction: onTap) {
+                Text(compressedRecipientLabel)
+                    .font(.caption)
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(1)
+            }
             // Only show action tags for inbox messages
             if message.isInInbox {
                 if let tag = message.actionTag {
