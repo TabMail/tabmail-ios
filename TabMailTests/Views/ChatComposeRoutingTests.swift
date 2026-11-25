@@ -120,7 +120,8 @@ struct ChatComposeRoutingTests {
     /// email it names (unless `asksForReply` is false), or on the email set with `reply(to:)` for a
     /// request that names none (the inbox's chat), or for `email_compose` of a new email with
     /// `asksForNewEmail`; one carrying the tool's result is answered "Done". With `failsFirst`, the
-    /// first `failures` requests fail that way.
+    /// first `failures` requests fail that way. The compose edit writes `composedSubject` as the
+    /// subject, as a new email's does (a reply's keeps its own).
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         final class Record: Sendable {
@@ -136,7 +137,7 @@ struct ChatComposeRoutingTests {
         static let composeEditPrompt = "system_prompt_compose_interactive"
 
         init(asksForReply: Bool = true, asksForNewEmail: Bool = false,
-             failsFirst: ChatReplyRecoveryTests.Failure? = nil, failures: Int = 1) {
+             failsFirst: ChatReplyRecoveryTests.Failure? = nil, failures: Int = 1, composedSubject: String = "") {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 let count = record.bodies.withLock { bodies in
@@ -152,7 +153,7 @@ struct ChatComposeRoutingTests {
                 let final: [String: Any]
                 if body.contains(Backend.composeEditPrompt) {
                     final = ["assistant": ComposeEditJSON.make(
-                        response: "Done.", subject: "", body: Backend.composed.body,
+                        response: "Done.", subject: composedSubject, body: Backend.composed.body,
                         textMessage: Backend.composed.textMessage ?? "", changeCommand: Backend.composed.changeCommand ?? "")]
                 } else if body.contains("conversation_state") || !asksForReply {
                     final = ["assistant": "Done"]
