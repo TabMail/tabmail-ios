@@ -2023,7 +2023,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        and agent session of its own (`ChatNewThreadModel.init(after:)`; left as it is, it saves
        nothing, and the sent email's discarded generation is never written again). The sent email's
        chat draft, if it was saved, is discarded through compose's own Discard after any save in
-       flight (`ChatNewThreadModel.discardSavedDraft`, `ComposeDraftDiscard`, which removes the
+       flight, except a reopened draft whose attachments could not be read: it is kept as it is, as
+       its save is refused, since those files were not in the email sent and may exist only in that
+       draft (`ChatNewThreadModel.discardSavedDraft`, `ComposeDraftDiscard`, which removes the
        server's copy too), and its session ends. The field starts each new email from that email's
        own words, once per session key (`DynamicIslandChat.startNewEmail`), so the sent words go.
      - The chat shows the email's Sending bubble (`ChatUnsentReplyBubble`: the fill, "Sending · Undo
