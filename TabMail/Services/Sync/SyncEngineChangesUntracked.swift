@@ -192,7 +192,7 @@ enum UntrackedRefresh: Sendable, Equatable {
 }
 
 /// The bound of a listing in an other-folder run's slice (#1110), the same as
-/// a request of the older-mail check (`IMAPProvider.catchUpFolder`). A request
+/// a request of the older-mail check (each provider's `catchUpFolder`). A request
 /// is one provider call (the epoch check's sample, the listing's window read),
 /// bounded as a whole: the call starts only while the slice has time, and the
 /// listing waits for it at most `timeoutSeconds` (the run's
