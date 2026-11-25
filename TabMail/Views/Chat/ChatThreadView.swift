@@ -505,7 +505,11 @@ struct ChatThreadView: View {
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
                 .onScrollGeometryChange(for: Bool.self) { geo in
-                    geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
+                    let isAbove = geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
+                    #if DEBUG
+                    if isAbove { NSLog("[cv10diag] jump shows at %@", String(describing: geo)) }
+                    #endif
+                    return isAbove
                 } action: { _, isAbove in
                     withAnimation(.easeInOut(duration: 0.2)) { showsJumpButton = isAbove }
                 }
