@@ -515,12 +515,14 @@ struct ChatComposeRoutingTests {
         return [:]
     }
 
-    /// Waits for a compose card and returns its recipients.
-    private static func openedCard(in screens: Screens) async throws -> [String: String] {
+    /// Waits for a compose card whose `fields` all show addresses, and returns its recipients. A
+    /// check that reads a field passes it here: the card's rows join the accessibility tree one by
+    /// one, so a Cc row can still be missing once To has its addresses (#1498).
+    private static func openedCard(in screens: Screens, showing fields: [String] = ["to"]) async throws -> [String: String] {
         var found: [String: String] = [:]
         try await waitUntil {
             found = card(in: screens)
-            return found["to"]?.isEmpty == false
+            return fields.allSatisfy { found[$0]?.isEmpty == false }
         }
         return found
     }
@@ -665,7 +667,7 @@ struct ChatComposeRoutingTests {
                         "control: the request names nobody: \(String(describing: request.fieldReply))")
 
                 router.composePresentationDidEnd()
-                let card = try await Self.openedCard(in: screens)
+                let card = try await Self.openedCard(in: screens, showing: ["to", "cc"])
                 #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "the sender and the other To: \(card)")
                 #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "the Cc stays: \(card)")
                 #expect(Self.addresses(card["bcc"]).isEmpty, "\(card)")
@@ -844,7 +846,7 @@ struct ChatComposeRoutingTests {
                 screens.route.chatShown = false
                 try await Self.waitUntil { Self.namesButton(in: screens.view) == nil }
                 #expect(Self.namesButton(in: screens.view) == nil, "control: the chat is closed")
-                let card = try await Self.openedCard(in: screens)
+                let card = try await Self.openedCard(in: screens, showing: ["to", "cc"])
                 #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "the inbox's Reply All: \(card)")
                 #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "\(card)")
                 #expect(router.composeQueueDepth == 0)
@@ -877,7 +879,7 @@ struct ChatComposeRoutingTests {
                     #expect(request.fieldReply == nil, "control: no reply field asked")
 
                     router.composePresentationDidEnd()
-                    let card = try await Self.openedCard(in: screens)
+                    let card = try await Self.openedCard(in: screens, showing: ["to", "cc"])
                     #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "the \(root.rawValue) screen's Reply All: \(card)")
                     #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "\(card)")
                     #expect(router.composeQueueDepth == 0)
@@ -906,7 +908,7 @@ struct ChatComposeRoutingTests {
                     #expect(request.fieldReply == nil, "control: asked in the sheet, not the field")
 
                     router.composePresentationDidEnd()
-                    let card = try await Self.openedCard(in: screens)
+                    let card = try await Self.openedCard(in: screens, showing: ["to", "cc"])
                     #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "the agent's recipients: \(card)")
                     #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "\(card)")
                     #expect(router.composeQueueDepth == 0, "the chat view took it, not the inbox under it")
@@ -1434,7 +1436,7 @@ struct ChatComposeRoutingTests {
 
                     // The email screen shows again and opens the reply.
                     screens.route.chatShown = false
-                    let card = try await Self.openedCard(in: screens)
+                    let card = try await Self.openedCard(in: screens, showing: ["to", "cc"])
                     #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "the email screen's Reply All: \(card)")
                     #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "\(card)")
                     #expect(router.composeQueueDepth == 0)

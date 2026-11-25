@@ -1023,8 +1023,10 @@ final class MessageDetailViewModel {
                     self.pendingRefreshIds.insert(updatedId)
                     return
                 }
-                applyOverlay(to: &updated)
-                self.message = updated
+                if storedRowIsShownMessage(held: self.message, stored: updated) {
+                    applyOverlay(to: &updated)
+                    self.message = updated
+                }
             }
         }
 
@@ -1042,7 +1044,8 @@ final class MessageDetailViewModel {
                 // shrink `threadMessages` during the suspension — a stale
                 // index would subscript out of bounds or overwrite the wrong
                 // row.
-                if let idx = self.threadMessages.firstIndex(where: { $0.id == updatedId }) {
+                if let idx = self.threadMessages.firstIndex(where: { $0.id == updatedId }),
+                   storedRowIsShownMessage(held: self.threadMessages[idx], stored: updated) {
                     // Field-level move preserve: AI/display fields always flow
                     // from the fresh row; local folder fields survive only
                     // while the move op is in flight (see preservingLocalMove).
@@ -1052,6 +1055,29 @@ final class MessageDetailViewModel {
                 }
             }
         }
+    }
+
+    /// Whether a per-row refresh may replace the row the screen holds with the row
+    /// stored under its id (tabmail-ios #1138). After a mailbox reset (a UIDVALIDITY
+    /// change) a different email can be stored under an id the screen still holds.
+    /// Swapping it in would show an email the screen never loaded, and an Undo
+    /// snapshot taken from the shown rows would record it. Keeping the held row keeps
+    /// the screen on the email it loaded, and Undo, which holds that email's witness,
+    /// refuses. An action on a shown row still resolves its target by id when it
+    /// runs: refusing that target after a reset is ADR-IOS-115 part 2 (#414).
+    /// `ExpectedMessageIdentity` only refuses: on a different Message-ID, or, when
+    /// the held row has none, a different proven epoch. A held row with no witness,
+    /// or no held row, never refuses. It never picks a row, so ADR-IOS-068 D4 holds.
+    /// A refused refresh leaves the held row as it is: the next thread load decides
+    /// which thread rows are shown, and a kept opened email stays until it is opened
+    /// again.
+    private func storedRowIsShownMessage(held: MessageHeader?, stored: MessageHeader) -> Bool {
+        guard let held, let identity = ExpectedMessageIdentity(header: held) else { return true }
+        if identity.matches(stored) { return true }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[DetailRender] refresh KEPT the shown row \(stored.id.prefix(40)): the row stored under its id is a different message")
+        }
+        return false
     }
 
     /// Field-level preserve for a locally-moved thread bubble

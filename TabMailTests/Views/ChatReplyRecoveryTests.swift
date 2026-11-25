@@ -472,9 +472,11 @@ struct ChatReplyRecoveryTests {
                 // The ghost's card is the exact Reply All, with the edit.
                 try await Self.openGhostCard(try #require(stored?.suggestion), in: chat)
                 var card: [String: String] = [:]
+                // To and Cc both shown: the check below reads both, and the card's rows join the
+                // accessibility tree one by one (#1125).
                 try await Self.waitUntil {
                     card = Self.composeRecipients(chat.controller.presentedViewController?.view)
-                    return card["to"]?.isEmpty == false
+                    return card["to"]?.isEmpty == false && card["cc"]?.isEmpty == false
                 }
                 #expect(Self.addresses(card["to"]).union(Self.addresses(card["cc"])) == ["alex@example.com", "david@example.com", "sam@example.com"],
                         "the card goes to everyone on the email: \(card)")
