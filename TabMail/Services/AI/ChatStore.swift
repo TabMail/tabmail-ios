@@ -492,8 +492,8 @@ actor ChatStore {
     /// Static + pure so tests can run it against an in-memory DB.
     nonisolated static func inboxSessionScopeSQL(demoActive: Bool) -> String {
         demoActive
-            ? "sessionId LIKE 'demo:%' AND sessionId NOT LIKE 'demo:msg:%' AND sessionId NOT LIKE 'demo:compose:%'"
-            : "sessionId NOT LIKE 'demo:%' AND sessionId NOT LIKE 'msg:%' AND sessionId NOT LIKE 'compose:%'"
+            ? "sessionId LIKE 'demo:%' AND sessionId NOT LIKE 'demo:thread:%' AND sessionId NOT LIKE 'demo:msg:%' AND sessionId NOT LIKE 'demo:compose:%'"
+            : "sessionId NOT LIKE 'demo:%' AND sessionId NOT LIKE 'thread:%' AND sessionId NOT LIKE 'msg:%' AND sessionId NOT LIKE 'compose:%'"
     }
 
     /// Load the last K distinct **inbox** sessions, ordered newest-last (rightmost in swipe UI).
