@@ -72,7 +72,9 @@ struct CompletedSendCleanupDisposition: Sendable {
     let accountId: String
     let outboxDir: String?
     let draftDir: String?
-    let replyDetectHeaderId: String?
+    /// The original message whose row this send changed (replied/forwarded
+    /// mark, or the cleared Reply tag), so an open email screen re-reads it.
+    let changedOriginalHeaderId: String?
     let serverDraftCleanup: ServerDraftCleanup?
     let preservedMismatchedDraftId: String?
 }
@@ -254,7 +256,6 @@ extension AccountManager {
 
         // Capture immutable, Sendable values for the @Sendable async write closure.
         let outboxToInsert = outbox
-        let inReplyTo = draft.inReplyTo
         let hadAttachments = !draft.attachments.isEmpty
         do {
             let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?, holdUntil: Date?) in
@@ -1107,7 +1108,7 @@ extension AccountManager {
             throw OutboxFinalizeError.outboxRowVanished(outboxId)
         }
 
-        var replyDetectHeaderId: String?
+        var changedOriginalHeaderId: String?
         if let originalId = outbox.originalMessageHeaderId,
            var original = try resolveOriginalMessage(
                 originalId: originalId,
@@ -1173,6 +1174,7 @@ extension AccountManager {
                         observedUidValidity: flagAdmission.observedUidValidity,
                         sentAt: outbox.sentAt)
                     try markForwardedOp.insert(db)
+                    changedOriginalHeaderId = originalId
                 }
             } else {
                 if let flagAdmission {
@@ -1188,6 +1190,7 @@ extension AccountManager {
                         replyAll: outbox.isReplyAll,
                         sentAt: outbox.sentAt)
                     try markRepliedOp.insert(db)
+                    changedOriginalHeaderId = originalId
                 }
                 // ⚑ DELIBERATELY OUTSIDE the admission guard. An action tag is
                 // LOCAL-ONLY (ADR-IOS-036) — clearing `reply` claims nothing about
@@ -1207,7 +1210,7 @@ extension AccountManager {
                         folderPath: original.folderPath,
                         tagValue: ActionTag.none.rawValue)
                     try setTagOp.insert(db)
-                    replyDetectHeaderId = originalId
+                    changedOriginalHeaderId = originalId
                 }
             }
             try original.update(db)
@@ -1260,7 +1263,7 @@ extension AccountManager {
             accountId: outbox.accountId,
             outboxDir: outboxDir,
             draftDir: draftDir,
-            replyDetectHeaderId: replyDetectHeaderId,
+            changedOriginalHeaderId: changedOriginalHeaderId,
             serverDraftCleanup: cleanup,
             preservedMismatchedDraftId: preservedMismatchedDraftId)
     }
@@ -1297,9 +1300,11 @@ extension AccountManager {
         if let draftDir = disposition.draftDir {
             DraftAttachmentStorage.deleteAttachments(dirName: draftDir)
         }
-        if let replyId = disposition.replyDetectHeaderId {
+        // The original's replied/forwarded mark is written only here, at send
+        // completion (#1468), so this is the one post that refreshes its open screen.
+        if let originalId = disposition.changedOriginalHeaderId {
             NotificationCenter.default.post(
-                name: .messageDataDidChange, object: replyId)
+                name: .messageDataDidChange, object: originalId)
         }
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
         NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
