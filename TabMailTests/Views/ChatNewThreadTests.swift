@@ -640,7 +640,7 @@ struct ChatNewThreadTests {
         #expect(Self.count(".modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))", in: view) == 1,
                 "the swell taken back out of the layout, so nothing above moves under the drag")
         // Never over the open panel, by drag or by VoiceOver.
-        #expect(Self.count("let opensPanel = !chatExpanded", in: view) == 1)
+        #expect(Self.count("let opensPanel = !chatExpanded return VStack(", in: view) == 1)
         #expect(Self.count(".gesture(ChatFieldPan(isEnabled: opensPanel, cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))", in: view) == 1)
         #expect(Self.count("showChat: opensPanel ? { withAnimation(.spring(ChatThreadView.pillSpringModel)) { chatExpanded = true } } : nil,", in: view) == 1)
         let moved = try Self.body(of: "private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {", in: view)
@@ -657,6 +657,8 @@ struct ChatNewThreadTests {
         #expect(Self.count(".modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })", in: view) == 1)
         let changed = try Self.body(of: "private func fieldDragChanged(_ dragging: Bool) {", in: view)
         #expect(Self.count("ChatSwipeHold.shared.begin(ChatThreadView.fieldDragHoldId)", in: changed) == 1)
+        #expect(Self.count("if dragging { ChatSwipeHold.shared.begin(ChatThreadView.fieldDragHoldId) ChatFieldDragTip.close() return }", in: changed) == 1,
+                "held once per drag, from its start; the drag ends the tip")
         #expect(Self.count("ChatSwipeHold.shared.release( ChatThreadView.fieldDragHoldId, after: ChatThreadView.fieldDragSettle + ChatViewLayout.freezeCooldown)", in: changed) == 1)
         #expect(Self.count(".onDisappear { ChatSwipeHold.shared.releaseNow(ChatThreadView.fieldDragHoldId) }", in: view) == 1,
                 "the field gone mid-drag ends its freeze")
