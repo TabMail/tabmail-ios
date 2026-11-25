@@ -911,9 +911,11 @@ same AI result, kept as long as the email itself is shown.
    passed on the same code). A UIKit pan takes no scrolls unless told to, and a list's swipe
    actions take a trackpad's two-finger swipe, so the swipes' pan now takes a trackpad's swipe and
    a mouse's scroll wheel as well as a drag (`ChatHorizontalPan.makePan`, `allowedScrollTypesMask`).
-   A scroll has no touch, so it never starts at the screen's edge
-   (`ChatHorizontalPan.Coordinator.gestureRecognizerShouldBegin` reads the edge only with a
-   touch down). The closer's pan takes scrolls only while something is open, so a scroll
+   A scroll has no touch, so it never starts at the screen's edge: the pan forgets where its last
+   touch came down once each drag, tap or scroll is over (`ChatHorizontalPan.Recognizer.reset`,
+   `Coordinator.gestureEnded`). The touch count at the begin decision cannot tell a scroll from a
+   drag, since UIKit can decide a quick drag's start once its touch has lifted (the swipe UI run
+   2026-11-25 took edge drags as bubble swipes that way). The closer's pan takes scrolls only while something is open, so a scroll
    elsewhere closes it as a drag does, and with nothing open no swipe waits for it to decline one
    (`ChatSwipeCloser.Coordinator.takesScrolls`). Tests (`ChatSwipeTests`): `swipesTakeScrolls`,
    `scrollNeverStartsAtTheEdge`, `closerTakesScrollsOnlyWhileOpen`; a trackpad's swipe itself

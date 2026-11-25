@@ -390,10 +390,20 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     /// and a mouse's scroll wheel as well as a finger's drag, as the inbox's list swipes do: a
     /// UIKit pan takes no scrolls unless told to.
     static func makePan(delegate: any UIGestureRecognizerDelegate) -> UIPanGestureRecognizer {
-        let pan = UIPanGestureRecognizer()
+        let pan = Recognizer()
         pan.delegate = delegate
         pan.allowedScrollTypesMask = .all
         return pan
+    }
+
+    /// The swipe's pan. UIKit resets it once each drag, tap or scroll is over; it then forgets
+    /// where its last touch came down (`Coordinator.gestureEnded`), so a later scroll, which has no
+    /// touch, never reads an earlier touch's start at the screen's edge.
+    final class Recognizer: UIPanGestureRecognizer {
+        override func reset() {
+            super.reset()
+            (delegate as? Coordinator)?.gestureEnded()
+        }
     }
 
     func updateUIGestureRecognizer(_ recognizer: UIPanGestureRecognizer, context: Context) {
@@ -470,13 +480,18 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
             windowX <= ChatViewLayout.backSwipeEdgeWidth
         }
 
-        /// A scroll (a trackpad or a scroll wheel) has no touch, so it never starts at the screen's
-        /// edge, whatever an earlier drag's touch left in `startsAtScreenEdge`.
+        /// The drag, tap or scroll is over (`Recognizer.reset`): the next one starts with no edge
+        /// start until its own first touch says so, and a scroll has none. The touch count cannot
+        /// tell a scroll from a drag: UIKit can decide a quick drag's start once its touch has lifted
+        /// (swipe UI run 2026-11-25: the edge drags stopped going back).
+        func gestureEnded() {
+            startsAtScreenEdge = false
+        }
+
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
             guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
             let velocity = pan.velocity(in: pan.view)
-            let atEdge = pan.numberOfTouches > 0 && startsAtScreenEdge
-            return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, atEdge)
+            return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, startsAtScreenEdge)
         }
 
         /// A swipe runs alone: once it has the drag, nothing else acts on it (a back swipe, the

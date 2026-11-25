@@ -5,6 +5,8 @@
 import Foundation
 import Testing
 import UIKit
+// `reset`, which UIKit calls on the swipe's pan once a drag, tap or scroll is over.
+import UIKit.UIGestureRecognizerSubclass
 @testable import TabMail
 
 /// ADR-IOS-114 decision 12: the chat's swipes.
@@ -356,7 +358,7 @@ struct ChatSwipeTests {
     func revealWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
         #expect(text.contains("shouldBegin: { velocityX, atEdge in ChatSwipe.takesDrag(id: id, openId: open.id, sign: sign, velocityX: velocityX, startsAtScreenEdge: atEdge) },"))
-        #expect(text.contains("return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, atEdge)"),
+        #expect(text.contains("return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, startsAtScreenEdge)"),
                 "a vertical drag stays the scroll view's")
         #expect(text.contains(".onDisappear { ChatSwipeHold.shared.releaseNow(id) open.left(id) }"),
                 "a reveal whose view leaves the chat is no longer open")
@@ -381,13 +383,10 @@ struct ChatSwipeTests {
         #expect(text.contains("func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer { Self.makePan(delegate: context.coordinator) }"))
     }
 
-    /// A pan whose speed and touch count the test sets, as UIKit reports them to the delegate before
-    /// the pan starts: one touch for a finger's drag, none for a trackpad's or scroll wheel's scroll.
+    /// A pan whose speed the test sets, as UIKit reports it to the delegate before the pan starts.
     private final class MovingPan: UIPanGestureRecognizer {
         var speed = CGPoint.zero
-        var touches = 1
         override func velocity(in view: UIView?) -> CGPoint { speed }
-        override var numberOfTouches: Int { touches }
     }
 
     // The owner's simulator run (2026-11-24): every chat swipe was dead, both ways, while the inbox's
@@ -403,22 +402,24 @@ struct ChatSwipeTests {
 
     @Test("A scroll never starts at the screen's edge, whatever an earlier finger's touch left")
     func scrollNeverStartsAtTheEdge() {
-        var edges: [Bool] = []
-        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _, atEdge in edges.append(atEdge); return true })
-        let pan = MovingPan()
-        pan.delegate = coordinator
-        pan.speed = CGPoint(x: 120, y: 4)
-        // A finger comes down at the screen's left edge.
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _, _ in true })
+        let pan = ChatHorizontalPan.makePan(delegate: coordinator)
+        // A finger comes down at the screen's left edge: its drag starts there, until it is over.
         let touch = PlacedTouch()
         touch.point = CGPoint(x: 1, y: 300)
-        pan.touches = 0
         #expect(coordinator.gestureRecognizer(pan, shouldReceive: touch))
         #expect(coordinator.startsAtScreenEdge, "control: that touch is in the back swipe's zone")
-        pan.touches = 1
-        #expect(coordinator.gestureRecognizerShouldBegin(pan))
-        pan.touches = 0
-        #expect(coordinator.gestureRecognizerShouldBegin(pan))
-        #expect(edges == [true, false], "the finger's drag starts at the edge; a scroll after it never does")
+        // UIKit resets the pan once the drag (or tap) is over; a scroll after it brings no touch.
+        pan.reset()
+        #expect(!coordinator.startsAtScreenEdge, "a scroll after it never starts at the edge")
+        // A finger's next touch away from the edge, and one at it again, read as before.
+        touch.point = CGPoint(x: 200, y: 300)
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: touch))
+        #expect(!coordinator.startsAtScreenEdge)
+        pan.reset()
+        touch.point = CGPoint(x: 1, y: 300)
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: touch))
+        #expect(coordinator.startsAtScreenEdge, "a drag from the edge is still the back swipe's")
     }
 
     @Test("While something is open a scroll elsewhere closes it as a drag does; with nothing open the closer takes no scroll")
