@@ -229,9 +229,25 @@ enum ThreadUtils {
         )
     }
 
-    /// Common reply/forward subject prefixes across languages.
-    /// English (Re/Fwd/Fw), German (Aw), Swedish (Sv), Norwegian/Danish (Vs).
-    private static let prefixes = ["re:", "fwd:", "fw:", "aw:", "sv:", "vs:"]
+    /// Common reply subject prefixes across languages: English (Re), German (Aw),
+    /// Swedish (Sv), and Vs, which Finnish uses for a reply and Norwegian/Danish for a
+    /// forward, so it is not read as a forward.
+    private static let replyPrefixes = ["re:", "aw:", "sv:", "vs:"]
+
+    /// Forward subject prefixes: Fwd and Fw (Outlook). Only these: they are what the
+    /// measured mail apps write (Thunderbird writes "Fwd:").
+    private static let forwardPrefixes = ["fwd:", "fw:"]
+
+    /// Every prefix the subject strip removes. No prefix in the list begins another, so
+    /// the order does not change what the strip returns.
+    private static let prefixes = replyPrefixes + forwardPrefixes
+
+    /// Whether a subject is a forward's: its first prefix (any case, after leading
+    /// whitespace) is a forward prefix. "Re: Fwd: Slides" answers a forward, so it is not.
+    static func hasForwardPrefix(_ subject: String) -> Bool {
+        let lower = subject.trimmingCharacters(in: .whitespaces).lowercased()
+        return forwardPrefixes.contains { lower.hasPrefix($0) }
+    }
 
     /// Strip reply/forward prefixes recursively and trim whitespace.
     /// e.g. "Re: Fwd: Re: Meeting notes" → "Meeting notes"

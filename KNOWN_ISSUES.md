@@ -101,7 +101,13 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 
 ## Post-freeze amendments
 
-> **Current tracker census (2026-11-24, #1400): unchanged at 6 `open` records.** Adds one
+> **Current tracker census (2026-11-25, #1492): unchanged at 6 `open` records.** Adds two
+> `accepted` records: `IOS-OUTBOX-008`, a forward from another app that names its original in
+> In-Reply-To marks it replied when its subject does not start with `Fwd:` or `Fw:` (an edited subject,
+> or a localized or `VS:` prefix); and `IOS-OUTBOX-009`, what Apple Mail and Outlook write on a forward
+> is not measured.
+>
+> *Preserved:* **Current tracker census (2026-11-24, #1400): unchanged at 6 `open` records.** Adds one
 > `accepted` record, `IOS-BODY-007`: each body queue's refill now admits the newest window of the rows
 > waiting for a body, so the window moves only as its rows leave the read: a row of an account with no
 > provider (no host or password, or not connected yet) stops the drain-time refill until the next full
@@ -349,6 +355,13 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 | [IOS-CATCHUP-003](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-003.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-13, #750)** — an older-mail read whose apply comes 1 hour or more after the read began (for example the app suspended in the middle of a slice) skips every read and flag correction in that result, because the in-memory log of completed user actions keeps only an hour. Removals, loads and the folder's state still apply, so the check never stalls, and no newer user value is overwritten. The skipped corrections wait for the next listing. Shared apply: Outlook, Gmail and IMAP. *Amended later the same day:* such a read also inserts no load (Gmail, Outlook), so "loads" above is superseded; a skipped load is missing again at the next listing, which loads it. |
 | [IOS-CATCHUP-004](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-004.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — the IMAP older-mail check lists and loads nothing in a folder whose UIDVALIDITY is not known or whose reset is pending (C3: nothing is decided about an unproven numbering). The deleted date-based self-heal also repaired such folders; that is not replaced. The folder stays owed, and the next listing after a SELECT reports the epoch loads what is missing. |
 | [IOS-CATCHUP-005](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-005.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — on a nonconforming server whose SELECT omits UIDNEXT (RFC 3501 §6.3.1, RFC 9051 §6.3.2 require it), a listing of a folder with no bookmark and no stored top lists only up to the last local UID (flags and removals as before) and completes only as not clean: mail above it is not looked for, and an owed folder stays owed and is listed again at the daily check. A later range SELECT without UIDNEXT keeps the stored top. A SELECT that reports UIDNEXT resumes the full listing. |
+
+### OUTBOX (2)
+
+| ID | Class | Executive statement |
+|---|---|---|
+| [IOS-OUTBOX-008](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-008.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1492).** A forward sent from another mail app that names its original in In-Reply-To (Thunderbird does) is read as a forward only when its subject starts with `Fwd:` or `Fw:`; with an edited subject, a localized prefix (`WG:`, `TR:`, `RV:`) or the ambiguous `VS:`, the original is marked replied and its Reply tag cleared. Tagging it Reply again restores the tag. |
+| [IOS-OUTBOX-009](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-009.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1492).** Not measured: whether Apple Mail and Outlook set In-Reply-To on a forward, and which prefix they write in each language. Only an In-Reply-To with a prefix outside `Fwd:`/`Fw:` gives a wrong mark (IOS-OUTBOX-008). |
 
 ### TEST (1)
 

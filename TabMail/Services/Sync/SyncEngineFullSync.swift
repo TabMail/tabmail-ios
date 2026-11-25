@@ -2568,7 +2568,7 @@ extension SyncEngine {
             // own reply (sent from another device); flip the parent's isReplied
             // locally. No-op when folder.role != .sent.
             let discoveredParents = try ReplyParentResolver.markParentsReplied(
-                inReplyTos: messages.map(\.inReplyTo),
+                sentCopies: messages.map { .init(inReplyTo: $0.inReplyTo, subject: $0.subject) },
                 folderRole: folder.role,
                 accountId: accountId,
                 db: db
