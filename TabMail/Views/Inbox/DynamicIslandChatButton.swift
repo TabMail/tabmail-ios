@@ -955,7 +955,7 @@ struct DynamicIslandChat: View {
             case .transcribing: break
             }
         } label: {
-            ChatMicCircle(symbol: micSymbol, listening: micListening)
+            ChatMicCircle(symbol: micSymbol, listening: micListening, transcribing: spinnerPlace == .mic)
                 .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .contentShape(Rectangle())
         }
@@ -963,7 +963,7 @@ struct DynamicIslandChat: View {
         // when opted out of AI (off if the language has no on-device model).
         .disabled(isWorking || dictation.phase == .transcribing
             || (!dictation.isActive && !speech.isRecording && !speech.isStarting && !canDictate))
-        .accessibilityLabel(micListening ? "Stop dictation" : "Dictate")
+        .accessibilityLabel(spinnerPlace == .mic ? "Transcribing" : micListening ? "Stop dictation" : "Dictate")
         .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
     }
 
@@ -1017,7 +1017,8 @@ struct DynamicIslandChat: View {
             }
     }
 
-    /// Send, or Stop while the agent works, Retry after a failure, the spinner while transcribing.
+    /// Send, or Stop while the agent works, Retry after a failure, the spinner while transcribing the
+    /// words Send stopped (the mic spins for the words it stopped, and Send keeps its look).
     @ViewBuilder
     var trailingButton: some View {
         if isWorking {
@@ -1041,7 +1042,7 @@ struct DynamicIslandChat: View {
                     .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
-        } else if dictation.phase == .transcribing {
+        } else if spinnerPlace == .send {
             DictationSpinner(isRetrying: dictation.isRetrying)
                 .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .accessibilityLabel("Transcribing")
@@ -1462,6 +1463,11 @@ struct DynamicIslandChat: View {
     /// The mic listens: a dictation on the backend, or on this iPhone when opted out of AI.
     private var micListening: Bool {
         dictation.phase == .listening || speech.isRecording
+    }
+
+    /// The button that spins while the words are transcribed: the one that stopped the dictation.
+    private var spinnerPlace: DictationSpinnerPlace? {
+        DictationSpinnerPlace.resolve(phase: dictation.phase, sendWhenDictated: sendWhenDictated)
     }
 
     /// The mic's glyph: the stop square while listening, else the outlined mic, struck through when

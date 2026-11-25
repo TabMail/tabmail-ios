@@ -140,11 +140,11 @@ enum ChatViewLayout {
     /// the field's other edge. Its tap area is Send's too (`fieldTapSize` square).
     static let fieldMicSize: CGFloat = fieldSendSize
     static let fieldMicInset: CGFloat = fieldSendInset
-    /// The idle mic circle's outline, and the point sizes of the mic glyph and the listening stop
-    /// square inside it. Fixed, as Send's circle is, so the glyphs always fit the circle.
-    static let fieldMicOutlineWidth: CGFloat = 1.5
+    /// The point sizes of the mic glyph and the listening stop square inside the mic circle, and
+    /// the transcribing spinner's diameter there. Fixed, as Send's circle is, so they always fit it.
     static let fieldMicGlyphPointSize: CGFloat = 15
     static let fieldMicStopPointSize: CGFloat = 11
+    static let fieldMicSpinnerSize: CGFloat = 18
     /// Every field button's tap height and the Send button's tap width.
     static let fieldTapSize: CGFloat = 44
     /// Above and below the text.
