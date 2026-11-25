@@ -59,14 +59,19 @@ struct ExecutedOperation: Sendable {
     /// per-member request in the first place. Empty for every provider and op type
     /// that cannot produce it.
     let confirmedGoneMembers: [String]
+    /// `MoveOutcome.copiedNothing`: the move retired without moving anything,
+    /// so `finishMove` keeps the local rows.
+    let copiedNothing: Bool
 
     init(
         provenMembers: [String]?,
         provenDestinations: [ProvenDestinationAddress],
         addressChangesOnMove: Bool = false,
         reconcileMoveSource: Bool = false,
-        confirmedGoneMembers: [String] = []
+        confirmedGoneMembers: [String] = [],
+        copiedNothing: Bool = false
     ) {
+        self.copiedNothing = copiedNothing
         self.provenMembers = provenMembers
         self.provenDestinations = provenDestinations
         self.addressChangesOnMove = addressChangesOnMove
@@ -183,6 +188,7 @@ final class AccountOperationExecutor {
             remaining: [String],
             provenDestinations: [ProvenDestinationAddress],
             addressChangesOnMove: Bool,
+            copiedNothing: Bool,
             confirmedGoneMembers: [String])
     }
 
@@ -220,7 +226,7 @@ final class AccountOperationExecutor {
         switch settlement {
         case .full(let value, _): op = value
         case .providerFailure(let value): op = value
-        case .partial(let value, _, _, _, _, _): op = value
+        case .partial(let value, _, _, _, _, _, _): op = value
         }
         do {
             guard try await manager.liveOperation(op.id) != nil else {
@@ -244,13 +250,14 @@ final class AccountOperationExecutor {
                 }
                 gone = executed.confirmedGoneMembers
                 reconcileSource = executed.reconcileMoveSource
-            case .partial(_, let proven, let remaining, let destinations, let changesAddress, let confirmedGone):
+            case .partial(_, let proven, let remaining, let destinations, let changesAddress, let copiedNothing, let confirmedGone):
                 var subset = op
                 subset.messageIds = proven
                 retired = subset
                 result = try await retryWrite(manager.dbPool, label: "Queue") { db in
                     try Self.commitPartialRetirement(retired, remaining: remaining,
-                        provenDestinations: destinations, addressChangesOnMove: changesAddress, db: db)
+                        provenDestinations: destinations, addressChangesOnMove: changesAddress,
+                        copiedNothing: copiedNothing, db: db)
                 }
                 gone = confirmedGone.filter(proven.contains)
                 reconcileSource = false
@@ -272,6 +279,16 @@ final class AccountOperationExecutor {
         confirmedGoneMembers: [String], reconcileMoveSource: Bool,
         context: DrainContext, using manager: isolated AccountManager) async {
         manager.logReaddressedFollowers(result, retiring: retired)
+        // Before `finishDrain` syncs the destination: a dropped remnant's
+        // rfc822 shield key would otherwise skip the very insert that brings
+        // the moved message back (see `releaseRecentlyCompleted`).
+        manager.releaseRecentlyCompleted(
+            messageIds: result.droppedRemnants.compactMap(\.rfc822MessageId))
+        // The retire write deleted the dropped rows' persisted pill mappings;
+        // drop the translator's in-memory half too (see `finishMove`).
+        if !result.droppedRemnants.isEmpty {
+            await ChatIdTranslator.shared.retireMappings(realIds: result.droppedRemnants.map(\.headerId))
+        }
         await manager.publishMoveFinish(result)
         await manager.retireConfirmedGoneMemberHeaders(retired, memberIds: confirmedGoneMembers)
         await manager.materializeDeferredMoveSuccessors(after: retired, result: result)
@@ -282,7 +299,9 @@ final class AccountOperationExecutor {
             context.foldersToSync.insert("\(retired.accountId)|\(dest)")
             if reconcileMoveSource { context.foldersToSync.insert("\(retired.accountId)|\(retired.folderPath)") }
             if retired.type == .move, dest != retired.folderPath {
-                await manager.recordMembersThatEnteredInbox(retired, destinationPath: dest, context: context)
+                await manager.recordMembersThatEnteredInbox(
+                    retired, destinationPath: dest, droppedRemnants: result.droppedRemnants,
+                    context: context)
             }
         }
         if [.saveDraft, .deleteDraft].contains(retired.type) {
@@ -446,7 +465,9 @@ final class AccountOperationExecutor {
             _ = try MessageHeaderRekey.finishMove(
                 // `true` matters only on IMAP; on Gmail and Outlook nothing is re-keyed with no destination.
                 op, destinations: [], addressChangesOnMove: true,
-                accountScopedIds: accountScopedIds, db: db)
+                // No provider result: no copy is proven (one is not ruled out),
+                // so the row is kept, exactly as before (`copiedNothing`).
+                accountScopedIds: accountScopedIds, copiedNothing: true, db: db)
         }
         return try PendingOperation.deleteOne(db, key: op.id)
     }
@@ -461,6 +482,7 @@ final class AccountOperationExecutor {
             destinations: executed.provenDestinations,
             addressChangesOnMove: executed.addressChangesOnMove,
             accountScopedIds: accountScopedIds,
+            copiedNothing: executed.copiedNothing,
             db: db)
         MessageHeaderRekey.publishAddressHandoffsAfterCommit(result.applied, in: db)
         _ = try PendingOperation.deleteOne(db, key: op.id)
@@ -507,6 +529,7 @@ final class AccountOperationExecutor {
         remaining: [String],
         provenDestinations: [ProvenDestinationAddress],
         addressChangesOnMove: Bool,
+        copiedNothing: Bool,
         db: Database
     ) throws -> MoveFinishResult {
         let accountScopedIdAccounts = try AccountOperationExecutor.accountScopedIdAccountIds(db)
@@ -515,6 +538,7 @@ final class AccountOperationExecutor {
             destinations: provenDestinations,
             addressChangesOnMove: addressChangesOnMove,
             accountScopedIds: accountScopedIdAccounts.contains(frozenRetiredOp.accountId),
+            copiedNothing: copiedNothing,
             db: db)
         MessageHeaderRekey.publishAddressHandoffsAfterCommit(result.applied, in: db)
         guard var fresh = try PendingOperation.fetchOne(db, key: frozenRetiredOp.id) else {
@@ -592,6 +616,7 @@ final class AccountOperationExecutor {
                     currentOp, provenMembers: provenMembers, remaining: remaining,
                     provenDestinations: executed.provenDestinations,
                     addressChangesOnMove: executed.addressChangesOnMove,
+                    copiedNothing: executed.copiedNothing,
                     confirmedGoneMembers: executed.confirmedGoneMembers,
                     context: context, using: manager)
             }
@@ -1277,6 +1302,7 @@ final class AccountOperationExecutor {
         remaining: [String],
         provenDestinations: [ProvenDestinationAddress],
         addressChangesOnMove: Bool,
+        copiedNothing: Bool,
         confirmedGoneMembers: [String] = [],
         context: DrainContext,
         using manager: isolated AccountManager
@@ -1315,7 +1341,8 @@ final class AccountOperationExecutor {
                 try Self.commitPartialRetirement(
                     frozenRetiredOp, remaining: remaining,
                     provenDestinations: provenDestinations,
-                    addressChangesOnMove: addressChangesOnMove, db: db)
+                    addressChangesOnMove: addressChangesOnMove,
+                    copiedNothing: copiedNothing, db: db)
             }
             await publishCommittedEffects(
                 frozenRetiredOp, result: finishResult,
@@ -1354,6 +1381,7 @@ final class AccountOperationExecutor {
                 op: currentOp, provenMembers: provenMembers, remaining: remaining,
                 provenDestinations: provenDestinations,
                 addressChangesOnMove: addressChangesOnMove,
+                copiedNothing: copiedNothing,
                 confirmedGoneMembers: confirmedGoneMembers.filter(provenMembers.contains))
             print("[Queue] CRITICAL: could not narrow partially-completed \(currentOp.id) after retries — the row stays inFlight with all members and the proven prefix is retained for replay at the next drain")
             BackgroundSyncLogger.logError(
@@ -1523,7 +1551,8 @@ final class AccountOperationExecutor {
             provenDestinations: outcome.provenDestinations,
             addressChangesOnMove: outcome.addressChangesOnMove,
             reconcileMoveSource: outcome.requiresSourceReconciliation,
-            confirmedGoneMembers: outcome.confirmedGoneMemberIds)
+            confirmedGoneMembers: outcome.confirmedGoneMemberIds,
+            copiedNothing: outcome.copiedNothing)
     }
 }
 
@@ -1543,11 +1572,12 @@ extension AccountManager {
     nonisolated func isMessageNotFoundError(_ error: Error) -> Bool { AccountOperationExecutor.isMessageNotFoundError(error) }
     @discardableResult
     func retirePartiallyCompletedOp(_ op: PendingOperation, provenMembers: [String], remaining: [String],
-        provenDestinations: [ProvenDestinationAddress], addressChangesOnMove: Bool,
+        provenDestinations: [ProvenDestinationAddress], addressChangesOnMove: Bool, copiedNothing: Bool,
         confirmedGoneMembers: [String] = [], context: AccountOperationExecutor.DrainContext) async -> QueueAttemptDisposition {
         await operationExecutor.retirePartiallyCompletedOp(op, provenMembers: provenMembers,
             remaining: remaining, provenDestinations: provenDestinations,
-            addressChangesOnMove: addressChangesOnMove, confirmedGoneMembers: confirmedGoneMembers,
+            addressChangesOnMove: addressChangesOnMove, copiedNothing: copiedNothing,
+            confirmedGoneMembers: confirmedGoneMembers,
             context: context, using: self)
     }
     #endif

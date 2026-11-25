@@ -4,6 +4,7 @@
 
 import Testing
 import Foundation
+import GRDB
 @testable import TabMail
 
 // MARK: - Core Translation Tests
@@ -821,5 +822,233 @@ struct TemplateDetailResolutionTests {
         let numericId = await translator.toNumericId(unique)
         let detail = await translator.resolveTemplateDetail(numericId)
         #expect(detail == nil)
+    }
+}
+
+// MARK: - Event pill re-link (compare-and-swap normal case)
+
+@Suite("ChatIdTranslator event pill re-link")
+struct EventPillRelinkTests {
+
+    /// **THE PROPERTY: the guarded re-link still moves an event pill in the
+    /// normal case.** With the stored mapping still on the pre-generated id,
+    /// `remapEventRealId` moves it to the provider's real id, and the pill
+    /// opens the event at that id.
+    @Test("An event pill re-link with the stored mapping on the old id still moves it")
+    func eventPillRelinkMovesTheStoredMapping() async throws {
+        let translator = ChatIdTranslator.createIsolated()
+        let accountId = "acct-evt-\(UUID().uuidString)"
+        let preId = "pre-\(UUID().uuidString)"
+        let realId = "real-\(UUID().uuidString)"
+        let oldKey = CompoundEventId.make(accountId: accountId, eventId: preId)
+        let newKey = CompoundEventId.make(accountId: accountId, eventId: realId)
+        let numeric = await translator.toNumericId(oldKey)
+        await translator.cacheEventDetail(
+            realId: preId, accountId: accountId, calendarId: "cal", calendarName: "Calendar",
+            title: "Planning", startDate: Date(), endDate: Date().addingTimeInterval(3600),
+            isAllDay: false, location: nil, notes: nil, attendees: [],
+            isRecurring: false, recurrenceRule: nil, availability: "busy", htmlLink: nil)
+        // NON-VACUITY: the stored mapping names the old id.
+        let storedBefore = try await AppDatabase.dbPool.read { db in
+            try String.fetchOne(db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [numeric])
+        }
+        #expect(storedBefore == oldKey)
+
+        await translator.remapEventRealId(from: preId, to: realId, accountId: accountId)
+
+        #expect(await translator.toRealId(numeric) == newKey)
+        let storedAfter = try await AppDatabase.dbPool.read { db in
+            try String.fetchOne(db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [numeric])
+        }
+        #expect(storedAfter == newKey, "the stored mapping did not move: \(String(describing: storedAfter))")
+        let detail = await translator.resolveEventDetail(numeric)
+        #expect(detail?.realId == newKey && detail?.title == "Planning")
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM chatIdMapping WHERE numericId = ?", arguments: [numeric])
+        }
+    }
+}
+
+// MARK: - Compare-and-swap miss with no stored row
+
+@Suite("ChatIdTranslator remap with no stored row")
+struct RemapWithNoStoredRowTests {
+
+    /// **THE PROPERTY: a remap whose stored mapping is gone moves nothing and
+    /// creates no row, and the translator's forward and reverse lookups stay
+    /// consistent.** (An unconditional write would resurrect the mapping
+    /// bound to the new id.)
+    @Test("A remap with its stored mapping gone is refused and creates no row")
+    func aRemapWithNoStoredRowIsRefused() async throws {
+        let translator = ChatIdTranslator.createIsolated()
+        let oldId = "acct-gone-\(UUID().uuidString)"
+        let newId = "acct-new-\(UUID().uuidString)"
+        let numeric = await translator.toNumericId(oldId)
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM chatIdMapping WHERE numericId = ?", arguments: [numeric])
+        }
+
+        let moved = await translator.remapRealId(from: oldId, to: newId)
+
+        #expect(moved == 0)
+        let stored = try await AppDatabase.dbPool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM chatIdMapping WHERE numericId = ? OR realId = ?",
+                             arguments: [numeric, newId])
+        }
+        #expect(stored == 0, "the refused remap wrote a mapping")
+        #expect(await translator.toRealId(numeric) == oldId)
+        #expect(await translator.toNumericId(oldId) == numeric)
+    }
+}
+
+// MARK: - Re-link onto an email another pill already names
+
+@Suite("ChatIdTranslator re-link collision")
+struct RelinkCollisionTests {
+
+    /// **THE PROPERTY: a pill whose re-link is refused because another pill
+    /// already names the email renders unavailable and opens nothing, and the
+    /// other pill keeps the email, also after a reload.**
+    @Test("A re-link onto an email another pill names greys the first pill out")
+    func aRelinkOntoAnotherPillsEmailGreysTheFirstOut() async throws {
+        let translator = ChatIdTranslator.createIsolated()
+        let oldId = "acct-relink-old-\(UUID().uuidString)"
+        let newId = "acct-relink-new-\(UUID().uuidString)"
+        let first = await translator.toNumericId(oldId)
+        let second = await translator.toNumericId(newId)
+
+        let moved = await translator.remapRealId(from: oldId, to: newId)
+
+        #expect(moved == 0)
+        let firstRetired = await translator.isRetiredPill(first)
+        #expect(firstRetired, "the refused pill is not greyed out")
+        #expect(MarkdownChatText.pillIsUnavailable(isHistory: false, isRetired: firstRetired))
+        #expect(await translator.resolveEmailDetail(first) == nil, "a tap on the refused pill opened a message")
+        #expect(await translator.toRealId(second) == newId)
+        #expect(await translator.toNumericId(newId) == second)
+        let stored = try await AppDatabase.dbPool.read { db in
+            try [String?](
+                [first, second].map { n in
+                    try String.fetchOne(db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [n])
+                })
+        }
+        #expect(stored[0].map { $0.hasPrefix(ChatIdTranslator.retiredRealIdPrefix) } == true,
+                "the refused pill's stored mapping is not retired: \(String(describing: stored[0]))")
+        #expect(stored[1] == newId, "the other pill lost its stored mapping")
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM chatIdMapping WHERE numericId IN (?, ?)", arguments: [first, second])
+        }
+    }
+}
+
+// MARK: - Retired pill availability
+
+@Suite("ChatIdTranslator retired pill availability")
+struct RetiredPillAvailabilityTests {
+
+    /// **THE PROPERTY: a pill whose mapping a move retired renders as
+    /// unavailable and opens nothing; a live pill stays available.**
+    @Test("A retired pill renders unavailable and opens nothing; a live pill does not")
+    func aRetiredPillRendersUnavailableAndOpensNothing() async throws {
+        let translator = ChatIdTranslator.createIsolated()
+        let liveId = "acct-live-\(UUID().uuidString)"
+        let movedId = "acct-moved-\(UUID().uuidString)"
+        let live = await translator.toNumericId(liveId)
+        let moved = await translator.toNumericId(movedId)
+        await translator.retireMappings(realIds: [movedId])
+
+        let liveRetired = await translator.isRetiredPill(live)
+        let movedRetired = await translator.isRetiredPill(moved)
+        #expect(!liveRetired)
+        #expect(movedRetired)
+        #expect(!MarkdownChatText.pillIsUnavailable(isHistory: false, isRetired: liveRetired))
+        #expect(MarkdownChatText.pillIsUnavailable(isHistory: false, isRetired: movedRetired))
+        #expect(await translator.resolveEmailDetail(moved) == nil, "a tap on the retired pill opened a message")
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM chatIdMapping WHERE numericId IN (?, ?)", arguments: [live, moved])
+        }
+    }
+    enum RetireProducer: String, CaseIterable, Sendable {
+        /// `retireMappings`: the drop of a dropped row's pill.
+        case retireMappings
+        /// The refusal arm of `remapRealId`: the stored mapping was retired
+        /// (by the move's own write) while memory still named the old row.
+        case refusedRemap
+    }
+
+    /// Records, on the posting thread, whether each `.chatPillsRetired` was
+    /// posted on the main thread.
+    private final class PostThreads: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [Bool] = []
+        func append(_ value: Bool) { lock.withLock { values.append(value) } }
+        var all: [Bool] { lock.withLock { values } }
+    }
+
+    /// **THE PROPERTY: pills already on screen turn grey in place when their
+    /// mapping is retired, by either producer.** Two mounted occurrences of
+    /// the moved pill (one with its popover open) and a live control use the
+    /// availability model a chip owns. Both occurrences become unavailable
+    /// and the open popover closes; the live control keeps its popover and
+    /// stays usable; every retirement notice is posted on the main thread.
+    @Test("Mounted pills grey out in place and close an open popover; a live pill stays usable",
+          arguments: RetireProducer.allCases)
+    @MainActor
+    func mountedPillsGreyOutInPlace(producer: RetireProducer) async throws {
+        let translator = ChatIdTranslator.createIsolated()
+        let liveId = "acct-live-\(UUID().uuidString)"
+        let movedId = "acct-moved-\(UUID().uuidString)"
+        let live = await translator.toNumericId(liveId)
+        let moved = await translator.toNumericId(movedId)
+
+        let first = ChatPillAvailability(numericId: moved, type: "email", isHistory: false, translator: translator)
+        let second = ChatPillAvailability(numericId: moved, type: "email", isHistory: false, translator: translator)
+        let control = ChatPillAvailability(numericId: live, type: "email", isHistory: false, translator: translator)
+        for pill in [first, second, control] {
+            pill.startObserving()
+            await pill.refresh()
+        }
+        // NON-VACUITY: as first rendered, every pill is available.
+        #expect(!first.isUnavailable && !second.isUnavailable && !control.isUnavailable)
+        first.presentation = .email(EmailPillDetail(
+            id: moved, realId: movedId, subject: "Subject", from: "a@example.com",
+            to: "b@example.com", date: nil, snippet: nil))
+        control.presentation = .email(EmailPillDetail(
+            id: live, realId: liveId, subject: "Subject", from: "a@example.com",
+            to: "b@example.com", date: nil, snippet: nil))
+
+        let threads = PostThreads()
+        let token = NotificationCenter.default.addObserver(
+            forName: .chatPillsRetired, object: nil, queue: nil
+        ) { _ in threads.append(Thread.isMainThread) }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        switch producer {
+        case .retireMappings:
+            await translator.retireMappings(realIds: [movedId])
+        case .refusedRemap:
+            try await AppDatabase.dbPool.write { db in
+                try ChatIdTranslator.retireStoredMappings(db, realId: movedId)
+            }
+            let remapped = await translator.remapRealId(from: movedId, to: "acct-new-\(UUID().uuidString)")
+            #expect(remapped == 0, "the remap of a retired mapping was not refused")
+        }
+
+        // Bounded wait: a missing notice fails here instead of hanging.
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !(first.isRetired && second.isRetired), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(first.isUnavailable, "the first mounted occurrence did not grey out")
+        #expect(second.isUnavailable, "the second mounted occurrence did not grey out")
+        #expect(first.presentation == nil, "the retired pill's open popover stayed open")
+        #expect(!control.isUnavailable, "a live pill turned grey")
+        #expect(control.presentation != nil, "a live pill's popover was closed")
+        let posted = threads.all
+        #expect(!posted.isEmpty, "no retirement notice was posted")
+        #expect(posted.allSatisfy { $0 }, "a retirement notice was posted off the main thread")
+        try await AppDatabase.dbPool.write { db in
+            try db.execute(sql: "DELETE FROM chatIdMapping WHERE numericId IN (?, ?)", arguments: [live, moved])
+        }
     }
 }

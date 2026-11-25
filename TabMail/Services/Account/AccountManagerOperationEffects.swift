@@ -107,9 +107,25 @@ extension AccountManager {
     /// is already cached (`executeSummaryJob` returns on a cache hit and still
     /// chains the action job), never a wrong or duplicated write.
     func recordMembersThatEnteredInbox(
-        _ op: PendingOperation, destinationPath: String, context: AccountOperationExecutor.DrainContext
+        _ op: PendingOperation, destinationPath: String, droppedRemnants: [DroppedRemnant],
+        context: AccountOperationExecutor.DrainContext
     ) async {
         let accountId = op.accountId
+        // A member whose move the wire did not name has had its optimistic row
+        // DELETED by `finishMove` (G4, `IOS-MOVE-002`), so the read below cannot
+        // see it. Its own captured fields stand in for the row; the post-drain
+        // enqueue resolves them by rfc822 identity in the destination after
+        // that folder's sync has inserted the real row.
+        let remnantEntries = droppedRemnants.compactMap { remnant
+            -> AccountOperationExecutor.DrainContext.InboxEntry? in
+            guard remnant.accountId == accountId,
+                  remnant.folderPath == destinationPath,
+                  remnant.isInInbox
+            else { return nil }
+            return AccountOperationExecutor.DrainContext.InboxEntry(
+                accountId: accountId, messageId: remnant.messageId,
+                rfc822MessageId: remnant.rfc822MessageId)
+        }
         // Follow the provider-proven handoff first: when `COPYUID` landed,
         // `finishMove` has already re-keyed this row to its destination address,
         // so the source-shaped id no longer names it. When it did not, the alias
@@ -120,7 +136,7 @@ extension AccountManager {
                 afterHandoffFrom: MessageIdentity.headerId(
                     accountId: accountId, folderPath: op.folderPath, messageId: messageId))
         }
-        let entries: [AccountOperationExecutor.DrainContext.InboxEntry] = (try? await dbPool.read { db in
+        let entries: [AccountOperationExecutor.DrainContext.InboxEntry] = ((try? await dbPool.read { db in
             var found: [AccountOperationExecutor.DrainContext.InboxEntry] = []
             for headerId in candidateIds {
                 guard let header = try MessageHeader.fetchOne(db, key: headerId),
@@ -134,7 +150,7 @@ extension AccountManager {
                     rfc822MessageId: header.rfc822MessageId))
             }
             return found
-        }) ?? []
+        }) ?? []) + remnantEntries
         guard !entries.isEmpty else { return }
         let key = "\(accountId)|\(destinationPath)"
         context.enteredInbox.withLock { $0[key, default: []].append(contentsOf: entries) }

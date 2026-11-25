@@ -973,17 +973,21 @@ struct ProviderActionOutcome: Sendable {
     let addressChangesOnMove: Bool
     let requiresSourceReconciliation: Bool
     let confirmedGoneMemberIds: [String]
+    /// `MoveOutcome.copiedNothing`: the move retired without moving anything.
+    let copiedNothing: Bool
 
     init(dispositionedMemberIds: [String],
          provenDestinations: [ProvenDestinationAddress] = [],
          addressChangesOnMove: Bool = false,
          requiresSourceReconciliation: Bool = false,
-         confirmedGoneMemberIds: [String] = []) {
+         confirmedGoneMemberIds: [String] = [],
+         copiedNothing: Bool = false) {
         self.dispositionedMemberIds = dispositionedMemberIds
         self.provenDestinations = provenDestinations
         self.addressChangesOnMove = addressChangesOnMove
         self.requiresSourceReconciliation = requiresSourceReconciliation
         self.confirmedGoneMemberIds = confirmedGoneMemberIds
+        self.copiedNothing = copiedNothing
     }
 
     init(move: MoveOutcome) {
@@ -991,7 +995,8 @@ struct ProviderActionOutcome: Sendable {
                   provenDestinations: move.provenDestinations,
                   addressChangesOnMove: true,
                   requiresSourceReconciliation: move.requiresSourceReconciliation,
-                  confirmedGoneMemberIds: move.confirmedGoneIds)
+                  confirmedGoneMemberIds: move.confirmedGoneIds,
+                  copiedNothing: move.copiedNothing)
     }
 
     init(disposition: ProviderMembersDispositioned) {

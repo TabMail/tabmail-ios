@@ -560,9 +560,61 @@ actor ChatIdTranslator {
         // at the old message address.
         ensureLoadedFromDB()
         guard let numericId = reverseMap.removeValue(forKey: oldRealId) else { return 0 }
+        // The durable remap moves the pill only if the stored mapping still
+        // names `oldRealId`. A move that dropped its row without proof of where
+        // the message landed retires that mapping in its own write
+        // (`retiredRealId`); an unconditional upsert here, between that write
+        // and `retireMappings`, would bring the pill back bound to another
+        // message. When the stored row says otherwise, memory adopts it.
+        //
+        // When another pill already names `newRealId` (`realId` is unique), the
+        // pill is not merged into it: it is retired exactly like a pill of an
+        // unproven move (greyed, a tap opens nothing), compare-and-swapped on
+        // the old id like the move itself.
+        let stored: (moved: Bool, realId: String?)
+        do {
+            stored = try AppDatabase.dbPool.write { db in
+                let occupied = try Bool.fetchOne(db, sql: """
+                    SELECT EXISTS(SELECT 1 FROM chatIdMapping WHERE realId = ? AND numericId != ?)
+                    """, arguments: [newRealId, numericId]) ?? false
+                if occupied {
+                    let retired = Self.retiredRealId(numericId: numericId, realId: oldRealId)
+                    try db.execute(
+                        sql: "UPDATE chatIdMapping SET realId = ? WHERE numericId = ? AND realId = ?",
+                        arguments: [retired, numericId, oldRealId])
+                    return (false, try String.fetchOne(
+                        db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [numericId]))
+                }
+                try db.execute(
+                    sql: "UPDATE chatIdMapping SET realId = ? WHERE numericId = ? AND realId = ?",
+                    arguments: [newRealId, numericId, oldRealId])
+                if db.changesCount > 0 { return (true, newRealId) }
+                return (false, try String.fetchOne(
+                    db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [numericId]))
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Remap of id=\(numericId) failed, kept: \(error)")
+            reverseMap[oldRealId] = numericId
+            return 0
+        }
+        guard stored.moved else {
+            guard let realId = stored.realId else {
+                // Nothing is stored for the number: the mapping lives only in
+                // memory (its save failed and was logged). Keep it exactly as it
+                // is; never create a stored row from a remap.
+                reverseMap[oldRealId] = numericId
+                return 0
+            }
+            idMap[numericId] = realId
+            reverseMap[realId] = numericId
+            subjectCache.removeValue(forKey: numericId)
+            displayCache.removeAll()
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Remap of id=\(numericId) refused: its stored mapping no longer names the old row")
+            if realId.hasPrefix(Self.retiredRealIdPrefix) { Self.postPillsRetired() }
+            return 0
+        }
         idMap[numericId] = newRealId
         reverseMap[newRealId] = numericId
-        persistMapping(numericId: numericId, realId: newRealId)
         lastAccessed = Date()
         BackgroundSyncLogger.logDebug("[ChatIdTranslator] Remapped id=\(numericId): \(oldRealId) → \(newRealId)")
         return 1
@@ -635,6 +687,78 @@ actor ChatIdTranslator {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ChatIdTranslator] Purged \(matches.count) mapping(s) for folder \(accountId.prefix(8)):\(folderPath)")
         }
+    }
+
+    /// The stored stand-in for a pill whose row a move dropped without proof of
+    /// where the message landed. It keeps the pill's numeric slot (so a reload
+    /// never hands the number to another message) and names no row (so the
+    /// pill resolves to nothing, and a remap from the old row id is a no-op).
+    /// The marker carries the numeric slot as well as the old id: an address
+    /// can be reused (a source reset hands it to a new message whose pill is
+    /// later retired too), and `chatIdMapping.realId` is unique, so a marker
+    /// derived from the address alone would collide on the second retirement.
+    nonisolated static func retiredRealId(numericId: Int, realId: String) -> String {
+        "\(retiredRealIdPrefix)\(numericId):\(realId)"
+    }
+
+    /// The one stored rewrite that retires every pill naming `realId`, used by
+    /// both writers (`MessageHeaderRekey.finishMove` inside its own write and
+    /// `retireMappings`), so they cannot drift apart. Each pill gets the
+    /// marker `retiredRealId(numericId:realId:)` of its own slot.
+    nonisolated static func retireStoredMappings(_ db: Database, realId: String) throws {
+        try db.execute(
+            sql: "UPDATE chatIdMapping SET realId = ? || numericId || ':' || realId WHERE realId = ?",
+            arguments: [retiredRealIdPrefix, realId])
+    }
+
+    nonisolated static let retiredRealIdPrefix = "retired-unproven-move:"
+
+    /// Tells every mounted chat pill to re-check its availability: a pill
+    /// already on screen when its mapping is retired turns grey in place.
+    nonisolated static func postPillsRetired() {
+        Task { @MainActor in
+            NotificationCenter.default.post(name: .chatPillsRetired, object: nil)
+        }
+    }
+
+    /// True when the pill's mapping was retired by an unproven move. The chat
+    /// renders such a pill as unavailable (the same look as a history pill)
+    /// and a tap opens nothing.
+    func isRetiredPill(_ numericId: Int) -> Bool {
+        ensureLoadedFromDB()
+        return idMap[numericId]?.hasPrefix(Self.retiredRealIdPrefix) ?? false
+    }
+
+    /// The in-memory half of retiring the pills of rows a move dropped without
+    /// proof (`MessageHeaderRekey.finishMove` rewrites the stored rows to
+    /// `retiredRealId` in its own write). The stored rewrite is repeated here,
+    /// so a mapping created for the old id in between is retired too. No
+    /// Message-ID-based path can later bind such a pill to a message that may
+    /// not be the moved one.
+    func retireMappings(realIds: [String]) {
+        ensureLoadedFromDB()
+        do {
+            try AppDatabase.dbPool.write { db in
+                for realId in realIds {
+                    try Self.retireStoredMappings(db, realId: realId)
+                }
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[ChatIdTranslator] Retiring \(realIds.count) stored pill mapping(s) failed: \(error)")
+        }
+        var retired = 0
+        for realId in realIds {
+            guard let numericId = reverseMap.removeValue(forKey: realId) else { continue }
+            let tombstone = Self.retiredRealId(numericId: numericId, realId: realId)
+            idMap[numericId] = tombstone
+            reverseMap[tombstone] = numericId
+            subjectCache.removeValue(forKey: numericId)
+            retired += 1
+        }
+        guard retired > 0 else { return }
+        displayCache.removeAll()
+        BackgroundSyncLogger.logDebug("[ChatIdTranslator] Retired \(retired) pill mapping(s) of unproven moves")
+        Self.postPillsRetired()
     }
 
     // MARK: - Email Subject Resolution
@@ -1029,8 +1153,8 @@ actor ChatIdTranslator {
         } else { newRealId }
         if oldKey == newKey { return }
         // `remapRealId` (the existing message-side helper) handles idMap +
-        // reverseMap + the `chatIdMapping` row update via `persistMapping`
-        // (INSERT OR REPLACE keyed by numericId).
+        // reverseMap + the `chatIdMapping` row, moved only while the stored
+        // row still names the old id (compare-and-swap; never created).
         _ = remapRealId(from: oldKey, to: newKey)
         displayCache.removeAll()
         // Move detail/calendar caches under the new key — these are event-only,
@@ -1236,6 +1360,21 @@ actor ChatIdTranslator {
     // MARK: - Clear
 
     /// Clear all mappings (called when chat history is cleared).
+    #if DEBUG
+    /// Test seam: forget the in-memory maps (not the stored ones), as a fresh
+    /// process would, so the next call reloads from GRDB.
+    func reloadFromDBForTesting() {
+        idMap.removeAll()
+        reverseMap.removeAll()
+        nextId = 1
+        freeIds.removeAll()
+        refCounts.removeAll()
+        subjectCache.removeAll()
+        displayCache.removeAll()
+        hasLoadedFromDB = false
+    }
+    #endif
+
     func clearAll() {
         idMap.removeAll()
         reverseMap.removeAll()

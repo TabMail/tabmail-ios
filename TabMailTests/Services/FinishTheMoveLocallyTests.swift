@@ -101,6 +101,7 @@ struct FinishTheMoveLocallyTests {
 
     /// The local header a swipe acts on, seeded as sync would leave it: at its
     /// source address, stamped with the source folder's live epoch.
+    @discardableResult
     private func seedHeader(
         _ fixture: Fixture, uid: Int, rfc: String,
         folderPath: String = "INBOX", epoch: Int? = 10
@@ -217,6 +218,694 @@ struct FinishTheMoveLocallyTests {
             """)
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - G4 — a move the server did not name leaves no remnant
+
+    /// **THE PROPERTY: once the destination has synced after a move whose
+    /// `COPYUID` named no destination, the local destination folder is exactly
+    /// the server's — every message at its real address with its epoch read —
+    /// and the moved message is actionable again.**
+    ///
+    /// Before: the optimistic row kept its SOURCE UID with a nil epoch. Nothing
+    /// could ever stamp it, so it was refused for every gesture, and sync took it
+    /// as a row at that numeric UID in the destination. Here the destination
+    /// already holds a DIFFERENT message at that UID, so the folder ended with a
+    /// permanent inert extra row beside the real copies (`IOS-MOVE-002`).
+    @Test("A move with no COPYUID leaves no remnant row once the destination syncs")
+    @MainActor
+    func aMoveWithNoCopyUidLeavesNoRemnantRow() async throws {
+        let target = "remnant-target@example.com"
+        let resident = "remnant-resident@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [Self.message(uid: 88, id: resident)],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-no-copyuid-remnant")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 88, rfc: target)
+        // The resident as an earlier sync of Archive left it.
+        try seedHeader(f, uid: 88, rfc: resident, folderPath: "Archive")
+
+        await AccountManager.shared.move([seeded], to: "Archive")
+        try await drainToQuiescence(f)
+        // NON-VACUITY: the move landed; the server only withheld where.
+        #expect(Set(server.messageIDs(in: "Archive")) == ["<\(target)>", "<\(resident)>"])
+
+        if let archive = try await f.pool.read({ db in
+            try Folder.filter(Column("accountId") == f.accountId && Column("path") == "Archive")
+                .fetchOne(db)
+        }) {
+            try await AccountManager.shared.syncEngine.syncFolderMessages(
+                folder: archive, provider: provider)
+        }
+
+        // THE PROPERTY: local Archive == server Archive, every row proven.
+        let serverArchive = Set(server.snapshotMessagesWithFlags(in: "Archive").map {
+            "\($0.message.uid)|\($0.message.messageID)"
+        })
+        let local = try rows(f).filter { $0.folderPath == "Archive" }
+        let localArchive = Set(local.map { "\($0.messageId)|<\($0.rfc822MessageId ?? "")>" })
+        #expect(local.count == serverArchive.count && localArchive == serverArchive,
+                "local Archive \(local.map(\.id)) is not the server's \(serverArchive)")
+        #expect(local.allSatisfy { $0.observedUidValidity == 10 },
+                "a row in Archive has an unread epoch: \(local.map { ($0.id, $0.observedUidValidity) })")
+
+        // And the moved message takes a gesture again.
+        let moved = local.filter { $0.rfc822MessageId == target }
+        #expect(moved.count == 1)
+        if moved.count == 1 {
+            await AccountManager.shared.move(moved, to: "Trash")
+            try await drainToQuiescence(f)
+            #expect(server.messageIDs(in: "Trash") == ["<\(target)>"])
+            #expect(server.messageIDs(in: "Archive") == ["<\(resident)>"])
+        }
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - A lost reply, a sync, then the retry
+
+    /// Drain once, so the move's first attempt runs and fails, leaving the op
+    /// queued.
+    @MainActor
+    private func drainOnceExpectingTheOpKept(_ fixture: Fixture) async throws {
+        await AccountManager.shared.drainPendingQueue()
+        for _ in 0..<300 where !(await AccountManager.shared.pendingQueueIsQuiescentForTesting()) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let kept = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
+        #expect(kept == 1, "precondition: the first attempt's reply was lost, so the op must still be queued")
+    }
+
+    /// The catch-up run the normal sync path makes after the drain. The drop's
+    /// write owed both folders a listing (ADR-IOS-111 item 11); this is the
+    /// listing that loads a copy the window does not reach. The completed
+    /// move's 30 s protection has lapsed by then, as in production.
+    @MainActor
+    private func runOwedCatchUp(_ fixture: Fixture) async throws {
+        await AccountManager.shared.clearRecentlyCompletedForTesting()
+        let account = try await fixture.pool.read { db in try Account.fetchOne(db, key: fixture.accountId) }
+        guard let account else {
+            Issue.record("the fixture's account is missing")
+            return
+        }
+        _ = await AccountManager.shared.syncEngine.runCatchUpRun(
+            account: account, run: .snapshot(deadline: Date().addingTimeInterval(30)))
+    }
+
+    /// The moved messages not yet stored in local Archive.
+    private func missingFromArchive(_ fixture: Fixture, _ targets: [String]) throws -> [String] {
+        let stored = Set(try rows(fixture).filter { $0.folderPath == "Archive" }.compactMap(\.rfc822MessageId))
+        return targets.filter { !stored.contains($0) }
+    }
+
+    @MainActor
+    private func syncArchive(_ fixture: Fixture, provider: IMAPProvider) async throws {
+        if let archive = try await fixture.pool.read({ db in
+            try Folder.filter(Column("accountId") == fixture.accountId && Column("path") == "Archive")
+                .fetchOne(db)
+        }) {
+            try await AccountManager.shared.syncEngine.syncFolderMessages(folder: archive, provider: provider)
+        }
+    }
+
+    /// **THE PROPERTY: every message a move copied ends up stored in the
+    /// destination even when the attempt that copied it lost its reply, a sync
+    /// of the destination then stored newer rows, and only the retry retired
+    /// the move.** More copies than the window holds, so the ones it does not
+    /// reach are stored by the catch-up the drop owed the folder.
+    @Test("A lost MOVE reply, then a destination sync, then the retry: every copy is stored")
+    @MainActor
+    func aLostReplyThenASyncThenTheRetryStoresEveryCopy() async throws {
+        let movedCount = SyncConfig.syncMessageLimit + 10
+        let sourceUids = (0..<movedCount).map { 5000 + $0 }
+        let targets = sourceUids.map { "lost-reply-\($0)@example.com" }
+        let residentUids = Array(1...10)
+        let residents = residentUids.map { "lost-reply-resident-\($0)@example.com" }
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": zip(sourceUids, targets).map { Self.message(uid: $0, id: $1) },
+            "Archive": zip(residentUids, residents).map { Self.message(uid: $0, id: $1) },
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: Set(sourceUids))
+        server.withholdMoveCOPYUID(forSourceUIDs: Set(sourceUids))
+        server.disconnectAfterNextUIDMoveCommit()
+        server.expectMutations(targets)
+        server.honorSearchUIDSetCriterion()
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-lost-reply-retry")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        var seeded: [MessageHeader] = []
+        for (uid, rfc) in zip(sourceUids, targets) { seeded.append(try seedHeader(f, uid: uid, rfc: rfc)) }
+        for (uid, rfc) in zip(residentUids, residents) {
+            try seedHeader(f, uid: uid, rfc: rfc, folderPath: "Archive")
+        }
+        try await f.pool.write { db in
+            _ = try Folder.filter(Column("accountId") == f.accountId)
+                .updateAll(db, Column("backfillComplete").set(to: true))
+            _ = try Folder.filter(Column("accountId") == f.accountId && Column("path") == "Archive")
+                .updateAll(db, Column("backfillUidCursor").set(to: 1))
+        }
+
+        await AccountManager.shared.move(seeded, to: "Archive")
+        try await drainOnceExpectingTheOpKept(f)
+        // NON-VACUITY: attempt 1 committed every copy on the server.
+        #expect(server.messageIDs(in: "Archive").count == movedCount + residentUids.count)
+
+        // A window sync of Archive stores the newest copies (above the oldest).
+        try await syncArchive(f, provider: provider)
+
+        // The retry retires the move with no destination named.
+        try await drainToQuiescence(f)
+        // NON-VACUITY: the window alone does not reach every copy.
+        #expect(!(try missingFromArchive(f, targets)).isEmpty,
+                "precondition: every copy is stored before the catch-up, so it is not exercised")
+        try await runOwedCatchUp(f)
+
+        // THE PROPERTY: local Archive is the server's Archive.
+        let serverArchive = Set(server.snapshotMessagesWithFlags(in: "Archive").map {
+            "\($0.message.uid)|\($0.message.messageID)"
+        })
+        let local = try rows(f).filter { $0.folderPath == "Archive" }
+        let localArchive = Set(local.map { "\($0.messageId)|<\($0.rfc822MessageId ?? "")>" })
+        let localRfcs = Set(local.compactMap(\.rfc822MessageId))
+        let missing = targets.filter { !localRfcs.contains($0) }
+        #expect(missing.isEmpty, "\(missing.count) of \(movedCount) copies are absent from local Archive")
+        #expect(local.count == serverArchive.count && localArchive == serverArchive,
+                "local Archive (\(local.count) rows) is not the server's (\(serverArchive.count))")
+        #expect(local.allSatisfy { $0.observedUidValidity == 10 })
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: AI content survives a no-COPYUID move even when a sync
+    /// stored the copy before the move's retry dropped the optimistic row.**
+    /// The copy's row then exists before the AI handoff reaches the cache, so
+    /// no insert restores it; the drop's own write fills it.
+    @Test("A copy stored before the drop still gets the moved message's AI content")
+    @MainActor
+    func aCopyStoredBeforeTheDropGetsTheAIContent() async throws {
+        let target = "lost-reply-ai@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [Self.message(uid: 3, id: "lost-reply-ai-resident@example.com")],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
+        server.disconnectAfterNextUIDMoveCommit()
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-lost-reply-ai")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        var seeded = try seedHeader(f, uid: 88, rfc: target)
+        seeded.summaryBlurb = "summary of the moved message"
+        seeded.summaryTodos = "todo of the moved message"
+        seeded.reminderDate = "2099-01-02"
+        seeded.reminderTime = "09:30"
+        seeded.reminderContent = "reminder of the moved message"
+        seeded.cachedReply = "reply to the moved message"
+        let summarized = seeded
+        try await f.pool.write { db in try summarized.update(db) }
+
+        await AccountManager.shared.move([summarized], to: "Archive")
+        try await drainOnceExpectingTheOpKept(f)
+        try await syncArchive(f, provider: provider)
+        try await drainToQuiescence(f)
+        try await syncArchive(f, provider: provider)
+
+        let all = try rows(f)
+        let moved = all.filter { $0.folderPath == "Archive" && $0.rfc822MessageId == target }
+        #expect(moved.count == 1, "the moved message is not in local Archive exactly once: \(all.map(\.id))")
+        guard moved.count == 1 else { return }
+        #expect(moved[0].observedUidValidity == 10)
+        #expect(moved[0].summaryBlurb == "summary of the moved message")
+        #expect(moved[0].summaryTodos == "todo of the moved message")
+        #expect(moved[0].reminderDate == "2099-01-02")
+        #expect(moved[0].reminderTime == "09:30")
+        #expect(moved[0].reminderContent == "reminder of the moved message")
+        #expect(moved[0].cachedReply == "reply to the moved message")
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: existing AI content survives a move whatever the server
+    /// reports about the destination.** The COPYUID path keeps it by re-keying
+    /// the row; a move with no COPYUID drops the row, so its AI state must reach
+    /// the row the destination sync inserts.
+    @Test("A move with no COPYUID keeps the message's AI content in the destination")
+    @MainActor
+    func aMoveWithNoCopyUidKeepsItsAIContent() async throws {
+        let target = "remnant-ai-target@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [Self.message(uid: 3, id: "remnant-ai-resident@example.com")],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-no-copyuid-ai-content")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        var seeded = try seedHeader(f, uid: 88, rfc: target)
+        seeded.summaryBlurb = "summary of the moved message"
+        seeded.summaryTodos = "todo of the moved message"
+        seeded.cachedReply = "reply to the moved message"
+        seeded.reminderDate = "2099-01-02"
+        seeded.reminderTime = "09:30"
+        seeded.reminderContent = "reminder of the moved message"
+        let summarized = seeded
+        // As the AI path leaves it: on the row, and in the cache under the
+        // folder the row was in when the AI ran.
+        try await f.pool.write { db in
+            try summarized.update(db)
+            try MessageAICache.writeThrough(
+                accountId: f.accountId, folderPath: "INBOX", rfc822MessageId: target,
+                summaryBlurb: summarized.summaryBlurb, summaryTodos: summarized.summaryTodos,
+                reminderDate: summarized.reminderDate, reminderTime: summarized.reminderTime,
+                reminderContent: summarized.reminderContent,
+                cachedReply: summarized.cachedReply, db: db)
+        }
+
+        await AccountManager.shared.move([summarized], to: "Archive")
+        try await drainToQuiescence(f)
+        // NON-VACUITY: the move landed; the server only withheld where.
+        #expect(server.messageIDs(in: "Archive").contains("<\(target)>"))
+
+        let all = try rows(f)
+        let moved = all.filter { $0.folderPath == "Archive" && $0.rfc822MessageId == target }
+        #expect(moved.count == 1, "the moved message is not in local Archive: \(all.map(\.id))")
+        guard moved.count == 1 else { return }
+        #expect(moved[0].observedUidValidity == 10, "the row in Archive is not the synced copy")
+        #expect(moved[0].summaryBlurb == "summary of the moved message")
+        #expect(moved[0].summaryTodos == "todo of the moved message")
+        #expect(moved[0].cachedReply == "reply to the moved message")
+        #expect(moved[0].reminderDate == "2099-01-02")
+        #expect(moved[0].reminderTime == "09:30")
+        #expect(moved[0].reminderContent == "reminder of the moved message")
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: every message of a move the server did not name is back in
+    /// the destination after the normal sync path, however many there were.**
+    /// The window sync reads only the newest messages and the older-mail walk is
+    /// complete here (its cursor at the bottom), so the copies the window does
+    /// not reach are stored by the catch-up listing the drop owed the folder
+    /// (ADR-IOS-111 item 11, #1062).
+    @Test("A large move with no COPYUID is complete in the destination after the drain and its catch-up")
+    @MainActor
+    func aLargeMoveWithNoCopyUidIsCompleteAfterTheDrain() async throws {
+        let window = SyncConfig.syncMessageLimit
+        let movedCount = window + 10
+        let residentCount = window + 10
+        let sourceUids = (0..<movedCount).map { 5000 + $0 }
+        let targets = sourceUids.map { "large-move-\($0)@example.com" }
+        let residentUids = Array(1...residentCount)
+        let residents = residentUids.map { "large-resident-\($0)@example.com" }
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": zip(sourceUids, targets).map { Self.message(uid: $0, id: $1) },
+            "Archive": zip(residentUids, residents).map { Self.message(uid: $0, id: $1) },
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: Set(sourceUids))
+        server.withholdMoveCOPYUID(forSourceUIDs: Set(sourceUids))
+        for target in targets { server.expectMutation(rfc822MessageId: target) }
+        // A walk's UID-range SEARCH must return only that range, as a real
+        // server's does, or a resumed low cursor would still see every UID.
+        server.honorSearchUIDSetCriterion()
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-no-copyuid-large-move")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        var seeded: [MessageHeader] = []
+        for (uid, rfc) in zip(sourceUids, targets) { seeded.append(try seedHeader(f, uid: uid, rfc: rfc)) }
+        for (uid, rfc) in zip(residentUids, residents) {
+            try seedHeader(f, uid: uid, rfc: rfc, folderPath: "Archive")
+        }
+        // Every folder fully walked, as on a device that finished its fill-in;
+        // Archive's walk saved its cursor at the bottom, so a resumed walk (as
+        // opposed to a restarted one) would never look above it.
+        try await f.pool.write { db in
+            _ = try Folder.filter(Column("accountId") == f.accountId)
+                .updateAll(db, Column("backfillComplete").set(to: true))
+            _ = try Folder.filter(Column("accountId") == f.accountId && Column("path") == "Archive")
+                .updateAll(db, Column("backfillUidCursor").set(to: 1))
+        }
+
+        await AccountManager.shared.move(seeded, to: "Archive")
+        try await drainToQuiescence(f)
+        // NON-VACUITY: every member landed; the server only withheld where.
+        #expect(server.messageIDs(in: "Archive").count == movedCount + residentCount)
+        // NON-VACUITY: the window alone does not reach every moved message.
+        #expect(!(try missingFromArchive(f, targets)).isEmpty,
+                "precondition: every moved message is stored before the catch-up, so it is not exercised")
+        try await runOwedCatchUp(f)
+
+        // THE PROPERTY: local Archive is the server's Archive — every moved
+        // message present at its real address with its epoch read.
+        let serverArchive = Set(server.snapshotMessagesWithFlags(in: "Archive").map {
+            "\($0.message.uid)|\($0.message.messageID)"
+        })
+        let local = try rows(f).filter { $0.folderPath == "Archive" }
+        let localArchive = Set(local.map { "\($0.messageId)|<\($0.rfc822MessageId ?? "")>" })
+        let localRfcs = Set(local.compactMap(\.rfc822MessageId))
+        let missing = targets.filter { !localRfcs.contains($0) }
+        #expect(missing.isEmpty,
+                "\(missing.count) of \(movedCount) moved messages are absent from local Archive after the drain and its catch-up")
+        #expect(local.count == serverArchive.count && localArchive == serverArchive,
+                "local Archive (\(local.count) rows) is not the server's (\(serverArchive.count))")
+        #expect(local.allSatisfy { $0.observedUidValidity == 10 },
+                "\(local.filter { $0.observedUidValidity != 10 }.count) Archive rows have an unread epoch")
+        #expect(server.wrongMessageViolations().isEmpty)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: a message moved INTO the inbox gets its window-exempt AI
+    /// jobs even when the server named no destination for it** — on the row the
+    /// destination sync inserted, never on the message already holding the
+    /// source UID there. Driven through the real drain, so the handoff from the
+    /// retirement to the entered-inbox recorder is what is under test.
+    @Test("A move into the inbox with no COPYUID still enqueues AI for the moved message only")
+    @MainActor
+    func aMoveIntoTheInboxWithNoCopyUidStillEnqueuesAI() async throws {
+        let target = "remnant-inbox-target@example.com"
+        let resident = "remnant-inbox-resident@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: resident)],
+            "Archive": [Self.message(uid: 88, id: target)],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let ai = ActiveAIQueue.shared
+        await ai.setDispatchSuppressedForTesting(true)
+        await ai.clearForTesting()
+
+        let f = try fixture(accountId: "address-no-copyuid-inbox-ai")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 88, rfc: target, folderPath: "Archive")
+
+        await AccountManager.shared.move([seeded], to: "INBOX")
+        try await drainToQuiescence(f)
+        // NON-VACUITY: the move landed; the server only withheld where.
+        #expect(Set(server.messageIDs(in: "INBOX")) == ["<\(target)>", "<\(resident)>"])
+
+        let inbox = try rows(f).filter { $0.folderPath == "INBOX" }
+        let moved = inbox.filter { $0.rfc822MessageId == target }
+        #expect(moved.count == 1, "the destination sync did not insert the moved message: \(inbox.map(\.id))")
+        let exempt = await ai.queuedJobsForTesting.filter { $0.windowExempt }
+        #expect(Set(exempt.map(\.headerId)) == Set(moved.map(\.id)) && moved.count == 1,
+                "window-exempt AI jobs \(exempt.map(\.headerId)) are not exactly the moved message \(moved.map(\.id))")
+        #expect(Set(exempt.map(\.jobType)) == [.summary, .reply])
+        // The source keeps its guard against a stale listing re-inserting the
+        // moved message (#106): only the dropped row's rfc822 key was released.
+        #expect(await AccountManager.shared.isRecentlyCompleted("88"),
+                "the bare source-UID shield key was released along with the rfc822 key")
+        #expect(server.wrongMessageViolations().isEmpty)
+        await ai.clearForTesting()
+        await ai.setDispatchSuppressedForTesting(false)
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: a move the server refused outright never takes the
+    /// message out of the local view.** The refusal retires the operation with
+    /// no destination evidence, exactly like a move that landed without
+    /// `COPYUID`, but here nothing left the source, so no destination sync will
+    /// ever bring a dropped row back.
+    @Test("A refused move keeps the local row")
+    @MainActor
+    func aRefusedMoveKeepsTheLocalRow() async throws {
+        let target = "refused-move@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 66, id: target)],
+            "Archive": [],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.failNextCommand(containing: "UID MOVE", message: "[NOPERM] Permission denied")
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-refused-move")
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 66, rfc: target)
+
+        await AccountManager.shared.move([seeded], to: "Archive")
+        try await drainToQuiescence(f)
+        // NON-VACUITY: the refusal was answered and the message never moved.
+        #expect(server.messageIDs(in: "INBOX") == ["<\(target)>"])
+        #expect(server.messageIDs(in: "Archive").isEmpty)
+
+        let local = try rows(f).filter { $0.rfc822MessageId == target }
+        #expect(local.count == 1,
+                "a refused move removed the only local row of a message that never left the source")
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    // MARK: - A dropped row's chat pill
+
+    /// Gives the INBOX row at UID 88 a chat pill, then moves it to Archive on a
+    /// server that names no destination. Archive already holds, at UID 4, a
+    /// DIFFERENT message with the same Message-ID that this device never
+    /// stored, so the copy lands at UID 5. Returns the pill's number and the
+    /// dropped row's id.
+    @MainActor
+    private func moveAPilledRowWithNoCopyUid(
+        accountId: String, target: String
+    ) async throws -> (server: FakeIMAPServer, fixture: Fixture, provider: IMAPProvider, numericId: Int, oldId: String) {
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [Self.message(uid: 4, id: target)],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+
+        let f = try fixture(accountId: accountId)
+        await ChatIdTranslator.shared.clearAll()
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 88, rfc: target)
+        let numericId = await ChatIdTranslator.shared.toNumericId(seeded.id)
+
+        await AccountManager.shared.move([seeded], to: "Archive")
+        try await drainToQuiescence(f)
+        return (server, f, provider, numericId, seeded.id)
+    }
+
+    /// The copy (UID 5) is deleted by another client and Archive syncs, so the
+    /// only stored message with the moved message's Message-ID is NOT the copy.
+    @MainActor
+    private func leaveOnlyTheSameIdNonCopy(
+        _ fixture: Fixture, server: FakeIMAPServer, provider: IMAPProvider, target: String, oldId: String
+    ) async throws {
+        // NON-VACUITY: the move landed beside the same-id message, and the
+        // remnant row is gone.
+        let archiveUids = server.snapshotMessagesWithFlags(in: "Archive").map(\.message.uid).sorted()
+        #expect(archiveUids == [4, 5], "the move did not land beside the same-id message: \(archiveUids)")
+        let remnantKept = try rows(fixture).contains { $0.id == oldId }
+        #expect(!remnantKept, "the remnant row was not dropped")
+        server.setMessages(
+            server.snapshotMessagesWithFlags(in: "Archive").map(\.message).filter { $0.uid != 5 }, in: "Archive")
+        try await syncArchive(fixture, provider: provider)
+        let sameId = try rows(fixture).filter { $0.rfc822MessageId == target }.map(\.messageId)
+        #expect(sameId == ["4"], "the only same-id row left should be the non-copy at UID 4: \(sameId)")
+    }
+
+    /// **THE PROPERTY: a dropped row's chat pill is never moved to a message by
+    /// its Message-ID alone.** Without `COPYUID` nothing proves which message is
+    /// the copy: here the copy is gone and the only candidate left is a
+    /// different message with the same Message-ID. The pill is retired with the
+    /// row, renders unavailable, and opens nothing.
+    @Test("A dropped row's chat pill is never moved by Message-ID alone")
+    @MainActor
+    func aDroppedRowsPillIsNeverMovedByMessageIdAlone() async throws {
+        let target = "pill-id-only@example.com"
+        let (server, f, provider, numericId, oldId) = try await moveAPilledRowWithNoCopyUid(
+            accountId: "address-pill-id-only", target: target)
+        defer { server.stop() }
+        try await leaveOnlyTheSameIdNonCopy(f, server: server, provider: provider, target: target, oldId: oldId)
+
+        let realId = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(realId == ChatIdTranslator.retiredRealId(numericId: numericId, realId: oldId),
+                "the pill was not retired with its row: it names \(String(describing: realId))")
+        let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId)
+        #expect(detail == nil, "a tap on the retired pill must open nothing")
+        let retired = await ChatIdTranslator.shared.isRetiredPill(numericId)
+        #expect(retired, "the retired pill is not reported as retired")
+        #expect(MarkdownChatText.pillIsUnavailable(isHistory: false, isRetired: retired),
+                "the retired pill does not render as unavailable")
+        await ChatIdTranslator.shared.clearAll()
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: resuming the moved message's chat session never binds
+    /// its old pill to a message by Message-ID alone.** The session's
+    /// Message-ID fallback (`ChatStore.resolveMessageHeaderId`) still finds a
+    /// same-id row for the session's context, but the pill was retired with
+    /// the dropped row, so the resumed session's remap binds nothing.
+    @Test("A resumed chat session does not rebind a dropped row's pill by Message-ID")
+    @MainActor
+    func aResumedSessionDoesNotRebindADroppedRowsPill() async throws {
+        let target = "pill-resume@example.com"
+        let (server, f, provider, numericId, oldId) = try await moveAPilledRowWithNoCopyUid(
+            accountId: "address-pill-resume", target: target)
+        defer { server.stop() }
+        try await leaveOnlyTheSameIdNonCopy(f, server: server, provider: provider, target: target, oldId: oldId)
+
+        // Resume the moved message's own chat session, as the chat surface does:
+        // a missing primary key falls back to the session's Message-ID, then the
+        // old pill is remapped onto whatever that resolved to.
+        let sessionId = "msg:\(f.accountId):\(target)"
+        let resolved = try await f.pool.read { db in
+            try ChatStore.resolveMessageHeaderId(originalId: oldId, sessionId: sessionId, db: db)
+        }
+        // NON-VACUITY: the fallback finds the same-id message that is not the copy.
+        let nonCopyId = try rows(f).first { $0.rfc822MessageId == target }?.id
+        #expect(resolved != nil && resolved == nonCopyId)
+        if let resolved {
+            _ = await ChatIdTranslator.shared.remapRealId(from: oldId, to: resolved)
+        }
+        let realId = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(realId == ChatIdTranslator.retiredRealId(numericId: numericId, realId: oldId),
+                "the resumed session bound the pill to \(String(describing: realId)) by Message-ID alone")
+        let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId)
+        #expect(detail == nil)
+        await ChatIdTranslator.shared.clearAll()
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: a retired pill's number is never handed to another
+    /// message, even after the translator reloads from storage.**
+    @Test("A dropped row's retired pill number is not reused after a reload")
+    @MainActor
+    func aRetiredPillsNumberIsNotReusedAfterAReload() async throws {
+        let target = "pill-reload@example.com"
+        // The pill is the only, and so the highest, mapping.
+        let (server, f, provider, numericId, oldId) = try await moveAPilledRowWithNoCopyUid(
+            accountId: "address-pill-reload", target: target)
+        defer { server.stop() }
+        let remnantKept = try rows(f).contains { $0.id == oldId }
+        #expect(!remnantKept, "the remnant row was not dropped")
+
+        await ChatIdTranslator.shared.reloadFromDBForTesting()
+        let other = MessageIdentity.headerId(accountId: f.accountId, folderPath: "Archive", messageId: "4")
+        let otherNumeric = await ChatIdTranslator.shared.toNumericId(other)
+        #expect(otherNumeric != numericId, "the retired pill's number was handed to another message")
+        let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId)
+        #expect(detail == nil)
+        await ChatIdTranslator.shared.clearAll()
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: the same address retired twice (reused after a source
+    /// reset) retires both pills, and the retiring write never fails.** A
+    /// failed write would abort the move's settlement and stop the queue.
+    @Test("An address retired twice retires both pills without a write failure")
+    @MainActor
+    func anAddressRetiredTwiceRetiresBothPills() async throws {
+        let f = try fixture(accountId: "address-pill-reuse")
+        await ChatIdTranslator.shared.clearAll()
+        let address = MessageIdentity.headerId(accountId: f.accountId, folderPath: "Archive", messageId: "88")
+        // Each writer on its own: the move's write (the shared stored rewrite
+        // `finishMove` runs) for the first retirement, then the translator's
+        // own (its stored rewrite does the work, nothing pre-retired).
+        let first = await ChatIdTranslator.shared.toNumericId(address)
+        try await AppDatabase.dbPool.write { db in
+            try ChatIdTranslator.retireStoredMappings(db, realId: address)
+        }
+        await ChatIdTranslator.shared.retireMappings(realIds: [address])
+        // The address is reused by a new message, whose pill is retired in turn.
+        let second = await ChatIdTranslator.shared.toNumericId(address)
+        #expect(second != first)
+        await ChatIdTranslator.shared.retireMappings(realIds: [address])
+        // And the move's write once more, for a third reuse.
+        let third = await ChatIdTranslator.shared.toNumericId(address)
+        try await AppDatabase.dbPool.write { db in
+            try ChatIdTranslator.retireStoredMappings(db, realId: address)
+        }
+
+        await ChatIdTranslator.shared.reloadFromDBForTesting()
+        for numeric in [first, second, third] {
+            let retired = await ChatIdTranslator.shared.isRetiredPill(numeric)
+            #expect(retired, "pill \(numeric) was not retired")
+            let detail = await ChatIdTranslator.shared.resolveEmailDetail(numeric)
+            #expect(detail == nil)
+        }
+        await ChatIdTranslator.shared.clearAll()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: a remap that lands between the retiring write and the
+    /// translator's in-memory retirement does not bring the pill back.**
+    @Test("A remap between the retiring write and the in-memory retirement is refused")
+    @MainActor
+    func aRemapBeforeTheInMemoryRetirementIsRefused() async throws {
+        let f = try fixture(accountId: "address-pill-window")
+        await ChatIdTranslator.shared.clearAll()
+        let oldId = MessageIdentity.headerId(accountId: f.accountId, folderPath: "Archive", messageId: "88")
+        let other = MessageIdentity.headerId(accountId: f.accountId, folderPath: "INBOX", messageId: "4")
+        let numeric = await ChatIdTranslator.shared.toNumericId(oldId)
+        // The move's retiring write, exactly as `finishMove` issues it.
+        try await AppDatabase.dbPool.write { db in
+            try ChatIdTranslator.retireStoredMappings(db, realId: oldId)
+        }
+        // A resumed session remaps before the in-memory retirement runs.
+        let moved = await ChatIdTranslator.shared.remapRealId(from: oldId, to: other)
+        await ChatIdTranslator.shared.retireMappings(realIds: [oldId])
+
+        #expect(moved == 0, "the remap moved a retired pill")
+        let afterRetire = await ChatIdTranslator.shared.toRealId(numeric)
+        #expect(afterRetire != other)
+        let stored = try await AppDatabase.dbPool.read { db in
+            try String.fetchOne(db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [numeric])
+        }
+        #expect(stored == ChatIdTranslator.retiredRealId(numericId: numeric, realId: oldId),
+                "the stored mapping was rebound: \(String(describing: stored))")
+        await ChatIdTranslator.shared.reloadFromDBForTesting()
+        let afterReload = await ChatIdTranslator.shared.toRealId(numeric)
+        #expect(afterReload != other)
+        await ChatIdTranslator.shared.clearAll()
         await finish(f)
     }
 
@@ -375,7 +1064,7 @@ struct FinishTheMoveLocallyTests {
                 // IMAP: a UID is mailbox-local, so the row is located by primary
                 // key at `destinationPath` and no queued follower is re-addressed.
                 accountScopedIds: false,
-                db: db)
+                copiedNothing: false, db: db)
             _ = try PendingOperation.deleteOne(db, key: op.id)
             return result
         }
