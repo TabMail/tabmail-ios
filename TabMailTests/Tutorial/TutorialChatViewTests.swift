@@ -1183,8 +1183,13 @@ extension TutorialChatViewRunTests {
         try await HostedAccessibility.withAutomation {
             let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
             let window = UIWindow(windowScene: scene)
+            // As the root view gives the demo: the tutorial's chat is scripted, so it counts as a
+            // TabMail session and the panel shows its input, not the sign-in bar.
+            let demoHasSession = DemoModeStore.shared.isActive && !DemoModeStore.shared.hidesAIContent
+            try #require(demoHasSession, "control: the tutorial's demo counts as a TabMail session")
             let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) }
-                .environment(NavigationStore()))
+                .environment(NavigationStore())
+                .environment(\.hasTabMailSession, demoHasSession))
             window.rootViewController = controller
             window.makeKeyAndVisible()
             defer {

@@ -1754,8 +1754,10 @@ struct ChatReplyFieldTests {
         #expect(built == ["DynamicIslandChatButton.swift": 4], "only the pill builds invocations: \(built)")
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(Self.count("composeOrigin: origin, fieldWordsKey:", in: island) == 3,
-                "the send, the closed field's compose and the resume name the screen that asked")
+        #expect(Self.count("composeOrigin: origin, fieldWordsKey:", in: island) == 1,
+                "the closed field's compose names the screen that asked and keeps its words")
+        #expect(Self.count("uiSink: SessionUISink(session: session), sessionKey: sessionKey, composeOrigin: origin)", in: island) == 2,
+                "the panel's send and the resume name the screen that asked")
         #expect(Self.count("invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey) )", in: island) == 1,
                 "the compose editor's chat, which opens no card, names none")
         #expect(Self.count("guard onAgentCompose != nil, composeContext == nil else { return nil }", in: island) == 1,
