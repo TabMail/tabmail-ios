@@ -602,12 +602,41 @@ struct ChatReadyReply: Identifiable {
     }
 }
 
+/// The AI Suggestion's ghost the user tapped, held in its place in the chat while its compose card
+/// is up, so the chat behind the card still shows it as the card opens and closes. UI only: the
+/// send itself is the card's, persisted to the outbox before the card closes. The hold ends once
+/// the card has finished closing: at once if nothing was sent, or if the chat does not show this
+/// send as its bubble (`showsBubble`); after a send it shows, once the reply shows (its outbox
+/// bubble, or the sent email itself), and the ghost turns into that bubble.
+struct ChatHeldGhost: Equatable {
+    /// The ghost's words, as it showed them.
+    let text: String
+    /// The chat shows this card's send as its bubble (`ChatThreadView.composeScreen`).
+    let showsBubble: Bool
+    /// The card sent the reply.
+    var sent = false
+    /// The card has finished closing.
+    var cardClosed = false
+
+    /// The hold ends now. `replyShows`: the chat shows the sent reply, as its outbox bubble or as
+    /// the sent email.
+    func ends(replyShows: Bool) -> Bool {
+        cardClosed && (!sent || !showsBubble || replyShows)
+    }
+
+    /// Ending turns the ghost into the sent reply's bubble (else it simply goes).
+    var morphs: Bool { sent && showsBubble }
+}
+
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the
 /// bottom of the chat whose email it answers. Read from the database and the chat's own emails,
 /// with nothing kept in memory: every outbox row whose In-Reply-To is the
 /// Message-ID of an email in the chat, from any account (the reply may go out from another account
 /// than the email it answers). A failed row reads "Not sent", with Retry and Delete; any other
 /// "Sending". Its text is the summary made at Send (`SentEmailSummary`), "Summarizing" until then.
+///
+/// The hand-over from the ghost: a ghost tapped open is held in its place while its card is up
+/// (`ChatHeldGhost`), and after a send it turns into this bubble.
 ///
 /// The hand-over to the sent email: once the provider takes the email the send stamps `sentAt`, then
 /// writes the optimistic Sent copy under the row's Message-ID. The chat's list of emails is not

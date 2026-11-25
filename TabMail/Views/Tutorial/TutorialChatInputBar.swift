@@ -39,16 +39,14 @@ struct TutorialChatInputBar: View {
 
     /// The tutorial tooltip's inset from the bar's edges.
     static let tooltipInset: CGFloat = 8
-    /// The tooltip arrow's centre from the tooltip's leading edge: over the mic glyph's centre.
-    static let tooltipArrowCenterX = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2 - tooltipInset
+    /// The tooltip arrow's centre from the tooltip's leading edge: over the mic circle's centre.
+    static let tooltipArrowCenterX = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicSize / 2 - tooltipInset
 
     /// The same row as the real bar (`ChatFieldBarRow`).
     private var inputRow: some View {
         ChatFieldBarRow {
-            Image(systemName: "mic")
-                .font(.body)
-                .foregroundStyle(prompt == nil ? AnyShapeStyle(.secondary.opacity(0.3)) : AnyShapeStyle(Theme.accent))
-                .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
+            ChatMicCircle(symbol: "mic", listening: false)
+                .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .accessibilityHidden(true)
         } text: {
             VStack(alignment: .leading, spacing: 2) {
@@ -86,8 +84,8 @@ struct TutorialChatInputBar: View {
 private struct TutorialInputTooltip: View {
     let close: () -> Void
 
-    /// The arrow's center sits over the microphone glyph: the row's inset to the glyph plus half
-    /// the glyph, less the bubble's own inset (`TutorialChatInputBar.tooltipArrowCenterX`).
+    /// The arrow's center sits over the mic circle: the row's inset to the circle plus half the
+    /// circle, less the bubble's own inset (`TutorialChatInputBar.tooltipArrowCenterX`).
     private let arrowCenterX = TutorialChatInputBar.tooltipArrowCenterX
     private let arrowSize = CGSize(width: 16, height: 8)
 

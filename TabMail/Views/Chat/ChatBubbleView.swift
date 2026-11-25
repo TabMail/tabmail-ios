@@ -511,7 +511,8 @@ struct ChatSenderLine: View {
                     }
                 }
             } else {
-                HStack(spacing: 4) {
+                // On one baseline: the name is a step larger than the label after it.
+                HStack(alignment: .firstTextBaseline, spacing: 4) {
                     senderName
                         .fixedSize()
                     if let only = item.repliedOnlyTo {
@@ -524,9 +525,12 @@ struct ChatSenderLine: View {
         .accessibilityHidden(true)
     }
 
+    /// The sender's name, a step larger than the "(replied only to …)" label after it.
+    static let nameFont = Font.footnote
+
     private var senderName: some View {
         Text(item.isOwn ? "You" : item.sender.name)
-            .font(.caption)
+            .font(Self.nameFont)
             .fontWeight(.medium)
             .foregroundStyle(item.isOwn ? Theme.textSecondary : ChatAvatar.color(for: item.sender))
     }

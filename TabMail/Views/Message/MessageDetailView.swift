@@ -67,6 +67,9 @@ struct MessageDetailView: View {
 #endif
     var showSideButtons: Bool { !chatExpanded && sideButtonsReady }
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) var optOutAllAI = false
+    /// The chat view is on as this email opens: its detail slides up from a chat and has no compose
+    /// button. In the classic view the detail has it (`ComposeToolbarButton`).
+    @State private var opensInChat = ChatViewConfig.opensInChat
     @Environment(\.dismiss) var dismiss
     @Environment(\.hasTabMailSession) var hasTabMailSession
     /// In the detail column: whether the list beside it has a sheet or cover up (`ListPresentationState`).
@@ -181,16 +184,18 @@ struct MessageDetailView: View {
                             }
                         }
                 }
-                ToolbarItem(placement: .topBarTrailing) {
-                    ComposeToolbarButton(onNewCompose: {
-                        if chatExpanded {
-                            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                                chatExpanded = false
+                if !opensInChat {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        ComposeToolbarButton(onNewCompose: {
+                            if chatExpanded {
+                                withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                                    chatExpanded = false
+                                }
                             }
-                        }
-                        askForNewEmail(nil)
-                    })
-                    .tutorialLockedNavigation()
+                            askForNewEmail(nil)
+                        })
+                        .tutorialLockedNavigation()
+                    }
                 }
             }
             .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }

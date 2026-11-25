@@ -946,6 +946,66 @@ struct TutorialChatViewRunTests {
         }
     }
 
+    // Part 2 opens Priya's chat at its bottom, the AI Suggestion its last row, with the coach card
+    // in the top bar: nothing is below, so the button that jumps to the newest email does not show.
+    @Test("In Priya's chat at its bottom, with the coach card and the AI Suggestion, no jump-to-newest button shows")
+    func chatAtItsBottomShowsNoJumpButton() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        try await withSettings(chatView: true) {
+            try await whileRunning(.reuseReply) {
+                #expect(TutorialCoordinator.shared.step == .replyToPriya)
+                let priya = try #require(try await fixture.0.read { db in
+                    try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                        && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                })
+                try await HostedAccessibility.withAutomation {
+                    let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+                    let window = UIWindow(windowScene: scene)
+                    let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) }
+                        .environment(NavigationStore()))
+                    window.rootViewController = controller
+                    window.makeKeyAndVisible()
+                    defer {
+                        window.isHidden = true
+                        window.rootViewController = nil
+                    }
+                    @MainActor func shows(_ id: String) -> Bool {
+                        HostedAccessibility.identifiers(in: controller.view).contains(id)
+                    }
+                    @MainActor func ready() -> Bool {
+                        shows("tutorial-coach") && shows(ChatSuggestionBubble.bubbleId)
+                    }
+                    for _ in 0..<80 where !ready() { try await Task.sleep(for: .milliseconds(100)) }
+                    let cardAndGhost = ready()
+                    #expect(cardAndGhost, "control: the coach card and the AI Suggestion show: \(HostedAccessibility.identifiers(in: controller.view))")
+                    // Past the button's fade and the landing's re-pins.
+                    try await Task.sleep(for: .seconds(1))
+                    // The chat's scroll view, as UIKit holds it: at its bottom, nothing lies below the
+                    // visible area (the bottom inset is the field's room).
+                    let tallest = Self.scrollViews(in: controller.view).max { $0.contentSize.height < $1.contentSize.height }
+                    let scroll = try #require(tallest, "the chat's scroll view")
+                    let below = scroll.contentSize.height + scroll.adjustedContentInset.bottom
+                        - (scroll.contentOffset.y + scroll.bounds.height)
+                    let geometry = "offset \(scroll.contentOffset.y), content \(scroll.contentSize.height), bounds \(scroll.bounds.height), "
+                        + "inset top \(scroll.adjustedContentInset.top) bottom \(scroll.adjustedContentInset.bottom), "
+                        + "contentInset top \(scroll.contentInset.top) bottom \(scroll.contentInset.bottom), "
+                        + "safe area top \(scroll.safeAreaInsets.top) bottom \(scroll.safeAreaInsets.bottom)"
+                    #expect(abs(below) < 1, "control: the chat is at its bottom: \(below) below; \(geometry)")
+                    let jump = HostedAccessibility.labels(in: controller.view).contains("Jump to the newest email")
+                    #expect(!jump, "no jump-to-newest button at the bottom; \(geometry)")
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private static func scrollViews(in view: UIView) -> [UIScrollView] {
+        let own: [UIScrollView] = (view as? UIScrollView).map { [$0] } ?? []
+        return own + view.subviews.flatMap { scrollViews(in: $0) }
+    }
+
     @Test("With Chat View off, or AI opted out, the run is today's: no chat, and Finish goes straight to the recap")
     func todaysRun() async throws {
         for (chatView, optedOut) in [(false, false), (true, true)] {
