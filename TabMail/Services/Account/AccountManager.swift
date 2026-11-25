@@ -470,6 +470,12 @@ actor AccountManager {
         let predecessorDestinationPath: String
         let oldHeaderId: String
         var desiredDestinationPath: String
+        /// The email this successor moves: the Message-ID of its row when the
+        /// successor was recorded, nil when that row has no usable Message-ID.
+        /// An Undo cancels a successor only for the same email; another email
+        /// that later took this address owns its successor (C3). A content
+        /// witness that can only refuse, never an address (ADR-IOS-068/D4).
+        let messageIdentity: ExpectedMessageIdentity?
     }
 
     /// Old source-address header id -> latest successor.
