@@ -142,11 +142,6 @@ extension AccountManager {
         }
 
         NotificationCenter.default.post(name: .backgroundDataDidChange, object: nil)
-        if let resolvedOriginalId = result.resolvedOriginalId {
-            NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
-            // Notify MessageDetailViewModel so reply/forward indicator updates immediately
-            NotificationCenter.default.post(name: .messageDataDidChange, object: resolvedOriginalId)
-        }
         // synchronous=NORMAL durability: the OutboxMessage row is committed, but NORMAL
         // does not fsync per commit. Harden the send NOW (async, off the compose-dismiss
         // path) so it survives an unclean power-off before the drain runs — a dropped send
@@ -185,13 +180,13 @@ extension AccountManager {
     /// "turn this draft into (at most) one outbox row", with NO drain side effects
     /// (so tests can drive it deterministically). Saves attachments to disk
     /// (outside the txn), then in ONE async write transaction either dedups against
-    /// an existing in-flight row (the firewall) or inserts the new row and applies
-    /// optimistic isReplied/isForwarded to the original message.
+    /// an existing in-flight row (the firewall) or inserts the new row. It never
+    /// touches the original message: its replied/forwarded mark and the cleared
+    /// Reply tag are written when the send goes out (`deleteCompletedSendAtomic`).
     ///
     /// Returns the id of the outbox row that now represents this send (the freshly
     /// inserted one, or the pre-existing in-flight one when deduped), whether it
-    /// deduped, the resolved original-header id for the reply/forward badge, and
-    /// that row's durable `holdUntil`.
+    /// deduped, and that row's durable `holdUntil`.
     ///
     /// `holdUntil` is returned because it is the ONLY authoritative statement of
     /// how long the send can still be undone, and it is anchored at persist START
@@ -212,7 +207,7 @@ extension AccountManager {
         draftId: String,
         instanceEpoch: String,
         holdsForUndo: Bool = true
-    ) async throws -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?, holdUntil: Date?) {
+    ) async throws -> (outboxId: String, deduped: Bool, holdUntil: Date?) {
         guard !instanceEpoch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw OutboxAdmissionError.invalidInstanceEpoch
         }
@@ -258,7 +253,7 @@ extension AccountManager {
         let outboxToInsert = outbox
         let hadAttachments = !draft.attachments.isEmpty
         do {
-            let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, resolvedOriginalId: String?, holdUntil: Date?) in
+            let result = try await AppDatabase.dbPool.write { db -> (outboxId: String, deduped: Bool, holdUntil: Date?) in
                 // PORT/SUBTRACT — the v2final authority projection and bounded
                 // same-account census, strengthened to require the live Draft.
                 // Replacement or disappearance fails closed before dedup/insert.
@@ -293,7 +288,7 @@ extension AccountManager {
                     // send was persisted and may already have elapsed. Reporting
                     // this send's discarded deadline would offer an Undo the
                     // drain has long since stopped honouring.
-                    return (existing.id, true, nil, existing.holdUntil)
+                    return (existing.id, true, existing.holdUntil)
                 }
                 try outboxToInsert.insert(db)
                 // No mark on the original here. Its replied/forwarded mark and the cleared
@@ -301,7 +296,7 @@ extension AccountManager {
                 // together with the server ops, so an Undo inside the hold leaves the
                 // original exactly as it was. Sync never clears isReplied, so an early
                 // mark here outlived every undone send (#1468).
-                return (outboxToInsert.id, false, nil, outboxToInsert.holdUntil)
+                return (outboxToInsert.id, false, outboxToInsert.holdUntil)
             }
             // Deduped → the attachments dir we just wrote (named by the discarded
             // new outbox.id) is orphaned; clean it up. The kept (existing) row owns
@@ -1300,8 +1295,9 @@ extension AccountManager {
         if let draftDir = disposition.draftDir {
             DraftAttachmentStorage.deleteAttachments(dirName: draftDir)
         }
-        // The original's replied/forwarded mark is written only here, at send
-        // completion (#1468), so this is the one post that refreshes its open screen.
+        // The send's own replied/forwarded mark and its Reply-tag clear are written
+        // here, at send completion (#1468), so this post refreshes the original's
+        // open screen.
         if let originalId = disposition.changedOriginalHeaderId {
             NotificationCenter.default.post(
                 name: .messageDataDidChange, object: originalId)

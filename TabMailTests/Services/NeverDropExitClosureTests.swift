@@ -2610,16 +2610,17 @@ struct NeverDropExitClosureTests {
     /// durable half.
     ///
     /// ⚠ SCOPE — READ THE NAME LITERALLY. This covers the COMPLETION producer,
-    /// `deleteCompletedSendAtomic`, and nothing else. It is deliberately NOT named
-    /// as an end-to-end guarantee, because there is not one: the OTHER producer,
-    /// `AccountManager.persistQueuedSend`, writes
+    /// `deleteCompletedSendAtomic`, and nothing else. When it was written there was
+    /// a second producer: `AccountManager.persistQueuedSend` wrote
     /// `UPDATE messageHeader SET isReplied = 1` optimistically at QUEUE time with no
-    /// admission gate, so on the full queue→send→complete path the local claim still
-    /// outlives an unaddressable parent. That write is verbatim in the shipped
-    /// release `07a4bb703`, is correct optimistic-UI behaviour per ADR-IOS-001, and
-    /// is deliberately unchanged; the residual end-to-end gap is registered in
-    /// `KNOWN_ISSUES.md`. A universally-quantified name here would repeat the exact
-    /// hazard that let the label-producer bug survive a release line —
+    /// admission gate (verbatim in the shipped release `07a4bb703`), so on the full
+    /// queue→send→complete path the local claim still outlived an unaddressable
+    /// parent, and that residual gap was registered in `KNOWN_ISSUES.md`
+    /// (`IOS-OUTBOX-003`). That queue-time write is gone (#1468): the completion is
+    /// now the only producer of the replied/forwarded mark, and
+    /// `SendReplyMarksTests` pins that queuing, Undo and a discarded failed send
+    /// leave the original as it was. A universally-quantified name here would still
+    /// repeat the hazard that let the label-producer bug survive a release line —
     /// `ProviderNativeActionAdmissionTests`' *"Every ordinary IMAP producer …"*
     /// enumerates four.
     ///
