@@ -52,22 +52,29 @@ struct DictationPillView: View {
 /// gradient arc circling it, in the icon's blue → purple; while a server error is tried again,
 /// both fade to the retry's colours (`Palette.retryArcStart` → `Palette.retryArcEnd`). The two sets
 /// of colours are two layers circling together, one fading out as the other fades in over
-/// `DictationConfig.colourTransition`, as TabMail Voice draws it.
+/// `DictationConfig.colourTransition`, as TabMail Voice draws it. With a `tint` (the chat field's
+/// mic circle) it is drawn in that one colour alone, track and arc, whatever `isRetrying` says.
 struct DictationSpinner: View {
     var isRetrying = false
+    var tint: Color?
+    var diameter = DictationConfig.spinnerDiameter
 
     var body: some View {
         TimelineView(.animation) { timeline in
             let turns = timeline.date.timeIntervalSinceReferenceDate * DictationConfig.thinkingRevolutionsPerSecond
             ZStack {
-                Self.layer(Self.colours(isRetrying: false), turns: turns)
-                    .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 0 : 1) }
-                Self.layer(Self.colours(isRetrying: true), turns: turns)
-                    .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 1 : 0) }
+                if let tint {
+                    Self.layer((tint, (tint, tint)), turns: turns)
+                } else {
+                    Self.layer(Self.colours(isRetrying: false), turns: turns)
+                        .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 0 : 1) }
+                    Self.layer(Self.colours(isRetrying: true), turns: turns)
+                        .animation(.easeInOut(duration: DictationConfig.colourTransition)) { $0.opacity(isRetrying ? 1 : 0) }
+                }
             }
             .padding(DictationConfig.thinkingRimWidth / 2)
         }
-        .frame(width: DictationConfig.spinnerDiameter, height: DictationConfig.spinnerDiameter)
+        .frame(width: diameter, height: diameter)
     }
 
     /// One set of the spinner's colours: its track and its arc, `turns` round.
