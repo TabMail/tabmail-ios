@@ -4289,6 +4289,8 @@ struct TokenField: View {
         .onTapGesture {
             revealedChipKey = isRevealed ? nil : key
         }
+        .contentShape(.contextMenuPreview, Capsule())
+        .copyAddressMenu(AddressCopy.recipient(token, displayNames: displayNames))
     }
 
     /// An entry that names no address TabMail can send to: red, removable, and
