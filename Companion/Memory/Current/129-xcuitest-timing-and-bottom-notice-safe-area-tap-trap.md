@@ -28,3 +28,24 @@ swallows `XCUIElement.tap()` — the element still `exists`, so existence assert
 tap does nothing. `ServerDraftCloseTestScene` keeps its bar at the **top** in `--draft-delete-refused`
 mode for exactly this reason. In production nothing occupies that region, so this is a
 harness-only hazard.
+
+## The reverse trap: content drawn out of a `.safeAreaBar` cannot be touched (2026-11-25)
+
+**Search terms:** safeAreaBar, bar slot, overflow, hit test, `_UIFloatingBarContainerView`,
+`_UITouchPassthroughView`, panel won't scroll, Close falls through to the dim, `TouchWatch`.
+
+SwiftUI hosts a `.safeAreaBar` bar's content in UIKit's floating bar container
+(`_UIFloatingBarContainerView` / `_UITouchPassthroughView`), which hit-tests only inside the bar's
+own bounds. The chat view's bar was a fixed slot of the collapsed field's height with the field
+drawn as an unclipped overlay that grew upward when the TabMail panel opened. The open panel was
+visible, but touches above the slot went to the page's hosting view underneath. Its history did
+not scroll, and a tap on its Close button fell through to the page's dim, which closed the panel,
+so "Close works" was a false pass. A debug window recognizer that records the touched view chain
+(`ChatFieldDragMarker.TouchWatch`, `touch=` in the marker) showed it: the only recognizers reached
+were the page's and the system's, with no scroll view pan.
+
+Rule: a `.safeAreaBar` may hold only what stays inside its bounds. To keep a fixed inset while
+something grows out of the bar, keep a clear slot in the bar and draw the control in a
+bottom-aligned overlay on the page right after it; both sit on the same safe-area or keyboard
+bottom (ADR-IOS-114 decision 20, amendment 2026-11-25). In a UI test, prove a tap was taken by its
+own control, not by something behind it that does the same thing (count the dim's taps).

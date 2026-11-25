@@ -4,6 +4,7 @@
 
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 
 /// What a drag on the reply field did to the chat, as an accessibility-only marker for the chat
 /// swipe UI tests: XCUITest reads a frame only once the app is idle, well after the swell and its
@@ -14,15 +15,16 @@ import UIKit
 /// background, so no layout change).
 ///
 /// The label reads `drags=<n> watching=<0|1> base=<0|1> at=<points> move=<points> held=<0|1>
-/// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none field=<points> rise=<points>
+/// frozen=<0|1> tip=<top>:<bottom>|none room=<top>:<bottom>|none field=<points> rest=<points> rise=<points>
 /// dims=<n> over=<points> events=<event>,…|none wait=<0|1>`: `base` once the drag's start had the
 /// newest row's place,
 /// `at` the newest row's last reported top, `held` whether the freeze was still held halfway
 /// through the cooldown after the settle (`heldAtSettle`), `frozen` whether it is held now, `tip`
 /// the field's drag tip's whole card while it shows (XCUITest sees only its words), `room` the space
 /// it must fit in, both in the chat's space; `field` the top of the field's glass on screen, swell
-/// included (the open panel's top while it is open), `rise` how far that top rose above where it
-/// was at the last drag's start while the finger moved (the swell XCUITest cannot see), `dims`
+/// included (the open panel's top while it is open), `rest` where that top rested before the last
+/// drag (its last place with no swell and no drag), `rise` how far that top rose above `rest` while
+/// the finger moved (the swell XCUITest cannot see), `dims`
 /// how many taps the open panel's dim has taken, `over` how far the text under the last drag went
 /// past its end while the drag moved (the most the field's pan read, negative if the text stayed
 /// short of its end; `none` until the pan has read it), `events` what happened to the last drag, in
@@ -42,7 +44,9 @@ import UIKit
 /// the first such call that scrolls it, how often the reply field's `inputField` was built while the
 /// finger was down (`pending` from a drag's start until its let-go) and from the let-go until the watch ended, and the text view's class; and `pop=<entry>,…|none`, the back swipe since it last began (`PopWatch`).
 /// `pan=<event>,…|none` (after `share`) holds `on:<state>`/`off:<state>` when the field's pan was
-/// turned on or off during the last drag, and `cancelled` when it was cancelled.
+/// turned on or off during the last drag, and `cancelled` when it was cancelled. Last,
+/// `touch=<view chain>|<recognizer>@<view>:<states>,…|none`: the last touch anywhere on screen,
+/// what it landed on and every gesture recognizer that received it (`TouchWatch`).
 enum ChatFieldDragMarker {
     static let identifier = "chatFieldDragMarker"
 
@@ -87,11 +91,14 @@ enum ChatFieldDragMarker {
     /// On the field's glass, swell included (before `pill(on:)` takes the swell back out of the
     /// layout): reports its top on screen.
     struct Glass: ViewModifier {
+        /// The drag whose swell the glass carries: a top read with no swell is the glass at rest.
+        let model: ChatFieldDrag.Model
+
         func body(content: Content) -> some View {
             #if DEBUG
             if Probe.isActive {
                 content.onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: {
-                    Probe.shared.glassMoved(to: $0)
+                    Probe.shared.glassMoved(to: $0, swollen: model.progress.swell != 0)
                 }
             } else {
                 content
@@ -313,9 +320,13 @@ enum ChatFieldDragMarker {
             tipFrame = frame.flatMap { $0.height >= 1 ? $0 : nil }
         }
 
-        /// The field's glass top on screen now, where it was at the last drag's start, and how far
-        /// it rose above that while the drag moved.
+        /// The field's glass top on screen now; where it last rested, with no swell and no drag
+        /// (`restTop`), which a drag's start takes as its rest (`glassRest`); and how far it rose
+        /// above that while the drag moved. The rest is not the top at the drag's start: a drag's
+        /// first move sets the drag and its first swell in one update, and the glass's swollen top
+        /// can be reported before the drag's start is.
         private(set) var glassTop: CGFloat?
+        private var restTop: CGFloat?
         private var glassRest: CGFloat?
         private(set) var rise: CGFloat = 0
         private var dragging = false
@@ -534,8 +545,10 @@ enum ChatFieldDragMarker {
             .joined(separator: "|")
         }
 
-        func glassMoved(to minY: CGFloat) {
+        func glassMoved(to minY: CGFloat, swollen: Bool) {
+            touchWatch.install()
             glassTop = minY
+            if !swollen && !dragging { restTop = minY }
             guard dragging, let glassRest else { return }
             rise = max(rise, glassRest - minY)
             if rise >= ChatViewLayout.fieldDragOpenDistance, let open = opensUnderTheDrag {
@@ -562,8 +575,9 @@ enum ChatFieldDragMarker {
                 baseline = newestMinY
                 largestMove = 0
                 heldAtSettle = false
-                glassRest = glassTop
-                rise = 0
+                glassRest = restTop ?? glassTop
+                // The glass may already show the first swell (see `glassTop`).
+                if let glassRest, let glassTop { rise = max(0, glassRest - glassTop) } else { rise = 0 }
                 pastEnd = nil
                 events = []
                 stopTextWatch()
@@ -598,8 +612,12 @@ enum ChatFieldDragMarker {
             let at = String(format: "%.1f", newestMinY ?? -1)
             let tip = tipFrame.map { String(format: "%.1f:%.1f", $0.minY, $0.maxY) } ?? "none"
             let room = tipRoom.map { String(format: "%.1f", $0) }.joined(separator: ":")
-            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(pastEnd.map { String(format: "%.1f", $0) } ?? "none") events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0) textAt=\(textAtLetGo ?? "none") textEnd=\(textAtWatchEnd ?? "none") textMove=\(textMoveAfterLetGo ?? "none")" + " " + handOffLabel + " " + callsLabel + " pop=\(popEntries.isEmpty ? "none" : popEntries.joined(separator: ","))"
+            return "drags=\(drags) watching=\(watching ? 1 : 0) base=\(baseline == nil ? 0 : 1) at=\(at) move=\(move) held=\(heldAtSettle ? 1 : 0) frozen=\(PreviewFreezeGate.shared.isFrozen ? 1 : 0) tip=\(tip) room=\(room.isEmpty ? "none" : room) field=\(String(format: "%.1f", glassTop ?? -1)) rest=\(String(format: "%.1f", glassRest ?? -1)) rise=\(String(format: "%.1f", rise)) dims=\(dims) over=\(pastEnd.map { String(format: "%.1f", $0) } ?? "none") events=\(events.isEmpty ? "none" : events.joined(separator: ",")) wait=\(tipWaiting ? 1 : 0) textAt=\(textAtLetGo ?? "none") textEnd=\(textAtWatchEnd ?? "none") textMove=\(textMoveAfterLetGo ?? "none")" + " " + handOffLabel + " " + callsLabel + " pop=\(popEntries.isEmpty ? "none" : popEntries.joined(separator: ",")) touch=\(lastTouch)"
         }
+
+        /// The last touch anywhere on screen (`TouchWatch`).
+        var lastTouch = "none"
+        private let touchWatch = TouchWatch()
 
         private var handOffLabel: String {
             let end = panTextEnd.map { String(format: "%.2f", $0) } ?? "none"
@@ -609,6 +627,88 @@ enum ChatFieldDragMarker {
 
         private var callsLabel: String {
             "calls=\(textCalls.isEmpty ? "none" : textCalls.joined(separator: ",")) callStack=\(textCallStack ?? "none") builds=\(downBuilds.map(String.init) ?? "pending"):\(inputFieldBuilds) textClass=\(textClass ?? "none")"
+        }
+    }
+
+    /// Every touch on the window, for the marker's `touch=`: the view it landed on and that view's
+    /// superviews, nearest first (`<class>>…`), then every gesture recognizer that received it, with
+    /// the view it is on and each state it moved through
+    /// (`|<recognizer>@<view>:<state>>…,…`), so a drag that did nothing names what took it. A
+    /// window recognizer that never recognizes, delays nothing and cancels nothing, so it changes
+    /// no touch's path. Names are cut to `nameLength` letters with no spaces or commas.
+    @MainActor
+    final class TouchWatch: UIGestureRecognizer, UIGestureRecognizerDelegate {
+        private static let nameLength = 40
+        private static let chainLength = 16
+        private var chain = ""
+        private var seen: [(recognizer: UIGestureRecognizer, states: [UIGestureRecognizer.State])] = []
+
+        init() {
+            super.init(target: nil, action: nil)
+            cancelsTouchesInView = false
+            delaysTouchesBegan = false
+            delaysTouchesEnded = false
+            delegate = self
+        }
+
+        /// Puts the watch on the key window, once.
+        func install() {
+            guard view == nil, let window = UIApplication.shared.connectedScenes
+                .compactMap({ ($0 as? UIWindowScene)?.keyWindow }).first else { return }
+            window.addGestureRecognizer(self)
+        }
+
+        func gestureRecognizer(_ recognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { true }
+
+        private static func name(_ object: AnyObject) -> String {
+            String(String(describing: type(of: object)).filter { $0 != " " && $0 != "," && $0 != "|" }.prefix(nameLength))
+        }
+
+        override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+            guard let touch = touches.first else { return }
+            var names: [String] = []
+            var view = touch.view
+            while let current = view, names.count < Self.chainLength {
+                names.append(Self.name(current))
+                view = current.superview
+            }
+            chain = names.joined(separator: ">")
+            seen = []
+            note(touch)
+        }
+
+        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+            if let touch = touches.first { note(touch) }
+        }
+
+        override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+            finish(touches.first)
+        }
+
+        override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+            finish(touches.first)
+        }
+
+        /// Each recognizer the touch reaches, and each new state it takes.
+        private func note(_ touch: UITouch) {
+            for recognizer in touch.gestureRecognizers ?? [] where recognizer !== self {
+                if let index = seen.firstIndex(where: { $0.recognizer === recognizer }) {
+                    if seen[index].states.last != recognizer.state { seen[index].states.append(recognizer.state) }
+                } else {
+                    seen.append((recognizer, [recognizer.state]))
+                }
+            }
+        }
+
+        private func finish(_ touch: UITouch?) {
+            if let touch { note(touch) }
+            let reached = seen.map { entry in
+                "\(Self.name(entry.recognizer))@\(entry.recognizer.view.map { Self.name($0) } ?? "none"):"
+                    + (entry.states + [entry.recognizer.state]).map(ChatFieldDragMarker.name(of:)).joined(separator: ">")
+            }
+            Probe.shared.lastTouch = chain + "|" + (reached.isEmpty ? "none" : reached.joined(separator: ","))
+            state = .failed
         }
     }
 

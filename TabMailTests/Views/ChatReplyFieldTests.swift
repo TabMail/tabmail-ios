@@ -1325,6 +1325,17 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".safeAreaBar(edge: .bottom, spacing: 0) {", in: chat) == 1, "the field is the bottom bar")
         #expect(Self.count(".safeAreaInset(edge: .bottom", in: chat) == 0)
         #expect(Self.count("ZStack(alignment: .bottom)", in: chat) == 0, "no field floating over the chat")
+        // The bar holds only the slot; the field is drawn on the page right over it. The bar's
+        // UIKit container takes touches only inside its own bounds, so a panel opened out of it
+        // could not be touched above the slot.
+        let chatCode = try Self.code("TabMail/Views/Chat/ChatThreadView.swift")
+        #expect(Self.count(".safeAreaBar(edge: .bottom, spacing: 0) { if thread.newest != nil { Color.clear.frame(height: pillHeight) } } .overlay(alignment: .bottom) { if let newest = thread.newest { pill(on: newest) .onGeometryChange(", in: chatCode) == 1,
+                "the field is drawn on the page over the bar's slot")
+        #expect(Self.count("pill(on: newest)", in: chatCode) == 1, "one field")
+        // The panel's own dim stays drawn but takes no touch in the chat view: a tap outside the
+        // panel reaches the page's dim.
+        let panel = try Self.code("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        #expect(Self.count(".frame(width: 3000, height: 3000) .contentShape(Rectangle()) .onTapGesture { withAnimation(expandSpring) { isExpanded = false } } .allowsHitTesting(replyField == nil)", in: panel) == 1)
         let header = try Self.source("TabMail/Views/Chat/ChatHeaderView.swift")
         #expect(Self.count(".background(.bar)", in: header) == 0)
         #expect(Self.count("Text(subject)", in: header) == 1, "the subject only in the thin line")
@@ -1563,10 +1574,65 @@ struct ChatReplyFieldTests {
         #expect(Self.count("reduceMotion: false", in: chat) == 0 && Self.count("reduceMotion: true", in: chat) == 0)
     }
 
-    @Test("The working status line keeps the field's padding above it")
-    func statusLinePadding() throws {
-        let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
-        #expect(Self.count(".frame(maxWidth: .infinity) // The row pads only itself: the status line keeps the field's padding above it. .padding(.top, ChatViewLayout.fieldVerticalPadding)", in: field) == 1)
+    @Test("The agent's status on a Send shows above the field, outside its glass, on both chat screens")
+    func statusLineAboveTheField() throws {
+        let field = try Self.code("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        // The field draws no status of its own: it hands the line to the screen.
+        #expect(Self.count("Text(workingStatus", in: field) == 0, "no status inside the field's glass")
+        #expect(Self.count("private func liveReplyFieldBar(_ field: ChatReplyField) -> some View { ChatFieldBarRow {", in: field) == 1,
+                "the field's bar is its one row")
+        #expect(Self.count(".preference(key: ChatFieldStatusKey.self, value: sentWorking ? (workingStatus.isEmpty ? \"Thinking...\" : workingStatus) : nil) .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))", in: field) == 1)
+        // Each screen shows it in the stack above the field, so its bar, and the chat, move up for it.
+        for path in ["TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Chat/ChatNewThreadView.swift"] {
+            let screen = try Self.code(path)
+            #expect(Self.count("if let fieldStatus { ChatFieldStatusLine(text: fieldStatus) .transition(.opacity) } DynamicIslandChat(", in: screen) == 1, "\(path): the line right above the field")
+            #expect(Self.count(".onPreferenceChange(ChatFieldStatusKey.self) { status in withAnimation(", in: screen) == 1, "\(path)")
+            #expect(Self.count("fieldStatus = status }", in: screen) == 1, "\(path)")
+        }
+    }
+
+    @Test("Only one status reaches the screen: the first field's")
+    func statusKeyKeepsTheFirst() {
+        var value: String? = nil
+        ChatFieldStatusKey.reduce(value: &value) { "Thinking..." }
+        #expect(value == "Thinking...")
+        ChatFieldStatusKey.reduce(value: &value) { "Searching email" }
+        #expect(value == "Thinking...")
+        ChatFieldStatusKey.reduce(value: &value) { nil }
+        #expect(value == "Thinking...")
+        #expect(ChatFieldStatusKey.defaultValue == nil)
+    }
+
+    @Test("The open panel closes like a sheet: past the close distance, on the let-go only")
+    func panelPull() {
+        let close = ChatViewLayout.panelCloseDistance
+        #expect(close == ChatViewLayout.fieldDragOpenDistance, "opening and closing go the same distance")
+        // At rest at the top of the history the offset is minus the top inset: not pulled.
+        #expect(ChatPanelPull.pastTop(offsetY: -40, topInset: 40) == 0)
+        #expect(ChatPanelPull.pastTop(offsetY: 200, topInset: 40) == 0, "scrolled down into the history")
+        #expect(ChatPanelPull.pastTop(offsetY: -40 - close, topInset: 40) == close)
+        #expect(!ChatPanelPull.isPastClose(offsetY: -40 - close + 1, topInset: 40))
+        #expect(ChatPanelPull.isPastClose(offsetY: -40 - close, topInset: 40))
+        // Only the finger's let-go closes, and only while pulled past the distance.
+        #expect(ChatPanelPull.closesOnLetGo(from: .interacting, to: .decelerating, pulledPastClose: true))
+        #expect(ChatPanelPull.closesOnLetGo(from: .interacting, to: .idle, pulledPastClose: true))
+        #expect(!ChatPanelPull.closesOnLetGo(from: .interacting, to: .decelerating, pulledPastClose: false))
+        #expect(!ChatPanelPull.closesOnLetGo(from: .decelerating, to: .idle, pulledPastClose: true), "a bounce settling is not a let-go")
+        #expect(!ChatPanelPull.closesOnLetGo(from: .tracking, to: .interacting, pulledPastClose: true))
+        // The header: the drag, or a flick's predicted end.
+        #expect(ChatPanelPull.headerCloses(translation: close, predictedEnd: 0))
+        #expect(ChatPanelPull.headerCloses(translation: 10, predictedEnd: close))
+        #expect(!ChatPanelPull.headerCloses(translation: close - 1, predictedEnd: close - 1))
+        #expect(!ChatPanelPull.headerCloses(translation: -close * 2, predictedEnd: -close * 2), "a drag up does not close")
+    }
+
+    @Test("Both closes are the chat view's only and close the panel as Close does")
+    func panelPullWiring() throws {
+        let panel = try Self.code("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        #expect(Self.count(".gesture(DragGesture().onEnded { drag in if ChatPanelPull.headerCloses(translation: drag.translation.height, predictedEnd: drag.predictedEndTranslation.height) { withAnimation(expandSpring) { isExpanded = false } } }, isEnabled: replyField != nil)", in: panel) == 1)
+        #expect(Self.count(".scrollBounceBehavior(replyField != nil ? .always : .basedOnSize)", in: panel) == 1)
+        #expect(Self.count(".onScrollGeometryChange(for: Bool.self) { geo in ChatPanelPull.isPastClose(offsetY: geo.contentOffset.y, topInset: geo.contentInsets.top) } action: { _, pulled in historyPulledToClose = pulled }", in: panel) == 1)
+        #expect(Self.count(".onScrollPhaseChange { old, phase in guard replyField != nil, ChatPanelPull.closesOnLetGo(from: old, to: phase, pulledPastClose: historyPulledToClose) else { return } historyPulledToClose = false withAnimation(expandSpring) { isExpanded = false } }", in: panel) == 1)
     }
 
     @Test("The tutorial tooltip's arrow points at the mic circle's centre")

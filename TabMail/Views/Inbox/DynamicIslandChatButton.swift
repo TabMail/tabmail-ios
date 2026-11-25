@@ -429,6 +429,12 @@ struct DynamicIslandChat: View {
                 .onTapGesture {
                     withAnimation(expandSpring) { isExpanded = false }
                 }
+                // In the chat view a drag down on the header closes the panel like a sheet.
+                .gesture(DragGesture().onEnded { drag in
+                    if ChatPanelPull.headerCloses(translation: drag.translation.height, predictedEnd: drag.predictedEndTranslation.height) {
+                        withAnimation(expandSpring) { isExpanded = false }
+                    }
+                }, isEnabled: replyField != nil)
                 .modifier(ChatPillCollapseTipModifier(isComposeMode: isComposeMode, hasMessage: message != nil))
 
                 if let message {
@@ -570,6 +576,9 @@ struct DynamicIslandChat: View {
                     .onTapGesture {
                         withAnimation(expandSpring) { isExpanded = false }
                     }
+                    // In the chat view a tap outside the panel goes to the page's own dim
+                    // (`ChatThreadView`), which closes the panel the same way.
+                    .allowsHitTesting(replyField == nil)
             }
         }
         // Keep the screen from auto-locking while the user is engaged with the
@@ -1132,6 +1141,9 @@ struct DynamicIslandChat: View {
     // MARK: - Chat messages
 
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
+    /// The history is pulled down past its top far enough to close the panel on let-go
+    /// (`ChatPanelPull`, the chat view only).
+    @State private var historyPulledToClose = false
 
     private var chatMessagesView: some View {
         let page = remindersForPage(isLive: true, sessionId: "")
@@ -1370,7 +1382,20 @@ struct DynamicIslandChat: View {
         .scrollDismissesKeyboard(.interactively)
         .scrollPosition($scrollPosition)
         .defaultScrollAnchor(.bottom)
-        .scrollBounceBehavior(.basedOnSize)
+        // In the chat view the history scrolls to its top and then a pull down closes the panel,
+        // as a sheet's does: so it bounces even when it fits, and a short history can be pulled too.
+        .scrollBounceBehavior(replyField != nil ? .always : .basedOnSize)
+        .onScrollGeometryChange(for: Bool.self) { geo in
+            ChatPanelPull.isPastClose(offsetY: geo.contentOffset.y, topInset: geo.contentInsets.top)
+        } action: { _, pulled in
+            historyPulledToClose = pulled
+        }
+        .onScrollPhaseChange { old, phase in
+            guard replyField != nil, ChatPanelPull.closesOnLetGo(from: old, to: phase, pulledPastClose: historyPulledToClose) else { return }
+            // The next panel's history starts unpulled.
+            historyPulledToClose = false
+            withAnimation(expandSpring) { isExpanded = false }
+        }
     }
 
     /// Convert a loaded ChatSession's turns into ChatMessage array for display.

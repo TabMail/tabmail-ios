@@ -8,7 +8,8 @@ import SwiftUI
 extension DynamicIslandChat {
     /// The chat view's reply field (`ChatReplyField`): [mic] [field] [Send] on the newest email.
     /// Empty, the field shows its hint and, under it, the "e.g." line (`ChatReplyField.example`);
-    /// while the agent works, the line above says what it is doing and the words pulse.
+    /// while the agent works, the words pulse, and the screen shows what it is doing in a line above
+    /// the field (`ChatFieldStatusLine`).
     /// In the tutorial the field is read-only and sends nothing: its words go to the people, and
     /// the tutorial's requests to TabMail are made in the panel. At part 2's drag-up step it says
     /// so (`tutorialDragHint`), and its drag up, or VoiceOver's "Show TabMail chat", opens the panel.
@@ -37,37 +38,30 @@ extension DynamicIslandChat {
     static let tutorialDragHintText = "Drag up to ask TabMail"
 
     private func liveReplyFieldBar(_ field: ChatReplyField) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if isWorking, fieldSentText != nil {
-                Text(workingStatus.isEmpty ? "Thinking..." : workingStatus)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    // The row pads only itself: the status line keeps the field's padding above it.
-                    .padding(.top, ChatViewLayout.fieldVerticalPadding)
-                    .transition(.opacity)
-            }
-            ChatFieldBarRow {
-                micButton
-            } text: {
-                if let attach = field.paperclip {
-                    // The paperclip sits at the field's end on Send's row: bottom-aligned with the
-                    // words and the "e.g." line as the row aligns Send, so it stays level with Send
-                    // whether or not that line shows. It stays in its place in every state; while
-                    // the agent works on a Send it is dimmed and not tappable.
-                    HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
-                        fieldText(field)
-                        ChatPaperclipButton(attach: attach)
-                            .disabled(sentWorking)
-                            .opacity(sentWorking ? ChatViewLayout.fieldPaperclipDimmedOpacity : 1)
-                    }
-                } else {
+        ChatFieldBarRow {
+            micButton
+        } text: {
+            if let attach = field.paperclip {
+                // The paperclip sits at the field's end on Send's row: bottom-aligned with the
+                // words and the "e.g." line as the row aligns Send, so it stays level with Send
+                // whether or not that line shows. It stays in its place in every state; while
+                // the agent works on a Send it is dimmed and not tappable.
+                HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
                     fieldText(field)
+                    ChatPaperclipButton(attach: attach)
+                        .disabled(sentWorking)
+                        .opacity(sentWorking ? ChatViewLayout.fieldPaperclipDimmedOpacity : 1)
                 }
-            } send: {
-                trailingButton
+            } else {
+                fieldText(field)
             }
+        } send: {
+            trailingButton
         }
+        // What the agent is doing about a Send goes to the screen, which shows it above the field,
+        // outside its glass: the field never grows for it (`ChatFieldStatusLine`).
+        .preference(key: ChatFieldStatusKey.self,
+                    value: sentWorking ? (workingStatus.isEmpty ? "Thinking..." : workingStatus) : nil)
         // A drag up swells the field itself toward the panel, its top following the finger.
         .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))
     }
@@ -124,6 +118,60 @@ extension DynamicIslandChat {
 
     /// The "e.g." line, as tests find it.
     static let exampleLineId = "chatExampleLine"
+}
+
+/// What the agent is doing about a Send from the chat's field ("Thinking...", its own reports), from
+/// the field to the screen around it; nil while it is not working on one, or while the panel is open.
+struct ChatFieldStatusKey: PreferenceKey {
+    static let defaultValue: String? = nil
+
+    static func reduce(value: inout String?, nextValue: () -> String?) {
+        value = value ?? nextValue()
+    }
+}
+
+/// The agent's status line above the chat's field, outside its glass, among the field's other
+/// notices: the field keeps its size, and the bar the field stands in grows by the line, so the
+/// chat moves up for it and back down when it goes. The screen that holds the field shows it.
+struct ChatFieldStatusLine: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(Theme.textSecondary)
+            .frame(maxWidth: .infinity)
+            .accessibilityIdentifier(Self.id)
+    }
+
+    /// The line, as tests find it.
+    static let id = "chatFieldStatus"
+}
+
+/// Closing the chat view's open TabMail panel like a sheet: a drag down on its header, or its
+/// history pulled down past its top. Let go far enough (`ChatViewLayout.panelCloseDistance`), it
+/// closes the panel as Close does: the history and the words in the input stay, and nothing is sent.
+enum ChatPanelPull {
+    /// How far the history is pulled down past the top of its content; 0 while it is not.
+    static func pastTop(offsetY: CGFloat, topInset: CGFloat) -> CGFloat {
+        max(0, -(offsetY + topInset))
+    }
+
+    /// The history is pulled far enough past its top for a let-go to close the panel.
+    static func isPastClose(offsetY: CGFloat, topInset: CGFloat) -> Bool {
+        pastTop(offsetY: offsetY, topInset: topInset) >= ChatViewLayout.panelCloseDistance
+    }
+
+    /// The finger let go of the history (its scroll left `.interacting`) while pulled past the close
+    /// distance.
+    static func closesOnLetGo(from old: ScrollPhase, to new: ScrollPhase, pulledPastClose: Bool) -> Bool {
+        pulledPastClose && old == .interacting && new != .interacting
+    }
+
+    /// A drag down on the header went far enough, or a flick down would have.
+    static func headerCloses(translation: CGFloat, predictedEnd: CGFloat) -> Bool {
+        max(translation, predictedEnd) >= ChatViewLayout.panelCloseDistance
+    }
 }
 
 extension View {
