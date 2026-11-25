@@ -1247,7 +1247,10 @@ struct SuggestionRewriteRouteTests {
             showingSuggestion: true, isForward: false, replyTo: email,
             recipients: after, subject: envelope.subject, accountId: nil, accounts: [])
         if keepsEntry {
-            #expect(opened?.to == envelope.to && opened?.subject == envelope.subject && output.contains("in place"),
+            // The card lists an entry with no address after the addresses; an envelope is the same in
+            // any order (`ChatReplyCompose.holds`).
+            let openedTo = Set(opened?.to ?? []), openedSubject = opened?.subject
+            #expect(openedTo == Set(envelope.to) && openedSubject == envelope.subject && output.contains("in place"),
                     "the entry kept: stored in place, then its card opens with the suggestion's own envelope")
             #expect(stored == edited, "the entry kept: the edit replaces the suggestion")
             #expect(cardTarget?.id == email.id, "the card's own edit replaces the suggestion too")
