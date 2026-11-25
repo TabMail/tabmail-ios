@@ -465,9 +465,11 @@ struct ChatReplyRecoveryTests {
                 }
                 let pulsing = "\(ChatSuggestionConfig.writingLine): \(Self.shownSuggestion.textMessage ?? "")"
                 try await Self.waitUntil { writing() == [pulsing] }
-                #expect(writing() == [pulsing], "while the edit is held the suggestion shown stays, pulsing: \(writing())")
-                #expect(!Self.ghosts(in: chat.view).contains { $0.text == edited.textMessage },
-                        "while the edit is held the ghost never shows it: \(Self.ghosts(in: chat.view).map(\.text))")
+                let shownWriting = writing()
+                #expect(shownWriting == [pulsing], "while the edit is held the suggestion shown stays, pulsing: \(shownWriting)")
+                let heldGhosts = Self.ghosts(in: chat.view).map(\.text)
+                let heldShowsEdit = heldGhosts.contains { $0 == edited.textMessage }
+                #expect(!heldShowsEdit, "while the edit is held the ghost never shows it: \(heldGhosts)")
                 let held = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
                 #expect(held?.suggestion == Self.shownSuggestion, "nothing is stored while the edit is held")
 

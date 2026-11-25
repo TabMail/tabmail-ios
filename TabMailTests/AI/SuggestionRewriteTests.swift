@@ -459,8 +459,8 @@ struct SuggestionRewriteRouteTests {
     /// written (an edit stored in place, an edit only on the card, or a fresh reply), the email's
     /// text version lands in the AI Suggestion's bubble before any card is queued, and the card
     /// then opens with that email. Before, an edit stored in place opened no card at all, and the
-    /// others opened theirs at once: "sometimes writes and opens compose, or sometimes just
-    /// updates the ai suggestion".
+    /// others opened theirs at once, so the same Send sometimes only changed the AI Suggestion and
+    /// sometimes opened the card.
     @Test("The field's email lands in the AI Suggestion's bubble before its card opens, whatever was written",
           arguments: [(true, true), (false, true), (true, false)])
     func writtenLandsBeforeItsCard(rewritesInPlace: Bool, suggestionShows: Bool) async throws {
@@ -485,13 +485,17 @@ struct SuggestionRewriteRouteTests {
         _ = try await task.value
     }
 
-    @Test("Stop while the email written is held in the bubble opens no card")
-    func stopDuringTheHoldOpensNothing() async throws {
+    /// Stop during the hold opens no card. An edit stored in place before it landed stays the AI
+    /// Suggestion, as when its card is closed unsent; a fresh reply stores nothing.
+    @Test("Stop while the email written is held in the bubble opens no card; an edit stored in place stays the AI Suggestion",
+          arguments: [false, true])
+    func stopDuringTheHoldOpensNothing(suggestionShows: Bool) async throws {
         let fixture = try await fixture()
+        let before = try await row(fixture.db, fixture.header.id).suggestion
         let tool = tool(fixture, calls: Calls(), answer: Self.edit())
         let landing = Landing()
         let invocation = ToolInvocation(
-            fieldReply: ChatFieldReply(email: fixture.header, onlyTo: nil, suggestion: nil),
+            fieldReply: ChatFieldReply(email: fixture.header, onlyTo: nil, suggestion: suggestionShows ? Self.shownReply : nil),
             composeOrigin: Self.asked,
             landWritten: { text in
                 landing.texts.append(text)
@@ -505,6 +509,14 @@ struct SuggestionRewriteRouteTests {
         #expect(landing.texts == [Self.editedText], "control: the email landed")
         #expect(fixture.router.composeQueueDepth == 0 && fixture.router.takeCompose(for: Self.chatHost) == nil, "no card opens")
         #expect(output.contains(ComposeOutcome.cancelled.describeForLLM), "\(output)")
+        let stored = try await row(fixture.db, fixture.header.id).suggestion
+        if suggestionShows {
+            let edited = ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand)
+            #expect(before == Self.shownReply, "control: the row held the suggestion shown")
+            #expect(stored == edited && output.contains("in place"), "the edit stored in place stays the AI Suggestion: \(output)")
+        } else {
+            #expect(stored == before, "a fresh reply stores nothing")
+        }
     }
 
     @Test("A failed edit leaves the suggestion as it was, and opens no card")
@@ -1156,9 +1168,10 @@ struct SuggestionRewriteRouteTests {
     /// A Reply-To entry that names no address (`Undisclosed-Recipients:;`) is part of the
     /// suggestion's envelope as its text, in any case. An edit that keeps every address but leaves
     /// that entry out is another audience: the card opens and the suggestion is unchanged. An edit
-    /// that keeps it is the suggestion's own envelope: it is published in place. The field's edit
-    /// and the card's own edit decide alike.
-    @Test("An edit that leaves out an audience entry with no address opens the card; one that keeps it is published in place",
+    /// that keeps it is the suggestion's own envelope: it is published in place, then its card opens
+    /// with that envelope (ADR-IOS-114 decision 17, amended 2026-11-25). The field's edit and the
+    /// card's own edit decide alike.
+    @Test("An edit that leaves out an audience entry with no address opens the card; one that keeps it is published in place, then its card opens",
           arguments: [false, true])
     func audienceEntryWithNoAddressDecidesInPlace(keepsEntry: Bool) async throws {
         let fixture = try await fixture()
@@ -1191,7 +1204,8 @@ struct SuggestionRewriteRouteTests {
             showingSuggestion: true, isForward: false, replyTo: email,
             recipients: after, subject: envelope.subject, accountId: nil, accounts: [])
         if keepsEntry {
-            #expect(opened == nil && output.contains("in place"), "the entry kept: no card opens")
+            #expect(opened?.to == envelope.to && opened?.subject == envelope.subject && output.contains("in place"),
+                    "the entry kept: stored in place, then its card opens with the suggestion's own envelope")
             #expect(stored == edited, "the entry kept: the edit replaces the suggestion")
             #expect(cardTarget?.id == email.id, "the card's own edit replaces the suggestion too")
             let otherCase = envelope.recipients.filling(

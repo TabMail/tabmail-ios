@@ -718,6 +718,18 @@ struct ChatReplyFieldTests {
         // Send); otherwise they are the user's again.
         #expect(Self.count("if case .sent? = written { fieldFill.apply(.completed) } else { fieldFill.apply(.notWritten) } if case .nothing? = written { showAgentToast(Self.newEmailNotWrittenNote) } }", in: text) == 1)
         #expect(Self.count("fieldFill.apply(", in: text) == 12)
+        // What the two changes do to the words of a field send whose card opened: on `.completed`
+        // they go, on `.notWritten` they are back in the field (what showed under the closing card).
+        var sent = ChatFieldFill()
+        sent.apply(.put("Tell them Friday works"))
+        sent.apply(.sentFromField)
+        sent.apply(.composeOpened)
+        var notSent = sent
+        sent.apply(.completed)
+        notSent.apply(.notWritten)
+        #expect(sent.words.isEmpty && sent.unsent.isEmpty, "sent: the words go: \(sent)")
+        #expect(notSent.words == "Tell them Friday works" && notSent.unsent == "Tell them Friday works",
+                "not written: the words are the user's again: \(notSent)")
     }
 
     @Test("The closed field's Send writes the email from the words and never reaches the agent; a new email's chat's own Send first says who it is to, or asks and stops there")
@@ -1744,7 +1756,10 @@ struct ChatReplyFieldTests {
         // The card and fieldComposeOpened are set only for a request this chat's own pill took
         // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
         #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat) == 1)
-        let open = try Self.body(of: "private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat)
+        // Read with comments blanked: the body's first line is a comment, and the next function's
+        // doc comment would end it.
+        let open = try Self.body(of: "private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {",
+                                 in: try Self.code("TabMail/Views/Chat/ChatThreadView.swift"))
         #expect(open.hasPrefix(" guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } fieldComposeOpened = req.isFieldsOwnReply"),
                 "a new email's bound account is looked up as the card is taken, before anything is set")
         #expect(open.hasSuffix(" agentCompose = req }"))
