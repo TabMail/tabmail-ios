@@ -1083,9 +1083,26 @@ struct SendReplyMarksTests {
         /// In the account's Sent folder, but a forward: another app's forward
         /// that names the original in In-Reply-To too (as Thunderbird's does).
         case sentForward
+        /// That forward with an upper-case `FW:` prefix (as Outlook writes it).
+        case sentUpperCaseForward
+        /// In the account's Sent folder, a reply whose subject carries a forward
+        /// prefix after its `Re:` (`Re: Fwd: Original`): a reply all the same.
+        case sentReplyWithForwardInSubject
         /// In the account's Sent folder, that forward stored first and a reply
         /// after it.
         case sentForwardAndReply
+        /// In the account's Sent folder, a reply stored first and that forward
+        /// after it.
+        case sentReplyAndForward
+
+        /// Whether a reply (not a forward) is stored in the account's Sent
+        /// folder: what keeps Send's changes on the original.
+        var storesAReplyInSent: Bool {
+            switch self {
+            case .sent, .sentReplyWithForwardInSubject, .sentForwardAndReply, .sentReplyAndForward: true
+            case .inbox, .drafts, .otherAccountSent, .sentForward, .sentUpperCaseForward: false
+            }
+        }
     }
 
     /// A message per subject in `subjects`, each naming `inReplyTo` in its
@@ -1120,9 +1137,10 @@ struct SendReplyMarksTests {
     /// cleared when TabMail's reply is removed unsent. Only a reply in Sent, in
     /// the same account, counts. Another app's forward there, which names the
     /// original in In-Reply-To as a reply does, is no reply (the rule
-    /// `ReplyParentResolver` marks the original forwarded by), so alone it keeps
-    /// nothing; stored before a reply, it does not hide that reply. A forward
-    /// from TabMail asks for no such evidence, and its mark goes back as before.
+    /// `ReplyParentResolver` marks the original forwarded by, whatever the
+    /// prefix's case), so alone it keeps nothing; stored before or after a
+    /// reply, it does not hide that reply. A forward from TabMail asks for no
+    /// such evidence, and its mark goes back as before.
     @Test("A reply the user sent elsewhere keeps the original replied when TabMail's reply is removed unsent",
           arguments: StoredReply.allCases, [false, true])
     func storedReplyKeepsTheMark(_ storedReply: StoredReply, isForward: Bool) async throws {
@@ -1148,15 +1166,22 @@ struct SendReplyMarksTests {
             try Self.storeReply(pool, accountId: otherAccountId, path: "Sent", inReplyTo: rfc)
         case .sentForward:
             try Self.storeReply(pool, accountId: accountId, path: "Sent", inReplyTo: rfc, subjects: ["Fwd: Original"])
+        case .sentUpperCaseForward:
+            try Self.storeReply(pool, accountId: accountId, path: "Sent", inReplyTo: rfc, subjects: ["FW: Original"])
+        case .sentReplyWithForwardInSubject:
+            try Self.storeReply(pool, accountId: accountId, path: "Sent", inReplyTo: rfc, subjects: ["Re: Fwd: Original"])
         case .sentForwardAndReply:
             try Self.storeReply(
                 pool, accountId: accountId, path: "Sent", inReplyTo: rfc, subjects: ["Fwd: Original", "Re: Original"])
+        case .sentReplyAndForward:
+            try Self.storeReply(
+                pool, accountId: accountId, path: "Sent", inReplyTo: rfc, subjects: ["Re: Original", "Fwd: Original"])
         }
 
         let cancelled = try await Self.cancel(pool: pool, outboxId: queued.outboxId, failedFirst: true)
         let after = try Self.marks(pool, headerId: originalId)
         let tags = try Self.queuedTags(pool)
-        let keeps = !isForward && (storedReply == .sent || storedReply == .sentForwardAndReply)
+        let keeps = !isForward && storedReply.storesAReplyInSent
         if keeps {
             #expect(cancelled.revertedOriginalHeaderId == nil, "the stored reply keeps what Send changed")
             let want = Self.held(before: before, isForward: false)

@@ -38,7 +38,7 @@ a reply that set the mark asks whether a reply to the original is stored in a Se
 another app stored there is no reply, though it may name the original in In-Reply-To (Thunderbird's
 does): `ReplyParentResolver.SentCopy.isForward`, the rule that marks the original forwarded instead,
 leaves it out, so the revert goes ahead unless a reply is stored beside it. If the
-removal comes before that copy syncs, `ReplyParentResolver` marks the original and clears the tag when
+removal comes before the reply's copy syncs, `ReplyParentResolver` marks the original and clears the tag when
 it does. Graph stores no In-Reply-To, so on Outlook neither step finds the reply; there a reply from
 another client reaches the original only through the server's last-verb properties (memory 151).
 

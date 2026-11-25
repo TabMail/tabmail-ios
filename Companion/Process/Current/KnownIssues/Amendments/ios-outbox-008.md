@@ -48,6 +48,8 @@ Related cases, same cause (the subject is the only signal):
 
 - **The converse:** a reply whose subject starts with `Fwd:` or `Fw:` (the user edited it, or an app
   wrote no `Re:`) marks its original forwarded and leaves its Reply tag. Clearing the tag is one gesture.
+  The unsent-removal revert (#1490) reads the same rule (`ReplyParentResolver.SentCopy.isForward`): such
+  a copy in Sent does not count as a stored reply, so removing TabMail's reply unsent takes its marks back.
 - **Originals marked before #1492:** an original a forward copy already marked replied keeps that mark
   and its cleared tag; no data is rewritten for it (a harmless leftover). A later listing of the copy
   adds the forwarded mark.
