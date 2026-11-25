@@ -1824,7 +1824,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `ChatNewEmailField`) with "Message or ask anything", an "e.g." line from its own config set
      (`ChatSuggestionConfig.newEmailExamples`), focus as it opens, and a paperclip at the end of the
      text (Photos, Camera, Files; `ChatPaperclipButton`, sized by `FieldButtonSlot`); the row's mic,
-     text and Send keep their places. `DynamicIslandChat.isInboxChat` is false for it, so none of
+     text and Send keep their places. Its field takes the same drag up as a thread's (decision 21:
+     `ChatFieldPan`, `ChatFieldDrag`, VoiceOver "Show TabMail chat") to open the TabMail chat, since
+     its Send writes the email itself and the drag is the way to ask TabMail to do something.
+     `DynamicIslandChat.isInboxChat` is false for it, so none of
      the inbox chat's history, reminders or idle clear applies.
    - *Add recipient.* The header's tap opens the "Reply to" sheet titled "Add recipient"
      (`ChatReplyToSheet(title:)`), starting from the people already picked (none at first) with its
