@@ -1087,6 +1087,160 @@ extension TutorialChatViewRunTests {
     }
 }
 
+// MARK: - The reply-is-ready step, on a first run and on a redo
+
+/// Reported from a simulator check: at Part 2's "Your reply is ready" the AI Suggestion did not show
+/// in Priya's chat, possibly on a redo of the tutorial. THE SYSTEM PROPERTY: whenever Part 2's card
+/// says "Tap the AI Suggestion" in Priya's chat, the chat shows it, on the first run in the app
+/// and on every run after one that sent its practice reply and was skipped.
+extension TutorialChatViewRunTests {
+    @Test("Priya's chat shows the AI Suggestion at Part 2 on the first run, and again on a redo after a run that sent and was skipped")
+    func replyIsReadyOnFirstRunAndRedo() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let fixture = try install()
+        defer { InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1) }
+        let pool = fixture.0
+        try await withSettings(chatView: true) {
+            let coordinator = TutorialCoordinator.shared
+            let workingBefore = ActiveAgentTracker.shared.workingSessions
+            for run in 1...2 {
+                try #require(!coordinator.isRunning, "control: no run is live before run \(run)")
+                // As the welcome's Start does: Part 1 first, then its Next.
+                await coordinator.start(.actOnEmail, hasTabMailSession: false)
+                do {
+                    try await DemoModeService.shared.completeSetup()
+                    coordinator.seedingFinished()
+                    #expect(coordinator.step == .archiveReceipt, "control: run \(run) starts at Part 1")
+                    coordinator.nextLesson()
+                    #expect(coordinator.step == .replyToPriya, "control: run \(run) is at Part 2")
+                    let priya = try #require(try await pool.read { db in
+                        try MessageHeader.filter(Column("accountId") == DemoSeed.demoAccountId
+                            && Column("messageId") == DemoSeed.TutorialFixture.priyaOffsite).fetchOne(db)
+                    })
+                    try await Self.expectGhostInPriyasChat(priya, run: run, pool: pool)
+                    if run == 1 {
+                        try await sendPracticeReply(to: priya, pool: pool)
+                        try await waitFor(.makeTemplate)
+                        // The template request is asked and its Create card waits: the run is
+                        // skipped while TabMail works on it.
+                        try await Self.askForTheTemplateInPriyasChat(priya)
+                    }
+                } catch {
+                    await coordinator.end()
+                    throw error
+                }
+                // Skip tutorial.
+                await coordinator.end()
+                let stillWorking = ActiveAgentTracker.shared.workingSessions.subtracting(workingBefore)
+                #expect(stillWorking.isEmpty, "run \(run): once the run ends, no chat still shows TabMail working; \(stillWorking)")
+            }
+        }
+    }
+
+    /// In Priya's chat at the template step: taps the step's Send and waits for the template's
+    /// Create card, which holds the request open until it is answered.
+    private static func askForTheTemplateInPriyasChat(_ priya: MessageHeader) async throws {
+        try await HostedAccessibility.withAutomation {
+            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let window = UIWindow(windowScene: scene)
+            let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) }
+                .environment(NavigationStore()))
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            // The field's own identifier ("chatReplyField") covers its parts, so its Send is
+            // found by that identifier and its label.
+            @MainActor func fieldSend() -> NSObject? {
+                HostedAccessibility.elements(under: controller.view).first {
+                    HostedAccessibility.identifier(of: $0) == "chatReplyField" && $0.accessibilityLabel == "Send"
+                }
+            }
+            for _ in 0..<80 where fieldSend() == nil {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let ids = HostedAccessibility.identifiers(in: controller.view)
+            let sent = fieldSend()?.accessibilityActivate() ?? false
+            try #require(sent, "control: the template step's Send is in Priya's chat; ids=\(ids)")
+            @MainActor func cardWaits() -> Bool {
+                HostedAccessibility.labels(in: controller.view).contains("Create")
+            }
+            for _ in 0..<80 where !cardWaits() {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let waits = cardWaits()
+            let labels = HostedAccessibility.labels(in: controller.view).prefix(30)
+            try #require(waits, "control: the template's Create card waits in Priya's chat; labels=\(labels)")
+            let working = !ActiveAgentTracker.shared.workingSessions.isEmpty
+            try #require(working, "control: TabMail is working on the request")
+        }
+    }
+
+    /// The practice reply as compose queues it: the scripted edit's reply, linked to Priya's email.
+    private func sendPracticeReply(to priya: MessageHeader, pool: DatabasePool) async throws {
+        let reply = TutorialChatScript.shorterReply
+        TutorialCoordinator.shared.practiceReplyAuthored(reply)
+        let draftId = "tutorial-practice-\(UUID().uuidString)"
+        try await pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: DemoSeed.demoAccountId,
+                toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Engineering offsite", body: reply, replyToId: nil,
+                isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970,
+                updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        let account = try #require(try await pool.read { try Account.fetchOne($0, key: DemoSeed.demoAccountId) })
+        _ = try await AccountManager.shared.queueSend(
+            draft: DraftMessage(to: ["priya@company.com"], subject: "Re: Engineering offsite", body: reply,
+                                inReplyTo: priya.rfc822MessageId),
+            from: account, replyToHeaderId: priya.id, draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+    }
+
+    /// Hosts Priya's chat as the inbox opens it and expects the coach card and the AI Suggestion; on a
+    /// miss, says what the chat and the database held.
+    private static func expectGhostInPriyasChat(_ priya: MessageHeader, run: Int, pool: DatabasePool) async throws {
+        try await HostedAccessibility.withAutomation {
+            let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+            let window = UIWindow(windowScene: scene)
+            let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: priya.id) }
+                .environment(NavigationStore()))
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+            }
+            @MainActor func shows(_ id: String) -> Bool {
+                HostedAccessibility.identifiers(in: controller.view).contains(id)
+            }
+            for _ in 0..<80 where !(shows("tutorial-coach") && shows(ChatSuggestionBubble.bubbleId)) {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let coach = shows("tutorial-coach")
+            let ghost = shows(ChatSuggestionBubble.bubbleId)
+            var facts = ""
+            if !(coach && ghost) {
+                let held = try await pool.read { db -> String in
+                    let header = try MessageHeader.fetchOne(db, key: priya.id)
+                    let outbox = try OutboxMessage.filter(Column("accountId") == DemoSeed.demoAccountId).fetchCount(db)
+                    let sent = try String.fetchAll(db, sql: "SELECT messageId FROM messageHeader WHERE folderId = ?",
+                                                   arguments: ["\(DemoSeed.demoAccountId):SENT"])
+                    return "suggestion=\(String(describing: header?.suggestion)) outbox=\(outbox) sent=\(sent)"
+                }
+                facts = "\(held); ids=\(HostedAccessibility.identifiers(in: controller.view)); "
+                    + "labels=\(HostedAccessibility.labels(in: controller.view).prefix(30))"
+            }
+            #expect(coach, "run \(run): the coach card shows in Priya's chat; \(facts)")
+            #expect(ghost, "run \(run): the AI Suggestion shows in Priya's chat; \(facts)")
+        }
+    }
+}
+
 extension TutorialChatViewContentTests {
     /// Every state Part 2 can be in, in Priya's chat: the card shown there asks for a move the
     /// chat offers. With the reply edited or not, that move is the tap on the AI Suggestion, and
