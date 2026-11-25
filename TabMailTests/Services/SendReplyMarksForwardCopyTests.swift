@@ -298,4 +298,39 @@ extension SendReplyMarksTests {
         #expect(server.wrongMessageViolations().isEmpty)
         await engine.remove(accountId: accountId)
     }
+
+    // MARK: - The copy arrives through a listing of Sent
+
+    /// A server without CONDSTORE lists the folder (`runListing`): the copy
+    /// arrives in the listing's batch, not through a change read.
+    @Test("Listing of Sent: another app's forward copy marks the original forwarded and keeps its Reply tag; a reply copy marks it replied",
+          arguments: [true, false])
+    func listingOtherAppCopy(isForward: Bool) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "other-listing-\(UUID().uuidString.prefix(8).lowercased())"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "Sent", role: .sent, pool: pool)
+        let original = try await Self.storeOriginal(accountId: accountId, pool: pool)
+        let sent = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: "Sent", pool: pool))
+
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([MessageHeaderInfo(
+            messageId: "7", rfc822MessageId: "other-listing-copy@example.com",
+            inReplyTo: "<\(original.rfc)>", references: ["<\(original.rfc)>"],
+            threadId: nil, subject: Self.otherAppSubject("inserted orig", isForward: isForward), from: "Me",
+            fromAddress: "me@example.com", to: "someone@example.com",
+            cc: "", bcc: "", replyTo: nil,
+            date: Date().addingTimeInterval(-3_600), snippet: "copy",
+            isRead: true, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: nil)])
+
+        _ = try await SyncEngine.runListing(
+            for: sent, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        try Self.expectOtherAppCopyMarks(
+            pool: pool, accountId: accountId, sentPath: "Sent", copyMessageId: "7",
+            original: original, isForward: isForward)
+    }
 }
