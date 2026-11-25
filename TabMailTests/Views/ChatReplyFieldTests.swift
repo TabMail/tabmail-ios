@@ -713,10 +713,11 @@ struct ChatReplyFieldTests {
         #expect(Self.count("guard let newEmail = replyField?.newEmail, newEmail.sessionKey != newEmailSession else { return } let opening = newEmailSession == nil newEmailSession = newEmail.sessionKey if opening { if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) } focusedInput = .replyField } else { fieldFill.apply(.put(newEmail.startWords)) } }", in: text) == 1)
         #expect(Self.count("focusedInput = .replyField", in: text) == 1, "the new email's opening is the only one that focuses the reply field")
         #expect(Self.count("isTextFieldFocused = true", in: text) == 1, "the forked chat's put is the only one that focuses the panel's input")
-        // A new email's field compose ends with the words the user's again, whatever became of them:
-        // sent, the next email's own words have already replaced them (`startNewEmail`).
-        #expect(Self.count("} ended: { written in fieldFill.apply(.notWritten) if case .nothing? = written { showAgentToast(Self.newEmailNotWrittenNote) } }", in: text) == 1)
-        #expect(Self.count("fieldFill.apply(", in: text) == 11)
+        // A new email's field compose: sent, the words go as the card reports the send, before it
+        // closes, so they never come back into the field under the closing card (the blink after
+        // Send); otherwise they are the user's again.
+        #expect(Self.count("if case .sent? = written { fieldFill.apply(.completed) } else { fieldFill.apply(.notWritten) } if case .nothing? = written { showAgentToast(Self.newEmailNotWrittenNote) } }", in: text) == 1)
+        #expect(Self.count("fieldFill.apply(", in: text) == 12)
     }
 
     @Test("The closed field's Send writes the email from the words and never reaches the agent; a new email's chat's own Send first says who it is to, or asks and stops there")
@@ -850,13 +851,37 @@ struct ChatReplyFieldTests {
         #expect(held.morphs == waitsForReply, "only that reply's bubble takes the ghost's place in motion")
     }
 
+    @Test("The field's Send: the suggestion shown pulses until the email written lands, which then shows still")
+    func fieldWritingBubble() {
+        var writing = ChatFieldWriting(shown: "Tuesday works for me")
+        #expect(writing.text == "Tuesday works for me" && writing.pulses, "the suggestion shown stays, pulsing")
+        writing.written = "Tuesday is fine"
+        #expect(writing.text == "Tuesday is fine" && !writing.pulses, "the email written lands, still")
+        var fresh = ChatFieldWriting(shown: nil)
+        #expect(fresh.text == nil && fresh.pulses, "no suggestion shown: the working bubble")
+        fresh.written = "Tuesday is fine"
+        #expect(fresh.text == "Tuesday is fine" && !fresh.pulses)
+        #expect(ChatSuggestionConfig.writtenHold > 0, "the email stays a moment to be read")
+    }
+
     @Test("The ghost tapped open stays while its card is up, and turns into the sent reply's bubble once the card has closed")
     func heldGhostWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         // The tap holds the ghost it opened, with whether the chat shows this card's send as a bubble.
         let open = try Self.body(of: "private func openSuggestion(_ shown: ReplyResult, on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {", in: text)
         #expect(Self.count("heldGhost = shown.textMessage.map { ChatHeldGhost(text: $0, showsBubble: composeScreen(answering: newest) == .chat) }", in: open) == 1)
-        #expect(Self.count("heldGhost = ", in: text) == 2, "set by the tap, cleared only as the hold ends")
+        #expect(Self.count("heldGhost = ", in: text) == 3, "set by the tap or the field's card, cleared only as the hold ends")
+        // The field's own card holds the email that landed in the bubble, as a tapped ghost is held
+        // (ChatSuggestionBubbleTests.fieldSendWritesIntoTheGhost runs it), and its close and send end
+        // the hold through the same rule.
+        let agentOpen = try Self.body(of: "private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: text)
+        #expect(Self.count("if req.isFieldsOwnReply, let writing = fieldWriting {", in: agentOpen) == 1)
+        #expect(Self.count("heldGhost = writing.written.map { ChatHeldGhost(text: $0, showsBubble: composeScreen(answering: req.replyTo) == .chat) } fieldWriting = nil", in: agentOpen) == 1)
+        #expect(Self.count(".fullScreenCover(item: $agentCompose, onDismiss: readyCardClosed) { composeView(for: $0) }", in: text) == 1)
+        let agentEnded = try Self.body(of: "private func composeEnded(_ outcome: ComposeOutcome, replyTo: MessageHeader?) {", in: text)
+        #expect(Self.count("heldGhost?.sent = true", in: agentEnded) == 1, "a sent field card turns the held email into its bubble")
+        #expect(Self.count(".onChange(of: chatWorking) { _, working in if !working { fieldWriting = nil } }", in: text) == 1,
+                "the send's end gives the bubble back to the chat's own AI Suggestion")
         // The card's close and the reply's arrival both end it, through the one rule.
         #expect(Self.count(".fullScreenCover(item: $readyReply, onDismiss: readyCardClosed) { ready in", in: text) == 1)
         let closed = try Self.body(of: "private func readyCardClosed() {", in: text)
@@ -919,13 +944,14 @@ struct ChatReplyFieldTests {
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
         let ghost = try #require(bubble.range(of: "struct ChatSuggestionBubble: View {")
             .flatMap { start in bubble[start.lowerBound...].range(of: "struct ChatSuggestionWorkingBubble").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
+        let captionText = "Text(writing ? ChatSuggestionConfig.writingLine : ChatSuggestionConfig.statusLine)"
         #expect(Self.count(".stroke(Palette.chatSuggestionStroke, style: StrokeStyle( lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))", in: ghost) == 1, "a dashed outline")
         #expect(Self.count(".fill(Palette.chatSuggestionFill)", in: ghost) == 1, "on a faded fill")
         #expect(Self.count(".foregroundStyle(Palette.chatSuggestionText)", in: ghost) == 1, "dark-blue text")
-        #expect(Self.count("Text(ChatSuggestionConfig.statusLine)", in: ghost) == 1, "the caption shows")
+        #expect(Self.count(captionText, in: ghost) == 1, "the caption shows")
         // The caption sits inside the button's label, so it takes the tap too.
         let button = try #require(ghost.range(of: "Button(action: onTap) {"))
-        let caption = try #require(ghost.range(of: "Text(ChatSuggestionConfig.statusLine)"))
+        let caption = try #require(ghost.range(of: captionText))
         let style = try #require(ghost.range(of: ".buttonStyle(.plain)"))
         #expect(button.upperBound <= caption.lowerBound && caption.upperBound <= style.lowerBound)
         #expect(Self.count("if pulses { TutorialPulseRing(", in: ghost) == 1, "the tutorial rings it")
@@ -1710,7 +1736,7 @@ struct ChatReplyFieldTests {
         // A card from a field request: the agent's closing words open nothing; a field send starts afresh.
         #expect(Self.count("fieldComposeOpened = req.isFieldsOwnReply", in: chat) == 1,
                 "the chat reads the reply tool's one decision of the field's own reply (FieldReplyCardWordsTests)")
-        #expect(Self.count("onFieldSend: { _ in fieldComposeOpened = false }, onAgentCompose: openAgentCompose, composeFromAccountId: viewModel.message?.accountId, composeHostCovered: isAnyPresentation)", in: chat) == 1,
+        #expect(Self.count("onFieldSend: { _ in fieldSent(shown: shown) }, onFieldWritten: { await landFieldWritten($0) }, onAgentCompose: openAgentCompose, composeFromAccountId: viewModel.message?.accountId, composeHostCovered: isAnyPresentation)", in: chat) == 1,
                 "the chat's pill binds the email's account as a new message's From and takes nothing while the chat is covered")
         // A new message's card opens from the account bound when the turn started, and records the
         // chat's screen, in the one presenter call.
@@ -1718,8 +1744,10 @@ struct ChatReplyFieldTests {
         // The card and fieldComposeOpened are set only for a request this chat's own pill took
         // (ADR-IOS-053 Phase 2; ChatComposeRoutingTests runs it with the inbox and the email screen mounted).
         #expect(Self.count("private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat) == 1)
-        #expect(Self.count("guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } fieldComposeOpened = req.isFieldsOwnReply agentCompose = req }", in: chat) == 1,
+        let open = try Self.body(of: "private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {", in: chat)
+        #expect(open.hasPrefix(" guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } fieldComposeOpened = req.isFieldsOwnReply"),
                 "a new email's bound account is looked up as the card is taken, before anything is set")
+        #expect(open.hasSuffix(" agentCompose = req }"))
         #expect(Self.count("private func agentAnswered() { guard !fieldComposeOpened else { return }", in: chat) == 1)
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
@@ -1734,7 +1762,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("composeFromField(text, ChatFieldSend(message: message, onlyTo: field.onlyTo, suggestion: field.suggestion))", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("runFieldCompose(fieldReply: send.fieldReply, fieldWordsKey: fieldWordsKey)", in: island) == 1)
-        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: capturedSessionKey, fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)", in: island) == 1,
+        #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: capturedSessionKey, fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey, landWritten: onFieldWritten)", in: island) == 1,
                 "and travel with the request to the compose tool")
         // With the chat that asked, read as the send starts: the closed field's compose belongs to the
         // chat view, the pill's send to the screen that asked. No send to the agent carries a field's

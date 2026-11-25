@@ -150,8 +150,10 @@ struct EmailComposeToolOutcomeTests {
         }
         opened.onOutcome(.sent)
         let written = await task.value
-        guard case .done = written else {
-            Issue.record("a sent card is written: \(written)")
+        // Sent, told apart from a card closed unsent: the field empties its words as the card
+        // reports the send (`DynamicIslandChat.composeNewEmailFromField`).
+        guard case .sent = written else {
+            Issue.record("a sent card is written and sent: \(written)")
             return
         }
         let request = asked.withLock { $0 }

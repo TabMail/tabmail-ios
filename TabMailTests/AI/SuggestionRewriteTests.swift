@@ -174,9 +174,12 @@ struct ComposeEditMarkerTests {
 /// the backend would:
 ///  1. The request is a compose edit OF the suggestion shown, in the draft its card would open
 ///     with: the suggestion's envelope (sender, subject, To/Cc/Bcc by role) and its body.
-///  2. In place, only while the edited draft is still that envelope: the edit, its text version
-///     and command replace the suggestion through the one writer; no card opens. Otherwise the
-///     card opens with exactly the edited envelope and the stored suggestion is unchanged.
+///  2. The card opens with exactly the edited envelope, every time (amended 2026-11-25). In place,
+///     only while the edited draft is still that envelope: first, the edit, its text version and
+///     command replace the suggestion through the one writer. Otherwise the stored suggestion is
+///     unchanged.
+///  2a. The closed field's request: the email written lands in the AI Suggestion's bubble
+///     (`ToolInvocation.landWritten`) before its card opens; Stop during that hold opens nothing.
 ///  3. A failed edit, a newer suggestion stored meanwhile, or a row that is no longer the email
 ///     shown leaves the stored suggestion as it is.
 ///  4. The field's audience applies to the email's copies in the same account, never another
@@ -282,12 +285,23 @@ struct SuggestionRewriteRouteTests {
 
     let request: [String: JSONValue] = ["unique_id": .int(1), "request": .string("more formal")]
 
-    @Test("In place: the edit of the shown suggestion, asked in its own envelope, replaces it; no card opens")
+    @Test("In place: the edit of the shown suggestion, asked in its own envelope, replaces it, then its card opens with it")
     func rewritesInPlace() async throws {
         let fixture = try await fixture()
         let calls = Calls()
-        let output = try await tool(fixture, calls: calls, answer: Self.edit()).run(
-            arguments: request, invocation: invocation(fixture.header), rewritesInPlace: true)
+        let tool = tool(fixture, calls: calls, answer: Self.edit())
+        let invocation = invocation(fixture.header)
+        let request = request
+        let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true) }
+        let card = try #require(await waitForCard(fixture.router), "the card opens, in place too")
+        // Stored before the card opened: a card closed unsent leaves the ghost showing the edit.
+        let row = try await row(fixture.db, fixture.header.id)
+        let edited = ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand)
+        #expect(row.suggestion == edited)
+        #expect(card.body == Self.editedBody && card.subject == "Re: Offsite" && card.suggestion == edited,
+                "the card holds the edit, its text version with it")
+        card.onOutcome(.cancelled)
+        let output = try await task.value
 
         let call = try #require(calls.all.first)
         #expect(call.body == Self.shown, "the suggestion shown is the draft edited")
@@ -297,26 +311,27 @@ struct SuggestionRewriteRouteTests {
         let envelope = ChatReplyCompose.suggestionEnvelope(for: fixture.header, accounts: [])
         #expect(call.context.toRecipients == envelope.to && call.context.ccRecipients == envelope.cc,
                 "To and Cc by role, as the card holds them")
-        let row = try await row(fixture.db, fixture.header.id)
-        #expect(row.suggestion == ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand))
         #expect(ChatReplyField.shown(newest: row, usersTurn: false, onlyTo: nil)?.textMessage == Self.editedText,
                 "the ghost shows the edit's text version")
-        #expect(fixture.router.composeQueueDepth == 0, "no compose card opens")
-        #expect(output.contains("in place") && output.contains(Self.editedText) && output.contains("Nothing was sent"))
+        #expect(output.contains("in place") && output.contains(Self.editedText) && output.contains("outcome"), "\(output)")
     }
 
-    @Test("End to end: a field request dispatched through the tool registry edits the suggestion shown, in place")
+    @Test("End to end: a field request dispatched through the tool registry edits the suggestion shown, in place, and opens its card")
     func fieldThroughRegistryEditsInPlace() async throws {
         let fixture = try await fixture()
         let calls = Calls()
         let registry = ToolRegistry()
         await registry.registerAll([tool(fixture, calls: calls, answer: Self.edit())])
-        let result = await registry.execute(name: "email_reply", arguments: request, invocation: invocation(fixture.header))
+        let invocation = invocation(fixture.header)
+        let request = request
+        let task = Task { await registry.execute(name: "email_reply", arguments: request, invocation: invocation) }
+        let card = try #require(await waitForCard(fixture.router))
+        #expect(try await row(fixture.db, fixture.header.id).cachedReply == Self.editedBody, "stored before the card opened")
+        card.onOutcome(.cancelled)
+        let result = await task.value
 
         #expect(result.ok)
         #expect(calls.all.first?.body == Self.shown, "the field's suggestion reaches the edit through dispatch")
-        #expect(try await row(fixture.db, fixture.header.id).cachedReply == Self.editedBody)
-        #expect(fixture.router.composeQueueDepth == 0)
         #expect(result.output.contains("in place"))
     }
 
@@ -432,6 +447,66 @@ struct SuggestionRewriteRouteTests {
         _ = try await task.value
     }
 
+    /// What the closed field's bubble was handed, and when (`ToolInvocation.landWritten`).
+    @MainActor
+    final class Landing {
+        var texts: [String] = []
+        /// The cards queued as each text landed.
+        var queuedAtLanding: [Int] = []
+    }
+
+    /// The closed field's one path (ADR-IOS-114 decision 10, amended 2026-11-25): whatever is
+    /// written (an edit stored in place, an edit only on the card, or a fresh reply), the email's
+    /// text version lands in the AI Suggestion's bubble before any card is queued, and the card
+    /// then opens with that email. Before, an edit stored in place opened no card at all, and the
+    /// others opened theirs at once: "sometimes writes and opens compose, or sometimes just
+    /// updates the ai suggestion".
+    @Test("The field's email lands in the AI Suggestion's bubble before its card opens, whatever was written",
+          arguments: [(true, true), (false, true), (true, false)])
+    func writtenLandsBeforeItsCard(rewritesInPlace: Bool, suggestionShows: Bool) async throws {
+        let fixture = try await fixture()
+        let tool = tool(fixture, calls: Calls(), answer: Self.edit())
+        let router = fixture.router
+        let landing = Landing()
+        let invocation = ToolInvocation(
+            fieldReply: ChatFieldReply(email: fixture.header, onlyTo: nil, suggestion: suggestionShows ? Self.shownReply : nil),
+            composeOrigin: Self.asked,
+            landWritten: { text in
+                landing.texts.append(text)
+                landing.queuedAtLanding.append(router.composeQueueDepth)
+            })
+        let request = request
+        let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: rewritesInPlace) }
+        let card = try #require(await waitForCard(router), "the card opens")
+        #expect(landing.texts == [Self.editedText], "the email's text version lands, once")
+        #expect(landing.queuedAtLanding == [0], "before its card is queued")
+        #expect(card.suggestion?.textMessage == Self.editedText, "the card holds the email that landed")
+        card.onOutcome(.cancelled)
+        _ = try await task.value
+    }
+
+    @Test("Stop while the email written is held in the bubble opens no card")
+    func stopDuringTheHoldOpensNothing() async throws {
+        let fixture = try await fixture()
+        let tool = tool(fixture, calls: Calls(), answer: Self.edit())
+        let landing = Landing()
+        let invocation = ToolInvocation(
+            fieldReply: ChatFieldReply(email: fixture.header, onlyTo: nil, suggestion: nil),
+            composeOrigin: Self.asked,
+            landWritten: { text in
+                landing.texts.append(text)
+                // Stop, while the email is held to be read.
+                withUnsafeCurrentTask { $0?.cancel() }
+            })
+        let request = request
+        let output = try await Task { @MainActor in
+            try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true)
+        }.value
+        #expect(landing.texts == [Self.editedText], "control: the email landed")
+        #expect(fixture.router.composeQueueDepth == 0 && fixture.router.takeCompose(for: Self.chatHost) == nil, "no card opens")
+        #expect(output.contains(ComposeOutcome.cancelled.describeForLLM), "\(output)")
+    }
+
     @Test("A failed edit leaves the suggestion as it was, and opens no card")
     func failedEditChangesNothing() async throws {
         let fixture = try await fixture()
@@ -463,12 +538,18 @@ struct SuggestionRewriteRouteTests {
     func noSubjectKeepsTheReplySubject(_ blank: String) async throws {
         // The shown suggestion: still its own envelope, so the edit is stored in place.
         let fixture = try await fixture()
-        let output = try await tool(fixture, calls: Calls(), answer: Self.edit(subject: blank)).run(
-            arguments: request, invocation: invocation(fixture.header), rewritesInPlace: true)
+        let shownTool = tool(fixture, calls: Calls(), answer: Self.edit(subject: blank))
+        let shownInvocation = invocation(fixture.header)
+        let request = request
+        let shownTask = Task { @MainActor in try await shownTool.run(arguments: request, invocation: shownInvocation, rewritesInPlace: true) }
+        let shownCard = try #require(await waitForCard(fixture.router))
+        #expect(shownCard.subject == "Re: Offsite")
+        shownCard.onOutcome(.cancelled)
+        let output = try await shownTask.value
         #expect(try await row(fixture.db, fixture.header.id).suggestion
                     == ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand),
                 "the subject stayed \"Re: Offsite\", so the edit is still the suggestion")
-        #expect(fixture.router.composeQueueDepth == 0 && output.contains("in place"), "no card: \(output)")
+        #expect(output.contains("in place"), "\(output)")
 
         // No suggestion showing: the fresh reply's card opens with "Re: Offsite".
         let fresh = try await self.fixture()
@@ -520,7 +601,7 @@ struct SuggestionRewriteRouteTests {
         let request = request
         // Bounded: a request that wrongly opens a card is cancelled, never awaited forever.
         let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true) }
-        let card = suggestionShows && !swapped ? nil : await waitForCard(fixture.router)
+        let card = await waitForCard(fixture.router)
         card?.onOutcome(.cancelled)
         let output = try await task.value
         let stored = try await row(db, id).suggestion
@@ -535,7 +616,7 @@ struct SuggestionRewriteRouteTests {
             #expect(calls.all.first?.body == (suggestionShows ? Self.shown : ""))
             if suggestionShows {
                 #expect(stored == ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand))
-                #expect(fixture.router.composeQueueDepth == 0 && output.contains("in place"))
+                #expect(card != nil && output.contains("in place"), "stored in place, and its card opens")
             } else {
                 #expect(card != nil, "a fresh reply opens its card")
                 #expect(stored == Self.shownReply)

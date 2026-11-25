@@ -63,6 +63,10 @@ struct DynamicIslandChat: View {
     let replyField: ChatReplyField?
     /// The user's own words went from the field to the agent.
     var onFieldSend: ((String) -> Void)?
+    /// The closed field's Send wrote the email: its text version lands in the host's AI
+    /// Suggestion bubble, and returns once it has been there long enough to read, before its
+    /// compose card opens (`ToolInvocation.landWritten`). Nil: the card opens at once.
+    var onFieldWritten: (@MainActor @Sendable (String) async -> Void)?
     /// The host presents the agent's compose cards that this pill's chat asked for (ADR-IOS-053
     /// Phase 2): the pill takes them from the router while it is on screen and hands each one
     /// here. Nil: the host presents none, and this pill's turns can open no compose card.
@@ -339,6 +343,7 @@ struct DynamicIslandChat: View {
         onAgentReply: ((String) -> Void)? = nil,
         replyField: ChatReplyField? = nil,
         onFieldSend: ((String) -> Void)? = nil,
+        onFieldWritten: (@MainActor @Sendable (String) async -> Void)? = nil,
         onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)? = nil,
         composeFromAccountId: String? = nil,
         composeHostCovered: Bool = false,
@@ -369,6 +374,7 @@ struct DynamicIslandChat: View {
         self.onAgentReply = onAgentReply
         self.replyField = replyField
         self.onFieldSend = onFieldSend
+        self.onFieldWritten = onFieldWritten
         self.onAgentCompose = onAgentCompose
         self.composeFromAccountId = composeFromAccountId
         self.composeHostCovered = composeHostCovered
@@ -1763,7 +1769,7 @@ struct DynamicIslandChat: View {
             await EmailReplyTool.composeWithRegisteredTool(text, invocation: invocation)
         } ended: { written in
             switch written {
-            case .done?:
+            case .done?, .sent?:
                 ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)
             case .nothing?:
                 ChatFieldWords.shared.apply(.notWritten, to: fieldWordsKey)
@@ -1778,8 +1784,9 @@ struct DynamicIslandChat: View {
     /// compose edit of a new email to `people` with the words as its request
     /// (`EmailComposeTool.composeFromField`), and the new email's compose card opens with the
     /// email written and its text version. The chat keeps its words itself (no `ChatFieldWords`
-    /// key): its card decides what becomes of them. Sent, the chat goes on as the next new email
-    /// with that email's own words (`startNewEmail`); closed unsent, nothing written, or Stop,
+    /// key): its card decides what becomes of them. Sent, they empty as the card reports the send
+    /// (`ChatFieldFill.completed`), and the chat goes on as the next new email with that email's
+    /// own words (`startNewEmail`); closed unsent, nothing written, or Stop,
     /// the send ends and they are the user's again, and nothing written shows a note.
     private func composeNewEmailFromField(_ text: String, to people: [ChatThread.Person]) {
         // As mailboxes with their names, so the email written can greet them by name.
@@ -1787,7 +1794,13 @@ struct DynamicIslandChat: View {
         runFieldCompose(fieldReply: nil, fieldWordsKey: nil) { invocation in
             await EmailComposeTool.composeWithRegisteredTool(text, to: to, invocation: invocation)
         } ended: { written in
-            fieldFill.apply(.notWritten)
+            // Sent: the card reports it before it closes, so the words go now, as the card
+            // closes, never back into the field under it first.
+            if case .sent? = written {
+                fieldFill.apply(.completed)
+            } else {
+                fieldFill.apply(.notWritten)
+            }
             if case .nothing? = written { showAgentToast(Self.newEmailNotWrittenNote) }
         }
     }
@@ -1810,7 +1823,7 @@ struct DynamicIslandChat: View {
         let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)
         let invocation = ToolInvocation(
             uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: capturedSessionKey,
-            fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)
+            fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey, landWritten: onFieldWritten)
         activeChatTask = Task {
             let written = await compose(invocation)
             if Task.isCancelled {

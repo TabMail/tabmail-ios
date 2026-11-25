@@ -18,7 +18,9 @@ import UIKit
 ///     the card is open. The card's body is checked in the running app only (`ChatSwipeUITests`).
 ///  3. One copy: the ghost reads the email's row, so a new text version there rewrites it in place,
 ///     and the old text is gone.
-///  4. The chat view says "AI Suggestion", never "AI Reply", in any string a user sees or hears.
+///  4. The field's Send writes into the AI Suggestion's bubble: the suggestion stays, pulsing, while
+///     the email is written; the email lands in it and stays to be read; then its card opens.
+///  5. The chat view says "AI Suggestion", never "AI Reply", in any string a user sees or hears.
 @Suite("The chat's AI Suggestion", .serialized, .processGlobalState)
 @MainActor
 struct ChatSuggestionBubbleTests {
@@ -238,7 +240,89 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    // MARK: - 4. The name
+    // MARK: - 4. The field's Send writes into the AI Suggestion's bubble
+
+    /// The compose edit a closed field's Send runs, answered only once the test lets it go, so the
+    /// bubble can be seen while the email is written. Bounded: never held past ten seconds.
+    final class HeldComposeEdit: @unchecked Sendable {
+        let http = FakeHTTP.Scenario()
+        let release = DispatchSemaphore(value: 0)
+        static let written = ReplyResult(
+            body: "Hi Sam,\n\nTuesday is fine, see you then.\n\nMe", textMessage: "Tuesday is fine, see you then.",
+            changeCommand: "suggest Monday")
+
+        init() {
+            http.register(path: "/completions/chat", method: "POST") { [release] _ in
+                _ = release.wait(timeout: .now() + 10)
+                let final: [String: Any] = ["assistant": ComposeEditJSON.make(
+                    response: "Done.", subject: "", body: HeldComposeEdit.written.body,
+                    textMessage: HeldComposeEdit.written.textMessage ?? "", changeCommand: HeldComposeEdit.written.changeCommand ?? "")]
+                let text = String(decoding: try! JSONSerialization.data(withJSONObject: final), as: UTF8.self)
+                return .bytes(Data("event: final\ndata: \(text)\n\n".utf8), contentType: "text/event-stream")
+            }
+        }
+
+        var service: AIService {
+            AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        }
+    }
+
+    /// The AI Suggestion's bubble, ready or being written.
+    private static func suggestionBubble(in view: UIView) -> NSObject? {
+        HostedAccessibility.elements(under: view).first {
+            let id = HostedAccessibility.identifier(of: $0)
+            return id == ChatSuggestionBubble.bubbleId || id == ChatSuggestionWorkingBubble.bubbleId
+        }
+    }
+
+    /// ADR-IOS-114 decision 10, amended 2026-11-25: one path for whatever the field's Send writes.
+    /// Before, an edit of the suggestion took the ghost away while it was written, then either
+    /// changed it with no card or opened the card at once.
+    @Test("A field Send: the ghost stays in its place, pulsing, while the email is written; the email lands in it and stays to be read; then its card opens with the ghost held behind it")
+    func fieldSendWritesIntoTheGhost() async throws {
+        let backend = HeldComposeEdit()
+        ChatPillState.shared.aiService = backend.service
+        defer {
+            backend.release.signal()
+            ChatPillState.shared.aiService = .shared
+            backend.http.close()
+            AgentToolRouter.shared.resetComposeQueueForTesting()
+        }
+        try await withChat { chat in
+            let written = "\(ChatSuggestionConfig.label): \(HeldComposeEdit.written.textMessage ?? "")"
+            #expect(ThreadChatTests.type("Say Tuesday is fine", in: chat.view), "control: the field takes words")
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(HostedAccessibility.activate("chatSend", in: chat.view), "control: Send takes a tap")
+
+            // While it is written: the suggestion stays in its place, "Writing" under it.
+            let writing = "\(ChatSuggestionConfig.writingLine): \(Self.ready)"
+            try await Self.waitUntil { Self.suggestionBubble(in: chat.view)?.accessibilityLabel == writing }
+            let bubble = Self.suggestionBubble(in: chat.view)
+            #expect(bubble?.accessibilityLabel == writing,
+                    "the suggestion shown stays, pulsing: \(String(describing: bubble?.accessibilityLabel))")
+            #expect(bubble.flatMap { HostedAccessibility.identifier(of: $0) } == ChatSuggestionWorkingBubble.bubbleId)
+
+            // The email written lands in it, and stays there before its card opens.
+            backend.release.signal()
+            try await Self.waitUntil { Self.suggestionBubble(in: chat.view)?.accessibilityLabel == written }
+            #expect(Self.suggestionBubble(in: chat.view)?.accessibilityLabel == written, "the email written lands in the bubble")
+            #expect(chat.controller.presentedViewController == nil, "its card waits while the email is there to read")
+            try await Self.openCard(chat)
+            #expect(Self.ghost(in: chat.view)?.accessibilityLabel == written, "the email stays in its place behind its card")
+
+            // Closed unsent: the edit was stored as the AI Suggestion, so the ghost still shows it.
+            chat.controller.dismiss(animated: false)
+            try await Self.waitUntil { chat.controller.presentedViewController == nil && !ActiveAgentTracker.shared.anyWorking }
+            try await Self.waitUntil { Self.ghost(in: chat.view)?.accessibilityLabel == written }
+            #expect(Self.ghost(in: chat.view)?.accessibilityLabel == written, "the ghost shows the edit")
+            let stored = try await chat.pool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+            #expect(stored?.replyTextMessage == HeldComposeEdit.written.textMessage, "the edit is the stored suggestion")
+            let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
+            #expect(queued == 0, "nothing was sent")
+        }
+    }
+
+    // MARK: - 5. The name
 
     @Test("No string in the chat view says AI Reply")
     func noAIReplyString() throws {
