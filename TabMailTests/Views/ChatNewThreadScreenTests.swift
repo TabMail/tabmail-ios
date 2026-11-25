@@ -390,7 +390,10 @@ struct ChatNewThreadScreenTests {
     @Test("With someone picked, Send asks nothing and keeps the words, saving nothing; the words go to the agent as a new email to the picked people")
     func sendWithPeoplePicked() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
-        try await HostedAccessibility.withAutomation { try await sendWithPeoplePickedBody() }
+        // AI on: with AI off (no choice made, as in a fresh test host) the agent is never asked.
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) { try await sendWithPeoplePickedBody() }
+        }
     }
 
     private func sendWithPeoplePickedBody() async throws {
