@@ -2202,9 +2202,9 @@ extension AccountManager {
         // whose predecessor already leaves the message in the undo source.
         // The successor must also belong to the email the Undo names: another
         // email that later took this address owns its successor, and the
-        // write path below refuses that member on the same Message-ID
-        // witness. An Undo whose email has no usable Message-ID keeps the
-        // address check alone.
+        // write path below refuses that member (its row has not reached the
+        // forward destination yet). An Undo whose email has no usable
+        // Message-ID keeps the address check alone.
         let memberHeaderIds = Set(members.map(\.originalHeaderId))
         if memberHeaderIds.count == members.count,
            members.allSatisfy({ member in
