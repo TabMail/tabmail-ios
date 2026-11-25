@@ -721,7 +721,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.apply(", in: text) == 9)
     }
 
-    @Test("The field's Send sends the words to the agent, except in a new email's chat, which takes its own Send; nothing in the field opens compose")
+    @Test("The field's Send sends the words to the agent; a new email's chat's own Send first says who it is to, or asks and stops there; nothing in the field opens compose")
     func fieldSendWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
@@ -729,14 +729,15 @@ struct ChatReplyFieldTests {
         // Send refuses only an empty input, and the collapsed field then takes its own route.
         #expect(message.hasPrefix(" let text = inputText.trimmingCharacters(in: .whitespaces) guard !text.isEmpty else { return } if let replyField, !isExpanded { sendFromReplyField(text, replyField) return }"))
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
-        // A new email's chat takes the words first and only (what its Send does is driven in
-        // ChatNewThreadScreenTests); every other send from the field goes to the agent.
-        #expect(send.hasPrefix(" // A new email's chat decides what its Send does; the words stay until it acts on them. if let newEmail = field.newEmail { newEmail.send(text) return } isTextFieldFocused = false"),
+        // A new email's chat's own Send runs first: with nobody picked it asks and the send stops
+        // there; with people picked their addresses go on with the words to the agent (what its
+        // Send does is driven in ChatNewThreadScreenTests). Every other send goes to the agent.
+        #expect(send.contains("var newEmailTo: [ChatThread.Person]? if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people } isTextFieldFocused = false"),
                 "a new email's chat takes its own Send, first")
         #expect(Self.count("return", in: send) == 1, "every other send from the field goes to the agent")
         #expect(Self.count("onSendReadyReply", in: text) == 0 && Self.count("ChatReplyField.route", in: text) == 0)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
-        #expect(Self.count("sendAgentChat(text, field: send)", in: send) == 1)
+        #expect(Self.count("sendAgentChat(text, field: send, newEmailTo: newEmailTo)", in: send) == 1)
         #expect(Self.count("sendFromReplyField(", in: text) == 2, "Send reaches it")
         #expect(Self.count("enrichedText = ChatReplyField.agentMessage( emailNumericId: numericId, text: text, isNoReply: field.isNoReply, onlyTo: field.onlyTo)", in: text) == 1)
         #expect(Self.count("enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)", in: text) == 1)
@@ -1565,7 +1566,7 @@ struct ChatReplyFieldTests {
         for dark in [false, true] {
             let traits = UITraitCollection(userInterfaceStyle: dark ? .dark : .light)
             // A gray has (almost) no saturation; the accent's and red's are far above this.
-            let colors = [(Palette.chatMicIdle, false), (Palette.chatMicListeningFill, false),
+            let colors = [(Palette.chatMicIdleFill, false), (Palette.chatMicIdleGlyph, false), (Palette.chatMicListeningFill, false),
                           (Palette.chatMicListeningStop, false), (Theme.accent, true)]
             for (color, isAccent) in colors {
                 var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
@@ -1579,11 +1580,30 @@ struct ChatReplyFieldTests {
             UIColor(Palette.chatMicListeningStop).resolvedColor(with: traits).getWhite(&stop, alpha: &alpha)
             let expectedFill: CGFloat = dark ? 1 : 0
             #expect(abs(fill - expectedFill) < 0.01 && abs(stop - (1 - expectedFill)) < 0.01, "fill \(fill), stop \(stop), dark \(dark)")
+            // Idle: a soft gray circle, light in light mode and dark in dark mode, so it reads quieter
+            // than the listening circle, with the mic in a gray that stands well apart from it.
+            var idleFill: CGFloat = 0, idleGlyph: CGFloat = 0
+            UIColor(Palette.chatMicIdleFill).resolvedColor(with: traits).getWhite(&idleFill, alpha: &alpha)
+            UIColor(Palette.chatMicIdleGlyph).resolvedColor(with: traits).getWhite(&idleGlyph, alpha: &alpha)
+            #expect(dark ? idleFill < 0.3 : idleFill > 0.8, "idle fill \(idleFill), dark \(dark)")
+            #expect(abs(idleFill - fill) > 0.5, "idle fill \(idleFill), listening fill \(fill), dark \(dark)")
+            #expect(abs(idleGlyph - idleFill) > 0.5, "idle glyph \(idleGlyph), idle fill \(idleFill), dark \(dark)")
         }
+        // The idle circle is filled, with no outline ring.
+        let row = try Self.source("TabMail/Views/Chat/ChatFieldBarRow.swift")
+        let circleStart = try #require(row.range(of: "struct ChatMicCircle: View {"))
+        let circleEnd = try #require(row[circleStart.upperBound...].range(of: "struct FieldButtonSlot: ViewModifier {"))
+        let circle = String(row[circleStart.upperBound..<circleEnd.lowerBound])
+        #expect(Self.count("strokeBorder", in: circle) == 0 && Self.count(".stroke(", in: circle) == 0, "no outline ring")
+        #expect(Self.count(".fill(listening ? Palette.chatMicListeningFill : Palette.chatMicIdleFill)", in: circle) == 1)
+        // Transcribing in the mic: its spinner in the mic's own gray, in place of the glyph.
+        #expect(Self.count("if transcribing { DictationSpinner(tint: Palette.chatMicIdleGlyph, diameter: ChatViewLayout.fieldMicSpinnerSize) } else {", in: circle) == 1)
+        #expect(ChatViewLayout.fieldMicSpinnerSize < ChatViewLayout.fieldMicSize)
         // Every field bar draws its mic as the circle and colours it nowhere else.
         let chat = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         let micButton = try Self.body(of: "var micButton: some View {", in: chat)
-        #expect(Self.count("ChatMicCircle(symbol: micSymbol, listening: micListening)", in: micButton) == 1)
+        #expect(Self.count("ChatMicCircle(symbol: micSymbol, listening: micListening, transcribing: spinnerPlace == .mic)", in: micButton) == 1)
+        #expect(Self.count(".accessibilityLabel(spinnerPlace == .mic ? \"Transcribing\" : micListening ? \"Stop dictation\" : \"Dictate\")", in: micButton) == 1)
         #expect(Self.count(".foregroundStyle", in: micButton) == 0, "the circle sets its own grays")
         let symbol = try Self.body(of: "var micSymbol: String {", in: chat)
         #expect(Self.count("if micListening { return \"stop.fill\" } return canDictate ? \"mic\" : \"mic.slash\"", in: symbol) == 1)

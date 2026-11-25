@@ -392,7 +392,49 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("With someone picked, Send asks nothing and keeps the words, saving nothing; the header's sheet lists who is picked, and the user's own addresses (every account's) typed there are not added")
+    @Test("With someone picked, Send asks nothing and keeps the words, saving nothing; the words go to the agent as a new email to the picked people")
+    func sendWithPeoplePicked() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        // AI on: with AI off (no choice made, as in a fresh test host) the agent is never asked.
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) { try await sendWithPeoplePickedBody() }
+        }
+    }
+
+    private func sendWithPeoplePickedBody() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        // A fake agent that answers "Done": the test reads what Send asked it, on no real network.
+        let backend = ChatComposeRoutingTests.Backend(asksForReply: false)
+        ChatPillState.shared.aiService = backend.service
+        defer {
+            ChatPillState.shared.aiService = .shared
+            backend.http.close()
+            AgentToolRouter.shared.resetComposeQueueForTesting()
+        }
+        let recorder = QueueRecorder()
+        let model = ChatNewThreadModel(account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
+        try await withScreen(model) { screen in
+            #expect(ThreadChatTests.type("Lunch on Friday?", in: screen.view))
+            try await Self.waitUntil { model.words == "Lunch on Friday?" }
+            try await Self.settle()
+            #expect(HostedAccessibility.activate("chatSend", in: screen.view), "Send takes a tap")
+            try await Self.settle()
+            #expect(Self.topPresented(screen) == nil, "with someone picked, Send asks nothing")
+            #expect(model.words == "Lunch on Friday?", "the words stay")
+            #expect(recorder.calls.isEmpty, "Send saves nothing")
+            let rows = try await rowCount(fixture)
+            #expect(rows == 0, "and writes no draft")
+            try await Self.waitUntil { !backend.bodies.isEmpty && !ActiveAgentTracker.shared.anyWorking }
+            #expect(backend.bodies.count == 1, "control: the agent was asked once and answered")
+            let asked = backend.bodies.first ?? ""
+            #expect(asked.contains("New email to Maria <maria@example.com>") && asked.contains("Lunch on Friday?"),
+                    "the words go to the agent as a new email to the picked people: \(asked.prefix(400))")
+        }
+    }
+
+    @Test("With someone picked, the header's sheet lists who is picked, and the user's own addresses (every account's) typed there are not added")
     func pickedPeople() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await pickedPeopleBody() }
@@ -412,18 +454,6 @@ struct ChatNewThreadScreenTests {
         let model = ChatNewThreadModel(account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
         model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
         try await withScreen(model) { screen in
-            #expect(ThreadChatTests.type("Lunch on Friday?", in: screen.view))
-            try await Self.waitUntil { model.words == "Lunch on Friday?" }
-            try await Self.settle()
-            #expect(HostedAccessibility.activate("chatSend", in: screen.view), "Send takes a tap")
-            try await Self.settle()
-            #expect(Self.topPresented(screen) == nil, "with someone picked, Send asks nothing")
-            #expect(model.words == "Lunch on Friday?", "the words stay")
-            #expect(Self.fieldText(in: screen.view) == "Lunch on Friday?", "in the field too")
-            #expect(recorder.calls.isEmpty, "Send saves nothing")
-            let rows = try await rowCount(fixture)
-            #expect(rows == 0, "and writes no draft")
-
             // The user's addresses are every account's: this email's account and the other one.
             // The screen reads them as it opens (`loadOwnAddresses`); the window before that read
             // ends is tabmail-ios#1236. This read is the test's own: it confirms both accounts are

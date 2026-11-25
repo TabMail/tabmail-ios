@@ -152,4 +152,16 @@ struct PillDictationModeTests {
         #expect(PillDictationMode.placeholder(isCompose: true, offNote: nil) == "Describe your edit...")
         #expect(PillDictationMode.placeholder(isCompose: false, offNote: nil) == "Type or speak...")
     }
+
+    /// While the words are transcribed, the button that stopped the dictation spins: the mic for
+    /// its own stop, Send for a send while listening. Nothing spins before or after.
+    @Test func theButtonThatStoppedTheDictationSpins() {
+        #expect(DictationSpinnerPlace.resolve(phase: .transcribing, sendWhenDictated: false) == .mic)
+        #expect(DictationSpinnerPlace.resolve(phase: .transcribing, sendWhenDictated: true) == .send)
+        for phase in [DictationController.Phase.idle, .listening] {
+            for sendWhenDictated in [false, true] {
+                #expect(DictationSpinnerPlace.resolve(phase: phase, sendWhenDictated: sendWhenDictated) == nil)
+            }
+        }
+    }
 }

@@ -955,7 +955,7 @@ struct DynamicIslandChat: View {
             case .transcribing: break
             }
         } label: {
-            ChatMicCircle(symbol: micSymbol, listening: micListening)
+            ChatMicCircle(symbol: micSymbol, listening: micListening, transcribing: spinnerPlace == .mic)
                 .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .contentShape(Rectangle())
         }
@@ -963,7 +963,7 @@ struct DynamicIslandChat: View {
         // when opted out of AI (off if the language has no on-device model).
         .disabled(isWorking || dictation.phase == .transcribing
             || (!dictation.isActive && !speech.isRecording && !speech.isStarting && !canDictate))
-        .accessibilityLabel(micListening ? "Stop dictation" : "Dictate")
+        .accessibilityLabel(spinnerPlace == .mic ? "Transcribing" : micListening ? "Stop dictation" : "Dictate")
         .popoverTip(DictationLanguageTip(), arrowEdge: .bottom)
     }
 
@@ -1017,7 +1017,8 @@ struct DynamicIslandChat: View {
             }
     }
 
-    /// Send, or Stop while the agent works, Retry after a failure, the spinner while transcribing.
+    /// Send, or Stop while the agent works, Retry after a failure, the spinner while transcribing the
+    /// words Send stopped (the mic spins for the words it stopped, and Send keeps its look).
     @ViewBuilder
     var trailingButton: some View {
         if isWorking {
@@ -1041,7 +1042,7 @@ struct DynamicIslandChat: View {
                     .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                     .contentShape(Rectangle())
             }
-        } else if dictation.phase == .transcribing {
+        } else if spinnerPlace == .send {
             DictationSpinner(isRetrying: dictation.isRetrying)
                 .frame(width: ChatViewLayout.fieldTapSize, height: ChatViewLayout.fieldTapSize)
                 .accessibilityLabel("Transcribing")
@@ -1464,6 +1465,11 @@ struct DynamicIslandChat: View {
         dictation.phase == .listening || speech.isRecording
     }
 
+    /// The button that spins while the words are transcribed: the one that stopped the dictation.
+    private var spinnerPlace: DictationSpinnerPlace? {
+        DictationSpinnerPlace.resolve(phase: dictation.phase, sendWhenDictated: sendWhenDictated)
+    }
+
     /// The mic's glyph: the stop square while listening, else the outlined mic, struck through when
     /// dictation is off.
     private var micSymbol: String {
@@ -1678,10 +1684,13 @@ struct DynamicIslandChat: View {
     /// the field, pulsing, while it works. The field empties when the reply goes out or the agent
     /// answers in the sheet; a closed compose card leaves the words.
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
-        // A new email's chat decides what its Send does; the words stay until it acts on them.
+        // A new email's chat decides what its Send does: with nobody to send to it asks, and the
+        // words stay as they are; with people picked, the words go to the agent to write the email
+        // to them, as a reply's do (they stay, pulsing, while it writes).
+        var newEmailTo: [ChatThread.Person]?
         if let newEmail = field.newEmail {
-            newEmail.send(text)
-            return
+            guard let people = newEmail.send(text) else { return }
+            newEmailTo = people
         }
         isTextFieldFocused = false
         fieldFill.apply(.sentFromField)
@@ -1693,7 +1702,7 @@ struct DynamicIslandChat: View {
         let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }
         Task { @MainActor in
             MessageChatCollapseTip.hasStartedMessageChat = true
-            sendAgentChat(text, field: send)
+            sendAgentChat(text, field: send, newEmailTo: newEmailTo)
         }
     }
 
@@ -2499,8 +2508,10 @@ struct DynamicIslandChat: View {
     /// complete the field's words (`fieldWordsKey`). A sheet Re-send of an answered turn carries the
     /// turn's `field` (its email and Reply to choice) but owns no words: its own send completed when
     /// it was answered, and words open by then belong to a newer send.
+    /// `newEmailTo`: a new email's chat's Send, the people it is written to (`ChatNewEmailField.agentMessage`).
     func sendAgentChat(
-        _ text: String, script: TutorialCoordinator.ChatPrompt? = nil, field: ChatFieldSend? = nil, ownsFieldWords: Bool = true
+        _ text: String, script: TutorialCoordinator.ChatPrompt? = nil, field: ChatFieldSend? = nil, ownsFieldWords: Bool = true,
+        newEmailTo: [ChatThread.Person]? = nil
     ) {
         // If on the "new session" page in multi-session mode, start a fresh session
         if hasSessionHistory, activeSessionIndex < loadedSessions.count,
@@ -2661,6 +2672,8 @@ struct DynamicIslandChat: View {
                     onlyTo: field.onlyTo)
             } else if let numericId = contextNumericId {
                 enrichedText = "Regarding [Email](\(numericId)): \(text)"
+            } else if let newEmailTo {
+                enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text)
             } else {
                 enrichedText = text
             }
