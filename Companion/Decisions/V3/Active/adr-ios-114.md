@@ -903,7 +903,7 @@ same AI result, kept as long as the email itself is shown.
    the drag crosses it; a full swipe that runs its button fires `.success`. The hint and the let-go
    read one rule (`ChatSwipe.isPastFull`, which `settle` uses). The clip that keeps the buttons inside
    the revealed width leaves room above and below for the grown icon, and the frame an open reveal
-   owns for taps stays the buttons' own, so a tap beside them still only closes. The swipe stays custom: SwiftUI's
+   owns for taps stays the buttons' row, so a tap above or below them still only closes. The swipe stays custom: SwiftUI's
    `.swipeActions` exist only on `List` rows. A label stays on one line, shrinking to
    `ChatViewLayout.swipeLabelMinScale`, and the round buttons are top-aligned in one row: "Unread
    from here" wrapped onto two lines and lifted its button above Move's. Tests:

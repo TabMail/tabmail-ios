@@ -65,7 +65,9 @@ final class ChatSwipeUITests: XCTestCase {
         openBubble(2, in: app)
         let move = app.buttons["Move"]
         // 3 pt above the round button: inside that room, outside the button.
-        tap(atY: move.frame.minY - 3, dx: move.frame.midX / app.frame.width, in: app)
+        let y = move.frame.minY - 3
+        XCTAssertGreaterThan(y, subject(in: app).frame.maxY, "control: the tap lands below the header")
+        tap(atY: y, dx: move.frame.midX / app.frame.width, in: app)
         XCTAssertTrue(move.waitForNonExistence(timeout: 3), "the tap only closed the open actions")
         XCTAssertFalse(app.buttons["Sheet Grabber"].waitForExistence(timeout: 2), "and opened no card")
         XCTAssertTrue(isInChat(app), "the chat stays")
@@ -85,8 +87,9 @@ final class ChatSwipeUITests: XCTestCase {
         let unread = unreadLine(in: app)
         XCTAssertFalse(unread.exists, "control: every email is read, so no Unread line")
         let dy = bubble(2, in: app).frame.midY / app.frame.height
-        // From just past the back swipe's edge zone to the far side: past the full-swipe point.
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.12, dy: dy))
+        // From on the bubble (where dragRight starts; left of it are the avatar and the gap, which
+        // are not the bubble's) to the far side: past the full-swipe point.
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: dy))
             .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.98, dy: dy)))
         XCTAssertTrue(isInChat(app), "the chat stays")
         XCTAssertTrue(unread.waitForExistence(timeout: 3), "the full swipe ran Unread from here")
