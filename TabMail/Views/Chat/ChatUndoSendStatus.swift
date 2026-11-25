@@ -68,14 +68,15 @@ extension ChatUnsentReply {
         reduceMotion || Self.bubbleOffersUndo(owner: owner) ? undoLook(at: instant, reduceMotion: reduceMotion) : .solid
     }
 
-    /// Undo on the bubble: the toast's own undo-and-reopen path for this row.
-    @MainActor func undo() {
+    /// Undo on the bubble: the toast's own undo-and-reopen path for this row. `screen`: the screen
+    /// showing the bubble, which the reopened compose records (`ReopenSnapshot.openedOn`).
+    @MainActor func undo(on screen: ComposeScreen = .chat) {
         let service = PendingSendService.shared
         guard let draftId, let instanceEpoch,
               Self.bubbleOffersUndo(owner: service.undoOwner(for: outboxId)) else { return }
         service.undoAndReopen(PendingSendService.Pending(
             id: outboxId, draftId: draftId, instanceEpoch: instanceEpoch, toSummary: "",
-            presentedAt: Date(), holdUntil: holdUntil))
+            presentedAt: Date(), holdUntil: holdUntil), bubbleScreen: screen)
     }
 }
 

@@ -932,6 +932,60 @@ struct ChatUndoSendRoutingTests {
         }
     }
 
+    /// A new email's chat (`ChatNewThreadView`) opens its own new email's card on a draft the chat
+    /// names (`ChatNewThreadModel.card`) and finds the send by it (`ChatNewEmailSend`): a new email
+    /// has no In-Reply-To to find it by.
+    @Test("A new email's chat's own card, sent with the chat view on, has its Undo on the chat's bubble, found by the card's draft; undone there and sent again from the compose the Undo reopened, it keeps the bubble")
+    func newEmailChatCardHasTheBubble() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
+        try await withSendEnvironment { fixture, saved in
+            let service = PendingSendService.shared
+            saved.setChatView(on: true)
+            let model = ChatNewThreadModel(account: fixture.account)
+            model.setPeople([ChatThread.Person(address: "someone@example.com", name: "Someone")])
+            let request = AgentToolRouter.ComposeRequest(
+                mode: .compose, replyTo: nil, to: ["someone@example.com"], cc: [], bcc: [], subject: "Plan",
+                body: "Here is the plan.", origin: ComposeOrigin(sessionKey: model.sessionKey, screen: .chat))
+            let draftId = ChatNewThreadModel.newCardDraftId()
+            let first = try await Self.send(
+                model.card(for: request, account: fixture.account, draftId: draftId) { _ in }, fixture: fixture)
+            #expect(first.inReplyTo == nil, "control: a new email")
+            #expect(first.draftId == draftId, "the send keeps the card's draft")
+            #expect(service.undoOwner(for: first.id) == .bubble, "its Undo is on the chat's bubble")
+            #expect(service.visibleToast?.id != first.id, "no toast for it")
+            try Self.expectQueuedHold(first, "the new email")
+
+            let key = ChatNewEmailSend.Key(draftId: draftId)
+            let found = try await fixture.pool.read { try ChatNewEmailSend.fetch(key, db: $0) }
+            let shown = try #require(found.reply, "the chat finds the send by the card's draft")
+            #expect(shown.id == first.id)
+            let messageId = try #require(first.sentMessageId, "control: the row names its Message-ID")
+            #expect(found.email == ChatNewEmailSend.Email(
+                accountId: first.accountId, messageId: EmailFilter.normalizeMessageId(messageId)), "the sent email, by the row")
+            #expect(found.sentCopyId == nil && !shown.filed, "control: no Sent copy before the send")
+            #expect(shown.bubbleUndoSecondsLeft(at: Date(), owner: service.undoOwner(for: first.id)) != nil,
+                    "its bubble offers the Undo")
+
+            // The test, not the clock, ends the window.
+            try await Self.holdOpen(first, fixture)
+            let held = try await fixture.pool.read { try ChatNewEmailSend.fetch(key, db: $0) }
+            let heldReply = try #require(held.reply, "control: still in the outbox")
+            heldReply.undo(on: .newEmailChat)
+            let reopen = try #require(service.reopenSnapshot, "the bubble's Undo reopens the compose")
+            #expect(reopen.openedOn == .newEmailChat, "the reopened compose records the new email's chat")
+            #expect(reopen.authority.draftId == draftId, "on the card's own draft")
+            let cancelled = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: first.id) } == nil
+            #expect(cancelled, "control: the first send is cancelled")
+
+            let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            #expect(again.draftId == draftId && again.inReplyTo == nil, "control: the same new email, sent again")
+            #expect(service.undoOwner(for: again.id) == .bubble, "its Undo is on the bubble again")
+            #expect(service.visibleToast?.id != again.id, "no toast for it")
+            let foundAgain = try await fixture.pool.read { try ChatNewEmailSend.fetch(key, db: $0) }
+            #expect(foundAgain.reply?.id == again.id, "the chat finds the send again by the same draft")
+        }
+    }
+
     @Test("A reply undone on its bubble, then opened from Drafts and sent, has the toast")
     func draftsSendKeepsTheToast() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")

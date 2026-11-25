@@ -490,10 +490,10 @@ struct ChatNewEmailRequestHostedTests {
                 if chat { ChatThreadView(messageId: id) } else { MessageDetailView(messageId: id) }
             }
         } body: { screen in
-            // The chat shows its person; the email screen its compose button.
+            // The chat shows its person; the email screen its reply menu.
             let shows: (UIView) -> Bool = chat
                 ? { ThreadChatTests.shows("Ann Example", in: $0) }
-                : { Self.composeButton(in: $0) != nil }
+                : { Self.emailScreenIsUp($0) }
             try await ThreadChatTests.wait { Self.depth(screen) == 1 && shows(screen.view) }
             let shown = shows(screen.view)
             #expect(shown, "control: the screen is up: \(ThreadChatTests.labels(screen.view).prefix(12))")
@@ -674,7 +674,7 @@ struct ChatNewEmailRequestHostedTests {
 
     // MARK: - The email screen
 
-    @Test("The email screen with nothing over it takes a link and a second link leaves its new email up; in the detail column, none while the list beside it has something up; its compose button opens an empty new email's chat")
+    @Test("The email screen with nothing over it takes a link and a second link leaves its new email up; in the detail column, none while the list beside it has something up; with the chat view on it has no compose button")
     func linkOverTheEmailScreen() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await linkOverTheEmailScreenBody() }
@@ -685,26 +685,18 @@ struct ChatNewEmailRequestHostedTests {
             NavigationStack { MessageDetailView(messageId: seed.email.id) }
                 .environment(\.listPresentationBesideDetail, seed.state)
         } body: { screen in
-            try await ThreadChatTests.wait { Self.composeButton(in: screen.view) != nil }
-            #expect(Self.composeButton(in: screen.view) != nil, "control: the email screen is up: \(ThreadChatTests.labels(screen.view).prefix(20))")
+            try await ThreadChatTests.wait { Self.emailScreenIsUp(screen.view) }
+            #expect(Self.emailScreenIsUp(screen.view), "control: the email screen is up: \(ThreadChatTests.labels(screen.view).prefix(20))")
             try await ThreadChatTests.settle()
             #expect(screen.topPresented() == nil, "control: nothing is presented over the email")
+            // With the chat view on, a new email starts from the mailbox's compose button or a link,
+            // never from the email screen.
+            #expect(Self.composeButton(in: screen.view) == nil, "no compose button: \(ThreadChatTests.labels(screen.view).prefix(20))")
             try await Self.notTakenBesideTheList(screen)
 
             _ = try await Self.postedLinkShowsNewEmail(screen)
             try await Self.secondLeavesItUp(screen)
             try await Self.backClosesAndSavesNothing(screen)
-
-            let compose = try #require(Self.composeButton(in: screen.view))
-            #expect(compose.accessibilityActivate(), "control: the compose button takes a tap")
-            try await ThreadChatTests.wait { Self.presentedNewEmail(screen) != nil }
-            let presentedLabels = screen.topPresented().map { Array(HostedAccessibility.labels(in: $0.view).prefix(16)) } ?? []
-            let empty = try #require(Self.presentedNewEmail(screen), "the compose button opens the new email's chat: \(presentedLabels)")
-            #expect(Self.fieldText(in: empty)?.isEmpty == true, "with no words")
-            #expect(Self.labels(of: ChatNewThreadView.ccLineId, in: empty).isEmpty, "and no Cc")
-            #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: empty), "Back takes a tap")
-            try await ThreadChatTests.wait { screen.topPresented() == nil }
-            #expect(screen.topPresented() == nil, "Back closes it")
         }
     }
 
@@ -720,7 +712,7 @@ struct ChatNewEmailRequestHostedTests {
         try await withScreen(chatView: chatView, signedIn: signedIn) { seed in
             NavigationStack { MessageDetailView(messageId: seed.email.id) }
         } body: { screen in
-            try await ThreadChatTests.wait { Self.composeButton(in: screen.view) != nil }
+            try await ThreadChatTests.wait { Self.emailScreenIsUp(screen.view) }
             try await ThreadChatTests.settle()
             #expect(screen.topPresented() == nil, "control: nothing is presented over the email")
             NotificationCenter.default.post(name: .contactPillComposeTapped, object: nil, userInfo: Self.link.toUserInfo())
@@ -771,7 +763,7 @@ struct ChatNewEmailRequestHostedTests {
             if chat {
                 try await ThreadChatTests.wait { ThreadChatTests.shows("Ann Example", in: screen.view) }
             } else {
-                try await ThreadChatTests.wait { Self.composeButton(in: screen.view) != nil }
+                try await ThreadChatTests.wait { Self.emailScreenIsUp(screen.view) }
             }
             try await ThreadChatTests.settle()
             #expect(screen.topPresented() == nil, "control: nothing is presented over the screen: \(ThreadChatTests.labels(screen.view).prefix(12))")
@@ -839,7 +831,7 @@ struct ChatNewEmailRequestHostedTests {
         try await withScreen { seed in
             NavigationStack { MessageDetailView(messageId: seed.email.id) }
         } body: { screen in
-            try await ThreadChatTests.wait { Self.composeButton(in: screen.view) != nil }
+            try await ThreadChatTests.wait { Self.emailScreenIsUp(screen.view) }
             try await ThreadChatTests.settle()
             #expect(screen.topPresented() == nil, "control: nothing is presented over the email")
             let shown = try await Self.postedLinkShowsNewEmail(screen)
@@ -1294,6 +1286,12 @@ struct ChatNewEmailRequestHostedTests {
 
     private static func composeButton(in view: UIView) -> NSObject? {
         button("Compose", in: view)
+    }
+
+    /// The email screen is up: its reply menu shows. (With the chat view on it has no compose
+    /// button to look for.)
+    private static func emailScreenIsUp(_ view: UIView) -> Bool {
+        HostedAccessibility.identifiers(in: view).contains("replyMenu")
     }
 
     private static func button(_ label: String, in view: UIView) -> NSObject? {

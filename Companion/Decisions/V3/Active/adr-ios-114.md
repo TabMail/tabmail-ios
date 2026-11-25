@@ -565,7 +565,11 @@ same AI result, kept as long as the email itself is shown.
    the deadline left it offering Undo past it. The agent's cards open through their one presenter on every
    host (`AgentToolRouter.ComposeRequest.composeView(account:openedOn:onOutcome:)`): the chat gives
    it its `composeScreen(answering:)` for the card's email, the inbox and the email's screen give
-   none, and a new email records none. Tests:
+   none, and a new email records none.
+   *Amended 2026-11-24 (#978):* a new email's chat records itself (`ComposeScreen.newEmailChat`)
+   for its own card, whose send it shows as its bubble, found by the card's draft rather than an
+   In-Reply-To; that send's Undo is on the bubble with the chat view on, and the compose it reopens
+   opens over that chat (decision 24, *The compose card and its Send*). Tests:
    `ChatUndoSendTests`, `ChatUndoSendRoutingTests` (the real Send of each kind of compose; the
    agent's cards, the AI Suggestion and the toolbar Forward from the mounted chat with the toast
    over it, one Undo on screen, checked on the hold Send gave the email; a compose built again with
@@ -1754,7 +1758,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      (`ChatNewDraft.send(people:)`); Cancel closes the ask and changes nothing. Writing the email for
      its recipients, the compose card that follows, and the Sending bubble after the card's Send are
      later work; until then Send with people picked does nothing, and keeps the words and
-     attachments.
+     attachments. (Built 2026-11-24: *The compose card and its Send*, below.)
    - *The agent chat.* Each new email's chat has its own session key, in memory only
      (`ChatNewEmailField.newSessionKey`, held by `ChatNewThreadModel.sessionKey`), never carried into
      another chat; no chat turn is stored for it (ADR-004). The screen ends it as it closes
@@ -1898,13 +1902,63 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      - Send's ask offers Add recipient: Done in the sheet it opens continues that Send for the people
        now picked, so the user does not press Send again; Cancel there leaves the words, files and
        picks as they were.
+   - *The compose card and its Send (built 2026-11-24, #978).* Send with people picked sends the
+     field's words to the agent as a new email to them; the agent's `email_compose` card opens over
+     the chat (`openAgentCompose`) with the chat's people, Cc, Bcc, subject and attachments and the
+     agent's words, on a draft of its own that the chat names (`ChatNewThreadModel.card`,
+     `newCardDraftId`: a plain id, so a card closed with Save is an ordinary draft, which reopens in
+     compose). A card the agent opens for another email (a reply or a forward) opens through the
+     agent's one presenter (`composeView(account:onOutcome:)`), and its send is not this chat's.
+     Once the card's Send has its durable outbox row (`ComposeOutcome.sent`):
+     - The chat does not close. When the card has gone it goes on as the next new email to the same
+       people, with the subject, Cc and Bcc it carries, an empty field and no attachments, in a draft
+       and agent session of its own (`ChatNewThreadModel.init(after:)`; left as it is, it saves
+       nothing, and the sent email's discarded generation is never written again). The sent email's
+       chat draft, if it was saved, is discarded through compose's own Discard after any save in
+       flight (`ChatNewThreadModel.discardSavedDraft`, `ComposeDraftDiscard`, which removes the
+       server's copy too), and its session ends. The field starts each new email from that email's
+       own words, once per session key (`DynamicIslandChat.startNewEmail`), so the sent words go.
+     - The chat shows the email's Sending bubble (`ChatUnsentReplyBubble`: the fill, "Sending · Undo
+       Ns", Not sent with Retry and Delete) for that send's outbox row, found by the card's draft id,
+       which the row keeps (`ChatNewEmailSend`, one observation). This replaces the plan above to
+       find the row by the email's Message-ID: the row is found by its draft, and the Message-ID the
+       row names (`OutboxMessage.sentMessageId`) is kept with the chat's key, so the Sent copy is
+       still found after the row has gone. A compose the bubble's Undo reopens keeps the card's
+       draft, so its send again is found the same way.
+     - Its Undo is on the bubble with the chat view on (`ComposeScreen.newEmailChat`;
+       `sendHasBubbleUndo` is true for that screen with no In-Reply-To), and the toast is not shown
+       for it. The compose the bubble's Undo reopens records the bubble's screen
+       (`undoAndReopen(_:bubbleScreen:)`, `ReopenSnapshot.openedOn`), so its send again keeps the
+       bubble.
+     - The bubble's Undo reopens the compose over the chat, not at RootView. The screens over
+       RootView's that can hold a chat are an ordered stack (`PendingSendService.chatModals`): the
+       Search sheet (`chatModalSheet`) and a new email's chat (`undoOutcomesPresented`). The one on
+       top deals with an Undo's outcome: Search closes itself for it (`closesForOutcome`), a new
+       email's chat presents the reopened compose and the "Couldn't undo" notice over itself
+       (`reopen(presentedBy:)`, `undoFailureMessage(presentedBy:)`), and RootView presents only while
+       none is open (`topLevelReopen`). That compose closed unsent returns to the new email's chat,
+       to the same people, with an empty field.
+     - Once the email's copy is in its account's Sent folder (the optimistic copy the send writes,
+       or the server's, read by folder and Message-ID through `messageHeader_rfc822MessageId`), the
+       chat is that email's thread for good (`ChatThreadView(messageId:)` on the Sent copy): later
+       replies land there, and the chat's own Back closes it. The change waits while anything is open
+       over the new email (a card, a picker, "Add recipient"), which it would take down. The new
+       email and the thread share one container (a `ZStack`, never a `Group`: a Group gives its
+       modifiers to each child, so the change would run the screen's close and open and take down
+       what it presents, a reopened compose included).
+     - Accepted: a card for another email opened from a new email's chat keeps the toast, which the
+       chat's cover hides until it closes.
    Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
    reopen route, the source wiring, including the camera's cover not closing the screen, which is
    checked only in the source: the simulator has no camera), `ChatNewThreadScreenTests` (the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
-   row and the opens from Drafts, and since 2026-11-22 a link's chat saving on background only once
-   changed), `ChatNewEmailRequestTests` (every new email: the route, what a link brings and its
+   row and the opens from Drafts, since 2026-11-22 a link's chat saving on background only once
+   changed, and since 2026-11-24 the card's Send: the chat kept as the next new email with the
+   Sending bubble, its Undo reopening the compose over the chat, the thread once the Sent copy is
+   in), `ChatUndoSendTests` and `ChatUndoSendRoutingTests` (since 2026-11-24 the new email's chat:
+   the bubble rule, finding the send by the card's draft, the chat modal stack, the real Send and
+   send again of its card), `ChatNewEmailRequestTests` (every new email: the route, what a link brings and its
    draft, the primary account, the source wiring) and `ChatNewEmailRequestHostedTests` (each screen
    hosted taking a contact pill's or a link's request, or not, compose filled through the email
    screen when the request goes to compose, and the agent's compose waiting for the cover),
