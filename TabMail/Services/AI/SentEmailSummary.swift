@@ -15,6 +15,12 @@ import GRDB
 /// earlier (ADR-IOS-008, recorded divergence). Nothing new is stored: it is the AI cache entry the
 /// Sent copy would have written. An entry no Sent copy takes (the send was undone, or Outlook filed
 /// its own copy under a Message-ID of its own) is purged with the other orphaned AI cache entries.
+///
+/// An email sent with its text version already in hand makes no summary call: the text version
+/// written with its body (the chat's field composition, the AI Suggestion, an edit of the card),
+/// sent with that body unchanged, goes into the same entry with the queue write
+/// (`writeTextVersion`). Only an email whose body was edited by hand, or that came with no text
+/// version, is summarized (ADR-IOS-114 decision 10).
 enum SentEmailSummary {
     /// Whether a send summarizes its email now: the chat view is on and AI may run. Read once, at
     /// the queue write.
@@ -91,6 +97,44 @@ enum SentEmailSummary {
                 blurb: words, todos: nil, reminderDate: nil, reminderTime: nil, reminderContent: nil,
                 textMessage: words)
         }
+    }
+
+    /// The text version a send writes with its queue write, or nil when its email is summarized as
+    /// before: only a text version that says something, and only when the Send-time summary would
+    /// run (`mayRun`, or the demo account's own sends, which `summarizeLocally` would cover).
+    static func textVersionToWrite(_ text: String?, isDemo: Bool) async -> String? {
+        guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        if isDemo { return text }
+        return await mayRun() ? text : nil
+    }
+
+    /// Writes `text`, the queued email's text version already in hand, as its summary under its
+    /// Sent folder and Message-ID, inside the queue write that inserted `outboxId`: the chat's
+    /// Sending bubble reads it from its first value, and the Sent copy restores it. The blurb is the
+    /// same words, as `summarizeLocally` writes it: an entry without one counts as not summarized.
+    /// No Sent folder yet writes nothing, as `summarize` skips.
+    static func writeTextVersion(_ text: String, outboxId: String, db: Database) throws {
+        guard let source = try source(outboxId: outboxId, db: db) else { return }
+        try MessageAICache.writeThrough(
+            accountId: source.accountId,
+            folderPath: source.sentFolderPath,
+            rfc822MessageId: source.messageId,
+            summaryBlurb: text,
+            summaryTextMessage: text,
+            db: db)
+    }
+
+    /// The text version of the queued email `row` (written with it, or the summary made at Send),
+    /// from the AI cache under its Sent folder and Message-ID; nil until there is one.
+    static func textMessage(of row: OutboxMessage, db: Database) throws -> String? {
+        guard let messageId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
+              let sentPath = try Folder
+                .filter(Column("accountId") == row.accountId && Column("role") == FolderRole.sent.rawValue)
+                .fetchOne(db)?.path,
+              let key = MessageAICache.cacheKey(accountId: row.accountId, folderPath: sentPath, rfc822MessageId: messageId),
+              let text = try MessageAICache.fetchOne(db, key: key)?.summaryTextMessage,
+              !text.isEmpty else { return nil }
+        return text
     }
 
     /// Reads the queued email `outboxId`, makes its summary with `produce`, and writes it to the AI

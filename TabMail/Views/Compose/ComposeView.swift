@@ -174,6 +174,15 @@ enum ComposeDraftGuards {
         text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// The text version a send carries (ADR-IOS-114 decision 10): the one written with the body a
+    /// writer put in the card (`written`), only while the body sent is still exactly that body. A
+    /// body edited by hand, or written with no text version, has none, and its email is summarized.
+    static func sentTextVersion(authoredBody: String, written: ReplyResult?) -> String? {
+        guard let written, written.body == authoredBody,
+              let text = written.textMessage, !isBlank(text) else { return nil }
+        return text
+    }
+
     enum AttachmentSnapshotProducer: CaseIterable, Sendable {
         case send
         case explicitSave
@@ -1172,6 +1181,11 @@ struct ComposeView: View {
     /// where it came: the stored suggestion, a recompute, an edit.
     @State private var shownSuggestion: ReplyResult?
     private var currentSuggestion: String? { shownSuggestion?.body }
+    /// The email a writer last put in this card, with the text version written with it: the
+    /// suggestion it opened with (the chat's field composition, the AI Suggestion), a recompute, an
+    /// edit; or, reopened by Undo, the undone send's. Sent with exactly that body, its text version
+    /// is the reply's text in the chat and no summary is made (`ComposeDraftGuards.sentTextVersion`).
+    @State private var writtenEmail: ReplyResult?
     @State private var isRecomputing = false
     /// The card's running recompute: only the card closing cancels it (`cardClosed`); the compose
     /// agent fence admits one Recompute or edit at a time.
@@ -1340,6 +1354,7 @@ struct ComposeView: View {
         preparedDraft: Draft? = nil,
         retainedDraftAuthority: PendingSendService.RetainedDraftAuthority? = nil,
         openedOn: ComposeScreen? = nil,
+        writtenEmail: ReplyResult? = nil,
         onAgentOutcome: (@MainActor (ComposeOutcome) -> Void)? = nil
     ) {
         self.replyTo = replyTo
@@ -1363,6 +1378,7 @@ struct ComposeView: View {
         self.preparedDraft = preparedDraft
         self.retainedDraftAuthority = retainedDraftAuthority
         _openedOn = State(initialValue: openedOn)
+        _writtenEmail = State(initialValue: writtenEmail)
         self.onAgentOutcome = onAgentOutcome
         if let preparedDraft {
             var recipients = ComposeDraftGuards.Recipients()
@@ -2317,6 +2333,7 @@ struct ComposeView: View {
                 // The card closed meanwhile.
                 guard !Task.isCancelled else { return }
                 shownSuggestion = result
+                writtenEmail = result
             }
             guard !Task.isCancelled else { return }
             isRecomputing = false
@@ -2428,6 +2445,8 @@ struct ComposeView: View {
                 BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
                 messageBody = b
             }
+            // The edit wrote this body, with the text version it returned (none: summarized at Send).
+            writtenEmail = edit.edited
         }
         if let value = edit.edited, let reply = edit.target {
             await Self.writeCachedReplyToDB(value, replacing: previous, replyTo: reply, db: dbPool)
@@ -3362,6 +3381,7 @@ struct ComposeView: View {
         }
         if let suggested = suggestionToShow, !suggested.body.isEmpty {
             shownSuggestion = suggested
+            writtenEmail = suggested
             withAnimation(.easeInOut(duration: 0.3)) {
                 showingSuggestion = true
             }
@@ -3772,6 +3792,8 @@ struct ComposeView: View {
             sendHasBubbleUndo: PendingSendService.sendHasBubbleUndo(
                 chatViewActive: chatViewActive, openedOn: openedOn, inReplyTo: outbound.inReplyTo),
             outbound: outbound)
+        // Read with the body above, in the same turn: the text version only of the body sent.
+        let textVersion = ComposeDraftGuards.sentTextVersion(authoredBody: snapshot.authoredBody, written: writtenEmail)
 
         // Capture existing draft (server-side metadata preserved through save-before-send).
         // Async read so the main actor isn't blocked behind a busy writer. `draftId`
@@ -3937,7 +3959,8 @@ struct ComposeView: View {
                 draftId: snapshot.draftId,
                 instanceEpoch: snapshot.instanceEpoch,
                 // The tutorial's practice reply goes out at once (owner 2026-10-21).
-                holdsForUndo: !snapshot.isTutorialPracticeReply
+                holdsForUndo: !snapshot.isTutorialPracticeReply,
+                textVersion: textVersion
             )
         } catch {
             // Persistence failed — the message is NOT queued. Re-enable Send so the

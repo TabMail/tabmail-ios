@@ -48,7 +48,11 @@ struct UndoReopenCompose: View {
             prefillDraftId: snapshot.authority.draftId,
             retainedDraftAuthority: snapshot.authority,
             // The chat after its bubble's Undo, so a send again keeps the bubble's Undo.
-            openedOn: snapshot.openedOn
+            openedOn: snapshot.openedOn,
+            // The kept row's body is the body the undone send's text version was written for.
+            writtenEmail: reopened?.draft.flatMap { draft in
+                snapshot.sentTextVersion.map { ReplyResult(body: draft.body, textMessage: $0) }
+            }
         )
     }
 }
