@@ -99,8 +99,9 @@ struct DynamicIslandChat: View {
         return ChatFieldWords.key(for: message)
     }
     @State var fieldPulse = false
-    /// A new email's chat has put its draft's words in the field (`ChatNewEmailField.startWords`).
-    @State private var newEmailStarted = false
+    /// The new email whose words the field took as it started (`ChatNewEmailField.startWords`), by
+    /// its session.
+    @State private var newEmailSession: String?
     @State private var inputSelection: TextSelection?
     @State private var dictation = DictationController()
     /// Dictation for a user opted out of AI: Apple's recognition on this iPhone only (`PillDictationMode`).
@@ -1788,12 +1789,19 @@ struct DynamicIslandChat: View {
 
     /// A new email's chat opening: its draft's words, once, then its reply field takes the
     /// keyboard (`InputFocus.replyField`: the panel, which `isTextFieldFocused` focuses, never
-    /// opens in a new email's chat).
+    /// opens in a new email's chat). The next new email after a send (a new session, the chat
+    /// already open) starts with its own words, none, in place of the sent email's; the keyboard
+    /// is left as it is.
     private func startNewEmail() {
-        guard let newEmail = replyField?.newEmail, !newEmailStarted else { return }
-        newEmailStarted = true
-        if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) }
-        focusedInput = .replyField
+        guard let newEmail = replyField?.newEmail, newEmail.sessionKey != newEmailSession else { return }
+        let opening = newEmailSession == nil
+        newEmailSession = newEmail.sessionKey
+        if opening {
+            if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) }
+            focusedInput = .replyField
+        } else {
+            fieldFill.apply(.put(newEmail.startWords))
+        }
     }
 
     /// A dictation is recording, transcribing, or starting: its words are coming to the field.

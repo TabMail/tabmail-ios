@@ -357,6 +357,34 @@ final class ChatNewThreadModel: Hashable {
         openedContent = savedContent
     }
 
+    /// The chat after its card sent the email (ADR-IOS-114): a new email to the same people, with
+    /// the subject, Cc and Bcc the chat carries, from the same account, with an empty field and no
+    /// attachments, in a draft and agent session of its own. Left as it is, it is not saved. Its own
+    /// draft, not the sent chat's: that one's row was discarded at the send, and its generation
+    /// with it.
+    init(after sent: ChatNewThreadModel) {
+        draftId = Draft.newEmailKey()
+        queueDraftSave = sent.queueDraftSave
+        account = sent.account
+        people = sent.people
+        toLeftovers = sent.toLeftovers
+        authoredTo = sent.authoredTo
+        startWords = ""
+        words = ""
+        carried = sent.carried
+        attachments = []
+        attachmentLoadFailed = false
+        cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
+        openedContent = ChatNewDraft.Content(
+            words: "",
+            recipients: ChatNewDraft.toEntries(people: sent.people, authored: sent.authoredTo, leftovers: sent.toLeftovers),
+            attachments: [])
+    }
+
+    /// A new draft id for each compose card the chat opens (`card`), as compose gives a new email
+    /// of its own: a card closed with Save is an ordinary draft, which reopens in compose.
+    nonisolated static func newCardDraftId() -> String { UUID().uuidString }
+
     var content: ChatNewDraft.Content {
         ChatNewDraft.Content(
             words: words,
@@ -425,15 +453,22 @@ final class ChatNewThreadModel: Hashable {
     /// writes them, `toEntries`), the subject, Cc and Bcc it carries (a link's or a reopened
     /// draft's subject wins over the agent's), the attachments waiting above the field, and From
     /// `account`, changeable on the card as compose's From is. Only the card's Send sends.
+    ///
+    /// `draftId` is the card's own draft, new for each card (`newCardDraftId`): no row has it yet,
+    /// so compose starts from these fields as any new email does, and its send's outbox row
+    /// carries it, so the chat finds the send by it (`ChatNewEmailSend`). The card records this
+    /// chat as its screen, so the send's Undo is on the chat's bubble
+    /// (`PendingSendService.sendHasBubbleUndo`).
     func card(
-        for req: AgentToolRouter.ComposeRequest, account: Account?,
+        for req: AgentToolRouter.ComposeRequest, account: Account?, draftId: String,
         onOutcome: @escaping @MainActor (ComposeOutcome) -> Void
     ) -> ComposeView {
         ComposeView(
             suggestedBody: req.body, account: account,
             prefillTo: content.recipients, prefillCc: carried.cc, prefillBcc: carried.bcc,
             prefillSubject: carried.shownSubject ?? req.subject,
-            prefillAttachments: attachments, onAgentOutcome: onOutcome)
+            prefillAttachments: attachments, prefillDraftId: draftId, openedOn: .newEmailChat,
+            onAgentOutcome: onOutcome)
     }
 
     /// After the card's Send has its durable outbox row: this chat's saved draft, if it has one,

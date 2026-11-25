@@ -4,12 +4,12 @@
 
 /// The kind of screen a compose window was opened on, given by that screen as the compose opens
 /// (`ComposeView.openedOn`) and never read later from what is on screen. With the chat view
-/// setting read at the Send tap, it decides whether a reply's Undo is on the chat's "Sending"
-/// bubble (`PendingSendService.sendHasBubbleUndo`): only a compose the chat opened for one of its
-/// own emails closes back onto the chat that shows that bubble. The compose an Undo reopens records
-/// the screen the undone send had (`PendingSendService.ReopenSnapshot.openedOn`): the chat after its
-/// bubble's Undo, none after the toast's. A compose opened anywhere else (the Drafts list, the
-/// inbox, an email screen) records none, and its send keeps the toast.
+/// setting read at the Send tap, it decides whether a send's Undo is on a chat's "Sending"
+/// bubble (`PendingSendService.sendHasBubbleUndo`): only a compose a chat opened for a send it
+/// shows closes back onto the chat that shows that bubble. The compose an Undo reopens records
+/// the screen of the bubble whose Undo reopened it (`PendingSendService.ReopenSnapshot.openedOn`),
+/// none after the toast's. A compose opened anywhere else (the Drafts list, the inbox, an email
+/// screen) records none, and its send keeps the toast.
 ///
 /// Only a screen whose compose behaves differently is named; nil stands for every other.
 enum ComposeScreen: Hashable, Sendable {
@@ -18,4 +18,8 @@ enum ComposeScreen: Hashable, Sendable {
     /// (`ChatThreadView.composeScreen`). A compose it opens for a new email, or for an email of
     /// another thread, records none.
     case chat
+    /// A new email's chat (`ChatNewThreadView`), for the compose card it opens for its own new
+    /// email: the chat shows that send as its bubble, found by the card's draft
+    /// (`ChatNewEmailSend`), not by an In-Reply-To.
+    case newEmailChat
 }
