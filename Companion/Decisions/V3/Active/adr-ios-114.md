@@ -485,11 +485,15 @@ same AI result, kept as long as the email itself is shown.
    that reports `sent` completes the field's words at once (`EmailReplyTool.Written.sent`,
    `ChatFieldFill.Change.completed` in `DynamicIslandChat.composeNewEmailFromField`): the card
    reports `sent` before it closes, so applying `notWritten` there put the words back into the
-   field under the closing card and emptied them a moment later, a visible blink. Tests:
+   field under the closing card and emptied them a moment later, a visible blink. It is the one
+   completion the pill applies through its own fill: a new email's chat has no `ChatFieldWords`
+   key, so its words are the pill's own, and the send's end holds the pill as it was at Send; a
+   request with a chat key ends on that key. Tests:
    `SuggestionRewriteRouteTests.writtenLandsBeforeItsCard` and `stopDuringTheHoldOpensNothing`,
    `ChatSuggestionBubbleTests.fieldSendWritesIntoTheGhost`,
    `ChatReplyRecoveryTests.heldFieldEditThroughTheGhostAndItsCard`,
    `ChatReplyFieldTests.fieldWritingBubble` and the new email's `ended` check,
+   `ChatReplyFieldRuntimeTests.clearWiring`,
    `EmailComposeToolOutcomeTests` (the `sent` outcome).
    **The AI Reply shows only while the field holds no words of the user's, and never on the user's
    turn (decided 2026-11-07):** `ChatFieldFill.offer`. An empty field, or the AI Reply the app itself

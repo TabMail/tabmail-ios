@@ -400,8 +400,15 @@ struct ChatReplyFieldRuntimeTests {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         #expect(!text.contains("fieldClearCount"), "no view counter carries a completion")
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(!island.contains("fieldFill.apply(.completed)") && !island.contains("fieldFill.apply(.confirmationCard)"),
-                "the pill never applies a request's transition to the chat it shows")
+        // A request with a chat key ends on that key, never through the pill's fill, which by then can
+        // be another chat's. A new email's chat has no chat key: its words are the pill's own, and its
+        // send's end applies to them through the pill as it was at Send (the closure holds that value).
+        let newEmail = try Self.function("private func composeNewEmailFromField(", in: island)
+        let completions = island.components(separatedBy: "fieldFill.apply(.completed)").count - 1
+        #expect(completions == 1 && newEmail.contains("fieldFill.apply(.completed)"),
+                "the pill completes only a new email's chat, which has no chat key, through its own fill")
+        #expect(!island.contains("fieldFill.apply(.confirmationCard)"),
+                "the pill never applies a request's confirmation card to the chat it shows")
         #expect(island.components(separatedBy: "ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)").count == 2,
                 "the closed field's written email completes on the key captured at send")
         let router = try Self.source("TabMail/Services/AI/AgentToolRouter.swift")

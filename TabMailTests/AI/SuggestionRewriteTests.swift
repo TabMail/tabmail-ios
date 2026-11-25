@@ -455,6 +455,24 @@ struct SuggestionRewriteRouteTests {
         var queuedAtLanding: [Int] = []
     }
 
+    /// What a request run in its own task told the agent, once it is in.
+    @MainActor
+    final class Told {
+        var text: String?
+    }
+
+    /// The closed field's Send as the app makes it. A fresh reply goes through the field's own
+    /// entry (`composeFromField`, the only caller that hands the tool a field reply); an edit of
+    /// the suggestion shown goes through `run`, the same edit path, so a test can take either
+    /// in-place choice. `words` are what the user put in the field.
+    static func fieldSend(
+        _ tool: EmailReplyTool, _ invocation: ToolInvocation, words: String, suggestionShows: Bool, rewritesInPlace: Bool
+    ) async throws -> String {
+        guard suggestionShows else { return await tool.composeFromField(words, invocation: invocation).text }
+        return try await tool.run(
+            arguments: ["unique_id": .int(1), "request": .string(words)], invocation: invocation, rewritesInPlace: rewritesInPlace)
+    }
+
     /// The closed field's one path (ADR-IOS-114 decision 10, amended 2026-11-25): whatever is
     /// written (an edit stored in place, an edit only on the card, or a fresh reply), the email's
     /// text version lands in the AI Suggestion's bubble before any card is queued, and the card
@@ -475,8 +493,9 @@ struct SuggestionRewriteRouteTests {
                 landing.texts.append(text)
                 landing.queuedAtLanding.append(router.composeQueueDepth)
             })
-        let request = request
-        let task = Task { @MainActor in try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: rewritesInPlace) }
+        let task = Task { @MainActor in
+            try await Self.fieldSend(tool, invocation, words: "more formal", suggestionShows: suggestionShows, rewritesInPlace: rewritesInPlace)
+        }
         let card = try #require(await waitForCard(router), "the card opens")
         #expect(landing.texts == [Self.editedText], "the email's text version lands, once")
         #expect(landing.queuedAtLanding == [0], "before its card is queued")
@@ -502,12 +521,24 @@ struct SuggestionRewriteRouteTests {
                 // Stop, while the email is held to be read.
                 withUnsafeCurrentTask { $0?.cancel() }
             })
-        let request = request
-        let output = try await Task { @MainActor in
-            try await tool.run(arguments: request, invocation: invocation, rewritesInPlace: true)
-        }.value
+        let told = Told()
+        let task = Task { @MainActor in
+            told.text = try await Self.fieldSend(tool, invocation, words: "more formal", suggestionShows: suggestionShows, rewritesInPlace: true)
+        }
+        // A card that opens anyway is taken and closed, so a failure here never leaves the run
+        // waiting on a card no one closes.
+        var opened: AgentToolRouter.ComposeRequest?
+        let deadline = Date().addingTimeInterval(2)
+        while told.text == nil, opened == nil, Date() < deadline {
+            opened = fixture.router.takeCompose(for: Self.chatHost)
+            await Task.yield()
+        }
+        opened?.onOutcome(.cancelled)
+        try await task.value
+        let output = try #require(told.text, "the request ends")
         #expect(landing.texts == [Self.editedText], "control: the email landed")
-        #expect(fixture.router.composeQueueDepth == 0 && fixture.router.takeCompose(for: Self.chatHost) == nil, "no card opens")
+        let cardOpened = opened != nil
+        #expect(!cardOpened && fixture.router.composeQueueDepth == 0, "no card opens")
         #expect(output.contains(ComposeOutcome.cancelled.describeForLLM), "\(output)")
         let stored = try await row(fixture.db, fixture.header.id).suggestion
         if suggestionShows {
