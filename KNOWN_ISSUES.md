@@ -364,7 +364,7 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 | [IOS-CATCHUP-004](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-004.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — the IMAP older-mail check lists and loads nothing in a folder whose UIDVALIDITY is not known or whose reset is pending (C3: nothing is decided about an unproven numbering). The deleted date-based self-heal also repaired such folders; that is not replaced. The folder stays owed, and the next listing after a SELECT reports the epoch loads what is missing. |
 | [IOS-CATCHUP-005](Companion/Process/Current/KnownIssues/Amendments/ios-catchup-005.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-20, #1062)** — on a nonconforming server whose SELECT omits UIDNEXT (RFC 3501 §6.3.1, RFC 9051 §6.3.2 require it), a listing of a folder with no bookmark and no stored top lists only up to the last local UID (flags and removals as before) and completes only as not clean: mail above it is not looked for, and an owed folder stays owed and is listed again at the daily check. A later range SELECT without UIDNEXT keeps the stored top. A SELECT that reports UIDNEXT resumes the full listing. |
 
-### OUTBOX (2)
+### OUTBOX (4)
 
 | ID | Class | Executive statement |
 |---|---|---|
