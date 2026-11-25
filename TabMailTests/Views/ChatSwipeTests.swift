@@ -356,7 +356,7 @@ struct ChatSwipeTests {
     func revealWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatSwipe.swift")
         #expect(text.contains("shouldBegin: { velocityX, atEdge in ChatSwipe.takesDrag(id: id, openId: open.id, sign: sign, velocityX: velocityX, startsAtScreenEdge: atEdge) },"))
-        #expect(text.contains("return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, startsAtScreenEdge)"),
+        #expect(text.contains("return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, atEdge)"),
                 "a vertical drag stays the scroll view's")
         #expect(text.contains(".onDisappear { ChatSwipeHold.shared.releaseNow(id) open.left(id) }"),
                 "a reveal whose view leaves the chat is no longer open")
@@ -381,10 +381,59 @@ struct ChatSwipeTests {
         #expect(text.contains("func makeUIGestureRecognizer(context: Context) -> UIPanGestureRecognizer { Self.makePan(delegate: context.coordinator) }"))
     }
 
-    /// A pan whose speed the test sets, as UIKit reports it to the delegate before the pan starts.
+    /// A pan whose speed and touch count the test sets, as UIKit reports them to the delegate before
+    /// the pan starts: one touch for a finger's drag, none for a trackpad's or scroll wheel's scroll.
     private final class MovingPan: UIPanGestureRecognizer {
         var speed = CGPoint.zero
+        var touches = 1
         override func velocity(in view: UIView?) -> CGPoint { speed }
+        override var numberOfTouches: Int { touches }
+    }
+
+    // The owner's simulator run (2026-11-24): every chat swipe was dead, both ways, while the inbox's
+    // list swipes worked. A UIKit pan takes no scrolls unless told to, so a two-finger trackpad swipe
+    // or a scroll wheel never reached the chat's swipes; a drag did (the swipe UI tests).
+    @Test("The swipes take a trackpad's two-finger swipe and a scroll wheel, as the inbox's list swipes do")
+    func swipesTakeScrolls() {
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _, _ in true })
+        let pan = ChatHorizontalPan.makePan(delegate: coordinator)
+        #expect(pan.allowedScrollTypesMask.contains(.continuous), "a trackpad's two-finger swipe")
+        #expect(pan.allowedScrollTypesMask.contains(.discrete), "a mouse's scroll wheel")
+    }
+
+    @Test("A scroll never starts at the screen's edge, whatever an earlier finger's touch left")
+    func scrollNeverStartsAtTheEdge() {
+        var edges: [Bool] = []
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _, atEdge in edges.append(atEdge); return true })
+        let pan = MovingPan()
+        pan.delegate = coordinator
+        pan.speed = CGPoint(x: 120, y: 4)
+        // A finger comes down at the screen's left edge.
+        let touch = PlacedTouch()
+        touch.point = CGPoint(x: 1, y: 300)
+        pan.touches = 0
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: touch))
+        #expect(coordinator.startsAtScreenEdge, "control: that touch is in the back swipe's zone")
+        pan.touches = 1
+        #expect(coordinator.gestureRecognizerShouldBegin(pan))
+        pan.touches = 0
+        #expect(coordinator.gestureRecognizerShouldBegin(pan))
+        #expect(edges == [true, false], "the finger's drag starts at the edge; a scroll after it never does")
+    }
+
+    @Test("While something is open a scroll elsewhere closes it as a drag does; with nothing open the closer takes no scroll")
+    func closerTakesScrollsOnlyWhileOpen() {
+        let open = ChatSwipeOpen()
+        let closer = ChatSwipeCloser.Coordinator(open: open)
+        #expect(closer.pan.allowedScrollTypesMask.isEmpty, "nothing open: no swipe waits for the closer on a scroll")
+        open.open("b", frame: CGRect(x: 0, y: 100, width: 300, height: 50), buttons: .zero)
+        #expect(closer.pan.allowedScrollTypesMask.contains(.continuous) && closer.pan.allowedScrollTypesMask.contains(.discrete),
+                "something open: a trackpad or wheel scroll elsewhere closes it")
+        open.close()
+        #expect(closer.pan.allowedScrollTypesMask.isEmpty, "nothing open again")
+        open.open("b", frame: .zero, buttons: .zero)
+        open.left("b")
+        #expect(closer.pan.allowedScrollTypesMask.isEmpty, "the open reveal's view left: nothing open")
     }
 
     @Test("A sideways drag starts the swipe unless the rule declines it; an upright drag never asks")

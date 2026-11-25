@@ -386,10 +386,13 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
     }
 
     /// The swipe's pan, asking `delegate` before it starts so a vertical drag stays the scroll
-    /// view's (`Coordinator.gestureRecognizerShouldBegin`).
+    /// view's (`Coordinator.gestureRecognizerShouldBegin`). It takes a trackpad's two-finger swipe
+    /// and a mouse's scroll wheel as well as a finger's drag, as the inbox's list swipes do: a
+    /// UIKit pan takes no scrolls unless told to.
     static func makePan(delegate: any UIGestureRecognizerDelegate) -> UIPanGestureRecognizer {
         let pan = UIPanGestureRecognizer()
         pan.delegate = delegate
+        pan.allowedScrollTypesMask = .all
         return pan
     }
 
@@ -467,10 +470,13 @@ struct ChatHorizontalPan: UIGestureRecognizerRepresentable {
             windowX <= ChatViewLayout.backSwipeEdgeWidth
         }
 
+        /// A scroll (a trackpad or a scroll wheel) has no touch, so it never starts at the screen's
+        /// edge, whatever an earlier drag's touch left in `startsAtScreenEdge`.
         func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
             guard let pan = recognizer as? UIPanGestureRecognizer else { return false }
             let velocity = pan.velocity(in: pan.view)
-            return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, startsAtScreenEdge)
+            let atEdge = pan.numberOfTouches > 0 && startsAtScreenEdge
+            return abs(velocity.x) > abs(velocity.y) && shouldBegin(velocity.x, atEdge)
         }
 
         /// A swipe runs alone: once it has the drag, nothing else acts on it (a back swipe, the
@@ -891,11 +897,27 @@ struct ChatSwipeCloser: UIViewRepresentable {
         init(open: ChatSwipeOpen) {
             self.open = open
             super.init()
-            open.openChanged = { [weak self] isOpen in self?.setEdgePop(enabled: !isOpen) }
+            open.openChanged = { [weak self] isOpen in self?.openChanged(isOpen) }
             for recognizer in [pan, tap] as [UIGestureRecognizer] {
                 recognizer.delegate = self
                 recognizer.addTarget(self, action: #selector(handle(_:)))
             }
+            takesScrolls(open.id != nil)
+        }
+
+        /// Something opened, or nothing is open any more: the screen-edge back swipe is off while
+        /// something is open, and the closing pan takes scrolls only then.
+        private func openChanged(_ isOpen: Bool) {
+            setEdgePop(enabled: !isOpen)
+            takesScrolls(isOpen)
+        }
+
+        /// While something is open, a trackpad's two-finger swipe or a scroll wheel elsewhere closes
+        /// it as a drag does (the swipes take scrolls, `ChatHorizontalPan.makePan`). With nothing open
+        /// the pan takes none, as it takes no touch then (`shouldReceive`), so no swipe ever waits for
+        /// it to decline a scroll.
+        private func takesScrolls(_ takes: Bool) {
+            pan.allowedScrollTypesMask = takes ? .all : []
         }
 
         func install(on view: UIView, anchor: UIView, edgePop: UIGestureRecognizer?) {
