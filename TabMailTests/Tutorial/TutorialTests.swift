@@ -156,16 +156,26 @@ struct TutorialCoachContentTests {
         #expect(!last.examples.isEmpty)
     }
 
-    @Test("Compose asks for the Edit first, then Use Suggestion, then Send")
+    @Test("Compose asks for the Edit first, then a Send that sends nothing, then Use Suggestion, then Send")
     func composeFollowsTheSuggestion() throws {
-        func compose(showingSuggestion: Bool, edited: Bool) throws -> TutorialCoachContent {
+        func compose(showingSuggestion: Bool, edited: Bool, sendTried: Bool = false) throws -> TutorialCoachContent {
             try #require(TutorialCoachContent.make(
                 step: .replyToPriya, lesson: .reuseReply, host: .compose(showingSuggestion: showingSuggestion),
-                flightsAsked: false, replyEdited: edited))
+                flightsAsked: false, replyEdited: edited, sendAsIsTapped: sendTried))
         }
-        #expect(try compose(showingSuggestion: true, edited: false).message.contains("Edit"))
-        #expect(try compose(showingSuggestion: true, edited: true).message.contains("Use Suggestion"))
-        #expect(try compose(showingSuggestion: false, edited: true).title.contains("Send"))
+        let edit = try compose(showingSuggestion: true, edited: false)
+        let sendAsIs = try compose(showingSuggestion: true, edited: true)
+        let useSuggestion = try compose(showingSuggestion: true, edited: true, sendTried: true)
+        let send = try compose(showingSuggestion: false, edited: true, sendTried: true)
+        #expect(edit.message.contains("Edit"))
+        #expect(sendAsIs.message.contains("tap Send") && sendAsIs.message.contains("won't go out"),
+                "after the edit: Send sends it as it is, and in the tutorial that tap sends nothing")
+        #expect(!sendAsIs.message.contains("Use Suggestion"), "Use Suggestion is the next stage, not this one")
+        #expect(useSuggestion.message.contains("Use Suggestion") && useSuggestion.message.contains("then Send"))
+        #expect(send.title.contains("Send"))
+        let stages = [edit, sendAsIs, useSuggestion, send]
+        #expect(Set(stages.map(\.title)).count == stages.count, "each stage turns the page")
+        #expect(stages.allSatisfy { $0.progressLine.hasPrefix("2 of 3") }, "the new stage is still part 2 of 3")
     }
 
 
@@ -255,10 +265,16 @@ struct TutorialCoachContentTests {
             }
         }
         #expect(admitted == allowed)
-        // Use Suggestion comes after the practice reply's edit, never before.
-        #expect(TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: .replyToPriya, replyEdited: true))
+        // Use Suggestion comes after the practice reply's edit and its Send that sends nothing, never before.
+        #expect(TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: .replyToPriya,
+                                           replyEdited: true, sendAsIsTapped: true))
+        #expect(!TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: .replyToPriya,
+                                            replyEdited: true), "not before the Send that sends nothing")
+        #expect(!TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: .replyToPriya,
+                                            sendAsIsTapped: true), "not before the edit")
         for step in Self.allSteps where step != .replyToPriya {
-            #expect(!TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: step, replyEdited: true))
+            #expect(!TutorialCoordinator.allows(.useSuggestion, messageId: fixture.priyaOffsite, step: step,
+                                                replyEdited: true, sendAsIsTapped: true))
         }
     }
 
@@ -776,11 +792,21 @@ struct TutorialLifecycleTests {
         // The draft chat holds the edit; Use Suggestion waits for it.
         #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt)
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
+        #expect(!coordinator.practiceSendIsNoOp, "before the edit, Send is not the practice tap")
+        coordinator.practiceSendAsIsTapped()
+        #expect(!coordinator.sendAsIsTapped, "a tap before the edit does not skip a stage")
         var edited: ReplyResult?
         await coordinator.runPracticeReplyEdit { edited = $0 }
         #expect(edited?.body == TutorialChatScript.shorterReply, "the draft receives the shorter reply")
         #expect(coordinator.replyEdited)
         #expect(coordinator.composeEditPrompt == nil, "the edit is not offered again")
+        // Then a Send that sends nothing; Use Suggestion waits for it.
+        #expect(coordinator.practiceSendIsNoOp)
+        #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
+        coordinator.practiceSendAsIsTapped()
+        #expect(coordinator.sendAsIsTapped)
+        #expect(!coordinator.practiceSendIsNoOp, "only the first Send after the edit sends nothing")
+        #expect(coordinator.step == .replyToPriya, "the step still waits for the reply")
         #expect(coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
         let reply = "Count me in."
         coordinator.practiceReplyAuthored(reply)
@@ -927,6 +953,36 @@ struct TutorialLifecycleTests {
         #expect(edited == nil, "the ended run's edit must not reach a draft")
         #expect(!coordinator.replyEdited, "the new run's reply is not edited")
         #expect(coordinator.composeEditPrompt == TutorialCoordinator.editPrompt, "the new run still offers its edit")
+        #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
+        await coordinator.end()
+    }
+
+    /// Skip from the stage after the Send that sends nothing, then part 2 again: the new run starts
+    /// at the edit, so its compose goes through every stage again.
+    @Test("Skip after the Send that sends nothing; a new run asks for the edit and that Send again")
+    func skipFromTheSendAsIsStageResetsIt() async throws {
+        let fixture = try install()
+        let store = DemoModeStore.shared
+        let coordinator = TutorialCoordinator.shared
+        defer {
+            store._resetForTests()
+            InstalledTestDatabaseLifetime.finish(previous: fixture.2, pool: fixture.0, directory: fixture.1)
+        }
+        store._resetForTests()
+        try #require(!coordinator.isRunning)
+
+        try await startRun(.reuseReply)
+        try #require(coordinator.step == .replyToPriya)
+        await coordinator.runPracticeReplyEdit { _ in }
+        coordinator.practiceSendAsIsTapped()
+        try #require(coordinator.sendAsIsTapped, "control: the stage was reached")
+
+        await coordinator.end()
+        #expect(!coordinator.sendAsIsTapped, "Skip ends the stage with the run")
+        try await startRun(.reuseReply)
+        try #require(coordinator.step == .replyToPriya)
+        #expect(!coordinator.replyEdited && !coordinator.sendAsIsTapped, "the new run starts at the edit")
+        #expect(!coordinator.practiceSendIsNoOp, "Send before the edit is not the practice tap")
         #expect(!coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId, messageId: DemoSeed.TutorialFixture.priyaOffsite))
         await coordinator.end()
     }

@@ -16,8 +16,8 @@ enum TutorialCoachHost: Equatable {
     case compose(showingSuggestion: Bool)
     /// A chat in the chat view: Priya's in part 2, Jordan's in part 3.
     case chat
-    /// The TabMail panel opened from Priya's chat (part 2): its card sits above the panel's
-    /// input, since the open panel covers the chat's own card.
+    /// The TabMail panel opened from Priya's chat (part 2): its card sits at the panel's top,
+    /// under the email card, since the open panel covers the chat's own card.
     case chatPanel
     /// Action Classification, opened by "See rule" on the part 1 result.
     case actionRules
@@ -63,6 +63,7 @@ struct TutorialCoachContent: Equatable {
     /// The card `host` shows for `step`, or nil when this host has none.
     /// `isSending`: a send is waiting out its undo window (`PendingSendService`).
     /// `replyEdited`: the practice reply's scripted edit ran.
+    /// `sendAsIsTapped`: after the edit, the practice Send that sends nothing was tapped.
     /// `templateAsked`: part 2's template request was sent from the panel.
     static func make(
         step: TutorialCoordinator.Step,
@@ -70,6 +71,7 @@ struct TutorialCoachContent: Equatable {
         host: TutorialCoachHost,
         flightsAsked: Bool,
         replyEdited: Bool = false,
+        sendAsIsTapped: Bool = false,
         isSending: Bool = false,
         templateAsked: Bool = false
     ) -> TutorialCoachContent? {
@@ -124,9 +126,14 @@ struct TutorialCoachContent: Equatable {
             if !showingSuggestion {
                 return card("Tap Send.", "Practice only: it goes to the demo Sent folder. Nobody receives an email.")
             }
-            return replyEdited
-                ? card("TabMail changed it.", "Tap Use Suggestion to put it in your reply.")
-                : card("TabMail wrote the email.", "Say what to change: tap Edit at the top, then Send.")
+            // The edit, then a Send that sends nothing (Send sends the AI Suggestion as it is),
+            // then Use Suggestion to edit it by hand.
+            if !replyEdited {
+                return card("TabMail wrote the email.", "Say what to change: tap Edit at the top, then Send.")
+            }
+            return sendAsIsTapped
+                ? card("Or make it yours.", "Tap Use Suggestion, change what you like, then Send.")
+                : card("TabMail changed it.", "Looks good? Just tap Send. Don't worry, this one won't go out.")
         case (.makeTemplate, .chat):
             return card(
                 "Sent. Now ask TabMail.",

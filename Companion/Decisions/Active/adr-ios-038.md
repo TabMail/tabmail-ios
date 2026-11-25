@@ -584,3 +584,15 @@ TabMail panel: the field's hint says to drag it up, the panel opens only at that
 the filled-in request "Save this as my template.", and its Send runs `TutorialChatScript` inside
 `sendAgentChat(_:script:)` as the inbox chat's prompts do. The reply field holds no words and sends nothing in the
 tutorial. Detail, wording and tests: ADR-IOS-114, decision 13, amendment 2026-11-25.
+
+**Amendment 2026-11-25 (later the same day): Send as it is, then Use Suggestion.** After the scripted edit, compose's
+practice reply asks first for a tap on Send, saying that Send sends the AI Suggestion as it is. In the tutorial that
+tap sends nothing: `ComposeView.trySend`'s accept-and-send branch calls `practiceSendAsIsTapped()` and returns, so no
+undo window opens and nothing reaches Sent; the card then turns ("Or make it yours." / "Tap Use Suggestion, change
+what you like, then Send."). The two cards are short and plain on purpose: the first says "Looks good? Just tap
+Send. Don't worry, this one won't go out." Only after that tap does `MailGesture.useSuggestion` unlock (`allows(...,
+sendAsIsTapped:)`), so Use Suggestion and the accept-and-send of ADR-IOS-100 item 4 wait for both the edit and that
+tap. Send's ring shows at that tap and again at the last Send; Use Suggestion's ring after it. The compose card's
+identity follows both flags (`.id([replyEdited, sendAsIsTapped])`), for the reason given in smoke-test round 3. A run
+or part start resets the flag with `replyEdited`. Why: the tutorial shows that Send alone sends the
+suggestion as it is, and that Use Suggestion lets the user edit it by hand first.

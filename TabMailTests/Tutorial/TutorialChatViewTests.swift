@@ -28,11 +28,12 @@ struct TutorialChatViewContentTests {
 
     private func card(
         _ step: Step, _ lesson: TutorialLesson, _ host: TutorialCoachHost,
-        flightsAsked: Bool = false, replyEdited: Bool = false, isSending: Bool = false, templateAsked: Bool = false
+        flightsAsked: Bool = false, replyEdited: Bool = false, sendAsIsTapped: Bool = false,
+        isSending: Bool = false, templateAsked: Bool = false
     ) -> TutorialCoachContent? {
         TutorialCoachContent.make(
             step: step, lesson: lesson, host: host, flightsAsked: flightsAsked, replyEdited: replyEdited,
-            isSending: isSending, templateAsked: templateAsked)
+            sendAsIsTapped: sendAsIsTapped, isSending: isSending, templateAsked: templateAsked)
     }
 
     @Test("Each chat-view card shows where its step happens: part 2 in Priya's chat and its panel, part 3's answer in Jordan's chat, then the switch")
@@ -84,13 +85,17 @@ struct TutorialChatViewContentTests {
         #expect(try #require(card(.replyToPriya, .reuseReply, .inbox, isSending: true)).showsProgress)
     }
 
-    @Test("In the chat view, compose asks for the Edit, then Use Suggestion, then Send")
+    @Test("In the chat view, compose asks for the Edit, then a Send that sends nothing, then Use Suggestion, then Send")
     func composeInTheChatView() throws {
         let first = try #require(card(.replyToPriya, .reuseReply, .compose(showingSuggestion: true)))
         #expect(first.message.contains("Edit"))
         let edited = try #require(card(.replyToPriya, .reuseReply, .compose(showingSuggestion: true), replyEdited: true))
-        #expect(edited.message.contains("Use Suggestion"))
-        let send = try #require(card(.replyToPriya, .reuseReply, .compose(showingSuggestion: false), replyEdited: true))
+        #expect(edited.message.contains("tap Send") && !edited.message.contains("Use Suggestion"))
+        let tried = try #require(card(.replyToPriya, .reuseReply, .compose(showingSuggestion: true),
+                                      replyEdited: true, sendAsIsTapped: true))
+        #expect(tried.message.contains("Use Suggestion"))
+        let send = try #require(card(.replyToPriya, .reuseReply, .compose(showingSuggestion: false),
+                                     replyEdited: true, sendAsIsTapped: true))
         #expect(send.title.contains("Send"))
     }
 
@@ -1120,7 +1125,11 @@ extension TutorialChatViewRunTests {
                     replyEdited: coordinator.replyEdited, isSending: false))
                 #expect(card.message.contains("Tap the AI Suggestion"))
                 #expect(coordinator.fieldMove(inPracticeChat: true) == .tapSuggestion, "the tap the card asks for is the chat's move")
-                // The tap reopens the card, where Use Suggestion is now admitted, so the run goes on.
+                // The tap reopens the card, where Send sends nothing and turns the page, and then
+                // Use Suggestion is admitted, so the run goes on.
+                #expect(coordinator.practiceSendIsNoOp)
+                coordinator.practiceSendAsIsTapped()
+                #expect(coordinator.step == .replyToPriya)
                 #expect(coordinator.admits(.useSuggestion, accountId: DemoSeed.demoAccountId,
                                            messageId: DemoSeed.TutorialFixture.priyaOffsite))
             }
@@ -1362,6 +1371,12 @@ struct TutorialChatViewWiringTests {
                 "only the inbox chat rings its close; Priya's panel holds its own card")
         #expect(Self.count("if TutorialCoordinator.shared.isRunning, let cardAction = replyField?.tutorialPanelCard {", in: pill) == 1)
         #expect(Self.count("TutorialCoachView(host: .chatPanel, onAction: cardAction)", in: pill) == 1, "the open panel shows the step's card")
+        // At the panel's top, under the email card: never over the conversation or the Create card's buttons.
+        let emailCard = try #require(pill.range(of: ".accessibilityIdentifier(\"chatEmailCard\")"))
+        let panelCard = try #require(pill.range(of: "TutorialCoachView(host: .chatPanel, onAction: cardAction)"))
+        let conversation = try #require(pill.range(of: "chatMessagesView .transition(.opacity)"))
+        #expect(emailCard.lowerBound < panelCard.lowerBound && panelCard.lowerBound < conversation.lowerBound,
+                "the panel's card sits between the email card and the conversation")
         #expect(Self.count("if replyField?.tutorialPanelCard != nil { return TutorialCoordinator.shared.panelPrompt(inPracticeChat: true) }", in: pill) == 1,
                 "the panel of Priya's chat holds the step's request")
         #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) sendAgentChat(prompt.rawValue, script: prompt)", in: pill) == 1)
@@ -1379,6 +1394,30 @@ struct TutorialChatViewWiringTests {
                 "in the tutorial only the step that asks for it opens the card")
         #expect(Self.count("TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)", in: chat) == 1,
                 "the chat opened at Jordan's email completes part 3")
+    }
+
+    @Test("After the edit, compose's first Send on the practice reply sends nothing and turns the page; then Use Suggestion, then Send")
+    func composeSendAsIsWiring() throws {
+        let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
+        let trySend = try #require(compose.range(of: "private func trySend() {"))
+        let accepting = try #require(compose.range(of: "case .sendAcceptingSuggestion:", range: trySend.upperBound..<compose.endIndex))
+        let noOp = "if isTutorialPracticeReply && TutorialCoordinator.shared.practiceSendIsNoOp { TutorialCoordinator.shared.practiceSendAsIsTapped() return }"
+        #expect(Self.count(noOp, in: compose) == 1, "the practice tap only turns the page: nothing is sent, no undo window")
+        let tap = try #require(compose.range(of: noOp))
+        let gate = try #require(compose.range(
+            of: ".useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return } acceptVisibleSuggestionIfOffered() startSend()"))
+        let typed = try #require(compose.range(of: "case .sendAsTyped:", range: accepting.upperBound..<compose.endIndex))
+        #expect(accepting.lowerBound < tap.lowerBound && tap.lowerBound < gate.lowerBound && gate.lowerBound < typed.lowerBound,
+                "in Send with the suggestion shown: the practice tap first, then the Use Suggestion gate and the send")
+        // The rings and the card follow the stage.
+        #expect(Self.count("if isTutorialPracticeReply && (!showingSuggestion || TutorialCoordinator.shared.practiceSendIsNoOp) {", in: compose) == 1,
+                "Send rings at the practice tap and at the real Send")
+        #expect(Self.count("if isTutorialPracticeReply && TutorialCoordinator.shared.replyEdited && TutorialCoordinator.shared.sendAsIsTapped {", in: compose) == 1,
+                "Use Suggestion rings after the practice tap")
+        #expect(Self.count(".id([TutorialCoordinator.shared.replyEdited, TutorialCoordinator.shared.sendAsIsTapped])", in: compose) == 1,
+                "a new card per stage")
+        let card = try Self.source("TabMail/Views/Tutorial/TutorialCoachCard.swift")
+        #expect(Self.count("replyEdited: tutorial.replyEdited, sendAsIsTapped: tutorial.sendAsIsTapped,", in: card) == 1)
     }
 
     @Test("The switch step's sheet, the Reply tag and the reference's highlight are wired")

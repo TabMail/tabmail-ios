@@ -27,6 +27,10 @@ prompt was friction.
    scripted edit (ADR-IOS-038). Before the edit, Send with the visible suggestion shows the locked
    notice and does nothing. (The old alert's button bypassed that lock.) After the edit the coach card
    still says "Tap Use Suggestion", which remains correct.
+   *Amended 2026-11-25:* after the edit the card first asks for a tap on Send, saying Send sends the
+   suggestion as it is. In the tutorial that first Send sends nothing and turns the page
+   (`TutorialCoordinator.practiceSendIsNoOp`); only then is the gate open, and the card says "Tap Use
+   Suggestion". Outside the tutorial nothing changes (ADR-IOS-038, amendment of the same day).
 
 **Invariant pinned by tests:** Send with an empty body and a visible suggestion sends exactly the
 suggestion text and never shows a prompt; empty body with no usable suggestion prompts; a typed body

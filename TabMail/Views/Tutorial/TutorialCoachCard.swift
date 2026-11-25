@@ -20,6 +20,7 @@ struct TutorialCoachView: View {
             step: step, lesson: lesson, host: host,
             flightsAsked: tutorial.flightsAsked,
             replyEdited: tutorial.replyEdited,
+            sendAsIsTapped: tutorial.sendAsIsTapped,
             isSending: PendingSendService.shared.isSending,
             templateAsked: tutorial.templateAsked) {
             TutorialCoachCard(
