@@ -2,6 +2,8 @@
 > **Current routing note (ADR-IOS-114, 2026-11-05):** decision 7 below, "Caching with TTL", is superseded on iOS: there is no TTL; an AI result lives as long as its email is on the device, a documented deviation from TB.
 >
 > **Trigger-only divergence (owner 2026-11-07, ADR-IOS-114):** with the chat view on, iOS summarizes an email the user sends from the moment it is queued (`SentEmailSummary`), not when its Sent copy is processed as TB does. It is the same summary call on the same final email (`isSentByUser`), written to the same AI cache key (Sent folder plus the email's own Message-ID), which the Sent copy then restores; only the moment it runs differs, so the chat's Sending bubble can show it while the email goes out.
+>
+> **Widened 2026-11-25 (ADR-IOS-114 decision 10, the text version in hand):** an email sent from a compose card with the body a writer put in it (the chat's field composition, the AI Suggestion, an edit of the card), unchanged, makes no summary call at all: the text version written with that body is stored as its summary (blurb and text message) in the same AI cache entry, at the queue write. Only a body edited by hand, or one written with no text version, is summarized as above. TB has no such path; its Sent copy is always summarized.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ## ADR-IOS-008: AI Processing Must Replicate TB Addon Architecture
