@@ -73,8 +73,11 @@ final class TutorialCoordinator {
     private(set) var flightsAsked = false
     /// "What can you do?" was sent: nothing more to send, Finish is on the card.
     private(set) var whatCanYouDoAsked = false
-    /// The practice reply's scripted edit ran: compose moves on to Use Suggestion.
+    /// The practice reply's scripted edit ran: compose moves on to a Send that sends nothing.
     private(set) var replyEdited = false
+    /// After the edit, that Send was tapped: compose moves on to Use Suggestion, then the real
+    /// practice Send.
+    private(set) var sendAsIsTapped = false
     /// Part 2's template request was sent from the panel: its card moves on to Create.
     private(set) var templateAsked = false
     /// "See rule" opened the Action Classification sheet with the sample rule.
@@ -182,6 +185,7 @@ final class TutorialCoordinator {
         flightsAsked = false
         whatCanYouDoAsked = false
         replyEdited = false
+        sendAsIsTapped = false
         templateAsked = false
         showsActionRule = false
         savedTemplateId = nil
@@ -226,6 +230,7 @@ final class TutorialCoordinator {
 
     private func begin(_ lesson: TutorialLesson) {
         replyEdited = false
+        sendAsIsTapped = false
         templateAsked = false
         switch lesson {
         case .actOnEmail: step = .archiveReceipt
@@ -365,6 +370,18 @@ final class TutorialCoordinator {
         replyEdited = true
     }
 
+    /// Compose's Send on the practice reply only shows what Send does: after the edit, before Use
+    /// Suggestion, a tap sends nothing (no undo window) and the card moves on.
+    var practiceSendIsNoOp: Bool {
+        step == .replyToPriya && replyEdited && !sendAsIsTapped
+    }
+
+    /// The practice reply's Send that sends nothing was tapped.
+    func practiceSendAsIsTapped() {
+        guard practiceSendIsNoOp else { return }
+        sendAsIsTapped = true
+    }
+
     /// The step's email reference in the chat answer (and its Open Email) is
     /// the next tap.
     var highlightsEmailReference: Bool { step == .askFlights && flightsAsked }
@@ -495,7 +512,8 @@ final class TutorialCoordinator {
         case tagTap
         /// Choosing a tag from the tag menu (teaching the right action).
         case retag
-        /// Use Suggestion on the practice reply, once its edit ran.
+        /// Use Suggestion on the practice reply, once its edit ran and the Send that sends nothing
+        /// was tapped.
         case useSuggestion
         /// Swipes, triage and every other mail action.
         case other
@@ -503,13 +521,14 @@ final class TutorialCoordinator {
 
     /// Whether the step asks for `gesture` on `messageId` (nil: no message).
     nonisolated static func allows(
-        _ gesture: MailGesture, messageId: String?, step: Step?, replyEdited: Bool = false
+        _ gesture: MailGesture, messageId: String?, step: Step?, replyEdited: Bool = false,
+        sendAsIsTapped: Bool = false
     ) -> Bool {
         guard let messageId, messageId == tagTarget(for: step) else { return false }
         switch gesture {
         case .tagTap: return step == .archiveReceipt || step == .replyToPriya
         case .retag: return step == .retagDailyTech
-        case .useSuggestion: return step == .replyToPriya && replyEdited
+        case .useSuggestion: return step == .replyToPriya && replyEdited && sendAsIsTapped
         case .other: return false
         }
     }
@@ -519,7 +538,8 @@ final class TutorialCoordinator {
     func admits(_ gesture: MailGesture, accountId: String? = nil, messageId: String? = nil) -> Bool {
         guard isRunning else { return true }
         if accountId == DemoSeed.demoAccountId,
-           Self.allows(gesture, messageId: messageId, step: step, replyEdited: replyEdited) {
+           Self.allows(gesture, messageId: messageId, step: step, replyEdited: replyEdited,
+                       sendAsIsTapped: sendAsIsTapped) {
             return true
         }
         showLockedNotice()

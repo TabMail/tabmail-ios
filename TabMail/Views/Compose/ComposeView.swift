@@ -1527,8 +1527,8 @@ struct ComposeView: View {
                         TutorialCoachView(host: .compose(showingSuggestion: showingSuggestion))
                             // The cover does not re-run this card when the edit
                             // lands (measured: only the inbox card did), while
-                            // compose itself redraws: a new card per edit state.
-                            .id(TutorialCoordinator.shared.replyEdited)
+                            // compose itself redraws: a new card per stage.
+                            .id([TutorialCoordinator.shared.replyEdited, TutorialCoordinator.shared.sendAsIsTapped])
                             .padding(.vertical, 8)
                     }
 
@@ -1762,8 +1762,10 @@ struct ComposeView: View {
                                     hasUnacknowledgedFailure:
                                         attachmentCarryGate.hasUnacknowledgedFailure) != .ready)
                             .overlay {
-                                // Guided tutorial: Send is the practice reply's last step.
-                                if isTutorialPracticeReply && !showingSuggestion {
+                                // Guided tutorial: Send is the practice reply's last step, and
+                                // after the edit its Send that sends nothing.
+                                if isTutorialPracticeReply
+                                    && (!showingSuggestion || TutorialCoordinator.shared.practiceSendIsNoOp) {
                                     TutorialPulseRing(shape: Capsule(), outset: 8)
                                 }
                             }
@@ -2279,7 +2281,8 @@ struct ComposeView: View {
                         .background(Theme.accent)
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                         .overlay {
-                            if isTutorialPracticeReply && TutorialCoordinator.shared.replyEdited {
+                            if isTutorialPracticeReply && TutorialCoordinator.shared.replyEdited
+                                && TutorialCoordinator.shared.sendAsIsTapped {
                                 TutorialPulseRing(shape: RoundedRectangle(cornerRadius: 8), lineWidth: 2, outset: 3)
                             }
                         }
@@ -3644,8 +3647,15 @@ struct ComposeView: View {
         case .promptEmptyBody:
             showEmptyBodyPrompt = true
         case .sendAcceptingSuggestion:
+            // Guided tutorial: after the scripted edit, the practice reply's first Send only shows
+            // that Send sends the suggestion as it is. Nothing is sent and no undo window opens;
+            // the card moves on to Use Suggestion.
+            if isTutorialPracticeReply && TutorialCoordinator.shared.practiceSendIsNoOp {
+                TutorialCoordinator.shared.practiceSendAsIsTapped()
+                return
+            }
             // Same gate as the card's Use Suggestion: the guided tutorial
-            // unlocks it only after the scripted edit.
+            // unlocks it only after the scripted edit and that Send.
             guard TutorialCoordinator.shared.admits(
                 .useSuggestion, accountId: replyTo?.accountId, messageId: replyTo?.messageId) else { return }
             acceptVisibleSuggestionIfOffered()
