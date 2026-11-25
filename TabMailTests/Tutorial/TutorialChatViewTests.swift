@@ -1086,7 +1086,7 @@ struct TutorialChatViewWiringTests {
     @Test("The tutorial's field holds the request and nothing else: never the AI Suggestion")
     func fieldText() {
         let field = { (move: TutorialCoordinator.FieldMove?) in
-            ChatReplyField(example: nil, isNoReply: false, tutorialMove: move)
+            ChatReplyField(example: nil, tutorialMove: move)
         }
         #expect(DynamicIslandChat.tutorialFieldText(field(.tapSuggestion)) == nil, "the move is a tap on the ghost")
         #expect(DynamicIslandChat.tutorialFieldText(field(.ask(.saveReplyAsTemplate)))
@@ -1099,7 +1099,7 @@ struct TutorialChatViewWiringTests {
         let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count("TutorialChatInputBar( prompt: Self.tutorialFieldText(field), isWorking: isWorking, send: { sendTutorialField(field) })", in: field) == 1)
         #expect(Self.count("case .tapSuggestion, nil: break", in: field) == 1, "the field's Send never opens compose")
-        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: field) == 1)
+        #expect(Self.count("TutorialCoordinator.shared.chatPromptSent(prompt) let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, suggestion: field.suggestion) } sendAgentChat(prompt.rawValue, script: prompt, field: send)", in: field) == 1)
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count("if let status = script?.workingStatus { enqueueStatus(status) }", in: pill) == 1, "Saving template shows while it works")
         #expect(Self.count("if (isInboxChat || replyField != nil) && TutorialCoordinator.shared.highlightsChatClose {", in: pill) == 1,

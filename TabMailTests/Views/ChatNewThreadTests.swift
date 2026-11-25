@@ -283,17 +283,14 @@ struct ChatNewThreadTests {
 
     // MARK: - The field and the header
 
-    @Test("The new email's field has its own placeholder; every other field keeps its own")
+    @Test("The new email's field has its own placeholder; a thread's field keeps its own")
     func fieldPlaceholder() {
         let field = Self.newEmailField()
-        let newEmail = ChatReplyField(example: nil, isNoReply: false, newEmail: field)
-        let noReplyNewEmail = ChatReplyField(example: nil, isNoReply: true, newEmail: field)
-        let reply = ChatReplyField(example: nil, isNoReply: false)
-        let noReply = ChatReplyField(example: nil, isNoReply: true)
+        let newEmail = ChatReplyField(example: nil, newEmail: field)
+        let reply = ChatReplyField(example: nil)
         #expect(newEmail.placeholder == "Message or ask anything")
-        #expect(noReplyNewEmail.placeholder == ChatNewEmailField.placeholder)
-        #expect(reply.placeholder == "Reply or ask anything")
-        #expect(noReply.placeholder == "Ask anything")
+        #expect(newEmail.placeholder == ChatNewEmailField.placeholder)
+        #expect(reply.placeholder == "Write your reply")
         #expect(reply.newEmail == nil)
     }
 

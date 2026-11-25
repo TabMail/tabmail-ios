@@ -182,7 +182,7 @@ struct ChatNewThreadView: View {
                 isInputFocused: $chatInputFocused,
                 isWorking: $chatWorking,
                 replyField: ChatReplyField(
-                    example: example, isNoReply: false,
+                    example: example,
                     newEmail: ChatNewEmailField(
                         startWords: model.startWords,
                         sessionKey: model.sessionKey,

@@ -1016,7 +1016,7 @@ struct ChatThreadView: View {
                 replyingOnlyTo(only)
             }
             if isNoReply && !chatExpanded {
-                // The field stays usable (the agent declines to write a reply).
+                // The field stays usable: its Send writes a reply all the same, which nobody reads.
                 Text("This is a no-reply email. Replies won't be read.")
                     .font(.caption)
                     .foregroundStyle(Theme.textSecondary)
@@ -1030,7 +1030,6 @@ struct ChatThreadView: View {
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
                     example: ChatReplyField.example(shown: shown, configured: example),
-                    isNoReply: isNoReply,
                     onlyTo: replyTarget.only,
                     tutorialMove: tutorialMove(thread),
                     drag: fieldDrag,

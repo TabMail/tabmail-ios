@@ -139,7 +139,7 @@ struct PillDictationModeTests {
         #expect(view.contains(".onChange(of: speech.isStarting) { _, _ in refreshDictationPermissions() }"))
         #expect(view.contains("speechPermission = SFSpeechRecognizer.authorizationStatus()\n        microphonePermission = AVAudioApplication.shared.recordPermission"))
         #expect(view.contains("onDevice: onDeviceReadiness,"))
-        #expect(view.contains("PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote)"))
+        #expect(view.contains("PillDictationMode.placeholder(\n                isCompose: isComposeMode, isChatPanel: replyField != nil, offNote: dictationOffNote)"))
         let controller = try String(contentsOf: root.appendingPathComponent("TabMail/Services/Dictation/DictationController.swift"), encoding: .utf8)
         #expect(controller.contains("guard canUseAI, !isOptedOutOfAI() else {"))
     }
@@ -147,9 +147,12 @@ struct PillDictationModeTests {
     /// Why the mic is off comes first in either bar; without a reason each bar keeps its own hint.
     @Test func theReadinessNoteOutranksTheBarsOwnPlaceholder() throws {
         let note = try #require(OnDeviceReadiness.microphoneBlocked.note)
-        #expect(PillDictationMode.placeholder(isCompose: true, offNote: note) == note)
-        #expect(PillDictationMode.placeholder(isCompose: false, offNote: note) == note)
-        #expect(PillDictationMode.placeholder(isCompose: true, offNote: nil) == "Describe your edit...")
-        #expect(PillDictationMode.placeholder(isCompose: false, offNote: nil) == "Type or speak...")
+        #expect(PillDictationMode.placeholder(isCompose: true, isChatPanel: false, offNote: note) == note)
+        #expect(PillDictationMode.placeholder(isCompose: false, isChatPanel: false, offNote: note) == note)
+        #expect(PillDictationMode.placeholder(isCompose: false, isChatPanel: true, offNote: note) == note)
+        #expect(PillDictationMode.placeholder(isCompose: true, isChatPanel: false, offNote: nil) == "Describe your edit...")
+        #expect(PillDictationMode.placeholder(isCompose: false, isChatPanel: false, offNote: nil) == "Type or speak...")
+        // The chat view's TabMail panel says its words go to TabMail.
+        #expect(PillDictationMode.placeholder(isCompose: false, isChatPanel: true, offNote: nil) == "Ask TabMail")
     }
 }

@@ -1963,7 +1963,7 @@ struct DictationOptOutFlagTests {
         #expect(overlay.contains("if dictation.isActive { DictationPillView(controller: dictation)"))
         #expect(source.components(separatedBy: "DictationPillView(").count == 2)
         #expect(source.components(separatedBy: "TextField(").count == 2)
-        #expect(source.contains("inputField(placeholder: PillDictationMode.placeholder(isCompose: isComposeMode, offNote: dictationOffNote))"))
+        #expect(source.contains("inputField(placeholder: PillDictationMode.placeholder(\n                isCompose: isComposeMode, isChatPanel: replyField != nil, offNote: dictationOffNote))"))
         #expect(DictationConfig.dimmedInputOpacity > 0 && DictationConfig.dimmedInputOpacity < 0.5)
     }
 
