@@ -1469,7 +1469,7 @@ struct SendReplyMarksTests {
         return try await pool.write { db in
             try MessageHeaderRekey.finishMove(
                 move, destinations: [proven],
-                addressChangesOnMove: true, accountScopedIds: accountScopedIds, db: db)
+                addressChangesOnMove: true, accountScopedIds: accountScopedIds, copiedNothing: false, db: db)
         }
     }
 

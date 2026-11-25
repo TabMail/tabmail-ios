@@ -666,7 +666,10 @@ struct ProcessResponseForDisplayTests {
 
 // MARK: - clearAll Tests
 
-@Suite("ChatIdTranslator clearAll")
+/// `.processGlobalState`: `clearAll()` runs `DELETE FROM chatIdMapping` on the
+/// shared database, which would otherwise wipe the stored rows of the suites
+/// that carry the trait while they run.
+@Suite("ChatIdTranslator clearAll", .processGlobalState)
 struct ClearAllTests {
 
     @Test("clearAll resets all state")

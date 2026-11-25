@@ -1727,6 +1727,40 @@ struct QueueCoreInvariantTests {
                 "a refused move dropped the only local row of a message that never left the source")
     }
 
+    /// A move that leaves the queue with NO provider result (a retry-limit exit,
+    /// an epoch refusal, a not-found drop, a claim-time retire) proves no copy,
+    /// so its optimistic IMAP row and body stay: the message may never have left
+    /// its source, and this row may be its only local copy.
+    @Test("IMAP: a move retired with no provider result keeps its row and body")
+    func moveRetiredWithNoProviderResultKeepsTheRow() async throws {
+        let fixture = try fixture(accountId: "acc-retired-no-result")
+        defer { finish(fixture) }
+
+        let row = try seedHeader(
+            fixture, messageId: "55", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        try await fixture.pool.write { db in
+            try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>retired</p>")
+                .insert(db)
+        }
+        let op = PendingOperation(
+            type: .move, messageIds: ["55"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        let retired = try await fixture.pool.write { db in
+            var queued = op
+            try queued.insert(db)
+            return try AccountOperationExecutor.deleteRetiringOperation(queued, db: db)
+        }
+        #expect(retired, "precondition: the operation left the queue")
+
+        let (header, body) = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: row.id),
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: row.id)))
+        }
+        #expect(header != nil && body != nil,
+                "a move with no provider result dropped the only local row of a message no copy was proven for")
+    }
+
     @Test("account-scoped: a retired move with no proven destination keeps its row and body")
     func accountScopedMissingEvidenceKeepsTheRow() async throws {
         let fixture = try fixture(
