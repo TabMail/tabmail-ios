@@ -174,8 +174,10 @@ struct ChatThreadLayoutTests {
                 #expect(abs(mic.midY - lineMid) < 1, "mic \(mic) on the line at \(lineMid)")
                 #expect(abs(send.midX - (field.maxX - ChatViewLayout.fieldSendInset - ChatViewLayout.fieldSendSize / 2)) < 1,
                         "Send circle 6 in from the edge: \(send), field \(field)")
-                #expect(abs(mic.midX - (field.minX + ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2)) < 1,
-                        "mic 12 in from the edge: \(mic), field \(field)")
+                // The mic circle mirrors Send: as far in from the field's start as Send is from its end.
+                #expect(abs((mic.midX - field.minX) - (field.maxX - send.midX)) < 1,
+                        "mic \(mic) mirrors Send \(send) in the field \(field)")
+                #expect(abs(mic.width - send.width) < 1, "the mic's tap area is Send's: \(mic.width) and \(send.width)")
                 #expect(send.height >= 44 && mic.height >= 44, "tap areas stay 44 tall")
             }
         }

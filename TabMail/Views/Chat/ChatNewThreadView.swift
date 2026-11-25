@@ -335,12 +335,12 @@ struct ChatPaperclipButton: View {
             Image(systemName: "paperclip")
                 .font(.body)
                 .foregroundStyle(Theme.textSecondary)
-                .frame(width: ChatViewLayout.fieldMicTapWidth, height: ChatViewLayout.fieldTapSize)
+                .frame(width: ChatViewLayout.fieldPaperclipTapWidth, height: ChatViewLayout.fieldTapSize)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .modifier(FieldButtonSlot(
-            glyphWidth: ChatViewLayout.fieldPaperclipGlyphWidth, tapWidth: ChatViewLayout.fieldMicTapWidth,
+            glyphWidth: ChatViewLayout.fieldPaperclipGlyphWidth, tapWidth: ChatViewLayout.fieldPaperclipTapWidth,
             lineHeight: lineHeight))
         .accessibilityLabel("Attach")
         .accessibilityIdentifier(Self.id)

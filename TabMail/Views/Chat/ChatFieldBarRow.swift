@@ -28,7 +28,7 @@ struct ChatFieldBarRow<Mic: View, Field: View, Send: View>: View {
     var body: some View {
         HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
             mic.modifier(FieldButtonSlot(
-                glyphWidth: ChatViewLayout.fieldMicGlyphWidth, tapWidth: ChatViewLayout.fieldMicTapWidth,
+                glyphWidth: ChatViewLayout.fieldMicSize, tapWidth: ChatViewLayout.fieldTapSize,
                 lineHeight: lineHeight))
             text.frame(maxWidth: .infinity, minHeight: lineHeight, alignment: .leading)
             send.modifier(FieldButtonSlot(
@@ -38,6 +38,30 @@ struct ChatFieldBarRow<Mic: View, Field: View, Send: View>: View {
         .padding(.leading, ChatViewLayout.fieldMicInset)
         .padding(.trailing, ChatViewLayout.fieldSendInset)
         .padding(.vertical, ChatViewLayout.fieldVerticalPadding)
+    }
+}
+
+/// The field's mic, a circle that mirrors Send (`ChatViewLayout.fieldMicSize`), in grays only so
+/// Send stays the field's one colour (`Palette.chatMic*`). Idle: a gray outline around `symbol`
+/// (the outlined mic, or the struck-through one when dictation is off). Listening: a solid circle
+/// with `symbol` (the stop square) in the opposite colour.
+struct ChatMicCircle: View {
+    let symbol: String
+    let listening: Bool
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(listening ? Palette.chatMicListeningFill : .clear)
+            Circle()
+                .strokeBorder(listening ? Palette.chatMicListeningFill : Palette.chatMicIdle,
+                              lineWidth: ChatViewLayout.fieldMicOutlineWidth)
+            Image(systemName: symbol)
+                .contentTransition(.symbolEffect(.replace))
+                .font(.system(size: listening ? ChatViewLayout.fieldMicStopPointSize : ChatViewLayout.fieldMicGlyphPointSize))
+                .foregroundStyle(listening ? Palette.chatMicListeningStop : Palette.chatMicIdle)
+        }
+        .frame(width: ChatViewLayout.fieldMicSize, height: ChatViewLayout.fieldMicSize)
     }
 }
 

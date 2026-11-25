@@ -288,11 +288,11 @@ struct ChatNewThreadScreenTests {
             let inOrder = mic.midX < text.minX && text.maxX < clip.midX && clip.midX < send.midX
             #expect(inOrder, "mic, words, paperclip, Send, in that order: \(mic) \(text) \(clip) \(send)")
             let sendAtEnd = row.maxX - ChatViewLayout.fieldSendInset - ChatViewLayout.fieldSendSize / 2
-            let micAtStart = row.minX + ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2
+            let micAtStart = row.minX + ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicSize / 2
             #expect(abs(send.midX - sendAtEnd) < 1, "Send keeps its place at the row's end: \(send), row \(row)")
             #expect(abs(mic.midX - micAtStart) < 1, "the mic keeps its place at the row's start: \(mic), row \(row)")
             #expect(abs(send.width - ChatViewLayout.fieldTapSize) < 1, "Send keeps its width: \(send.width)")
-            #expect(abs(mic.width - ChatViewLayout.fieldMicTapWidth) < 1, "the mic keeps its width: \(mic.width)")
+            #expect(abs(mic.width - ChatViewLayout.fieldTapSize) < 1, "the mic keeps its width: \(mic.width)")
             // With the e.g. line under the words, the paperclip stays on Send's line, level with
             // Send and the mic, not up on the words' first line.
             #expect(fromNewEmail, "control: the e.g. line shows")

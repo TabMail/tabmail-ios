@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftUI
 import Testing
+import UIKit
 @testable import TabMail
 
 /// ADR-IOS-114: the chat's reply field.
@@ -1550,10 +1552,43 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".frame(maxWidth: .infinity) // The row pads only itself: the status line keeps the field's padding above it. .padding(.top, ChatViewLayout.fieldVerticalPadding)", in: field) == 1)
     }
 
-    @Test("The tutorial tooltip's arrow points at the mic glyph's centre")
+    @Test("The tutorial tooltip's arrow points at the mic circle's centre")
     func tutorialArrowOnTheMic() {
-        let micCentre = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2
+        let micCentre = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicSize / 2
         #expect(TutorialChatInputBar.tooltipArrowCenterX + TutorialChatInputBar.tooltipInset == micCentre)
+    }
+
+    @Test("The mic circle mirrors Send and draws in grays only: Send is the field's one colour")
+    func micCircleGrays() throws {
+        #expect(ChatViewLayout.fieldMicSize == ChatViewLayout.fieldSendSize)
+        #expect(ChatViewLayout.fieldMicInset == ChatViewLayout.fieldSendInset)
+        for dark in [false, true] {
+            let traits = UITraitCollection(userInterfaceStyle: dark ? .dark : .light)
+            // A gray has (almost) no saturation; the accent's and red's are far above this.
+            let colors = [(Palette.chatMicIdle, false), (Palette.chatMicListeningFill, false),
+                          (Palette.chatMicListeningStop, false), (Theme.accent, true)]
+            for (color, isAccent) in colors {
+                var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
+                UIColor(color).resolvedColor(with: traits).getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+                let gray = saturation < 0.1
+                #expect(gray != isAccent, "saturation \(saturation), dark \(dark), accent \(isAccent) (the accent is the control)")
+            }
+            // Listening: black on white in light mode, white on black in dark mode.
+            var fill: CGFloat = 0, stop: CGFloat = 0, alpha: CGFloat = 0
+            UIColor(Palette.chatMicListeningFill).resolvedColor(with: traits).getWhite(&fill, alpha: &alpha)
+            UIColor(Palette.chatMicListeningStop).resolvedColor(with: traits).getWhite(&stop, alpha: &alpha)
+            let expectedFill: CGFloat = dark ? 1 : 0
+            #expect(abs(fill - expectedFill) < 0.01 && abs(stop - (1 - expectedFill)) < 0.01, "fill \(fill), stop \(stop), dark \(dark)")
+        }
+        // Every field bar draws its mic as the circle and colours it nowhere else.
+        let chat = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        let micButton = try Self.body(of: "var micButton: some View {", in: chat)
+        #expect(Self.count("ChatMicCircle(symbol: micSymbol, listening: micListening)", in: micButton) == 1)
+        #expect(Self.count(".foregroundStyle", in: micButton) == 0, "the circle sets its own grays")
+        let symbol = try Self.body(of: "var micSymbol: String {", in: chat)
+        #expect(Self.count("if micListening { return \"stop.fill\" } return canDictate ? \"mic\" : \"mic.slash\"", in: symbol) == 1)
+        let tutorial = try Self.source("TabMail/Views/Tutorial/TutorialChatInputBar.swift")
+        #expect(Self.count("ChatMicCircle(symbol: \"mic\", listening: false)", in: tutorial) == 1)
     }
 
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")

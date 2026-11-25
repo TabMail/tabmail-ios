@@ -131,17 +131,20 @@ enum ChatViewLayout {
     // Every open field bar's row (`ChatFieldBarRow`): the chat's reply field, the opened pill's
     // input bar (inbox, edit mode over a draft, the per-message pill) and the tutorial's copy.
     // Measured from the visible glyphs. The collapsed Chat pill keeps its own size.
-    /// The field's edge to the mic glyph.
-    static let fieldMicInset: CGFloat = 12
-    /// The mic glyph's width at the body size.
-    static let fieldMicGlyphWidth: CGFloat = 13
-    /// The mic's tap width; it may reach past the field's edge into the side margin.
-    static let fieldMicTapWidth: CGFloat = 38
     /// Between a button's glyph and the text.
     static let fieldTextGap: CGFloat = 10
     /// The Send circle's diameter, and its distance from the field's edge.
     static let fieldSendSize: CGFloat = 28
     static let fieldSendInset: CGFloat = 6
+    /// The mic circle (`ChatMicCircle`) mirrors Send: the same diameter and the same distance from
+    /// the field's other edge. Its tap area is Send's too (`fieldTapSize` square).
+    static let fieldMicSize: CGFloat = fieldSendSize
+    static let fieldMicInset: CGFloat = fieldSendInset
+    /// The idle mic circle's outline, and the point sizes of the mic glyph and the listening stop
+    /// square inside it. Fixed, as Send's circle is, so the glyphs always fit the circle.
+    static let fieldMicOutlineWidth: CGFloat = 1.5
+    static let fieldMicGlyphPointSize: CGFloat = 15
+    static let fieldMicStopPointSize: CGFloat = 11
     /// Every field button's tap height and the Send button's tap width.
     static let fieldTapSize: CGFloat = 44
     /// Above and below the text.
@@ -150,9 +153,10 @@ enum ChatViewLayout {
     static let fieldLineHeight: CGFloat = 22
     /// The collapsed reply field's corner: a capsule at one line (42 / 2), then fixed as it grows.
     static let fieldCornerRadius: CGFloat = 21
-    /// The field's paperclip, at the text's end on Send's row: its glyph's width at the body size.
-    /// Its tap width is the mic's (`fieldMicTapWidth`).
+    /// The field's paperclip, at the text's end on Send's row: its glyph's width at the body size,
+    /// and its tap width.
     static let fieldPaperclipGlyphWidth: CGFloat = 13
+    static let fieldPaperclipTapWidth: CGFloat = 38
     /// The paperclip while the agent works on a Send from the field: it stays in its place, dimmed
     /// to this opacity and not tappable.
     static let fieldPaperclipDimmedOpacity: Double = 0.35
