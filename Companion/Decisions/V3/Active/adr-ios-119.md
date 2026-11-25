@@ -60,6 +60,10 @@ inbox instead reads about 85k rows at 105k.
    its successor (`MessageIdentity.headerIdRange`, `prefixUpperBound`, shared with
    `BodyAssetStore`), plus the no-deeper-colon guard so a child folder keeps its HTML. Before, a
    body left without a header survived the reset and the new message given that UID adopted it.
+   That guard also leaves out the folder's own headers whose id tail holds a `:` (a draft save's
+   placeholder, IOS-IDENTITY-002): their ids (`folderId` of the folder, id = the folder's prefix plus
+   the row's `messageId`) are read before the header delete and their bodies deleted by primary key
+   after it, so the trigger still finds no header to rewrite (#1495).
    An optimistic move still in flight keeps its source id until the drain re-keys it
    (ADR-IOS-061): a message moving out of the folder keeps its header and loses its cached HTML
    (its address is in the renumbered space; the trigger clears its pair), and a message moving in
