@@ -130,12 +130,15 @@ final class ChatSwipeUITests: XCTestCase {
 
     /// Memory 129: a control at the bottom safe-area bar can exist yet swallow nothing, or take
     /// nothing, so the opened panel is tapped, not only found: Close closes it, and so does the dim
-    /// above it.
+    /// above it. Close must take its own tap: a tap that falls through it to the dim also closes
+    /// the panel, so the dim's tap count shows which one took it.
     func testDraggedOpenPanelClosesOnCloseAndOnTheDim() throws {
         let app = launchIntoChat()
         dragFieldOpen(in: app)
+        let opened = try XCTUnwrap(settledDragMarker(in: app), "control: the marker shows")
         app.buttons["chatClose"].tap()
         XCTAssertTrue(app.buttons["chatClose"].waitForNonExistence(timeout: 3), "Close closed the panel")
+        XCTAssertEqual(readDragMarker(in: app)?.dims, opened.dims, "Close took its own tap, not the dim behind it")
         XCTAssertTrue(replyField(in: app).isHittable, "the collapsed field is back")
 
         dragFieldOpen(in: app)
@@ -153,6 +156,108 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(close.waitForNonExistence(timeout: 3), "a tap on the dim closed the panel")
         XCTAssertEqual(readDragMarker(in: app)?.dims, open.dims + 1, "the dim's own tap handler took the tap")
         XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// A drag inside the open panel's history scrolls it: the fixture's history is taller than the
+    /// panel, the panel opens at its newest line, and a drag down inside it brings older lines into
+    /// view (the newest line moves down with the content).
+    func testDragInsideTheOpenPanelsHistoryScrollsIt() throws {
+        let app = launchIntoChat(panelHistory: true)
+        dragFieldOpen(in: app)
+        let close = app.buttons["chatClose"]
+        let newest = panelLine(Self.panelHistoryCount - 1, in: app)
+        XCTAssertTrue(newest.waitForExistence(timeout: 5), "control: the panel shows its newest history line")
+        let oldest = panelLine(0, in: app)
+        let before = newest.frame
+        XCTAssertGreaterThan(before.minY, close.frame.maxY, "control: the newest line is inside the panel, below Close")
+        XCTAssertFalse(oldest.exists && oldest.frame.minY > close.frame.maxY,
+                       "control: the oldest line is scrolled out of the panel (\(oldest.exists ? "\(oldest.frame)" : "none"))")
+        // From inside the history, above the newest line, a slow drag down.
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: (before.minY - Self.panelDragInset) / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: Self.panelScrollDrag)),
+                    withVelocity: .slow, thenHoldForDuration: 0.1)
+        XCTAssertTrue(close.exists, "the drag left the panel open")
+        let after = newest.exists ? newest.frame : .null
+        XCTAssertTrue(after.isNull || after.minY > before.minY + Self.panelScrollDrag / 2,
+                      "the history scrolled with the drag: the newest line was at \(before.minY), now \(after.isNull ? "gone below" : "\(after.minY)"); \(lastTouch(in: app))")
+    }
+
+    /// Signed in, with a draft: a drag down on the open panel's header closes it like a sheet, and
+    /// the draft comes back to the field whole: closing never sends. Not the dim's tap.
+    func testDragDownOnTheOpenPanelsHeaderClosesItKeepingTheDraft() throws {
+        let app = launchIntoChat(signedIn: true)
+        let field = replyField(in: app, placeholder: Self.signedInPlaceholder)
+        field.tap()
+        XCTAssertTrue(waitForTypingFocus(field, timeout: 5), "control: the reply field has the keyboard")
+        field.typeText(Self.shortQuestion)
+        let typed = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(typed.waitForExistence(timeout: 5), "control: the question is in the field")
+        waitForTheKeyboardBack(under: typed, in: app)
+        dragUp(atY: typed.frame.midY, in: app)
+        let close = app.buttons["chatClose"]
+        XCTAssertTrue(close.waitForExistence(timeout: 3), "control: the drag opened the panel")
+        let open = try XCTUnwrap(settledDragMarker(in: app), "control: the marker shows")
+        let title = app.staticTexts[Self.panelTitle]
+        XCTAssertTrue(title.waitForExistence(timeout: 3), "control: the panel's header shows its title")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: title.frame.midY / app.frame.height))
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: Self.panelScrollDrag)),
+                    withVelocity: .slow, thenHoldForDuration: 0.1)
+        XCTAssertTrue(close.waitForNonExistence(timeout: 3), "the drag down on the header closed the panel")
+        XCTAssertEqual(readDragMarker(in: app)?.dims, open.dims, "the drag closed it, not a tap on the dim")
+        let restored = typedField(containing: Self.shortQuestion, in: app)
+        XCTAssertTrue(restored.waitForExistence(timeout: 3), "the field holds the draft again: nothing was sent")
+        XCTAssertEqual(restored.value as? String, Self.shortQuestion, "the draft, whole and unchanged")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// At the top of its history (a short one is always there), a pull down closes the open panel
+    /// on the let-go, as a sheet's does; a pull shorter than the close distance leaves it open.
+    func testPullingTheOpenPanelsHistoryDownPastItsTopClosesIt() throws {
+        let app = launchIntoChat()
+        dragFieldOpen(in: app)
+        let close = app.buttons["chatClose"]
+        let card = app.descendants(matching: .any)["chatEmailCard"].firstMatch
+        XCTAssertTrue(card.waitForExistence(timeout: 3), "control: the panel shows the email it is about")
+        let open = try XCTUnwrap(settledDragMarker(in: app), "control: the marker shows")
+        // Inside the history, under the email card.
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: (card.frame.maxY + Self.panelDragInset) / app.frame.height))
+        // The history moves no further than the finger, so this pull stays short of the distance.
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: Self.shortPull)),
+                    withVelocity: .slow, thenHoldForDuration: 0.1)
+        XCTAssertFalse(close.waitForNonExistence(timeout: 2), "control: a short pull leaves the panel open")
+        start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: Self.longPull)),
+                    withVelocity: .slow, thenHoldForDuration: 0.1)
+        XCTAssertTrue(close.waitForNonExistence(timeout: 3), "the pull past the history's top closed the panel")
+        XCTAssertEqual(readDragMarker(in: app)?.dims, open.dims, "the pull closed it, not a tap on the dim")
+        XCTAssertTrue(replyField(in: app).isHittable, "the collapsed field is back")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
+    /// The open panel's title (`DynamicIslandChat`'s header).
+    private static let panelTitle = "Agent Chat"
+    /// A pull shorter than the close distance (the history moves at most as far as the finger),
+    /// and one far past it even after the rubber band's slowing.
+    private static let shortPull: CGFloat = 40
+    private static let longPull: CGFloat = 400
+
+    /// The marker's record of the last touch (`ChatFieldDragMarker.TouchWatch`): what it landed on
+    /// and every gesture recognizer that received it.
+    private func lastTouch(in app: XCUIApplication) -> String {
+        let marker = app.descendants(matching: .any)["chatFieldDragMarker"].firstMatch
+        guard marker.exists else { return "touch=(no marker)" }
+        return marker.label.split(separator: " ").first { $0.hasPrefix("touch=") }.map(String.init) ?? "touch=(not recorded)"
+    }
+
+    /// The fixture's history size and line text (`ChatSwipeTestScene.panelHistoryLine`).
+    private static let panelHistoryCount = 30
+    /// How far from a line or card in the panel (above the newest line, under the email card) a
+    /// drag in its history starts, and how far a scroll drag moves.
+    private static let panelDragInset: CGFloat = 60
+    private static let panelScrollDrag: CGFloat = 200
+
+    private func panelLine(_ index: Int, in app: XCUIApplication) -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label CONTAINS %@", "History line \(index) of \(Self.panelHistoryCount)")).firstMatch
     }
 
     /// How far from the navigation bar and the panel a dim tap must land to be the dim's. The open
@@ -183,7 +288,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(markerReads(focused: false, in: app), "the short drag left the field unfocused")
         XCTAssertEqual(marker.newestMinY, rest.newestMinY, accuracy: 1, "control: the marker's newest row is the row read at rest")
         // The glass rose under the held finger (read by the app while the finger was down)...
-        XCTAssertGreaterThan(marker.rise, Self.shortDragTravel / 2, "the field's glass swelled under the finger: \(marker.rise)")
+        XCTAssertGreaterThan(marker.rise, Self.shortDragTravel / 2, "the field's glass swelled under the finger: \(marker.rise); \(dragMarkerLabel(afterDrags: 0, in: app))")
         XCTAssertLessThanOrEqual(marker.rise, Self.shortDragTravel + 1, "no further than the finger went")
         // ...and is back at its resting top once settled.
         XCTAssertEqual(marker.fieldTop ?? -1, restingGlass, accuracy: 1, "the swell settled back")
@@ -277,7 +382,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertGreaterThan(start.screenPoint.x, field.frame.minX, "control: the drag starts on the field's text")
         XCTAssertGreaterThan(start.screenPoint.x, Self.backSwipeEdge, "control: outside the screen edge's own back swipe")
         start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: Self.longBackSwipeEnd, dy: y)))
-        XCTAssertTrue(wentBack(app), "a right drag from the field goes back")
+        XCTAssertTrue(wentBack(app), "a right drag from the field goes back; \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// A right drag across most of the screen, and the screen edge's own back-swipe zone
@@ -290,7 +395,7 @@ final class ChatSwipeUITests: XCTestCase {
     func testNothingOpenEdgeDragOnTheReplyFieldGoesBack() {
         let app = launchIntoChat()
         dragFromEdge(atY: replyField(in: app).frame.midY, in: app)
-        XCTAssertTrue(wentBack(app), "an edge drag at the field goes back")
+        XCTAssertTrue(wentBack(app), "an edge drag at the field goes back; \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// Starts on the field's glass itself, where it overlaps the back swipe's zone at the screen's
@@ -308,7 +413,7 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertLessThan(x, Self.backSwipeEdgeWidth, "control: and inside the back swipe's zone")
         let start = app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: x, dy: y))
         start.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: y / app.frame.height)))
-        XCTAssertTrue(wentBack(app), "an edge drag that starts on the field goes back")
+        XCTAssertTrue(wentBack(app), "an edge drag that starts on the field goes back; \(dragMarkerLabel(afterDrags: 0, in: app))")
     }
 
     /// `ChatViewLayout.backSwipeEdgeWidth`, the back swipe's zone at the left edge, and how far into
@@ -585,7 +690,7 @@ final class ChatSwipeUITests: XCTestCase {
     private func assertTipStaysGoneOnTheNextPresentations(of app: XCUIApplication,
                                                           file: StaticString = #filePath, line: UInt = #line) {
         dragFromEdge(atY: bubble(3, in: app).frame.midY, in: app)
-        XCTAssertTrue(wentBack(app), "control: back at the list", file: file, line: line)
+        XCTAssertTrue(wentBack(app), "control: back at the list; \(dragMarkerLabel(afterDrags: 0, in: app))", file: file, line: line)
         app.buttons["Open chat"].tap()
         XCTAssertTrue(bubble(3, in: app).waitForExistence(timeout: 10), "control: the chat is open again", file: file, line: line)
         XCTAssertFalse(app.staticTexts[Self.fieldDragTipText].firstMatch.waitForExistence(timeout: Self.tipStaysGoneWait),
@@ -690,7 +795,7 @@ final class ChatSwipeUITests: XCTestCase {
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: field.frame.midY / app.frame.height))
         start.press(forDuration: 0.05, thenDragTo: start.withOffset(CGVector(dx: 0, dy: -Self.shortFlick)),
                     withVelocity: .fast, thenHoldForDuration: 0)
-        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the flick opened the panel")
+        XCTAssertTrue(app.buttons["chatClose"].waitForExistence(timeout: 3), "the flick opened the panel; \(dragMarkerLabel(afterDrags: 0, in: app))")
         XCTAssertTrue(isInChat(app), "the chat stays")
     }
 
@@ -1628,7 +1733,8 @@ final class ChatSwipeUITests: XCTestCase {
                                 suggestionOnJump: Bool = false, writing: Bool = false,
                                 readyAtOpen: Bool = false, fieldDragTip: Bool = false,
                                 textSize: String? = nil, signedIn: Bool = false,
-                                openPanelUnderDrag: Bool = false, tipStore: TipStore? = nil) -> XCUIApplication {
+                                openPanelUnderDrag: Bool = false, panelHistory: Bool = false,
+                                tipStore: TipStore? = nil) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["--screenshot-splash", "--chat-swipe-ui-test"]
@@ -1645,6 +1751,7 @@ final class ChatSwipeUITests: XCTestCase {
             + (textSize.map { ["-UIPreferredContentSizeCategoryName", $0] } ?? [])
             + (signedIn ? ["--chat-swipe-signed-in"] : [])
             + (openPanelUnderDrag ? ["--chat-swipe-open-panel-under-drag"] : [])
+            + (panelHistory ? ["--chat-swipe-panel-history"] : [])
         if let tipStore {
             app.launchArguments += ["--chat-field-drag-tip-store"] + Self.noticeAlreadyShown
             if tipStore == .fresh { app.launchArguments.append("--chat-field-drag-tip-fresh") }

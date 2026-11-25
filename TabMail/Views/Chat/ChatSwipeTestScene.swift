@@ -74,6 +74,11 @@ struct ChatSwipeTestScene: View {
     /// `--chat-swipe-signed-in`: the scene runs with a TabMail session, so the open panel shows its
     /// editor (signed out it shows the sign-in bar instead) and the field its signed-in hint.
     private let signedIn = ProcessInfo.processInfo.arguments.contains("--chat-swipe-signed-in")
+    /// `--chat-swipe-panel-history`: the newest email's TabMail chat holds a history taller than the
+    /// open panel (`panelHistoryCount` messages, each naming its line), so a drag inside it can scroll.
+    nonisolated private static let panelHistory = ProcessInfo.processInfo.arguments.contains("--chat-swipe-panel-history")
+    nonisolated static let panelHistoryCount = 30
+    nonisolated static func panelHistoryLine(_ index: Int) -> String { "History line \(index) of \(panelHistoryCount)" }
     /// `--chat-swipe-open-panel-under-drag`: a strip under the whole navigation stack holds "Open
     /// the panel under the next drag", which arms the panel's expansion to run the moment the next
     /// drag held on the field has swollen it past the open distance (`openPanelUnderTheNextDrag`),
@@ -191,6 +196,22 @@ struct ChatSwipeTestScene: View {
 
     private static func headerId(_ index: Int) -> String {
         MessageIdentity.headerId(accountId: accountID, folderPath: "INBOX", messageId: "swipe-\(index)")
+    }
+
+    /// The newest email's chat gets `panelHistoryCount` messages, the user's and the agent's in
+    /// turn, a minute apart, in its in-process session (nothing is stored). The session is marked
+    /// active now, as a chat turn marks it, or opening the panel evicts it as idle
+    /// (`ChatPillState.evictIdleSessions`).
+    private static func seedPanelHistory() async throws {
+        let id = headerId(count - 1)
+        guard let header = try await AppDatabase.dbPool.read({ try MessageHeader.fetchOne($0, key: id) }) else { return }
+        let start = Date().addingTimeInterval(-TimeInterval(panelHistoryCount) * 60)
+        let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: header))
+        session.chatMessages = (0..<panelHistoryCount).map {
+            ChatMessage(role: $0.isMultiple(of: 2) ? .user : .agent, content: panelHistoryLine($0),
+                        timestamp: start.addingTimeInterval(TimeInterval($0) * 60))
+        }
+        session.lastChatActivity = Date()
     }
 
     private func arm() {
@@ -351,6 +372,7 @@ struct ChatSwipeTestScene: View {
                     }
                 }
             }
+            if Self.panelHistory { try await Self.seedPanelHistory() }
             await readDrafts()
             status = "Fixture ready"
             ready = true

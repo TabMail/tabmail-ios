@@ -1449,6 +1449,18 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    the last line, as in the option-B drawing), `ChatReplyFieldTests.everyOpenBarSharesTheRow`,
    `statusLinePadding` and `tutorialArrowOnTheMic`.
 
+   **Amendment 2026-11-25: the agent's status shows above the field, never inside it.** While the
+   agent works on a Send from the field, what it is doing ("Thinking...", "Writing your email", its
+   own reports) used to be a line inside the field's glass, above the row, so the field grew.
+   It is now a line above the field, outside its glass, among the field's other notices
+   (`ChatFieldStatusLine`): the field keeps its size and its contents, and its words still pulse.
+   The field hands the line to its screen (`ChatFieldStatusKey`), and both chat screens, a thread's
+   and a new email's, show it right above the field. The stack the bar measures grows by the line,
+   so the chat above moves up with the pill's spring and back down when it goes. The AI
+   Suggestion's working bubble (decision 16) stays the chat's own row. `statusLinePadding`, which
+   pinned the line's padding inside the glass, is replaced by
+   `ChatReplyFieldTests.statusLineAboveTheField` and `statusKeyKeepsTheFirst`.
+
 20. **The field is the chat's bottom bar (amendment 2026-11-20).** The reply field is the scroll
    view's `.safeAreaBar(edge: .bottom, spacing: 0)`, as the header is its top bar (decision 15), so
    the chat scrolls under it and the system blurs the strip below it, as in Messages; no field
@@ -1460,6 +1472,21 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    inset changes (the field's height and the keyboard arrive as that inset). Tests:
    `ChatThreadLayoutTests.chatScrollsBehindTheField` and `openingThePillKeepsTheChat`,
    `ChatReplyFieldTests.messagesLayout` (the bottom bar, no plain bottom inset).
+
+   **Amendment 2026-11-25: the bar holds only the slot; the field is drawn on the page over it.**
+   The bar's content is hosted by UIKit's floating bar container, which takes touches only inside
+   the bar's own bounds. The opened panel drawn above the slot was visible but could not be
+   touched: a drag in its history did not scroll it, and taps on it fell through to the page's dim,
+   so Close only seemed to work because the dim closed the panel (a UI test recorded the touch
+   reaching only the page's hosting view). So the bar now holds only the clear slot of the
+   collapsed field's measured height. The field (`pill(on:)`, with its two geometry reads) is a
+   bottom-aligned page overlay right after the bar, sitting on the same safe-area or keyboard
+   bottom. The inset, the blur and the chat under the panel are unchanged. The opened panel is
+   sized by the overlay's own proposal, so the chat-height state that used to frame it is gone. The panel
+   keeps drawing its own dim as on the other screens, but in the chat view that dim takes no
+   touches (`allowsHitTesting(replyField == nil)`), so a tap outside the panel reaches the page's
+   dim, as before. Tests: `ChatSwipeUITests.testDragInsideTheOpenPanelsHistoryScrollsIt` and
+   `testDraggedOpenPanelClosesOnCloseAndOnTheDim`, plus the fences in `messagesLayout`.
 
 21. **Drag the field up to open the TabMail chat (amendment 2026-11-20).** Until now the panel
    opened only on an agent answer, a confirmation card or `.openMessageWithChat`. A drag up on the
@@ -1660,6 +1687,22 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    (`fieldDragSettleFences`, which pinned the deleted settle token, gate and timer chain, was
    removed with them on 2026-11-21.) The VoiceOver action:
    `ChatThreadLayoutTests.showChatActionOpensThePanel`.
+
+   **Amendment 2026-11-25: the open panel closes like a sheet.** In the chat view the panel closes
+   on a drag down on its header (the drag, or a flick's predicted end), or on a pull of its history
+   down past the history's top, let go. A drag in a history that is not at its top scrolls it, so
+   the history scrolls to its top first and only then does a pull close the panel. The history
+   bounces even when it fits, so a short history can be pulled too. Both go
+   `ChatViewLayout.panelCloseDistance`, the distance the drag up opens it by. For the pull that is
+   the history's own travel past its top, which the rubber band keeps under the finger's. Only the
+   let-go closes it (the scroll leaving `.interacting`), never a bounce settling. Both close the
+   panel as Close does: the history and the words in the input stay, and nothing is sent. The other
+   pills are unchanged: the header drag and the bounce are the chat view's only (`replyField != nil`).
+   A tap outside the panel already closed it (the page's dim, decision 20's amendment). Tests:
+   `ChatReplyFieldTests.panelPull` and `panelPullWiring`,
+   `ChatSwipeUITests.testDragDownOnTheOpenPanelsHeaderClosesItKeepingTheDraft`,
+   `testPullingTheOpenPanelsHistoryDownPastItsTopClosesIt` (a short pull leaves it open) and
+   `testDragInsideTheOpenPanelsHistoryScrollsIt` (a drag in a long history scrolls and leaves it open).
 
 22. **The first-time drag tip (amendment 2026-11-20).** Once, above the collapsed reply field, a
    tip in today's TipKit style (`ChatFieldDragTip`, behind the onboarding gate, shown at most once)
