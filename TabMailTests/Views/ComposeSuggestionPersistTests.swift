@@ -429,6 +429,27 @@ struct ComposeSuggestionPersistTests {
         #expect(!source.contains("You have an AI suggestion that hasn't been accepted"))
     }
 
+    /// ADR-IOS-114 decision 10: a send carries the text version written with its body only while the
+    /// body sent is exactly the one written; anything else is summarized at Send.
+    @Test("A send carries the text version written with its body only while that body is sent unchanged")
+    func sentTextVersionOnlyForTheWrittenBody() {
+        let written = ReplyResult(body: "Tuesday works for me.", textMessage: "Tuesday works!")
+        #expect(ComposeDraftGuards.sentTextVersion(authoredBody: "Tuesday works for me.", written: written) == "Tuesday works!",
+                "sent as written: its text version")
+        #expect(ComposeDraftGuards.sentTextVersion(authoredBody: "Tuesday works for me. See you then.", written: written) == nil,
+                "edited by hand: none, summarized")
+        #expect(ComposeDraftGuards.sentTextVersion(authoredBody: "Tuesday works for me", written: written) == nil,
+                "one character off is an edit")
+        #expect(ComposeDraftGuards.sentTextVersion(authoredBody: "Tuesday works for me.", written: nil) == nil,
+                "nothing written in the card: none")
+        let noText = ReplyResult(body: "Tuesday works for me.", textMessage: nil)
+        #expect(ComposeDraftGuards.sentTextVersion(authoredBody: "Tuesday works for me.", written: noText) == nil,
+                "written with no text version (an agent's body): none")
+        let blank = ReplyResult(body: "Tuesday works for me.", textMessage: "  \n")
+        #expect(ComposeDraftGuards.sentTextVersion(authoredBody: "Tuesday works for me.", written: blank) == nil,
+                "a text version that says nothing is none")
+    }
+
     @Test("An edit's text version is stored with it; an edit without one clears the old one")
     func storesTheEditsTextVersion() async throws {
         let db = try TestDatabase.make()

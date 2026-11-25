@@ -455,7 +455,9 @@ same AI result, kept as long as the email itself is shown.
    only for the tutorial's scripted field ask, until the tutorial moves that ask into the panel;
    the field-reply logic of ADR-IOS-053 amendment 3 in `EmailReplyTool` (the shown row's check,
    who it goes to, the edit of the shown suggestion) is now reached from the field only through
-   `composeFromField`, and the agent's requests from the panel carry no field. A new email's chat (amendment 24 and *Every new email*) still sends its field's words to the agent with its own nudge (`ChatNewEmailField.agentMessage`), as the first round of its Send built it; moving it to a direct compose is the part of this decision still to do. Tests:
+   `composeFromField`, and the agent's requests from the panel carry no field. A new email's chat (amendment 24 and *Every new email*) sent its field's words to the agent with its own nudge (`ChatNewEmailField.agentMessage`) in the first round of its Send. Since 2026-11-25 its closed field composes the same way: the words are the request of the new email's compose edit (`EmailComposeTool.composeFromField`, the registry's tool, `composeWithRegisteredTool`; mode `edit_new`, Thunderbird's `runComposeEdit`) to the people picked, given as mailboxes under their names (`ChatNewDraft.toEntries`), never a turn for the agent; the card opens over the chat with the written email and its text version (`ChatNewThreadModel.card` passes `ComposeRequest.suggestion`), and its To is the chat's people, so recipients the edit would add or remove are not applied. With nobody picked, Send asks and stops, as before. A compose that writes nothing ends the send with the words kept in the field and a note (`DynamicIslandChat.newEmailNotWrittenNote`); the reply field and the new email share one runner (`runFieldCompose`). The nudge is deleted. Tests:
+   `EmailComposeToolOutcomeTests.fieldComposeOpensTheWrittenEmail`, `ChatNewThreadScreenTests.sendWithPeoplePicked` and
+   `failedSendKeepsTheWords`, `ChatNewThreadTests` (the new email's field Send),
    `ChatReplyFieldTests.fieldSendWiring` and `noAgentNudge`, `ChatComposeRoutingTests` (case 3: the
    words reach only the compose edit; a failed compose keeps them), `ChatReplyRecoveryTests`
    (an edit in place or on the field's own card asks the agent nothing),
@@ -520,6 +522,30 @@ same AI result, kept as long as the email itself is shown.
    ids, which restarts the summary observation (decision 9), and its first value asks for the
    newest emails, the joining one first. The summary at Send (`SentEmailSummary`) and the
    Message-ID at the queue write are unchanged.
+   *Amended 2026-11-25 (the text version in hand; simulator smoke):* a sent reply's text in the
+   chat is a text version already in hand, and the summary at Send runs only when there is none.
+   The compose card keeps the email a writer last put in it with the text version written with it
+   (`ComposeView.writtenEmail`): the suggestion it opened with (the closed field's composition,
+   `ReplyResult.textMessage`, or the AI Suggestion, the ghost's own text), a Recompute, or an edit
+   of the card (a field edit such as "more formal", only when the edit returned one). Sent with
+   exactly that body (`ComposeDraftGuards.sentTextVersion`), the text version travels with the send
+   (`queueSend(textVersion:)`) and is written inside the queue write's own transaction
+   (`SentEmailSummary.writeTextVersion`) into the same AI cache entry the summary takes (Sent folder
+   plus Message-ID), blurb and text message alike, as `summarizeLocally` writes the demo account's:
+   the Sending bubble shows it from its first value, never "Summarizing", the held ghost morphs into
+   the same words, and the Sent copy restores it; no summary call is made. A body edited by hand,
+   or a card with no text version (an agent's card opens on the body only), is summarized as
+   before. Same gate as the summary (`mayRun`, or the demo account's own sends): with it closed
+   nothing is written and the Sent copy is summarized as it arrives. An Undo carries the undone
+   send's text version (`ReopenSnapshot.sentTextVersion`, read with the row before it is deleted),
+   and the compose it reopens keeps it for the kept row's body, so a send again with the body
+   unchanged needs no summary. Nothing new is stored: no column, table or migration. Accepted: the
+   entry's blurb is the text version, so the other readers of a Sent copy's summary get the text
+   version: a Device Sync peer's AI cache probe, the classic email screen's summary bubble, the Sent
+   list's summary line and the agent's inbox read tool. Tests: `ChatUndoSendRoutingTests` 1h (the
+   real card's Send, on the demo account so no request can reach a backend; Undo and send again),
+   `ChatSendingBubbleTests.queueSendWritesTheTextVersionInHand`,
+   `ComposeSuggestionPersistTests.sentTextVersionOnlyForTheWrittenBody`.
    **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
    chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
    instead of the undo-send toast, which is not shown for it. Who offers a send's Undo
@@ -1948,7 +1974,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    - *The compose card and its Send (built 2026-11-24, #978).* Send with people picked sends the
      field's words to the agent as a new email to them; the agent's `email_compose` card opens over
      the chat (`openAgentCompose`) with the chat's people, Cc, Bcc, subject and attachments and the
-     agent's words, on a draft of its own that the chat names (`ChatNewThreadModel.card`,
+     agent's words, on a draft of its own (since 2026-11-25 the words are the request of the new
+     email's compose edit, not an agent turn, and the card carries the written email and its text
+     version, decision 10) that the chat names (`ChatNewThreadModel.card`,
      `newCardDraftId`: a plain id, so a card closed with Save is an ordinary draft, which reopens in
      compose). A card the agent opens for another email (a reply or a forward) opens through the
      agent's one presenter (`composeView(account:onOutcome:)`), and its send is not this chat's.

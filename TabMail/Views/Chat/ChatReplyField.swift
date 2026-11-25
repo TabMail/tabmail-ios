@@ -147,8 +147,9 @@ struct ChatNewEmailField {
     /// Each change of the field's words.
     let wordsChanged: (String) -> Void
     /// Send with words in the field: the chat decides (`ChatNewDraft.send`). It returns the people
-    /// the email is written to, read at the tap, and the field's words go to the agent to write it,
-    /// as a reply's do; nil when the chat asked who it is to, and the words stay as they are.
+    /// the email is written to, read at the tap, and the field's words are the request of the new
+    /// email's compose edit, as a reply's are (`EmailComposeTool.composeFromField`, never the
+    /// agent); nil when the chat asked who it is to, and the words stay as they are.
     let send: (String) -> [ChatThread.Person]?
     /// A choice in the paperclip's menu.
     let attach: (AttachSource) -> Void
@@ -160,17 +161,6 @@ struct ChatNewEmailField {
 
     /// Whether `key` is a new email's chat session key (`newSessionKey`).
     static func isSessionKey(_ key: String) -> Bool { key.hasPrefix(sessionKeyPrefix) }
-
-    /// The agent's message for words sent in a new email's field: the words, with a nudge that
-    /// they are what to write in a new email to `people`, so the agent writes it (`email_compose`,
-    /// the words as its request). The field's words are always what to write, decided by where
-    /// they were typed, never by guessing intent: a question in them is one to ask the people.
-    static func agentMessage(to people: [ChatThread.Person], text: String) -> String {
-        let recipients = people.map { "\($0.name) <\($0.address)>" }.joined(separator: ", ")
-        return "New email to \(recipients) (typed in its field: my words are what to write to them, "
-            + "and a question in them is one to ask them; write this new email with email_compose, "
-            + "my words as the request): \(text)"
-    }
 }
 
 /// The chat input's words, which are all the reply field shows: the AI Suggestion never enters the
@@ -631,7 +621,9 @@ struct ChatHeldGhost: Equatable {
 /// with nothing kept in memory: every outbox row whose In-Reply-To is the
 /// Message-ID of an email in the chat, from any account (the reply may go out from another account
 /// than the email it answers). A failed row reads "Not sent", with Retry and Delete; any other
-/// "Sending". Its text is the summary made at Send (`SentEmailSummary`), "Summarizing" until then.
+/// "Sending". Its text is the email's text version (`SentEmailSummary.textMessage`): the one written
+/// with its body when it was sent unchanged, from its first value; otherwise the summary made at
+/// Send, "Summarizing" until then.
 ///
 /// The hand-over from the ghost: a ghost tapped open is held in its place while its card is up
 /// (`ChatHeldGhost`), and after a send it turns into this bubble.
@@ -682,7 +674,7 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             }
             return ChatUnsentReply(outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
                                    draftId: row.draftId, instanceEpoch: row.instanceEpoch, filed: filed,
-                                   textMessage: try summary(of: row, db: db))
+                                   textMessage: try SentEmailSummary.textMessage(of: row, db: db))
         }
     }
 
@@ -700,18 +692,6 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             .tracking { db in try fetch(answering: messageIds, db: db) }
             .removeDuplicates()
             .values(in: AppDatabase.rawPool)
-    }
-
-    /// The summary made at Send, from the AI cache under the row's Sent folder and Message-ID.
-    nonisolated static func summary(of row: OutboxMessage, db: Database) throws -> String? {
-        guard let messageId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
-              let sentPath = try Folder
-                .filter(Column("accountId") == row.accountId && Column("role") == FolderRole.sent.rawValue)
-                .fetchOne(db)?.path,
-              let key = MessageAICache.cacheKey(accountId: row.accountId, folderPath: sentPath, rfc822MessageId: messageId),
-              let text = try MessageAICache.fetchOne(db, key: key)?.summaryTextMessage,
-              !text.isEmpty else { return nil }
-        return text
     }
 
     /// Retry on a "Not sent" bubble: the Outbox's own Retry for the same row.

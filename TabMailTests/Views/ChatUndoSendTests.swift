@@ -1187,9 +1187,9 @@ struct ChatUndoSendTests {
         let fixture = try await Self.makeFixture(pool)
         let row = try await Self.queueReply(fixture, draftId: "draft-db-sent")
         try await Self.setHold(pool, row.id, Date().addingTimeInterval(3600))
-        // The summary made at Send, which the bubble shows (`ChatUnsentReply.summary`): the real Send
-        // writes it to the AI cache under the row's Sent folder and Message-ID; the queue write alone
-        // does not. The cache keeps a summary's text only with its blurb, as `SentEmailSummary` writes both.
+        // The summary made at Send, which the bubble shows (`SentEmailSummary.textMessage`): the real
+        // Send writes it to the AI cache under the row's Sent folder and Message-ID; this queue write,
+        // with no text version, does not. The cache keeps a summary's text only with its blurb, as `SentEmailSummary` writes both.
         let sentMessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId, "control: the queued row has its Message-ID"))
         try await pool.write { db in
             try MessageAICache.writeThrough(
