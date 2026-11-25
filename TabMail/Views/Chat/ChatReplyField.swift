@@ -705,7 +705,7 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     }
 
     /// The summary made at Send, from the AI cache under the row's Sent folder and Message-ID.
-    private nonisolated static func summary(of row: OutboxMessage, db: Database) throws -> String? {
+    nonisolated static func summary(of row: OutboxMessage, db: Database) throws -> String? {
         guard let messageId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
               let sentPath = try Folder
                 .filter(Column("accountId") == row.accountId && Column("role") == FolderRole.sent.rawValue)

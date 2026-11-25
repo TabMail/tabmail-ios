@@ -14,8 +14,17 @@ import SwiftUI
 /// app going to the background save the draft when there is something to keep
 /// (`ChatNewDraft.needsSave`), and Back leaves once that save is durable. The screen going away
 /// any other way (the mailbox list it sits on replaced) saves it too.
+///
+/// After the compose card's Send the chat stays: its saved draft is discarded, and it goes on as a
+/// new email to the same people with an empty field (`ChatNewThreadModel.init(after:)`), showing
+/// the send as its "Sending" bubble (`ChatNewEmailSend`) with the bubble's Undo, Retry and Delete.
+/// Once the sent email's copy is in the Sent folder, the chat becomes that email's thread
+/// (`ChatThreadView`) for good; Back closes it. Undo reopens the compose over the chat
+/// (`undoOutcomesPresented`); closed unsent, it leaves the chat as it was before the card's Send,
+/// with the people and an empty field.
 struct ChatNewThreadView: View {
-    let model: ChatNewThreadModel
+    /// The new email the chat writes: the one it opened with, then the next one after each send.
+    @State private var model: ChatNewThreadModel
 
     /// The field's "e.g." example, picked once as the chat opens, from the new-email set.
     @State private var example = ChatSuggestionConfig.randomExample(from: ChatSuggestionConfig.newEmailExamples)
@@ -43,13 +52,35 @@ struct ChatNewThreadView: View {
     @State private var accounts: [Account] = []
     /// The compose card the agent wrote from the field's words (`email_compose`), taken by this
     /// chat's pill for this chat's own session only.
-    @State private var agentCompose: AgentToolRouter.ComposeRequest?
+    @State private var agentCompose: AgentCard?
     /// A card opened for the field's latest Send: the agent's closing words then open nothing.
     @State private var cardOpened = false
-    /// The card's Send has a durable outbox row: once the card has gone, the chat closes.
+    /// The card's Send has a durable outbox row: once the card has gone, the chat goes on as the
+    /// next new email (`cardClosed`).
     @State private var cardSent = false
+    /// The card's send the chat shows (`ChatNewEmailSend`): the card's draft, and the email its row
+    /// named once seen.
+    @State private var sendKey: ChatNewEmailSend.Key?
+    /// That send, as last read.
+    @State private var cardSend: ChatNewEmailSend?
+    /// The sent email's Sent copy, once read: the chat is its thread from then on, never back.
+    @State private var threadId: String?
+    /// This screen's own id among the chat modals (`undoOutcomesPresented`).
+    @State private var modalId = UUID()
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+
+    init(model: ChatNewThreadModel) {
+        _model = State(initialValue: model)
+    }
+
+    /// A compose card the agent asked for, with a draft of its own for a new email
+    /// (`ChatNewThreadModel.card`).
+    struct AgentCard: Identifiable {
+        let request: AgentToolRouter.ComposeRequest
+        let draftId = ChatNewThreadModel.newCardDraftId()
+        var id: UUID { request.id }
+    }
 
     /// The field, as tests find it.
     static let fieldId = "chatNewEmailField"
@@ -73,34 +104,19 @@ struct ChatNewThreadView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: ChatViewLayout.bubbleSpacing) {
-                Text(ChatNewDraft.recipientsLine(model.people) ?? ChatNewDraft.emptyHint)
-                    .font(.footnote)
-                    .foregroundStyle(Theme.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .accessibilityIdentifier(Self.hintId)
-                // Cc and Bcc a link brought or a reopened draft holds: shown, changed on the compose card.
-                copyLine(ChatNewDraft.copyLine("Cc", model.carried.cc), id: Self.ccLineId)
-                copyLine(ChatNewDraft.copyLine("Bcc", model.carried.bcc), id: Self.bccLineId)
-                if let savedAt = model.savedAt {
-                    Text(ChatNewDraft.savedLine(savedAt))
-                        .font(.caption2)
-                        .foregroundStyle(Theme.textSecondary)
-                        .accessibilityIdentifier(Self.savedLineId)
-                }
+        // One container for both, never a Group: a Group gives its modifiers to each child, so the
+        // swap would run this screen's close and open, and take down a cover presented over it
+        // (a reopened compose included). The ZStack keeps one host for the whole presentation.
+        ZStack {
+            if let threadId {
+                // The sent email's thread, with its own header, Forward and reply field.
+                ChatThreadView(messageId: threadId)
+            } else {
+                newEmail
             }
-            .padding()
-            .frame(maxWidth: .infinity)
         }
-        .defaultScrollAnchor(.bottom)
-        .scrollDismissesKeyboard(.interactively)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Palette.previewPaneBg)
-        .dismissKeyboardOnTap()
-        .navigationTitle("")
-        .navigationBarTitleDisplayMode(.inline)
-        // Back saves first, so the system's Back (and its swipe) is replaced by this chat's own.
+        // Back saves first, so the system's Back (and its swipe) is replaced by this chat's own,
+        // on the sent email's thread too: Back closes the chat.
         .navigationBarBackButtonHidden(true)
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
@@ -111,6 +127,52 @@ struct ChatNewThreadView: View {
                 .accessibilityLabel("Back")
                 .accessibilityIdentifier(Self.backId)
             }
+        }
+        .undoOutcomesPresented(by: modalId)
+        .task(id: sendKey) { await followSend() }
+        .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
+        .onAppear { opened() }
+        // The camera's cover hides this screen without closing it.
+        .onDisappear { if !showsCamera { closed() } }
+    }
+
+    /// The new email being written: the chat area, its header and the field.
+    private var newEmail: some View {
+        ScrollView {
+            VStack(spacing: ChatViewLayout.bubbleSpacing) {
+                VStack(spacing: ChatViewLayout.bubbleSpacing) {
+                    Text(ChatNewDraft.recipientsLine(model.people) ?? ChatNewDraft.emptyHint)
+                        .font(.footnote)
+                        .foregroundStyle(Theme.textSecondary)
+                        .multilineTextAlignment(.center)
+                        .accessibilityIdentifier(Self.hintId)
+                    // Cc and Bcc a link brought or a reopened draft holds: shown, changed on the compose card.
+                    copyLine(ChatNewDraft.copyLine("Cc", model.carried.cc), id: Self.ccLineId)
+                    copyLine(ChatNewDraft.copyLine("Bcc", model.carried.bcc), id: Self.bccLineId)
+                    if let savedAt = model.savedAt {
+                        Text(ChatNewDraft.savedLine(savedAt))
+                            .font(.caption2)
+                            .foregroundStyle(Theme.textSecondary)
+                            .accessibilityIdentifier(Self.savedLineId)
+                    }
+                }
+                .padding()
+                .frame(maxWidth: .infinity)
+                // The card's send while it is in the outbox, as a thread's chat shows a reply's.
+                if let reply = cardSend?.reply {
+                    ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() },
+                                          undo: { reply.undo(on: .newEmailChat) })
+                }
+            }
+        }
+        .defaultScrollAnchor(.bottom)
+        .scrollDismissesKeyboard(.interactively)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Palette.previewPaneBg)
+        .dismissKeyboardOnTap()
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
             ToolbarItem(placement: .principal) {
                 ChatHeaderView(people: model.people, emptyTitle: ChatReplyToSheet.addRecipientTitle,
                                hint: ChatHeaderView.newEmailHint) { showsAddRecipient = true }
@@ -165,9 +227,6 @@ struct ChatNewThreadView: View {
             if phase == .background { Task { await saveInBackground() } }
         }
         .task { await loadOwnAddresses() }
-        .onAppear { opened() }
-        // The camera's cover hides this screen without closing it.
-        .onDisappear { if !showsCamera { closed() } }
     }
 
     static let askTitle = "Who is this to?"
@@ -204,8 +263,7 @@ struct ChatNewThreadView: View {
                 onFieldSend: { _ in cardOpened = false },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: model.account?.id,
-                composeHostCovered: showsAddRecipient || showsCamera || showsPhotoPicker || showsFilePicker
-                    || agentCompose != nil)
+                composeHostCovered: newEmailCovered)
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.fieldId)
         }
@@ -233,34 +291,80 @@ struct ChatNewThreadView: View {
     private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
         guard AgentToolRouter.shared.canOpen(req, accounts: accounts) else { return }
         cardOpened = true
-        agentCompose = req
+        agentCompose = AgentCard(request: req)
     }
 
-    /// The card, as the chat's reply cards open: today's compose. The email the agent wrote goes
-    /// to this chat's people, with its Cc, Bcc, subject and attachments (`ChatNewThreadModel.card`).
-    private func cardView(for req: AgentToolRouter.ComposeRequest) -> ComposeView {
+    /// The card, as the chat's reply cards open: today's compose. The new email the agent wrote
+    /// goes to this chat's people, with its Cc, Bcc, subject and attachments, in the card's own
+    /// draft (`ChatNewThreadModel.card`), and its Send is this chat's send. A card the agent opens
+    /// for another email (a reply or a forward) is the agent's presenter's, and its send is not
+    /// this chat's.
+    private func cardView(for card: AgentCard) -> ComposeView {
+        let req = card.request
         let account = accounts.first { $0.id == req.fromAccountId }
-        let ended: @MainActor (ComposeOutcome) -> Void = { outcome in
+        guard req.mode == .compose else { return req.composeView(account: account, onOutcome: req.onOutcome) }
+        return model.card(for: req, account: account, draftId: card.draftId) { outcome in
             req.onOutcome(outcome)
-            if case .sent = outcome { cardSent = true }
+            guard case .sent = outcome else { return }
+            cardSent = true
+            sendKey = ChatNewEmailSend.Key(draftId: card.draftId)
         }
-        guard req.mode == .compose else { return req.composeView(account: account, onOutcome: ended) }
-        return model.card(for: req, account: account, onOutcome: ended)
     }
 
-    /// The card has gone. Sent: the email is in the outbox (its Undo is the toast's), so the
-    /// chat's own draft is discarded through compose's Discard and the chat closes without saving.
-    /// Closed unsent: the words and attachments are still here.
+    /// The card has gone. Sent: the email is in the outbox, shown as this chat's bubble
+    /// (`sendKey`), and the chat goes on as the next new email to the same people with an empty
+    /// field (`ChatNewThreadModel.init(after:)`), in a draft and agent session of its own; the
+    /// sent email's saved draft is discarded through compose's Discard. Closed unsent: the words
+    /// and attachments are still here.
     private func cardClosed() {
         guard cardSent else { return }
         cardSent = false
+        let sent = model
+        let next = ChatNewThreadModel(after: sent)
+        model = next
+        DraftSessionRegistry.shared.register(next.draftId)
+        ChatPillState.shared.endSession(for: sent.sessionKey)
         Task {
-            if case .refused(let message) = await model.discardSavedDraft(), DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[ChatNewEmail] draft discard after send refused for \(model.draftId): \(message)")
+            if case .refused(let message) = await sent.discardSavedDraft(), DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ChatNewEmail] draft discard after send refused for \(sent.draftId): \(message)")
             }
-            leavesWithoutSaving = true
-            dismiss()
+            DraftSessionRegistry.shared.unregister(sent.draftId)
         }
+    }
+
+    /// Follows the card's send (`sendKey`): its bubble while its row is in the outbox, then the
+    /// sent email's thread once its Sent copy is read (`swapToThread`). The email the row names
+    /// goes into the key, so the copy is found after the row has gone, and a send again from the
+    /// compose its Undo reopened (a new row, the same draft) is followed too.
+    private func followSend() async {
+        guard let key = sendKey else { return }
+        do {
+            for try await found in ChatNewEmailSend.changes(key) {
+                cardSend = found
+                if let email = found.email, email != key.email {
+                    sendKey?.email = email
+                    return
+                }
+                swapToThread()
+            }
+        } catch {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[ChatNewEmail] send observation ended: \(error)")
+            }
+        }
+    }
+
+    /// The sent email's copy is in the Sent folder: the chat becomes its thread for good, once
+    /// nothing is open over the new email (a card, a picker or "Add recipient"), which the change
+    /// would take down.
+    private func swapToThread() {
+        guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered else { return }
+        threadId = copy
+    }
+
+    /// Something is open over the new email: a picker, "Add recipient" or a compose card.
+    private var newEmailCovered: Bool {
+        showsAddRecipient || showsCamera || showsPhotoPicker || showsFilePicker || agentCompose != nil
     }
 
     /// The agent answered the field's Send with something to say: the chat rises with the request

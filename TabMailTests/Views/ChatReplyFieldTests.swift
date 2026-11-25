@@ -711,14 +711,16 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.apply(.put(text)) isTextFieldFocused = true", in: text) == 1)
         // The "e.g." line's change goes in as words and is never sent from here.
         #expect(Self.count("func putExample(_ example: String) { fieldFill.apply(.put(example)) inputSelection = .init(insertionPoint: inputText.endIndex) }", in: text) == 1)
-        // A new email's saved words go in once, as its chat first opens; the screen hidden and
-        // shown again keeps what was typed since (ChatNewThreadScreenTests.hiddenAndShownKeepsTyping).
+        // A new email's saved words go in once per email, as its chat first opens; the screen hidden
+        // and shown again keeps what was typed since (ChatNewThreadScreenTests.hiddenAndShownKeepsTyping).
         // Then its reply field takes the keyboard: the panel's input, which `isTextFieldFocused`
         // focuses, is never there in a new email's chat. Only the forked chat's put focuses the panel.
-        #expect(Self.count("guard let newEmail = replyField?.newEmail, !newEmailStarted else { return } newEmailStarted = true if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) } focusedInput = .replyField }", in: text) == 1)
+        // The next email after a Send (a new session) starts from its own words, which empties the
+        // sent ones, and leaves the keyboard as it is.
+        #expect(Self.count("guard let newEmail = replyField?.newEmail, newEmail.sessionKey != newEmailSession else { return } let opening = newEmailSession == nil newEmailSession = newEmail.sessionKey if opening { if !newEmail.startWords.isEmpty { fieldFill.apply(.put(newEmail.startWords)) } focusedInput = .replyField } else { fieldFill.apply(.put(newEmail.startWords)) } }", in: text) == 1)
         #expect(Self.count("focusedInput = .replyField", in: text) == 1, "the new email's opening is the only one that focuses the reply field")
         #expect(Self.count("isTextFieldFocused = true", in: text) == 1, "the forked chat's put is the only one that focuses the panel's input")
-        #expect(Self.count("fieldFill.apply(", in: text) == 9)
+        #expect(Self.count("fieldFill.apply(", in: text) == 10)
     }
 
     @Test("The field's Send sends the words to the agent; a new email's chat's own Send first says who it is to, or asks and stops there; nothing in the field opens compose")

@@ -63,6 +63,9 @@ struct ChatNewThreadScreenTests {
     private struct Navigation: View {
         @Bindable var stage: Stage
         let model: ChatNewThreadModel
+        /// The app's navigation store, with the chat's account: the sent email's thread and a
+        /// compose an Undo reopens read it, as under RootView.
+        let navigationStore: NavigationStore
 
         var body: some View {
             if stage.shown {
@@ -80,6 +83,7 @@ struct ChatNewThreadScreenTests {
                 }
                 .environment(\.scenePhase, stage.phase)
                 .environment(\.hasTabMailSession, true)
+                .environment(navigationStore)
             } else {
                 // The list the chat sat on, replaced (on iPad, another mailbox picked).
                 Color.clear
@@ -432,6 +436,161 @@ struct ChatNewThreadScreenTests {
             #expect(asked.contains("New email to Maria <maria@example.com>") && asked.contains("Lunch on Friday?"),
                     "the words go to the agent as a new email to the picked people: \(asked.prefix(400))")
         }
+    }
+
+    @Test("The card's Send keeps the chat open as the next new email to the same people with an empty field, the email's Sending bubble in it; the bubble's Undo reopens the compose over the chat, and that compose closed unsent returns to the chat as it was")
+    func cardSendShowsTheBubbleAndUndoReturnsToTheChat() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, model, screen in
+                    let service = PendingSendService.shared
+                    let hint = [ChatNewDraft.recipientsLine(model.people) ?? ""]
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    #expect(row.inReplyTo == nil && row.draftId != model.draftId, "control: a new email, on the card's own draft")
+                    #expect(service.undoOwner(for: row.id) == .bubble, "its Undo is on the chat's bubble")
+                    #expect(service.visibleToast?.id != row.id, "no toast for it")
+                    try await Self.waitUntil { Self.hasUndo(screen) && Self.fieldText(in: screen.view) == "" }
+                    #expect(Self.hasUndo(screen), "the chat shows the email's Sending bubble with its Undo: \(HostedAccessibility.identifiers(in: screen.view))")
+                    #expect(HostedAccessibility.identifiers(in: screen.view).contains(ChatNewThreadView.backId), "the chat stays open")
+                    #expect(Self.fieldText(in: screen.view) == "", "the field is empty for the next email")
+                    #expect(Self.labels(of: ChatNewThreadView.hintId, in: screen.view) == hint, "to the same people")
+                    try await Self.waitUntil { !DraftSessionRegistry.shared.isActive(model.draftId) }
+                    #expect(!DraftSessionRegistry.shared.isActive(model.draftId), "the sent email's chat draft is let go")
+
+                    // Undo on the bubble: the send is cancelled and its compose reopens over the chat.
+                    #expect(HostedAccessibility.activate(ChatUndoSendStatus.undoId, in: screen.view), "the bubble's Undo takes a tap")
+                    try await Self.waitUntil { Self.topPresented(screen) != nil }
+                    let reopened = try #require(Self.topPresented(screen), "the compose reopens over the chat")
+                    #expect(HostedAccessibility.identifiers(in: reopened.view).contains(ComposeView.sendButtonId),
+                            "a compose: \(HostedAccessibility.identifiers(in: reopened.view).prefix(12))")
+                    #expect(service.reopenSnapshot?.openedOn == .newEmailChat, "it records the new email's chat")
+                    #expect(service.topLevelReopen == nil, "the chat presents it, not the screen under it")
+                    let left = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
+                    #expect(left == nil, "the send is cancelled")
+
+                    // Closed unsent: back on the chat, to the same people, with an empty field.
+                    reopened.presentingViewController?.dismiss(animated: false)
+                    try await Self.waitUntil { Self.topPresented(screen) == nil && service.reopenSnapshot == nil && !Self.hasUndo(screen) }
+                    #expect(Self.topPresented(screen) == nil && service.reopenSnapshot == nil, "the compose has closed")
+                    #expect(Self.labels(of: ChatNewThreadView.hintId, in: screen.view) == hint, "the chat, to the same people")
+                    #expect(Self.fieldText(in: screen.view) == "", "with an empty field")
+                    #expect(!Self.hasUndo(screen), "the cancelled send's bubble has gone")
+                }
+            }
+        }
+    }
+
+    @Test("Once the sent email's copy is in the account's Sent folder, the chat is that email's thread, and Back closes it")
+    func sentCopyTurnsTheChatIntoItsThread() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, model, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    var copy = MessageHeader(
+                        messageId: "screen-sent-copy", subject: "Lunch", from: "me@example.com", fromAddress: "me@example.com",
+                        to: "maria@example.com", date: Date(), snippet: "Lunch on Friday?",
+                        folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: "Sent"),
+                        accountId: Self.accountId, folderPath: "Sent", isInInbox: false)
+                    copy.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
+                    copy.headerComplete = true
+                    copy.bodyComplete = true
+                    copy.isRead = true
+                    let stored = copy
+                    try await fixture.pool.write { try stored.insert($0) }
+
+                    func isThread() -> Bool {
+                        let ids = HostedAccessibility.identifiers(in: screen.view)
+                        return ids.contains(ChatThreadView.forwardId) && Self.labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
+                    }
+                    try await Self.waitUntil { isThread() }
+                    #expect(isThread(), "the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
+                    #expect(HostedAccessibility.identifiers(in: screen.view).contains(ChatNewThreadView.backId), "with the chat's own Back")
+                    #expect(screen.stage.pushed != nil, "control: still open")
+
+                    #expect(HostedAccessibility.activate(ChatNewThreadView.backId, in: screen.view), "Back takes a tap")
+                    try await Self.waitUntil { screen.stage.pushed == nil }
+                    #expect(screen.stage.pushed == nil, "Back closes the chat")
+                }
+            }
+        }
+    }
+
+    /// The new email's chat, to Maria, with a fake agent that writes the email the field's words
+    /// ask for (`email_compose`) on no real network, the account's Sent and Drafts folders, and the
+    /// consent held off so no send reaches a real summary call (`SentEmailSummary.mayRun`).
+    private func withCardSend(_ body: @MainActor (Fixture, ChatNewThreadModel, Screen) async throws -> Void) async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        try FolderEpochTestFixture.insertFolder(accountId: Self.accountId, path: "Sent", role: .sent, pool: fixture.pool)
+        try FolderEpochTestFixture.insertFolder(accountId: Self.accountId, path: "Drafts", role: .drafts, pool: fixture.pool)
+        let standard = UserDefaults.standard
+        let consentBefore = standard.object(forKey: AgeAndTermsConsent.completedKey)
+        standard.set(false, forKey: AgeAndTermsConsent.completedKey)
+        let backend = ChatComposeRoutingTests.Backend(asksForReply: false, asksForNewEmail: true)
+        ChatPillState.shared.aiService = backend.service
+        let service = PendingSendService.shared
+        defer {
+            ChatPillState.shared.aiService = .shared
+            backend.http.close()
+            AgentToolRouter.shared.resetComposeQueueForTesting()
+            service.dismiss()
+            service.resetUndoOwnersForTesting()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            if let consentBefore { standard.set(consentBefore, forKey: AgeAndTermsConsent.completedKey) } else {
+                standard.removeObject(forKey: AgeAndTermsConsent.completedKey)
+            }
+        }
+        service.dismiss()
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        let model = ChatNewThreadModel(account: fixture.account)
+        model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
+        try await withScreen(model) { screen in try await body(fixture, model, screen) }
+    }
+
+    /// Types `words` and sends them; the agent's card opens over the chat, and its Send is tapped
+    /// until it has queued the email (a compose still binding its draft ignores a tap). Returns the
+    /// send's outbox row once the card has gone, its hold moved an hour on, so the test, not the
+    /// clock, ends its Undo window.
+    private static func sendFromTheCard(_ words: String, screen: Screen, fixture: Fixture) async throws -> OutboxMessage {
+        #expect(ThreadChatTests.type(words, in: screen.view), "control: the field takes words")
+        try await waitUntil { fieldText(in: screen.view) == words }
+        try await settle()
+        #expect(HostedAccessibility.activate("chatSend", in: screen.view), "the field's Send takes a tap")
+        try await waitUntil { topPresented(screen) != nil }
+        let card = try #require(topPresented(screen), "the agent's card opens over the chat")
+        func sendEnabled() -> Bool {
+            HostedAccessibility.elements(under: card.view).contains {
+                HostedAccessibility.identifier(of: $0) == ComposeView.sendButtonId && !$0.accessibilityTraits.contains(.notEnabled)
+            }
+        }
+        try await waitUntil { sendEnabled() }
+        let before = try await fixture.pool.read { try OutboxMessage.fetchAll($0).map(\.id) }
+        var queued: OutboxMessage?
+        for poll in 0..<100 where queued == nil {
+            if poll.isMultiple(of: 20), sendEnabled() {
+                _ = HostedAccessibility.activate(ComposeView.sendButtonId, in: card.view)
+            }
+            try await Task.sleep(for: .milliseconds(100))
+            queued = try await fixture.pool.read { db in try OutboxMessage.fetchAll(db).first { !before.contains($0.id) } }
+        }
+        let row = try #require(queued, "the card's Send queued the email")
+        let id = row.id
+        let hold = Date().addingTimeInterval(3600)
+        try await fixture.pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?", arguments: [hold, id])
+        }
+        try await waitUntil { topPresented(screen) == nil }
+        return row
+    }
+
+    /// The Sending bubble's Undo is on screen.
+    private static func hasUndo(_ screen: Screen) -> Bool {
+        HostedAccessibility.identifiers(in: screen.view).contains(ChatUndoSendStatus.undoId)
     }
 
     @Test("With someone picked, the header's sheet lists who is picked, and the user's own addresses (every account's) typed there are not added")
@@ -993,7 +1152,9 @@ struct ChatNewThreadScreenTests {
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
         let stage = Stage()
-        let controller = UIHostingController(rootView: AnyView(Navigation(stage: stage, model: model)))
+        let navigationStore = NavigationStore()
+        navigationStore.accounts = model.account.map { [$0] } ?? []
+        let controller = UIHostingController(rootView: AnyView(Navigation(stage: stage, model: model, navigationStore: navigationStore)))
         window.rootViewController = controller
         window.makeKeyAndVisible()
         let screen = Screen(controller: controller, stage: stage)
