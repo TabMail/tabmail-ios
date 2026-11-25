@@ -737,6 +737,21 @@ enum MessageHeaderRekey {
                 result.removedOldHeaderIds.append(oldId)
                 continue
             }
+            // A reply or forward still in the Outbox names its original by header
+            // id (#1479). The completion's server mark and an unsent removal's
+            // revert read the original by that key, so it follows the original to
+            // the address the server just proved, in this transaction, as queued
+            // operations do (`readdressQueuedOperations`). Only this re-key
+            // carries it: not the collision arm above (the row already at the new
+            // id is not the row Send marked, and its numbering is unproven), and
+            // not `apply`'s other callers (sync's UID remap re-keys on Message-ID
+            // evidence, and the Message-ID never chooses a message to change,
+            // ADR-IOS-068 D4). An original moved in another client that sync
+            // stores as a new row is therefore not found (`IOS-OUTBOX-012`).
+            // outboxMessage holds only unsent, failed and unfinalized sends.
+            try db.execute(
+                sql: "UPDATE outboxMessage SET originalMessageHeaderId = ? WHERE originalMessageHeaderId = ?",
+                arguments: [newId, oldId])
             result.applied.append(HeaderRekeyRecord(
                 oldHeaderId: oldId, newHeaderId: newId,
                 newProviderMessageId: newMessageId,

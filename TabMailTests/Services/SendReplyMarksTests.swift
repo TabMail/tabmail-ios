@@ -23,7 +23,9 @@ import Testing
 /// row's own record: the mark goes back to unset, and the tag goes back to Reply
 /// while it is still Send's none. No provider's sync clears
 /// `isReplied`/`isForwarded`, so a mark nothing took back would outlive an undone
-/// send for good (#1468).
+/// send for good (#1468). An original re-keyed by a move while the send is held
+/// is found at its new address: the re-key carries the queued send's pointer
+/// (#1479).
 ///
 /// The world tests drive the real queue, cancel and completion paths against the
 /// stateful Gmail, IMAP and Outlook fakes, and run the provider's passes while
@@ -1411,72 +1413,185 @@ struct SendReplyMarksTests {
 
     // MARK: - The original moved before the send went out
 
-    /// TODAY'S BEHAVIOUR, pinned so that a change to it is deliberate. Archiving
-    /// the original while the reply is held gives it a new address (on IMAP a UID
-    /// in Archive; the row is re-keyed when the move lands), and the moved row
-    /// keeps the marks Send wrote. The queued row still names the old address, so
-    /// neither the completion nor an Undo finds the original: a completed send
-    /// queues no server mark, and an Undo leaves the moved original marked
-    /// (#1479).
-    @Test("A reply whose original is archived while it is held: the moved original keeps Send's marks, and neither the completion nor an Undo finds it",
-          arguments: [Outcome.completed, .undone])
-    func originalArchivedWhileTheSendIsHeld(outcome: Outcome) async throws {
+    static let archivePath = "Archive"
+    static let archiveEpoch = SendReplyMarksTests.imapEpoch + 1
+
+    /// An Archive folder with a known epoch, for an original moved there.
+    static func insertArchive(_ pool: DatabasePool, accountId: String) throws {
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: Self.archivePath, role: .archive, pool: pool,
+            lastKnownUidValidity: Self.archiveEpoch)
+    }
+
+    /// Archiving the original while its send is held gives it a new address (on
+    /// IMAP a UID in Archive; the row is re-keyed when the move lands), and the
+    /// queued send follows it (#1479): the completion marks the moved original
+    /// and queues the server's mark at its Archive address, and an unsent
+    /// removal takes Send's marks back from it.
+    @Test("An original archived while its reply or forward is held: the completion marks it at its Archive address, and an Undo takes Send's marks back from it",
+          arguments: [false, true], [Outcome.completed, .undone])
+    func originalArchivedWhileTheSendIsHeld(isForward: Bool, outcome: Outcome) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         let accountId = try Self.localAccount(pool, prefix: "marks-moved")
-        let archivePath = "Archive"
-        let archiveEpoch = Self.imapEpoch + 1
-        try FolderEpochTestFixture.insertFolder(
-            accountId: accountId, path: archivePath, role: .archive, pool: pool,
-            lastKnownUidValidity: archiveEpoch)
-        let parentRfc = "moved-parent@example.com"
-        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: parentRfc, tag: .reply)
+        try Self.insertArchive(pool, accountId: accountId)
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: "moved-parent@example.com", tag: .reply)
         let before = try Self.marks(pool, headerId: original.id)
         let queued = try await Self.queueAndCheckHeld(
-            pool: pool, accountId: accountId, original: original, isForward: false, before: before)
+            pool: pool, accountId: accountId, original: original, isForward: isForward, before: before)
 
         // The archive gesture moves the row locally; it keeps its key until the move lands ...
-        let archiveFolderId = MessageIdentity.folderId(accountId: accountId, folderPath: archivePath)
+        let archiveFolderId = MessageIdentity.folderId(accountId: accountId, folderPath: Self.archivePath)
         try await pool.write { db in
             try db.execute(
                 sql: "UPDATE messageHeader SET folderPath = ?, folderId = ?, isInInbox = 0, observedUidValidity = NULL WHERE id = ?",
-                arguments: [archivePath, archiveFolderId, original.id])
+                arguments: [Self.archivePath, archiveFolderId, original.id])
         }
         // ... and when it lands, the row takes the Archive copy's address the server named.
         let move = PendingOperation(
             type: .move, messageIds: [original.messageId], accountId: accountId,
-            folderPath: Self.imapPath, destinationPath: archivePath, observedUidValidity: Self.imapEpoch)
+            folderPath: Self.imapPath, destinationPath: Self.archivePath, observedUidValidity: Self.imapEpoch)
         let finished = try await pool.write { db in
             try MessageHeaderRekey.finishMove(
                 move, destinations: [ProvenDestinationAddress(
                     sourceProviderId: original.messageId, destinationProviderId: "9",
-                    destinationUidValidity: UInt32(archiveEpoch))],
+                    destinationUidValidity: UInt32(Self.archiveEpoch))],
                 addressChangesOnMove: true, accountScopedIds: false, db: db)
         }
         #expect(finished.applied.count == 1, "precondition: the move re-keyed the original")
-        let movedId = MessageIdentity.headerId(accountId: accountId, folderPath: archivePath, messageId: "9")
+        let movedId = MessageIdentity.headerId(accountId: accountId, folderPath: Self.archivePath, messageId: "9")
         let moved = try Self.marks(pool, headerId: movedId)
-        let held = Self.held(before: before, isForward: false)
+        let held = Self.held(before: before, isForward: isForward)
         #expect(moved == held, "the moved original keeps Send's marks: \(moved)")
+        let outboxId = queued.outboxId
+        let pointer = try await pool.read { db in
+            try OutboxMessage.fetchOne(db, key: outboxId)?.originalMessageHeaderId
+        }
+        #expect(pointer == movedId, "the queued send follows its original to the Archive address: \(pointer ?? "nil")")
+
+        let markType = isForward ? OperationType.markForwarded : OperationType.markReplied
+        switch outcome {
+        case .completed:
+            let disposition = try await Self.complete(pool: pool, outboxId: outboxId)
+            #expect(disposition.changedOriginalHeaderId == movedId, "the completion finds the moved original")
+            let serverMarks = try Self.markOps(pool).filter { $0.type == markType }
+            #expect(serverMarks.count == 1, "the completed send queues the server's \(markType.rawValue)")
+            guard serverMarks.count == 1 else { return }
+            #expect(serverMarks[0].messageIds == ["9"], "the server's mark names the Archive copy: \(serverMarks[0].messageIds)")
+            let markEpoch = serverMarks[0].observedUidValidity
+            #expect(markEpoch == Self.archiveEpoch, "the server's mark carries the Archive epoch: \(String(describing: markEpoch))")
+            let tags = try Self.queuedTags(pool)
+            let wantTags: [String?] = isForward ? [] : [ActionTag.none.rawValue]
+            #expect(tags == wantTags, "the completion sends Send's tag clear to the server: \(tags)")
+        case .undone, .discardedAfterFailure:
+            let cancelled = try await Self.cancel(
+                pool: pool, outboxId: outboxId, failedFirst: outcome == .discardedAfterFailure)
+            #expect(cancelled.revertedOriginalHeaderId == movedId, "the Undo finds the moved original")
+            let serverMarks = try Self.queuedCount(pool, markType)
+            #expect(serverMarks == 0, "no server mark for a send that never went out")
+            let tags = try Self.queuedTags(pool)
+            let wantTags: [String?] = isForward ? [] : [ActionTag.reply.rawValue]
+            #expect(tags == wantTags, "the restored Reply goes to the server: \(tags)")
+        }
+        let folders = try Self.markOps(pool).map(\.folderPath)
+        let archivePath = Self.archivePath
+        let allInArchive = folders.allSatisfy { $0 == archivePath }
+        #expect(allInArchive, "every queued mark or tag names the Archive copy: \(folders)")
+        let after = try Self.marks(pool, headerId: movedId)
+        let want = Self.expected(before: before, isForward: isForward, outcome: outcome)
+        #expect(after == want, "\(outcome.rawValue): \(after), want \(want)")
+    }
+
+    /// An original moved in another client while its send is held: sync drops the
+    /// INBOX row and stores the Archive copy as a new row. Only the Message-ID
+    /// links that row to the queued send, and the Message-ID never selects a
+    /// message to change (ADR-IOS-068 D4), so neither the completion nor an Undo
+    /// finds it, and neither changes it or queues anything for it
+    /// (`IOS-OUTBOX-012`).
+    @Test("An original moved in another client while its reply or forward is held: neither the completion nor an Undo touches the copy sync stored",
+          arguments: [false, true], [Outcome.completed, .undone])
+    func originalMovedElsewhereWhileTheSendIsHeld(isForward: Bool, outcome: Outcome) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-elsewhere")
+        try Self.insertArchive(pool, accountId: accountId)
+        let parentRfc = "elsewhere-parent@example.com"
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: parentRfc, tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: isForward, before: before)
+
+        // Sync finds the original gone from INBOX and a new message in Archive,
+        // with the server's state: no mark (Send never reached the server) and
+        // the Reply tag.
+        let originalId = original.id
+        let copy = try await pool.write { db -> MessageHeader in
+            _ = try MessageHeader.deleteOne(db, key: originalId)
+            var copy = MessageHeader(
+                messageId: "9", subject: "Original", from: "Sender",
+                fromAddress: "sender@example.com", to: "me@example.com", date: Date(),
+                snippet: "original",
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: Self.archivePath),
+                accountId: accountId, folderPath: Self.archivePath, isInInbox: false)
+            copy.rfc822MessageId = parentRfc
+            copy.headerComplete = true
+            copy.observedUidValidity = Self.archiveEpoch
+            copy.setActionTag(.reply, at: Date().addingTimeInterval(-3_600))
+            try copy.insert(db)
+            return copy
+        }
+        let copyBefore = try Self.rowSnapshot(pool, headerId: copy.id)
+        #expect(!copyBefore.isEmpty, "precondition: sync stored the Archive copy")
 
         switch outcome {
         case .completed:
             let disposition = try await Self.complete(pool: pool, outboxId: queued.outboxId)
-            #expect(disposition.changedOriginalHeaderId == nil, "the queued row names the address the original left")
-            let serverMarks = try Self.queuedCount(pool, .markReplied)
-            #expect(serverMarks == 0, "no server mark is queued for an original the completion cannot find")
-            // The Sent copy's sync names the original by its Message-ID; it is already marked.
-            let marked = try await pool.write { db in
-                try ReplyParentResolver.markParentsReplied(
-                    sentCopies: [.init(inReplyTo: "<\(parentRfc)>", subject: "Re: Original")], folderRole: .sent,
-                    accountId: accountId, db: db)
-            }
-            #expect(marked.isEmpty, "the moved original is already marked replied")
+            #expect(disposition.changedOriginalHeaderId == nil, "the completion finds no original")
         case .undone, .discardedAfterFailure:
-            let cancelled = try await Self.cancel(pool: pool, outboxId: queued.outboxId)
-            #expect(cancelled.revertedOriginalHeaderId == nil, "the Undo cannot find the moved original")
+            let cancelled = try await Self.cancel(
+                pool: pool, outboxId: queued.outboxId, failedFirst: outcome == .discardedAfterFailure)
+            #expect(cancelled.revertedOriginalHeaderId == nil, "the Undo finds no original")
         }
-        let after = try Self.marks(pool, headerId: movedId)
-        #expect(after == held, "\(outcome.rawValue): the moved original keeps Send's marks: \(after)")
+        let queuedTypes = try Self.markOps(pool).map(\.type.rawValue)
+        #expect(queuedTypes.isEmpty, "nothing is queued for the copy: \(queuedTypes)")
+        let copyAfter = try Self.rowSnapshot(pool, headerId: copy.id)
+        #expect(copyAfter == copyBefore, "\(outcome.rawValue): the copy sync stored is unchanged")
+    }
+
+    /// Sync's own re-key of a row (its UID remap, through
+    /// `MessageHeaderRekey.apply`) rests on Message-ID evidence, so it does not
+    /// carry the queued send's pointer: the completion finds no original and
+    /// queues nothing (`IOS-OUTBOX-012`). Only a landed move's proven re-key
+    /// (`finishMove`) carries it.
+    @Test("Sync's own re-key of a held reply's original does not carry the send to it")
+    func syncRekeyDoesNotCarryTheSend() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-remap")
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: "remap-parent@example.com", tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: false, before: before)
+
+        let originalId = original.id
+        let remappedId = MessageIdentity.headerId(accountId: accountId, folderPath: Self.imapPath, messageId: "58")
+        let rekeyed = try await pool.write { db -> Bool in
+            guard let row = try MessageHeader.fetchOne(db, key: originalId) else { return false }
+            var migrated = row
+            migrated.id = remappedId
+            migrated.messageId = "58"
+            return try MessageHeaderRekey.apply(from: row, to: migrated, db: db)
+        }
+        #expect(rekeyed, "precondition: sync's re-key moved the row")
+        let outboxId = queued.outboxId
+        let pointer = try await pool.read { db in
+            try OutboxMessage.fetchOne(db, key: outboxId)?.originalMessageHeaderId
+        }
+        #expect(pointer == originalId, "the queued send still names the old id: \(pointer ?? "nil")")
+
+        let disposition = try await Self.complete(pool: pool, outboxId: outboxId)
+        #expect(disposition.changedOriginalHeaderId == nil, "the completion finds no original")
+        let queuedTypes = try Self.markOps(pool).map(\.type.rawValue)
+        #expect(queuedTypes.isEmpty, "nothing is queued for the re-keyed row: \(queuedTypes)")
     }
 }
