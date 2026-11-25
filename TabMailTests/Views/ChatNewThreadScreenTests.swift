@@ -576,55 +576,6 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("The sent email's copy arriving while the TabMail panel is open waits for the panel to close, then the chat is that email's thread")
-    func sentCopyWaitsForTheOpenPanel() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
-        try await HostedAccessibility.withAutomation {
-            try await Self.withChatView(true) {
-                try await withCardSend { fixture, _, screen in
-                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
-                    try await Self.waitUntil { Self.hasUndo(screen) }
-                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
-                    // The user drags the field up to ask TabMail something while the email goes out
-                    // (VoiceOver's equivalent of the drag opens the same panel).
-                    #expect(HostedAccessibility.perform(ChatViewConfig.showChatActionName, in: screen.view), "the panel opens")
-                    try await Self.waitUntil { Self.panelOpen(screen) }
-                    #expect(Self.panelOpen(screen), "control: the panel is open")
-
-                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
-                    var copy = MessageHeader(
-                        messageId: "screen-sent-copy-panel", subject: "Lunch", from: "me@example.com", fromAddress: "me@example.com",
-                        to: "maria@example.com", date: Date(), snippet: "Lunch on Friday?",
-                        folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: "Sent"),
-                        accountId: Self.accountId, folderPath: "Sent", isInInbox: false)
-                    copy.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
-                    copy.headerComplete = true
-                    copy.bodyComplete = true
-                    copy.isRead = true
-                    let stored = copy
-                    try await fixture.pool.write { try stored.insert($0) }
-
-                    @MainActor func isThread() -> Bool {
-                        let ids = HostedAccessibility.identifiers(in: screen.view)
-                        return ids.contains(ChatThreadView.forwardId) && Self.labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
-                    }
-                    // Longer than the swap takes with nothing open (`sentCopyTurnsTheChatIntoItsThread`).
-                    for _ in 0..<30 {
-                        if isThread() || !Self.panelOpen(screen) { break }
-                        try await Task.sleep(for: .milliseconds(100))
-                    }
-                    #expect(!isThread(), "the swap waits while the panel is open")
-                    #expect(Self.panelOpen(screen), "the panel the user opened stays")
-
-                    #expect(HostedAccessibility.activate("chatClose", in: screen.view), "the panel's close takes a tap")
-                    try await Self.waitUntil { isThread() }
-                    #expect(isThread(), "with the panel closed, the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
-                    #expect(screen.stage.pushed != nil, "control: still open")
-                }
-            }
-        }
-    }
-
     /// The new email's chat, to Maria, with a fake backend that writes the email the field's words
     /// ask for (the field's compose edit) on no real network, the account's Sent and Drafts folders, and the
     /// consent held off so no send reaches a real summary call (`SentEmailSummary.mayRun`).
@@ -837,6 +788,55 @@ struct ChatNewThreadScreenTests {
             try await Self.settle()
             #expect(recorder.calls.count == 1, "the close tried no save of its own")
             #expect(!DraftSessionRegistry.shared.isActive(model.draftId))
+        }
+    }
+
+    @Test("The sent email's copy arriving while the TabMail panel is open waits for the panel to close, then the chat is that email's thread")
+    func sentCopyWaitsForTheOpenPanel() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    // The user drags the field up to ask TabMail something while the email goes out
+                    // (VoiceOver's equivalent of the drag opens the same panel).
+                    #expect(HostedAccessibility.perform(ChatViewConfig.showChatActionName, in: screen.view), "the panel opens")
+                    try await Self.waitUntil { Self.panelOpen(screen) }
+                    #expect(Self.panelOpen(screen), "control: the panel is open")
+
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    var copy = MessageHeader(
+                        messageId: "screen-sent-copy-panel", subject: "Lunch", from: "me@example.com", fromAddress: "me@example.com",
+                        to: "maria@example.com", date: Date(), snippet: "Lunch on Friday?",
+                        folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: "Sent"),
+                        accountId: Self.accountId, folderPath: "Sent", isInInbox: false)
+                    copy.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
+                    copy.headerComplete = true
+                    copy.bodyComplete = true
+                    copy.isRead = true
+                    let stored = copy
+                    try await fixture.pool.write { try stored.insert($0) }
+
+                    @MainActor func isThread() -> Bool {
+                        let ids = HostedAccessibility.identifiers(in: screen.view)
+                        return ids.contains(ChatThreadView.forwardId) && Self.labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
+                    }
+                    // Longer than the swap takes with nothing open (`sentCopyTurnsTheChatIntoItsThread`).
+                    for _ in 0..<30 {
+                        if isThread() || !Self.panelOpen(screen) { break }
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    #expect(!isThread(), "the swap waits while the panel is open")
+                    #expect(Self.panelOpen(screen), "the panel the user opened stays")
+
+                    #expect(HostedAccessibility.activate("chatClose", in: screen.view), "the panel's close takes a tap")
+                    try await Self.waitUntil { isThread() }
+                    #expect(isThread(), "with the panel closed, the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
+                    #expect(screen.stage.pushed != nil, "control: still open")
+                }
+            }
         }
     }
 
