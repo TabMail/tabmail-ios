@@ -531,7 +531,7 @@ struct ChatNewThreadScreenTests {
         let standard = UserDefaults.standard
         let consentBefore = standard.object(forKey: AgeAndTermsConsent.completedKey)
         standard.set(false, forKey: AgeAndTermsConsent.completedKey)
-        let backend = ChatComposeRoutingTests.Backend(asksForReply: false, asksForNewEmail: true)
+        let backend = ChatComposeRoutingTests.Backend(asksForNewEmail: true)
         ChatPillState.shared.aiService = backend.service
         let service = PendingSendService.shared
         defer {
