@@ -51,9 +51,9 @@ struct ChatBubbleNameLineLayoutTests {
         let sender = ChatSenderLine(
             item: Self.item(name: Self.longName))
         let line = Self.fittedSize(sender, width: Self.column, size: size)
-        let oneLine = Self.fittedSize(Text("Ag").font(.caption), width: Self.column, size: size).height
+        let oneLine = Self.fittedSize(Text("Ag").font(ChatSenderLine.nameFont), width: Self.column, size: size).height
         let label = Self.fittedSize(Text(Self.labelText).font(.caption), width: Self.column, size: size)
-        let name = Self.fittedSize(Text(Self.longName).font(.caption).fontWeight(.medium), width: Self.column, size: size)
+        let name = Self.fittedSize(Text(Self.longName).font(ChatSenderLine.nameFont).fontWeight(.medium), width: Self.column, size: size)
         #expect(name.height > oneLine * 1.5, "control: the long name would wrap if allowed")
         #expect(line.width <= Self.column + 0.5, "the sender line is \(line.width) wide; the column is \(Self.column)")
         #expect(line.height >= oneLine + label.height - 0.5,
@@ -67,7 +67,7 @@ struct ChatBubbleNameLineLayoutTests {
         let sender = ChatSenderLine(
             item: Self.item(name: "Alex"))
         let line = Self.fittedSize(sender, width: Self.column, size: size)
-        let oneLine = Self.fittedSize(Text("Ag").font(.caption), width: Self.column, size: size).height
+        let oneLine = Self.fittedSize(Text("Ag").font(ChatSenderLine.nameFont), width: Self.column, size: size).height
         let label = Self.fittedSize(Text(Self.labelText).font(.caption), width: .greatestFiniteMagnitude, size: size)
         #expect(abs(line.height - oneLine) <= 1, "the line is \(line.height) tall; one line is \(oneLine)")
         #expect(line.width > label.width, "the name and the label are not side by side")
@@ -122,9 +122,9 @@ struct ChatBubbleNameLineLayoutTests {
         let name = String(repeating: "Alexandra Montgomery-Fitzgerald ", count: 3)
         let only = ChatThread.OnlyTo(includesYou: true, people: Self.manyPeople)
         let line = Self.fittedSize(ChatSenderLine(item: Self.item(name: name, onlyTo: only)), width: Self.column, size: .large)
-        let oneLine = Self.fittedSize(Text("Ag").font(.caption), width: Self.column, size: .large).height
+        let oneLine = Self.fittedSize(Text("Ag").font(ChatSenderLine.nameFont), width: Self.column, size: .large).height
         let fullName = Self.fittedSize(
-            Text(name).font(.caption).fontWeight(.medium).fixedSize(), width: .greatestFiniteMagnitude, size: .large)
+            Text(name).font(ChatSenderLine.nameFont).fontWeight(.medium).fixedSize(), width: .greatestFiniteMagnitude, size: .large)
         #expect(fullName.width > Self.column, "control: the name is wider than the column")
         #expect(abs(line.height - oneLine) <= 1, "the line wrapped: \(line.height) tall; one line is \(oneLine)")
         #expect(line.width >= fullName.width - 0.5,
