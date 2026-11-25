@@ -420,6 +420,32 @@ final class ChatNewThreadModel: Hashable {
         addAttachment(attachment)
     }
 
+    /// The compose card for the new email the agent wrote from the field's words (`email_compose`):
+    /// today's compose, with the agent's subject and email, this chat's people as To (as a save
+    /// writes them, `toEntries`), the subject, Cc and Bcc it carries (a link's or a reopened
+    /// draft's subject wins over the agent's), the attachments waiting above the field, and From
+    /// `account`, changeable on the card as compose's From is. Only the card's Send sends.
+    func card(
+        for req: AgentToolRouter.ComposeRequest, account: Account?,
+        onOutcome: @escaping @MainActor (ComposeOutcome) -> Void
+    ) -> ComposeView {
+        ComposeView(
+            suggestedBody: req.body, account: account,
+            prefillTo: content.recipients, prefillCc: carried.cc, prefillBcc: carried.bcc,
+            prefillSubject: carried.shownSubject ?? req.subject,
+            prefillAttachments: attachments, onAgentOutcome: onOutcome)
+    }
+
+    /// After the card's Send has its durable outbox row: this chat's saved draft, if it has one,
+    /// is discarded through compose's own Discard (`ComposeDraftDiscard`, which also removes the
+    /// server's copy), after any save of it in flight. With no saved draft there is nothing to do.
+    func discardSavedDraft() async -> ComposeDraftDiscard.Outcome {
+        while let running = inFlight { _ = await running.value }
+        return await ComposeDraftDiscard.run(
+            .wholeDraft, draftId: draftId, epoch: cursor.newEpoch, readState: .loaded,
+            isSavingDraft: isSaving, isSending: false, agentSendFence: ComposeAgentSendFence())
+    }
+
     /// Saves the draft when leaving or going to the background requires it (`needsSave`), after
     /// any picked photo still loading has landed, or when the last version saved on the device
     /// still waits for its push (`pushPending`). One save at a time: a second waits for the first
