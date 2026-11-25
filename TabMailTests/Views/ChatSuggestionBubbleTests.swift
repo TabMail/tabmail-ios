@@ -14,8 +14,8 @@ import UIKit
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The ready suggestion shows as a ghost of the user's next message, labelled "AI Suggestion",
 ///     with "AI Suggestion · Tap to use" under it; the field stays empty.
-///  2. A tap on it opens the compose card, and sends nothing. The card's body is checked in the
-///     running app only (`ChatSwipeUITests`).
+///  2. A tap on it opens the compose card, and sends nothing; the ghost stays in its place while
+///     the card is open. The card's body is checked in the running app only (`ChatSwipeUITests`).
 ///  3. One copy: the ghost reads the email's row, so a new text version there rewrites it in place,
 ///     and the old text is gone.
 ///  4. The chat view says "AI Suggestion", never "AI Reply", in any string a user sees or hears.
@@ -172,7 +172,7 @@ struct ChatSuggestionBubbleTests {
             try await Self.openCard(chat)
             let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
             #expect(queued == 0, "nothing was sent")
-            #expect(Self.ghost(in: chat.view) == nil, "the ghost leaves while its own card is open")
+            #expect(Self.ghost(in: chat.view) != nil, "the ghost stays in its place while its own card is open")
             chat.controller.dismiss(animated: false)
             try await Self.waitUntil { chat.controller.presentedViewController == nil }
             try await Self.waitUntil { Self.ghost(in: chat.view) != nil }

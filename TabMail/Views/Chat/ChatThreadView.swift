@@ -100,6 +100,10 @@ struct ChatThreadView: View {
     @State private var chatWorking = false
     /// The ready AI Suggestion's compose card: the email it answers, and how it opens.
     @State private var readyReply: ChatReadyReply?
+    /// The ghost tapped open, held in its place while its card is up (`ChatHeldGhost`).
+    @State private var heldGhost: ChatHeldGhost?
+    /// The held ghost turning into the sent reply's bubble.
+    @Namespace private var sentMorph
     /// The field's "e.g." example, picked once as the chat opens.
     @State private var example = ChatSuggestionConfig.randomExample()
     @State private var agentCompose: AgentToolRouter.ComposeRequest?
@@ -274,6 +278,8 @@ struct ChatThreadView: View {
         }
         // A new newest email has its own people: the next reply is a Reply All to them.
         .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
+        // A held ghost whose card sent waits for the reply to show, then turns into its bubble.
+        .onChange(of: sentReplyShows) { _, _ in endHeldGhostIfDone() }
         .toolbar {
             // Who the reply goes to, in the navigation bar as in Messages: the avatars level with
             // Back, the names under them.
@@ -357,7 +363,7 @@ struct ChatThreadView: View {
             }
             .presentationDragIndicator(.visible)
         }
-        .fullScreenCover(item: $readyReply) { ready in
+        .fullScreenCover(item: $readyReply, onDismiss: readyCardClosed) { ready in
             let _ = ChatThreadView.logReadyCard(ready)
             // Today's reply compose: the ghost's, Reply All with the AI Suggestion in its box (the
             // full reply of the row the ghost showed, read with it, so the card holds the reply
@@ -395,8 +401,9 @@ struct ChatThreadView: View {
             attachPicked(pick)
             openPendingAttachCard()
         }
-        // Test seam: the paperclip's menu is a system menu a hosted test cannot open, so the test
-        // makes the menu's choice here and then drives the real picker. Production never posts it.
+        // Test seam: the paperclip's pop-up is a UIKit presentation a hosted test cannot drive, so
+        // the test makes the pop-up's choice here and then drives the real picker. Production never
+        // posts it.
         .onReceive(NotificationCenter.default.publisher(for: .chatPaperclipOpenForTesting)) { note in
             guard let source = note.object as? ChatNewEmailField.AttachSource else { return }
             attachFromField(source)
@@ -435,13 +442,22 @@ struct ChatThreadView: View {
                                 // Debug UI tests only: where the newest row sits during a field drag.
                                 .modifier(ChatFieldDragMarker.Row(isNewest: item.id == thread.items.last?.id))
                         }
-                        // Replies still in the outbox.
-                        ForEach(unsentReplies) { reply in
-                            ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })
+                        // Replies still in the outbox. Not while a ghost is held: the reply its
+                        // card sent shows as the hold ends, the ghost turning into its bubble.
+                        if heldGhost == nil {
+                            ForEach(unsentReplies) { reply in
+                                ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })
+                                    .matchedGeometryEffect(id: Self.sentMorphId(reply, newest: unsentReplies.last), in: sentMorph)
+                            }
                         }
                         // The AI Suggestion, where the reply lands once sent: the working bubble
-                        // while it is written, then the ghost.
-                        if let newest = thread.newest, let suggestion {
+                        // while it is written, then the ghost; the ghost tapped open stays while
+                        // its card is up.
+                        if let held = heldGhost {
+                            ChatSuggestionBubble(text: held.text) {}
+                                .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)
+                                .transition(.opacity)
+                        } else if let newest = thread.newest, let suggestion {
                             if !suggestionGrowPending, case .ready(let text) = suggestion {
                                 let move = tutorialMove(thread)
                                 // A tap opens the suggestion this ghost shows (`shown`: `.ready` comes only from it).
@@ -489,7 +505,12 @@ struct ChatThreadView: View {
                 .defaultScrollAnchor(.bottom)
                 .scrollDismissesKeyboard(.interactively)
                 .onScrollGeometryChange(for: Bool.self) { geo in
-                    geo.contentSize.height - (geo.contentOffset.y + geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
+                    let isAbove = Self.distanceBelowVisible(contentHeight: geo.contentSize.height, offsetY: geo.contentOffset.y,
+                                                            topInset: geo.contentInsets.top, containerHeight: geo.containerSize.height) > ChatViewLayout.jumpButtonThreshold
+                    #if DEBUG
+                    if isAbove { NSLog("[cv10diag] jump shows at %@", String(describing: geo)) }
+                    #endif
+                    return isAbove
                 } action: { _, isAbove in
                     withAnimation(.easeInOut(duration: 0.2)) { showsJumpButton = isAbove }
                 }
@@ -682,6 +703,15 @@ struct ChatThreadView: View {
     /// Whether a scroll phase is the user's own scroll, the only thing that ends the landing's pin.
     static func userTookOver(_ phase: ScrollPhase) -> Bool {
         phase == .tracking || phase == .interacting
+    }
+
+    /// How far the chat's end sits below the part of the screen between the top bar and the
+    /// field: 0 at the bottom, d once scrolled up by d, below 0 when a short chat leaves room.
+    /// The scroll geometry's container height leaves out both bars, while its offset counts from
+    /// under the top bar, so the top bar's inset is added back. Without it a tall top bar (the
+    /// tutorial's coach card) reads as chat below the screen and the jump button shows at the bottom.
+    static func distanceBelowVisible(contentHeight: CGFloat, offsetY: CGFloat, topInset: CGFloat, containerHeight: CGFloat) -> CGFloat {
+        contentHeight - (offsetY + topInset + containerHeight)
     }
 
     /// A scroll phase began: the user's own scroll ends the landing.
@@ -911,6 +941,15 @@ struct ChatThreadView: View {
     /// The toolbar's Forward, as tests find it.
     static let forwardId = "chatForward"
 
+    /// The held ghost's id in `sentMorph`. The newest outbox bubble takes it too, so the ghost turns
+    /// into the reply its card sent as the hold ends.
+    static let heldGhostMorphId = "chat-held-ghost"
+
+    /// An outbox bubble's id in `sentMorph`: the newest one's is the held ghost's.
+    static func sentMorphId(_ reply: ChatUnsentReply, newest: ChatUnsentReply?) -> String {
+        reply.id == newest?.id ? heldGhostMorphId : "chat-unsent-\(reply.id)"
+    }
+
     /// The AI Suggestion's row, from `suggestionPhase`. The working bubble filling in grows the row
     /// into the ghost over `ChatSuggestionConfig.fillDuration`, and while the landing holds its
     /// target the re-pin scroll runs in the same transaction, so the growing row stays above the
@@ -1000,6 +1039,10 @@ struct ChatThreadView: View {
             BackgroundSyncLogger.logDebug("[Chat] openSuggestion message=\(newest.id) alreadyOpen=\(readyReply != nil)")
         }
         readyReply = ChatReadyReply(message: newest, suggestion: shown, accounts: context.accounts)
+        // The ghost stays where it is while its card is up.
+        heldGhost = shown.textMessage.map {
+            ChatHeldGhost(text: $0, showsBubble: composeScreen(answering: newest) == .chat)
+        }
     }
 
     private func pill(on newest: MessageHeader) -> some View {
@@ -1248,7 +1291,36 @@ struct ChatThreadView: View {
     /// stays as it is; a reply sent clears "Replying only to", so the next one is a Reply All again.
     private func readyCardEnded(_ outcome: ComposeOutcome) {
         guard case .sent = outcome else { return }
+        heldGhost?.sent = true
         replyTarget = .replyAll
+    }
+
+    /// The ghost's or the paperclip's card has finished closing: a held ghost goes now, or once
+    /// the reply its card sent shows (`ChatHeldGhost.ends`).
+    private func readyCardClosed() {
+        heldGhost?.cardClosed = true
+        endHeldGhostIfDone()
+    }
+
+    /// The chat shows a reply of the user's below the newest email: an outbox bubble, or the sent
+    /// email itself.
+    private var sentReplyShows: Bool {
+        !unsentReplies.isEmpty || (thread.items.last?.isOwn ?? false)
+    }
+
+    /// Ends the held ghost once its hold is over. After a send its bubble shows: the ghost turns
+    /// into it (at once under Reduce Motion). Otherwise the live ghost is back in its place, the
+    /// same words, so the swap is at once.
+    private func endHeldGhostIfDone() {
+        guard let held = heldGhost, held.ends(replyShows: sentReplyShows) else { return }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[Chat] held ghost ends sent=\(held.sent) showsBubble=\(held.showsBubble) morphs=\(held.morphs)")
+        }
+        let morph = Animation.spring(
+            response: ChatSuggestionConfig.sentMorphResponse, dampingFraction: ChatSuggestionConfig.sentMorphDamping)
+        withAnimation(held.morphs && !reduceMotion ? morph : nil) {
+            heldGhost = nil
+        }
     }
 
     /// A compose card from the chat closed. Sent: a reply shows as its queued email's bubble, read

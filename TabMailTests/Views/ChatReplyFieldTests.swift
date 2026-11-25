@@ -3,7 +3,9 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftUI
 import Testing
+import UIKit
 @testable import TabMail
 
 /// ADR-IOS-114: the chat's reply field.
@@ -753,8 +755,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("ready.composeView(openedOn: composeScreen(answering: ready.message)) { outcome in readyCardEnded(outcome) }", in: text) == 1,
                 "the card is the value's own builder (its suggestion, draft and pick) and records the chat's screen")
         let readyEnded = try Self.body(of: "private func readyCardEnded(_ outcome: ComposeOutcome) {", in: text)
-        #expect(readyEnded.hasPrefix(" guard case .sent = outcome else { return } replyTarget = .replyAll }"),
-                "only a sent reply resets who the next one goes to, and the field is never emptied: \(readyEnded)")
+        #expect(readyEnded.hasPrefix(" guard case .sent = outcome else { return } heldGhost?.sent = true replyTarget = .replyAll }"),
+                "only a sent reply resets who the next one goes to and ends a held ghost as a send, and the field is never emptied: \(readyEnded)")
         #expect(Self.count("@State private var example = ChatSuggestionConfig.randomExample()", in: text) == 1,
                 "one example per chat open, kept across redraws")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
@@ -815,6 +817,85 @@ struct ChatReplyFieldTests {
         let bottom = try #require(text.range(of: "Color.clear.frame(height: ChatViewLayout.pillGap).id(Self.bottomId)"))
         #expect(rows.upperBound < unsent.lowerBound && unsent.upperBound < ghost.lowerBound && ghost.upperBound < bottom.lowerBound,
                 "the AI Suggestion is the last chat row")
+    }
+
+    @Test("A held ghost ends once its card has closed: at once unsent or with no bubble, after a send once the reply shows",
+          arguments: [false, true], [false, true])
+    func heldGhostEnds(sent: Bool, showsBubble: Bool) {
+        var held = ChatHeldGhost(text: "Tuesday works for me", showsBubble: showsBubble)
+        held.sent = sent
+        // While the card is up the ghost stays, whatever else happened.
+        #expect(!held.ends(replyShows: false) && !held.ends(replyShows: true), "the ghost stays while its card is up")
+        held.cardClosed = true
+        #expect(held.ends(replyShows: true), "a shown reply always ends it once the card closed")
+        let waitsForReply = sent && showsBubble
+        #expect(held.ends(replyShows: false) == !waitsForReply,
+                "closed: it waits only for a sent reply the chat shows as its bubble (sent \(sent), bubble \(showsBubble))")
+        #expect(held.morphs == waitsForReply, "only that reply's bubble takes the ghost's place in motion")
+    }
+
+    @Test("The ghost tapped open stays while its card is up, and turns into the sent reply's bubble once the card has closed")
+    func heldGhostWiring() throws {
+        let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        // The tap holds the ghost it opened, with whether the chat shows this card's send as a bubble.
+        let open = try Self.body(of: "private func openSuggestion(_ shown: ReplyResult, on newest: MessageHeader, tutorialMove: TutorialCoordinator.FieldMove?) {", in: text)
+        #expect(Self.count("heldGhost = shown.textMessage.map { ChatHeldGhost(text: $0, showsBubble: composeScreen(answering: newest) == .chat) }", in: open) == 1)
+        #expect(Self.count("heldGhost = ", in: text) == 2, "set by the tap, cleared only as the hold ends")
+        // The card's close and the reply's arrival both end it, through the one rule.
+        #expect(Self.count(".fullScreenCover(item: $readyReply, onDismiss: readyCardClosed) { ready in", in: text) == 1)
+        let closed = try Self.body(of: "private func readyCardClosed() {", in: text)
+        #expect(closed.hasPrefix(" heldGhost?.cardClosed = true endHeldGhostIfDone() }"))
+        #expect(Self.count(".onChange(of: sentReplyShows) { _, _ in endHeldGhostIfDone() }", in: text) == 1)
+        #expect(Self.count("!unsentReplies.isEmpty || (thread.items.last?.isOwn ?? false)", in: text) == 1,
+                "the reply shows as its outbox bubble or as the sent email")
+        let end = try Self.body(of: "private func endHeldGhostIfDone() {", in: text)
+        #expect(Self.count("guard let held = heldGhost, held.ends(replyShows: sentReplyShows) else { return }", in: end) == 1)
+        #expect(Self.count("withAnimation(held.morphs && !reduceMotion ? morph : nil) { heldGhost = nil }", in: end) == 1,
+                "the morph moves only after a send it shows, and never under Reduce Motion")
+        // While held the ghost keeps its row and the outbox bubbles wait; the newest bubble and the
+        // held ghost share one id, so the one turns into the other.
+        #expect(Self.count("if heldGhost == nil { ForEach(unsentReplies) { reply in", in: text) == 1)
+        #expect(Self.count(".matchedGeometryEffect(id: Self.sentMorphId(reply, newest: unsentReplies.last), in: sentMorph)", in: text) == 1)
+        #expect(Self.count("if let held = heldGhost { ChatSuggestionBubble(text: held.text) {} .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)", in: text) == 1)
+        #expect(Self.count("} else if let newest = thread.newest, let suggestion {", in: text) == 1, "the live ghost only when none is held")
+    }
+
+    @Test("Only the newest outbox bubble takes the held ghost's place")
+    func sentMorphIds() {
+        func reply(_ id: String) -> ChatUnsentReply {
+            ChatUnsentReply(outboxId: id, status: .queued, sentAt: nil, holdUntil: nil, draftId: nil, instanceEpoch: nil,
+                            filed: false, textMessage: nil)
+        }
+        let older = reply("outbox-1"), newest = reply("outbox-2")
+        #expect(ChatThreadView.sentMorphId(newest, newest: newest) == ChatThreadView.heldGhostMorphId)
+        #expect(ChatThreadView.sentMorphId(older, newest: newest) != ChatThreadView.heldGhostMorphId)
+        #expect(ChatThreadView.sentMorphId(older, newest: newest) != ChatThreadView.sentMorphId(reply("outbox-3"), newest: newest),
+                "every other bubble keeps an id of its own")
+    }
+
+    @Test("With the chat view on, the email's detail has no compose button; the classic view keeps it")
+    func detailComposeOnlyInClassic() throws {
+        let detail = try Self.source("TabMail/Views/Message/MessageDetailView.swift")
+        #expect(Self.count("@State private var opensInChat = ChatViewConfig.opensInChat", in: detail) == 1,
+                "the chat view's setting as the email opens")
+        #expect(Self.count("if !opensInChat { ToolbarItem(placement: .topBarTrailing) { ComposeToolbarButton(onNewCompose: {", in: detail) == 1,
+                "the compose button only in the classic view")
+        #expect(Self.count("ComposeToolbarButton(", in: detail) == 1, "and nowhere else on the email's screen")
+    }
+
+    @Test("The paperclip's choices open in a pop-up over the field, and the pick runs once the pop-up has gone")
+    func paperclipPopUpWiring() throws {
+        let text = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
+        let start = try #require(text.range(of: "struct ChatPaperclipButton: View {"))
+        let end = try #require(text.range(of: "struct ChatAttachChoices: View {"))
+        let clip = String(text[start.lowerBound..<end.lowerBound])
+        #expect(Self.count("Menu {", in: clip) == 0, "no system menu: it grows out of the field's glass and takes the field's place")
+        #expect(Self.count(".popover(isPresented: $showsChoices, arrowEdge: .bottom) {", in: clip) == 1)
+        #expect(Self.count("attach(", in: clip) == 1, "one call of the pick")
+        #expect(Self.count(".onDisappear { guard let source = chosen else { return } chosen = nil attach(source) }", in: clip) == 1,
+                "the pick runs once the pop-up has gone, so its picker is not refused while the pop-up closes")
+        #expect(Self.count("ChatAttachChoices { source in chosen = source showsChoices = false }", in: clip) == 1)
+        #expect(Self.count(".presentationCompactAdaptation(.popover)", in: text) >= 1, "a pop-up on iPhone too, never a sheet")
     }
 
     @Test("The ghost is dashed on a faded fill and captioned in one button; the e.g. line hides while dictating; compose's stored edits refresh the chat")
@@ -1471,10 +1552,43 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".frame(maxWidth: .infinity) // The row pads only itself: the status line keeps the field's padding above it. .padding(.top, ChatViewLayout.fieldVerticalPadding)", in: field) == 1)
     }
 
-    @Test("The tutorial tooltip's arrow points at the mic glyph's centre")
+    @Test("The tutorial tooltip's arrow points at the mic circle's centre")
     func tutorialArrowOnTheMic() {
-        let micCentre = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicGlyphWidth / 2
+        let micCentre = ChatViewLayout.fieldMicInset + ChatViewLayout.fieldMicSize / 2
         #expect(TutorialChatInputBar.tooltipArrowCenterX + TutorialChatInputBar.tooltipInset == micCentre)
+    }
+
+    @Test("The mic circle mirrors Send and draws in grays only: Send is the field's one colour")
+    func micCircleGrays() throws {
+        #expect(ChatViewLayout.fieldMicSize == ChatViewLayout.fieldSendSize)
+        #expect(ChatViewLayout.fieldMicInset == ChatViewLayout.fieldSendInset)
+        for dark in [false, true] {
+            let traits = UITraitCollection(userInterfaceStyle: dark ? .dark : .light)
+            // A gray has (almost) no saturation; the accent's and red's are far above this.
+            let colors = [(Palette.chatMicIdle, false), (Palette.chatMicListeningFill, false),
+                          (Palette.chatMicListeningStop, false), (Theme.accent, true)]
+            for (color, isAccent) in colors {
+                var hue: CGFloat = 0, saturation: CGFloat = 0, brightness: CGFloat = 0, alpha: CGFloat = 0
+                UIColor(color).resolvedColor(with: traits).getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha)
+                let gray = saturation < 0.1
+                #expect(gray != isAccent, "saturation \(saturation), dark \(dark), accent \(isAccent) (the accent is the control)")
+            }
+            // Listening: black on white in light mode, white on black in dark mode.
+            var fill: CGFloat = 0, stop: CGFloat = 0, alpha: CGFloat = 0
+            UIColor(Palette.chatMicListeningFill).resolvedColor(with: traits).getWhite(&fill, alpha: &alpha)
+            UIColor(Palette.chatMicListeningStop).resolvedColor(with: traits).getWhite(&stop, alpha: &alpha)
+            let expectedFill: CGFloat = dark ? 1 : 0
+            #expect(abs(fill - expectedFill) < 0.01 && abs(stop - (1 - expectedFill)) < 0.01, "fill \(fill), stop \(stop), dark \(dark)")
+        }
+        // Every field bar draws its mic as the circle and colours it nowhere else.
+        let chat = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        let micButton = try Self.body(of: "var micButton: some View {", in: chat)
+        #expect(Self.count("ChatMicCircle(symbol: micSymbol, listening: micListening)", in: micButton) == 1)
+        #expect(Self.count(".foregroundStyle", in: micButton) == 0, "the circle sets its own grays")
+        let symbol = try Self.body(of: "var micSymbol: String {", in: chat)
+        #expect(Self.count("if micListening { return \"stop.fill\" } return canDictate ? \"mic\" : \"mic.slash\"", in: symbol) == 1)
+        let tutorial = try Self.source("TabMail/Views/Tutorial/TutorialChatInputBar.swift")
+        #expect(Self.count("ChatMicCircle(symbol: \"mic\", listening: false)", in: tutorial) == 1)
     }
 
     @Test("Reply to, Forward and the chosen people reach the field and the compose card")
