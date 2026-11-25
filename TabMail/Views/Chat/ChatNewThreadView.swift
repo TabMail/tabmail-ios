@@ -327,8 +327,9 @@ struct ChatNewThreadView: View {
     /// The card has gone. Sent: the email is in the outbox, shown as this chat's bubble
     /// (`sendKey`), and the chat goes on as the next new email to the same people with an empty
     /// field (`ChatNewThreadModel.init(after:)`), in a draft and agent session of its own; the
-    /// sent email's saved draft is discarded through compose's Discard. Closed unsent: the words
-    /// and attachments are still here.
+    /// sent email's saved draft is discarded through compose's Discard, unless its attachments
+    /// could not be read, when it is kept (`discardSavedDraft`). Closed unsent: the words and
+    /// attachments are still here.
     private func cardClosed() {
         guard cardSent else { return }
         cardSent = false

@@ -361,7 +361,7 @@ final class ChatNewThreadModel: Hashable {
     /// the subject, Cc and Bcc the chat carries, from the same account, with an empty field and no
     /// attachments, in a draft and agent session of its own. Left as it is, it is not saved. Its own
     /// draft, not the sent chat's: that one's row was discarded at the send, and its generation
-    /// with it.
+    /// with it, or kept as it was when its attachments could not be read (`discardSavedDraft`).
     init(after sent: ChatNewThreadModel) {
         draftId = Draft.newEmailKey()
         queueDraftSave = sent.queueDraftSave
