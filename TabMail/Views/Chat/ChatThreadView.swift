@@ -87,8 +87,8 @@ struct ChatThreadView: View {
     /// remainder of that is the same height, `pillHeightMoved`), so the chat does not move under
     /// either.
     @State private var pillHeight = ChatViewLayout.pillStartHeight
-    /// The chat's own height: the opened pill grows upward out of the bottom bar into it.
-    @State private var chatAreaHeight: CGFloat = 0
+    /// What the agent is doing about a Send from the field, shown above it (`ChatFieldStatusKey`).
+    @State private var fieldStatus: String?
     /// A drag up on the collapsed field (`ChatFieldDrag`, `ChatFieldPan`): reset however the drag
     /// ends, a cancelled one included, with the pill's spring, so the swell always springs back
     /// (`fieldDragEnded`). Its progress is read only in modifiers (`ChatFieldDrag.Model`), never
@@ -608,28 +608,31 @@ struct ChatThreadView: View {
             }
             // The reply field is the chat's bottom bar, as in Messages: the chat scrolls under it
             // and the system blurs the strip below it. One field, always here. The bar is a slot
-            // of the collapsed field's height; the opened pill grows upward out of it (an overlay,
-            // not clipped), so the inset, and the chat under the panel, do not move.
+            // of the collapsed field's height, so the inset, and the chat under the opened panel,
+            // do not move.
             .safeAreaBar(edge: .bottom, spacing: 0) {
+                if thread.newest != nil {
+                    Color.clear.frame(height: pillHeight)
+                }
+            }
+            // The field itself is drawn over the slot, on the page, not inside the bar: the bar's
+            // UIKit container takes touches only inside its own bounds, so a panel opened upward
+            // out of it could be seen but not touched above the slot (its history did not scroll,
+            // and taps fell through to the dim behind it). Both sit on the same safe-area bottom.
+            .overlay(alignment: .bottom) {
                 if let newest = thread.newest {
-                    Color.clear
-                        .frame(height: pillHeight)
-                        .overlay(alignment: .bottom) {
-                            pill(on: newest)
-                                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-                                    if !chatExpanded, Self.pillHeightMoved(from: pillHeight, to: height) { pillHeight = height }
-                                }
-                                // ...and above the reply field.
-                                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
-                                    pillTop = $0
-                                    swipeOpen.reach(top: headerBottom, bottom: $0)
-                                }
-                                .frame(height: max(chatAreaHeight, pillHeight), alignment: .bottom)
+                    pill(on: newest)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                            if !chatExpanded, Self.pillHeightMoved(from: pillHeight, to: height) { pillHeight = height }
+                        }
+                        // ...and above the reply field.
+                        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .named(ChatSwipeOpen.space)).minY } action: {
+                            pillTop = $0
+                            swipeOpen.reach(top: headerBottom, bottom: $0)
                         }
                 }
             }
         }
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { chatAreaHeight = $0 }
         // While a swipe is open, a drag or tap anywhere else on the screen only closes it. The
         // closer's anchor fills the space every swipe frame is measured in.
         .background(ChatSwipeCloser(open: swipeOpen))
@@ -1065,6 +1068,10 @@ struct ChatThreadView: View {
                     .foregroundStyle(Theme.textSecondary)
                     .frame(maxWidth: .infinity)
             }
+            if let fieldStatus {
+                ChatFieldStatusLine(text: fieldStatus)
+                    .transition(.opacity)
+            }
             DynamicIslandChat(
                 message: newest,
                 isExpanded: $chatExpanded,
@@ -1088,6 +1095,11 @@ struct ChatThreadView: View {
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,
                 composeHostCovered: isAnyPresentation)
+            // The agent's status on a Send shows above the field (`ChatFieldStatusLine`); the stack
+            // grows by it, so the bar and the chat above move up with the pill's spring.
+            .onPreferenceChange(ChatFieldStatusKey.self) { status in
+                withAnimation(Self.pillSpring) { fieldStatus = status }
+            }
             // Debug UI tests only: the glass's top, swell included (`ChatFieldDragMarker`).
             .modifier(ChatFieldDragMarker.Glass())
             // The swell is not the field's room: its glass grows upward, and the same swell is taken

@@ -23,6 +23,8 @@ struct ChatNewThreadView: View {
     @State private var chatExpanded = false
     @State private var chatInputFocused = false
     @State private var chatWorking = false
+    /// What the agent is doing about a Send from the field, shown above it (`ChatFieldStatusKey`).
+    @State private var fieldStatus: String?
     @State private var showsAddRecipient = false
     @State private var asksForRecipient = false
     /// A save that did not happen, Back's or the background's: shown until the user chooses.
@@ -188,6 +190,10 @@ struct ChatNewThreadView: View {
             if !model.attachments.isEmpty {
                 ChatAttachmentTray(attachments: model.attachments) { model.removeAttachment(at: $0) }
             }
+            if let fieldStatus {
+                ChatFieldStatusLine(text: fieldStatus)
+                    .transition(.opacity)
+            }
             DynamicIslandChat(
                 isExpanded: $chatExpanded,
                 isInputFocused: $chatInputFocused,
@@ -206,6 +212,10 @@ struct ChatNewThreadView: View {
                 composeFromAccountId: model.account?.id,
                 composeHostCovered: showsAddRecipient || showsCamera || showsPhotoPicker || showsFilePicker
                     || agentCompose != nil)
+            // The agent's status on a Send shows above the field (`ChatFieldStatusLine`).
+            .onPreferenceChange(ChatFieldStatusKey.self) { status in
+                withAnimation(.spring(ChatThreadView.pillSpringModel)) { fieldStatus = status }
+            }
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.fieldId)
         }

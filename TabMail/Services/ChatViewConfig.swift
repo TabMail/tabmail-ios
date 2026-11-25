@@ -218,6 +218,11 @@ enum ChatViewLayout {
     /// duration (`ChatThreadView.fieldDragSettle`).
     static let pillSpringResponse: Double = 0.45
     static let pillSpringDamping: Double = 0.82
+    /// Closing the open TabMail panel like a sheet (`ChatPanelPull`): how far a drag down on its
+    /// header, or its history pulled down past its top, must go for the let-go to close it. For the
+    /// pull it is the history's own travel past its top, which the rubber band keeps shorter than
+    /// the finger's. The drag up that opens the panel goes the same distance.
+    static let panelCloseDistance: CGFloat = fieldDragOpenDistance
     /// A new email's arrival in the open chat (`ChatArrival`): it rises from behind the field over
     /// this long; under Reduce Motion the space opens at once and it fades in over the second.
     static let arrivalRiseDuration: Double = 0.42
