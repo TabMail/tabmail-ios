@@ -198,7 +198,7 @@ struct ChatReplyAttachTests {
         let newEmail = ChatReplyField(
             example: nil, isNoReply: false,
             newEmail: ChatNewEmailField(startWords: "", sessionKey: "attach-session", wordsChanged: { _ in },
-                                        send: { _ in }, attach: { newEmailChoices.append($0) }))
+                                        send: { _ in nil }, attach: { newEmailChoices.append($0) }))
         newEmail.paperclip?(.camera)
         #expect(newEmailChoices == [.camera] && threadChoices == [.files], "a new email's paperclip reaches its own chat")
     }
