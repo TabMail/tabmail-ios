@@ -162,4 +162,140 @@ extension SendReplyMarksTests {
         #expect(server.wrongMessageViolations().isEmpty)
         await engine.remove(accountId: accountId)
     }
+
+    // MARK: - The copy arrives through scroll to older mail, or the backfill walk
+
+    /// The original stored in INBOX and tagged Reply, as `F.insertHeader` stores a row.
+    static func storeOriginal(accountId: String, pool: DatabasePool) async throws -> (id: String, rfc: String) {
+        try BackfillPageWalkFixture.insertHeader("orig", accountId: accountId, path: "INBOX", pool: pool)
+        let stored = try await pool.read { db in
+            try MessageHeader.filter(Column("folderId") == "\(accountId):INBOX" && Column("messageId") == "orig").fetchOne(db)
+        }
+        let original = try #require(stored, "precondition: the original is stored")
+        let rfc = try #require(original.rfc822MessageId)
+        try await tagReply(pool, headerId: original.id)
+        return (original.id, rfc)
+    }
+
+    /// The stored Sent copy names the original (normalized), and the original's
+    /// marks and queued tag changes are a forward's or a reply's.
+    static func expectOtherAppCopyMarks(
+        pool: DatabasePool, accountId: String, sentPath: String, copyMessageId: String,
+        original: (id: String, rfc: String), isForward: Bool
+    ) throws {
+        let (copy, ops) = try pool.read { db in
+            (try MessageHeader.filter(Column("folderId") == "\(accountId):\(sentPath)"
+                && Column("messageId") == copyMessageId).fetchOne(db),
+             try PendingOperation.filter(Column("accountId") == accountId && Column("type") == OperationType.setTag.rawValue).fetchAll(db))
+        }
+        let named = copy?.inReplyTo.map(EmailFilter.normalizeMessageId)
+        #expect(named == original.rfc, "precondition: the Sent copy synced and names the original: \(named ?? "nil")")
+        let want = expectedAfterOtherAppCopy(isForward: isForward)
+        let after = try marks(pool, headerId: original.id)
+        #expect(after == want, "after the Sent copy synced: \(after), want \(want)")
+        #expect(ops.count == (isForward ? 0 : 1), "queued tag changes: \(ops.map { ($0.tagValue, $0.messageIds) })")
+    }
+
+    @Test("Scroll to older mail in Sent: another app's forward copy marks the original forwarded and keeps its Reply tag; a reply copy marks it replied",
+          arguments: [true, false])
+    func scrollOtherAppCopy(isForward: Bool) async throws {
+        typealias F = BackfillPageWalkFixture
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "other-scroll-\(UUID().uuidString.prefix(8).lowercased())"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "SENT", role: .sent, pool: pool)
+        let original = try await Self.storeOriginal(accountId: accountId, pool: pool)
+
+        // Sent holds a newer message already; the other app's copy is older, so
+        // scrolling Sent to older mail loads it.
+        let server = StatefulGmailActionServer(messages: [
+            F.gmailSeed("anchor", label: "SENT", daysAgo: 1),
+            StatefulGmailActionServer.Seed(
+                rfc822MessageId: "other-copy@example.com", providerMessageId: "othercopy", labels: ["SENT"],
+                internalDate: F.daysAgo(5),
+                headers: [
+                    "In-Reply-To": "<\(original.rfc)>",
+                    "References": "<\(original.rfc)>",
+                    "Subject": Self.otherAppSubject("inserted orig", isForward: isForward),
+                ]),
+        ])
+        defer { server.close() }
+        try F.insertHeader("anchor", accountId: accountId, path: "SENT", pool: pool)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET providerDate = date WHERE messageId = 'anchor'")
+        }
+        let sent = try #require(try FolderEpochTestFixture.readFolder(accountId: accountId, path: "SENT", pool: pool))
+        let engine = await F.registeredEngine(accountId: accountId, provider: server.provider())
+
+        _ = try await engine.fetchOlderMessages(folders: [sent])
+
+        try Self.expectOtherAppCopyMarks(
+            pool: pool, accountId: accountId, sentPath: "SENT", copyMessageId: "othercopy",
+            original: original, isForward: isForward)
+    }
+
+    @Test("IMAP backfill walk of Sent: another app's forward copy marks the original forwarded and keeps its Reply tag; a reply copy marks it replied",
+          arguments: [true, false])
+    func backfillWalkOtherAppCopy(isForward: Bool) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "other-walk-\(UUID().uuidString.prefix(8).lowercased())"
+        let epoch = Self.imapEpoch + 2
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try await pool.write { db in
+            var inbox = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            inbox.backfillComplete = true
+            try inbox.insert(db)
+        }
+        let original = try await Self.storeOriginal(accountId: accountId, pool: pool)
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let copy = FakeIMAPServer.makeMessage(uid: 7, rfc822Text: """
+            From: Me <me@example.com>\r
+            To: Someone <someone@example.com>\r
+            Subject: \(Self.otherAppSubject("inserted orig", isForward: isForward))\r
+            Date: \(formatter.string(from: Date().addingTimeInterval(-3_600)))\r
+            Message-ID: <other-walk-copy@example.com>\r
+            In-Reply-To: <\(original.rfc)>\r
+            References: <\(original.rfc)>\r
+            Content-Type: text/plain; charset=utf-8\r
+            \r
+            copy body.\r
+
+            """)
+        let server = FakeIMAPServer(mailboxes: ["INBOX": [], "Sent": [copy]])
+        server.setUidValidity(epoch, for: "Sent")
+        // A real server's ENVELOPE names the message a copy replies to.
+        server.reportInReplyToInEnvelopes()
+        try server.start()
+        defer { server.stop() }
+        try await pool.write { db in
+            var sent = Folder(name: "Sent", path: "Sent", role: .sent, accountId: accountId)
+            sent.backfillComplete = false
+            sent.backfillUidCursor = 7
+            sent.lastKnownUidValidity = epoch
+            try sent.insert(db)
+        }
+        let imap = IMAPProvider(
+            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
+        try await imap.connect()
+        defer { Task { try? await imap.disconnect() } }
+        let engine = SyncEngine()
+        await engine.register(
+            accountId: accountId, provider: imap,
+            workQueue: ProviderWorkQueue(provider: imap, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
+
+        _ = await engine.runBackfillWalk(account: account, deadline: BackfillPageWalkFixture.deadline())
+
+        try Self.expectOtherAppCopyMarks(
+            pool: pool, accountId: accountId, sentPath: "Sent", copyMessageId: "7",
+            original: original, isForward: isForward)
+        #expect(server.wrongMessageViolations().isEmpty)
+        await engine.remove(accountId: accountId)
+    }
 }

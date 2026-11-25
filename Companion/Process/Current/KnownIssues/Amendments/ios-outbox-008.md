@@ -44,6 +44,17 @@ does not start with `Fwd:` or `Fw:`:
 The original then shows the replied mark, and its Reply tag is cleared on every device. Sync merges the
 replied mark set-only (a later pass never clears it), so the mark stays.
 
+Related cases, same cause (the subject is the only signal):
+
+- **The converse:** a reply whose subject starts with `Fwd:` or `Fw:` (the user edited it, or an app
+  wrote no `Re:`) marks its original forwarded and leaves its Reply tag. Clearing the tag is one gesture.
+- **Originals marked before #1492:** an original a forward copy already marked replied keeps that mark
+  and its cleared tag; no data is rewritten for it (a harmless leftover). A later listing of the copy
+  adds the forwarded mark.
+- **The v53 historic backfill** (`ReplyParentResolver.runHistoricBackfill`, a released migration that
+  cannot change) marks replied every original a stored Sent message names in `In-Reply-To`, forwards
+  included. It ran once, on databases upgrading through v53.
+
 ## When it happens
 
 Rare. It needs another app that sets `In-Reply-To` on a forward (Thunderbird does; Apple Mail and
