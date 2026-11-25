@@ -1562,7 +1562,6 @@ struct OtherFolderOutlookTests {
                 try w.insertRow(id, in: Self.projects, date: c.daysAgo(days))
             }
             try await w.baselineAll()
-            let before = try w.account()
             let syncable = SyncEngine.isSyncable(try w.folder(Self.projects))
             #expect(!syncable, "setup: the folder is outside the syncable set")
 
@@ -1574,6 +1573,9 @@ struct OtherFolderOutlookTests {
             let untouched = try w.cursor(Self.projects)
             #expect(passRequests == 0, "the passes sent no request for it")
             #expect(untouched == nil, "and stored no bookmark for it")
+            // The account as the runs find it: each pass moves the account's folder-list link (every
+            // folder delta read hands out a new one), so only what the runs do is compared below.
+            let before = try w.account()
 
             // The runs baseline it.
             for _ in 0..<Self.runs {

@@ -257,6 +257,10 @@ extension IMAPChangeCondstoreCheckTests {
         }
     }
 
+    /// The requests of the check's proof step (its FETCH and its confirming
+    /// SEARCH), as a pass prices the step before it starts it.
+    static let proofRequests: TimeInterval = 2
+
     /// The clock of a slice that runs out the moment the proof's confirming
     /// SEARCH has been sent (the proof's FETCH of `candidate`, then a SEARCH):
     /// the proof finishes, and nothing after it may start.
@@ -341,10 +345,12 @@ extension IMAPChangeCondstoreCheckTests {
                 guard found != nil else { return }
                 let stored = try await store.bookmark()
 
-                // A pass takes the proof, and its time runs out before the arrivals' FETCH.
+                // A pass takes the proof, and its time runs out before the arrivals' FETCH. A pass
+                // starts a check step only while its time covers the step's requests at the pass's
+                // request bound, so it gets exactly the proof's price.
                 C.add([arrival], to: w.server)
                 let start = Date()
-                let deadline = start.addingTimeInterval(SyncConfig.catchUpSliceSeconds)
+                let deadline = start.addingTimeInterval(Self.proofRequests * SyncConfig.changeReadRequestTimeoutSeconds)
                 let short = ChangeContext(
                     deadline: deadline,
                     clock: Self.runsOutAfterTheProof(w.server, candidate: candidate, from: start, deadline: deadline),

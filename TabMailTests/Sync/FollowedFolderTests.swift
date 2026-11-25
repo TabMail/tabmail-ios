@@ -1042,7 +1042,13 @@ struct FollowedFolderOutlookTests {
             try await w.baselineAll()
             try await Self.catchUpUntilListed(w, engine, w.archive)
             #expect(try w.cursor(Self.projects) == nil, "precondition: no change read of a folder that is not followed")
-            #expect(try w.folder(Self.projects).catchUpState == nil, "precondition: no catch-up of it either")
+            // A folder outside the syncable set is the catch-up's too (#1110), but Outlook's
+            // tracking gate holds it: no listing starts before its change read's baseline, and
+            // nothing is sent for it.
+            let unlisted = ExchangeCatchUpState.decode(try w.folder(Self.projects).catchUpState)
+            let sentForIt = w.server.requestCount(containing: Self.projects)
+            #expect(unlisted?.listing == nil && unlisted?.lastCompletedAt == nil, "precondition: no catch-up listing of it either")
+            #expect(sentForIt == 0, "precondition: nothing was sent for it")
             #expect(try w.rowIds(in: Self.projects) == ["p-keep", "p-gone", "p-read"])
 
             let marked = try await w.pool.write { db in try SyncEngine.markFollowed(folderIds: [customId], db: db) }
