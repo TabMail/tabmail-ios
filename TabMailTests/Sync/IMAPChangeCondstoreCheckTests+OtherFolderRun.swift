@@ -81,11 +81,14 @@ extension IMAPChangeCondstoreCheckTests {
     }
 
     /// The request of one slice over the world's Inbox, made as the engine
-    /// makes it: the stored bookmark, and the stored rows.
-    static func sliceRequest(_ w: R.World, _ store: Store, context: ChangeContext) async throws -> ChangeRequest {
+    /// makes it: the stored bookmark, and the stored rows. `.all` makes a
+    /// pass's request over the same store instead.
+    static func sliceRequest(
+        _ w: R.World, _ store: Store, context: ChangeContext, scope: ChangeScope = .otherFolders
+    ) async throws -> ChangeRequest {
         let stored = try await store.bookmark()
         return ChangeRequest(
-            folders: R.folders(w, cursors: [w.inboxId: stored]), scope: .otherFolders, recheck: [:],
+            folders: R.folders(w, cursors: [w.inboxId: stored]), scope: scope, recheck: [:],
             context: context, localRows: SyncEngineCatchUpRowReader(pool: PrioritizedDatabase(pool: store.pool)))
     }
 
@@ -98,9 +101,11 @@ extension IMAPChangeCondstoreCheckTests {
         return answer
     }
 
-    /// One slice: its read, then its apply.
-    static func slice(_ w: R.World, _ store: Store, context: ChangeContext) async throws -> FolderChanges {
-        let request = try await sliceRequest(w, store, context: context)
+    /// One slice: its read, then its apply. `.all` reads and applies a pass instead.
+    static func slice(
+        _ w: R.World, _ store: Store, context: ChangeContext, scope: ChangeScope = .otherFolders
+    ) async throws -> FolderChanges {
+        let request = try await sliceRequest(w, store, context: context, scope: scope)
         let set = try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: request)
         return try await apply(w, set, to: store)
     }
@@ -313,6 +318,49 @@ extension IMAPChangeCondstoreCheckTests {
                 let cursor = IMAPChangeCursor.decode(committed)
                 #expect(cursor?.pendingCheck == nil && cursor?.uidNext == found.pending.uidNext,
                         "the check's own bookmark is committed: \(String(describing: cursor))")
+            }
+        }
+    }
+
+    @Test("A pass whose removal check finishes but whose arrivals cannot start is unchanged by the run's rule: the folder is not read this pass, nothing the check proved is applied, and the stored bookmark stays for the next pass")
+    func aPassWhoseArrivalsCannotStartReadsTheFolderNextPass() async throws {
+        let held = Array(1...10)
+        let candidate = 4
+        let arrival = held.count + 1
+        try await C.withWorld(inbox: held) { w in
+            await w.provider.setRemovalCheckWindowForTesting(held.count)
+            let base = try await R.baseline(w)
+            C.remove([candidate], from: w.server)
+            let clock = IMAPChangeEngineTests.StillClock(Date())
+            try await Self.withStore(w, uids: held, bookmark: base) { store in
+                // A run's slice leaves the check with only the candidate's proof to take.
+                _ = try await Self.slice(w, store, context: Self.roomySlice(clock))
+                let found = try await store.progress()
+                #expect(found?.unproven == [UInt32(candidate)] && found?.remaining == 0,
+                        "precondition: only the candidate's proof is left: \(String(describing: found))")
+                guard found != nil else { return }
+                let stored = try await store.bookmark()
+
+                // A pass takes the proof, and its time runs out before the arrivals' FETCH.
+                C.add([arrival], to: w.server)
+                let start = Date()
+                let deadline = start.addingTimeInterval(SyncConfig.catchUpSliceSeconds)
+                let short = ChangeContext(
+                    deadline: deadline,
+                    clock: Self.runsOutAfterTheProof(w.server, candidate: candidate, from: start, deadline: deadline),
+                    onProgress: { _ in })
+                let before = w.server.recordedCommands().count
+                let pass = try await Self.slice(w, store, context: short, scope: .all)
+                let sent = w.server.recordedCommands().dropFirst(before).map { $0.uppercased() }
+                let proofTaken = sent.contains { $0.hasPrefix("UID FETCH \(candidate) ") }
+                #expect(proofTaken, "precondition: the pass took the proof: \(sent)")
+                var notRun = false
+                if case .notRun = pass.status { notRun = true }
+                #expect(notRun && pass.removals.isEmpty, "the pass does not read the folder: \(pass.status), removals \(pass.removals)")
+                let rows = try await store.uids()
+                #expect(rows.contains(candidate), "no removal is applied")
+                let after = try await store.bookmark()
+                #expect(after == stored, "the stored bookmark stays: \(String(describing: after))")
             }
         }
     }
