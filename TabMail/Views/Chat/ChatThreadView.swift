@@ -1315,7 +1315,8 @@ struct ChatThreadView: View {
     /// The email the closed field's Send wrote lands in the AI Suggestion's bubble, and stays
     /// there `ChatSuggestionConfig.writtenHold` to be read; the reply tool awaits this before its
     /// compose card opens (`ToolInvocation.landWritten`). It lands with the fill's animation (at
-    /// once under Reduce Motion). Stop ends the hold early, and no card opens.
+    /// once under Reduce Motion). Stop ends the hold early, and no card opens; an edit already
+    /// stored in place stays the AI Suggestion, as when its card is closed unsent.
     private func landFieldWritten(_ text: String) async {
         guard fieldWriting != nil else { return }
         if DebugModeManager.isLoggingEnabled() {

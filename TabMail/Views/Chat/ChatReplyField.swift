@@ -232,8 +232,8 @@ struct ChatFieldFill: Equatable {
         /// The open send completed (its compose card's reply went out): it empties the words only
         /// if a send is open and they are still the words sent, or none.
         case completed
-        /// The field's send finished with something written (its compose card closed, or the AI
-        /// Suggestion changed in place), or the agent answered it (the tutorial's scripted request):
+        /// The field's send finished with something written (its compose card closed, or an edit
+        /// stored in place whose card never opened), or the agent answered it (the tutorial's scripted request):
         /// `completed`, unless a compose card opened for it and closed unsent; then the words are
         /// the user's again, kept and not emptied.
         case answered

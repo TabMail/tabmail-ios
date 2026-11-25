@@ -479,7 +479,9 @@ same AI result, kept as long as the email itself is shown.
    after the fill animation (the hold alone under Reduce Motion); then the field's own card opens,
    with the landed text held behind it as the ghost (`ChatThreadView.openAgentCompose` hands
    `fieldWriting` to `heldGhost`). An edit that keeps its envelope is still stored in place first
-   (decision 17). Stop during the hold cancels the request, and no card opens. A new email's card
+   (decision 17). Stop during the hold cancels the request, and no card opens; an edit already
+   stored in place stays the AI Suggestion, as when its card is closed unsent, and the words are
+   back in the field. A new email's card
    that reports `sent` completes the field's words at once (`EmailReplyTool.Written.sent`,
    `ChatFieldFill.Change.completed` in `DynamicIslandChat.composeNewEmailFromField`): the card
    reports `sent` before it closes, so applying `notWritten` there put the words back into the

@@ -1729,8 +1729,8 @@ struct DynamicIslandChat: View {
     /// Send in the chat's reply field with the TabMail panel closed (ADR-IOS-114 decision 10,
     /// amended 2026-11-25): the words write the email to the people of this chat, never a message
     /// to the agent (`composeFromField`). They stay in the field, pulsing, while it is written. The
-    /// field empties when the reply goes out or the AI Suggestion changes in place; a compose card
-    /// closed unsent, or nothing written, leaves the words.
+    /// field empties when the reply goes out, or when an edit stored in place has no card to open; a
+    /// compose card closed unsent, or nothing written, leaves the words.
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
         // A new email's chat decides what its Send does: with nobody to send to it asks, and the
         // words stay as they are; with people picked, the words write the email to them (they
