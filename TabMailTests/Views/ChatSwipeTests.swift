@@ -5,6 +5,8 @@
 import Foundation
 import Testing
 import UIKit
+// `reset`, which UIKit calls on the swipe's pan once a drag, tap or scroll is over.
+import UIKit.UIGestureRecognizerSubclass
 @testable import TabMail
 
 /// ADR-IOS-114 decision 12: the chat's swipes.
@@ -385,6 +387,54 @@ struct ChatSwipeTests {
     private final class MovingPan: UIPanGestureRecognizer {
         var speed = CGPoint.zero
         override func velocity(in view: UIView?) -> CGPoint { speed }
+    }
+
+    // The owner's simulator run (2026-11-24): every chat swipe was dead, both ways, while the inbox's
+    // list swipes worked. A UIKit pan takes no scrolls unless told to, so a two-finger trackpad swipe
+    // or a scroll wheel never reached the chat's swipes; a drag did (the swipe UI tests).
+    @Test("The swipes take a trackpad's two-finger swipe and a scroll wheel, as the inbox's list swipes do")
+    func swipesTakeScrolls() {
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _, _ in true })
+        let pan = ChatHorizontalPan.makePan(delegate: coordinator)
+        #expect(pan.allowedScrollTypesMask.contains(.continuous), "a trackpad's two-finger swipe")
+        #expect(pan.allowedScrollTypesMask.contains(.discrete), "a mouse's scroll wheel")
+    }
+
+    @Test("A scroll never starts at the screen's edge, whatever an earlier finger's touch left")
+    func scrollNeverStartsAtTheEdge() {
+        let coordinator = ChatHorizontalPan.Coordinator(shouldBegin: { _, _ in true })
+        let pan = ChatHorizontalPan.makePan(delegate: coordinator)
+        // A finger comes down at the screen's left edge: its drag starts there, until it is over.
+        let touch = PlacedTouch()
+        touch.point = CGPoint(x: 1, y: 300)
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: touch))
+        #expect(coordinator.startsAtScreenEdge, "control: that touch is in the back swipe's zone")
+        // UIKit resets the pan once the drag (or tap) is over; a scroll after it brings no touch.
+        pan.reset()
+        #expect(!coordinator.startsAtScreenEdge, "a scroll after it never starts at the edge")
+        // A finger's next touch away from the edge, and one at it again, read as before.
+        touch.point = CGPoint(x: 200, y: 300)
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: touch))
+        #expect(!coordinator.startsAtScreenEdge)
+        pan.reset()
+        touch.point = CGPoint(x: 1, y: 300)
+        #expect(coordinator.gestureRecognizer(pan, shouldReceive: touch))
+        #expect(coordinator.startsAtScreenEdge, "a drag from the edge is still the back swipe's")
+    }
+
+    @Test("While something is open a scroll elsewhere closes it as a drag does; with nothing open the closer takes no scroll")
+    func closerTakesScrollsOnlyWhileOpen() {
+        let open = ChatSwipeOpen()
+        let closer = ChatSwipeCloser.Coordinator(open: open)
+        #expect(closer.pan.allowedScrollTypesMask.isEmpty, "nothing open: no swipe waits for the closer on a scroll")
+        open.open("b", frame: CGRect(x: 0, y: 100, width: 300, height: 50), buttons: .zero)
+        #expect(closer.pan.allowedScrollTypesMask.contains(.continuous) && closer.pan.allowedScrollTypesMask.contains(.discrete),
+                "something open: a trackpad or wheel scroll elsewhere closes it")
+        open.close()
+        #expect(closer.pan.allowedScrollTypesMask.isEmpty, "nothing open again")
+        open.open("b", frame: .zero, buttons: .zero)
+        open.left("b")
+        #expect(closer.pan.allowedScrollTypesMask.isEmpty, "the open reveal's view left: nothing open")
     }
 
     @Test("A sideways drag starts the swipe unless the rule declines it; an upright drag never asks")
