@@ -130,6 +130,29 @@ struct OutboxMessage: Codable, FetchableRecord, PersistableRecord, Identifiable,
     /// fire DraftStore.delete — deferred from compose-time so Undo-Send can
     /// reopen compose with the draft contents intact.
     var draftId: String?
+    /// What queuing this send changed on its original (`QueuedOriginalChanges`
+    /// raw value, v117, #1490), written in the same transaction as the row. An
+    /// unsent removal undoes exactly these changes, and the completion sends the
+    /// cleared Reply tag to the server. NULL for a row queued before v117, which
+    /// changed nothing at queue time.
+    var originalChangesAtQueue: Int?
+
+    /// The changes queuing a reply or forward made to its original
+    /// (`AccountManager.persistQueuedSend`, #1490). They are the row's own record
+    /// of the user's gesture: nothing else writes them and they leave with the row.
+    struct QueuedOriginalChanges: OptionSet, Sendable {
+        let rawValue: Int
+        /// This send set the original's replied mark (a forward: forwarded).
+        static let setMark = QueuedOriginalChanges(rawValue: 1 << 0)
+        /// This send changed the original's Reply tag to none, stamped with this
+        /// row's `createdAt`.
+        static let clearedReplyTag = QueuedOriginalChanges(rawValue: 1 << 1)
+    }
+
+    /// The recorded queue-time changes; empty for a row queued before v117.
+    var queuedOriginalChanges: QueuedOriginalChanges {
+        QueuedOriginalChanges(rawValue: originalChangesAtQueue ?? 0)
+    }
 
     // MARK: - Computed accessors
 

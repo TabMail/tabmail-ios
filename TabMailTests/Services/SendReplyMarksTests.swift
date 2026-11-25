@@ -8,26 +8,33 @@ import Synchronization
 import Testing
 @testable import TabMail
 
-/// A reply or forward marks the ORIGINAL only when the send goes out.
+/// A reply or forward marks the ORIGINAL at Send, and a send that never goes out
+/// takes back exactly what it changed (#1490).
 ///
-/// Queuing a send (`AccountManager.persistQueuedSend`) leaves the original as it
-/// was. The send's completion (`AccountManager.deleteCompletedSendAtomic`) sets
-/// `isReplied` (or `isForwarded` for a forward), clears a `reply` action tag on a
-/// reply, and queues the matching server op. A send that never goes out, undone
-/// inside its hold or discarded from the Outbox after it failed
-/// (`AccountManager.cancelHeldOutboxRow`), therefore leaves nothing to revert. No
-/// provider's sync clears `isReplied`/`isForwarded` or brings back a local action
-/// tag, so a mark written before the send could outlive an undone send for good.
+/// Queuing a send (`AccountManager.persistQueuedSend`) sets `isReplied` (or
+/// `isForwarded` for a forward) on an original the server can be asked to mark,
+/// and clears a reply's `reply` action tag, in the queuing write. The outbox row
+/// records what it changed (`OutboxMessage.originalChangesAtQueue`). No server op
+/// is queued then. The send's completion
+/// (`AccountManager.deleteCompletedSendAtomic`) queues the server's mark, and the
+/// tag clear while Send's clear still stands. A send that never goes out, undone
+/// inside its hold, undone back to Drafts, or discarded from the Outbox after it
+/// failed, runs `AccountManager.cancelHeldOutboxRow`, which takes back only that
+/// row's own record: the mark goes back to unset, and the tag goes back to Reply
+/// while it is still Send's none. No provider's sync clears
+/// `isReplied`/`isForwarded`, so a mark nothing took back would outlive an undone
+/// send for good (#1468).
 ///
-/// Each test drives the real queue, cancel and completion paths against the
-/// stateful Gmail, IMAP and Outlook fakes, then runs the provider's passes: a
-/// change pass, a foreground pass with the full sync due, and a change pass after
-/// another client changed the original (so the change reader reads it again). The
-/// original's marks are checked after every step, and a send that never goes
-/// out must leave the original's row byte-identical and queue no operation.
+/// The world tests drive the real queue, cancel and completion paths against the
+/// stateful Gmail, IMAP and Outlook fakes, and run the provider's passes while
+/// the send is held and after its outcome: a change pass, a foreground pass with
+/// the full sync due, and, after the outcome, a change pass after another client
+/// changed the original (so the change reader reads it again). The original's
+/// marks are checked after every step.
 ///
-/// `.serialized, .processGlobalState`: the worlds replace `AppDatabase.shared`.
-@Suite("Reply and forward marks are written when the send goes out, never at queue time", .serialized, .processGlobalState)
+/// `.serialized, .processGlobalState`: the worlds replace `AppDatabase.shared`,
+/// and the Undo test uses `PendingSendService.shared`.
+@Suite("Reply and forward marks are written at Send and taken back with an unsent send", .serialized, .processGlobalState)
 struct SendReplyMarksTests {
 
     static let imapEpoch = 71_400
@@ -66,6 +73,11 @@ struct SendReplyMarksTests {
         return Marks(isReplied: header.isReplied, isForwarded: header.isForwarded, actionTag: header.actionTag)
     }
 
+    static func header(_ pool: DatabasePool, headerId: String) throws -> MessageHeader {
+        let stored = try pool.read { db in try MessageHeader.fetchOne(db, key: headerId) }
+        return try #require(stored)
+    }
+
     /// Whether the other client's change reached the row: proves the last pass
     /// really re-read the original.
     static func otherChangeLanded(_ pool: DatabasePool, headerId: String, _ other: OtherChange) throws -> Bool {
@@ -100,20 +112,43 @@ struct SendReplyMarksTests {
         try pool.read { db in try PendingOperation.fetchCount(db) }
     }
 
+    /// The queued ops that mark or tag a message, in queue order.
+    static func markOps(_ pool: DatabasePool) throws -> [PendingOperation] {
+        let types = [OperationType.markReplied, .markForwarded, .setTag].map(\.rawValue)
+        return try pool.read { db in
+            try PendingOperation.filter(types.contains(Column("type")))
+                .order(Column("queuePosition")).fetchAll(db)
+        }
+    }
+
+    /// The `.setTag` values queued, in queue order.
+    static func queuedTags(_ pool: DatabasePool) throws -> [String?] {
+        try markOps(pool).filter { $0.type == .setTag }.map(\.tagValue)
+    }
+
+    static func queuedCount(_ pool: DatabasePool, _ type: OperationType) throws -> Int {
+        try markOps(pool).filter { $0.type == type }.count
+    }
+
     /// A queued send, and the original as it was right before the queue.
     struct Queued {
         let outboxId: String
         let originalRow: [String: DatabaseValue]
         let operations: Int
+        /// The original whose row queuing changed, as `persistQueuedSend` reported it.
+        let changedOriginalHeaderId: String?
+        /// The queued row as stored.
+        let row: OutboxMessage
     }
 
     /// Queue a reply (or forward) to `original` from a live draft, as Send does.
-    /// Nothing has drained when it returns. Queuing must write nothing to the
-    /// original and queue no operation.
+    /// Nothing has drained when it returns. Queuing never queues an operation:
+    /// the server is told only when the send goes out.
     static func queue(
-        pool: DatabasePool, accountId: String, original: MessageHeader, isForward: Bool
+        pool: DatabasePool, accountId: String, original: MessageHeader, isForward: Bool,
+        draftId explicitDraftId: String? = nil
     ) async throws -> Queued {
-        let draftId = "\(isForward ? "forward" : "reply"):\(accountId):\(original.stableId)"
+        let draftId = explicitDraftId ?? "\(isForward ? "forward" : "reply"):\(accountId):\(original.stableId)"
         let originalId = original.id
         let sendSubject = "\(isForward ? "Fwd" : "Re"): \(original.subject)"
         try await pool.write { db in
@@ -131,32 +166,40 @@ struct SendReplyMarksTests {
         #expect(!rowBefore.isEmpty, "precondition: the original is stored")
         let operationsBefore = try Self.operationCount(pool)
 
-        // The thread headers exactly as Send derives them (ComposeView): a reply
-        // names the original in In-Reply-To, a forward only as its last
-        // References id (#1483).
-        #expect(original.rfc822MessageId != nil, "precondition: the original has a Message-ID")
-        let stored = try await pool.read { db in try Account.fetchOne(db, key: accountId) }
-        let account = try #require(stored, "precondition: the account is stored")
-        let thread = ThreadUtils.outgoingThreadHeaders(
-            replyTo: original, isForward: isForward, sendAccountId: accountId,
-            sendSubject: sendSubject, providerKind: account.provider)
-        let message = DraftMessage(
-            to: ["sender@example.com"], subject: sendSubject, body: "Answer",
-            inReplyTo: thread.inReplyTo, references: thread.references, threadId: thread.threadId)
         let queued = try await AccountManager.persistQueuedSend(
-            draft: message, accountId: accountId, replyToHeaderId: originalId,
+            draft: try await Self.outgoing(pool: pool, accountId: accountId, original: original, isForward: isForward),
+            accountId: accountId, replyToHeaderId: originalId,
             isForward: isForward, serverDraftId: nil,
             draftId: draftId, instanceEpoch: Self.draftEpoch)
         let outboxId = queued.outboxId
-        let row = try await pool.read { db in try OutboxMessage.fetchOne(db, key: outboxId) }
-        let linked = row?.originalMessageHeaderId
-        #expect(linked == originalId, "precondition: the queued send names its original")
+        let stored = try await pool.read { db in try OutboxMessage.fetchOne(db, key: outboxId) }
+        let row = try #require(stored, "precondition: the send is queued")
+        #expect(row.originalMessageHeaderId == originalId, "precondition: the queued send names its original")
+        #expect(row.originalChangesAtQueue != nil, "a send queued now records what it changed, even nothing")
 
-        let rowAfter = try Self.rowSnapshot(pool, headerId: originalId)
-        #expect(rowAfter == rowBefore, "queuing must write nothing to the original")
         let operationsAfter = try Self.operationCount(pool)
         #expect(operationsAfter == operationsBefore, "queuing must queue no operation")
-        return Queued(outboxId: outboxId, originalRow: rowBefore, operations: operationsBefore)
+        return Queued(
+            outboxId: outboxId, originalRow: rowBefore, operations: operationsBefore,
+            changedOriginalHeaderId: queued.changedOriginalHeaderId, row: row)
+    }
+
+    /// The message Send builds: the thread headers exactly as Send derives them
+    /// (ComposeView). A reply names the original in In-Reply-To, a forward only
+    /// as its last References id (#1483).
+    static func outgoing(
+        pool: DatabasePool, accountId: String, original: MessageHeader, isForward: Bool
+    ) async throws -> DraftMessage {
+        #expect(original.rfc822MessageId != nil, "precondition: the original has a Message-ID")
+        let stored = try await pool.read { db in try Account.fetchOne(db, key: accountId) }
+        let account = try #require(stored, "precondition: the account is stored")
+        let sendSubject = "\(isForward ? "Fwd" : "Re"): \(original.subject)"
+        let thread = ThreadUtils.outgoingThreadHeaders(
+            replyTo: original, isForward: isForward, sendAccountId: accountId,
+            sendSubject: sendSubject, providerKind: account.provider)
+        return DraftMessage(
+            to: ["sender@example.com"], subject: sendSubject, body: "Answer",
+            inReplyTo: thread.inReplyTo, references: thread.references, threadId: thread.threadId)
     }
 
     /// The send goes out and is appended to Sent; the completion step runs, as the
@@ -175,36 +218,58 @@ struct SendReplyMarksTests {
         }
     }
 
-    /// The action drain is not part of these worlds. A completed reply to a
-    /// Reply-tagged original leaves its queued `.setTag(none)`, which shields the
-    /// row's read and flag state from the server until it drains
+    /// The unsent send is removed through the write every removal runs (Undo,
+    /// Undo to Drafts and the Outbox discard all call it).
+    @discardableResult
+    static func cancel(
+        pool: DatabasePool, outboxId: String, failedFirst: Bool = false
+    ) async throws -> AccountManager.HeldOutboxCancellation {
+        if failedFirst {
+            try await pool.write { db in
+                try db.execute(
+                    sql: "UPDATE outboxMessage SET status = ? WHERE id = ?",
+                    arguments: [OutboxStatus.failed.rawValue, outboxId])
+            }
+        }
+        let cancelled = try await pool.write { db in
+            try AccountManager.cancelHeldOutboxRow(db: db, messageId: outboxId)
+        }
+        #expect(cancelled.deleted, "precondition: the send was cancelled")
+        return cancelled
+    }
+
+    /// The action drain is not part of these worlds. A queued `.setTag` (the
+    /// completion's clear, or an Undo's restored Reply) shields the row's read
+    /// and flag state from the server until it drains
     /// (`PendingOperationSnapshot.flag`), so the other client's change below could
-    /// not land. Before that change, retire the completion's queued ops as their
+    /// not land. Before that change, retire the queued mark and tag ops as their
     /// successful drain does. The passes before it run with the shield in place.
-    static func retireCompletionOps(_ pool: DatabasePool) async throws {
+    static func retireMarkOps(_ pool: DatabasePool, expected: Int) async throws {
         let types = [OperationType.markReplied, .markForwarded, .setTag].map(\.rawValue)
         let retired = try await pool.write { db in
             try PendingOperation.filter(types.contains(Column("type"))).deleteAll(db)
         }
-        #expect(retired >= 1, "precondition: the completion queued its server ops")
+        #expect(retired == expected, "precondition: \(expected) mark or tag op(s) were queued, found \(retired)")
     }
 
     /// An IMAP account whose INBOX epoch is known, with no server behind it: for
     /// the steps that need no sync.
-    static func localIMAPAccount(_ pool: DatabasePool, prefix: String) throws -> String {
+    static func localAccount(
+        _ pool: DatabasePool, prefix: String, provider: AccountProvider = .imap
+    ) throws -> String {
         let accountId = "\(prefix)-\(UUID().uuidString.prefix(8).lowercased())"
-        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: provider, pool: pool)
         try FolderEpochTestFixture.insertFolder(
             accountId: accountId, path: Self.imapPath, role: .inbox, pool: pool,
-            lastKnownUidValidity: Self.imapEpoch)
+            lastKnownUidValidity: provider == .imap ? Self.imapEpoch : nil)
         return accountId
     }
 
-    /// A stored original in the INBOX. It is addressable on the server only when
-    /// `observed` is the folder's epoch.
+    /// A stored original in the INBOX. On IMAP it is addressable on the server
+    /// only when `observed` is the folder's epoch.
     static func storedOriginal(
         _ pool: DatabasePool, accountId: String, rfc: String,
-        observed: Int? = SendReplyMarksTests.imapEpoch, tag: ActionTag? = nil
+        observed: Int? = SendReplyMarksTests.imapEpoch, tag: ActionTag? = nil, isReplied: Bool = false
     ) throws -> MessageHeader {
         var parent = MessageHeader(
             messageId: "57", subject: "Original", from: "Sender",
@@ -215,62 +280,94 @@ struct SendReplyMarksTests {
         parent.rfc822MessageId = rfc
         parent.headerComplete = true
         parent.observedUidValidity = observed
+        parent.isReplied = isReplied
         if let tag { parent.setActionTag(tag, at: Date().addingTimeInterval(-3_600)) }
         let row = parent
         try pool.write { db in try row.insert(db) }
         return row
     }
 
-    /// The marks the original must show once `outcome` has happened.
-    static func expected(before: Marks, isForward: Bool, outcome: Outcome) -> Marks {
-        guard outcome == .completed else { return before }
-        var after = before
+    /// The marks Send writes on an addressable original.
+    static func held(before: Marks, isForward: Bool) -> Marks {
+        var held = before
         if isForward {
-            after.isForwarded = true
+            held.isForwarded = true
         } else {
-            after.isReplied = true
-            if before.actionTag == .reply { after.actionTag = ActionTag.none }
+            held.isReplied = true
+            if before.actionTag == .reply { held.actionTag = ActionTag.none }
         }
-        return after
+        return held
     }
 
-    /// Queue a reply (or forward) to `original` from a live draft, as Send does,
-    /// then let `outcome` happen to it. A send that never goes out leaves the
-    /// original byte-identical and queues no operation; a completed one sets the
-    /// marks and queues the server's mark.
-    static func queueThen(
-        _ outcome: Outcome, pool: DatabasePool, accountId: String, original: MessageHeader,
-        isForward: Bool, before: Marks
-    ) async throws {
+    /// The marks the original must show once `outcome` has happened.
+    static func expected(before: Marks, isForward: Bool, outcome: Outcome) -> Marks {
+        outcome == .completed ? held(before: before, isForward: isForward) : before
+    }
+
+    /// The mark and tag ops queued once `outcome` has happened to a send that
+    /// marked an addressable original: the completion's server mark and, for a
+    /// reply whose Reply tag Send cleared, its clear; an unsent removal's
+    /// restored Reply.
+    static func expectedMarkOps(before: Marks, isForward: Bool, outcome: Outcome) -> Int {
+        let clearedTag = !isForward && before.actionTag == .reply
+        switch outcome {
+        case .completed: return 1 + (clearedTag ? 1 : 0)
+        case .undone, .discardedAfterFailure: return clearedTag ? 1 : 0
+        }
+    }
+
+    /// Queue a reply (or forward) to an addressable `original` from a live
+    /// draft, as Send does, and check what Send wrote: the mark at once, the
+    /// Reply tag cleared on a reply, the row's record of both, no operation.
+    static func queueAndCheckHeld(
+        pool: DatabasePool, accountId: String, original: MessageHeader, isForward: Bool, before: Marks
+    ) async throws -> Queued {
         let originalId = original.id
         let queued = try await Self.queue(
             pool: pool, accountId: accountId, original: original, isForward: isForward)
-        let outboxId = queued.outboxId
+        #expect(queued.changedOriginalHeaderId == originalId, "Send must report the original it marked")
+        let heldNow = try Self.marks(pool, headerId: originalId)
+        let want = Self.held(before: before, isForward: isForward)
+        #expect(heldNow == want, "Send must mark the original at once: \(heldNow), want \(want)")
+        var recorded: OutboxMessage.QueuedOriginalChanges = [.setMark]
+        if !isForward, before.actionTag == .reply { recorded.insert(.clearedReplyTag) }
+        let changes = queued.row.queuedOriginalChanges
+        #expect(changes == recorded, "the row records exactly what Send changed: \(changes.rawValue), want \(recorded.rawValue)")
+        if recorded.contains(.clearedReplyTag) {
+            let stamped = try Self.header(pool, headerId: originalId).actionTagSetAt
+            #expect(stamped == queued.row.createdAt, "Send's none carries the row's own stamp")
+        }
+        return queued
+    }
 
+    /// Let `outcome` happen to a queued send. An unsent removal takes back what
+    /// Send changed and queues the restored Reply; a completed send keeps the
+    /// marks and queues the server's mark.
+    static func apply(
+        _ outcome: Outcome, queued: Queued, pool: DatabasePool, original: MessageHeader,
+        isForward: Bool, before: Marks
+    ) async throws {
+        let originalId = original.id
+        let restoresTag = !isForward && before.actionTag == .reply
         switch outcome {
         case .undone, .discardedAfterFailure:
-            if outcome == .discardedAfterFailure {
-                try await pool.write { db in
-                    try db.execute(
-                        sql: "UPDATE outboxMessage SET status = ? WHERE id = ?",
-                        arguments: [OutboxStatus.failed.rawValue, outboxId])
-                }
-            }
-            let cancelled = try await pool.write { db in
-                try AccountManager.cancelHeldOutboxRow(db: db, messageId: outboxId)
-            }
-            #expect(cancelled.deleted, "precondition: the send was cancelled")
-            let rowAfter = try Self.rowSnapshot(pool, headerId: originalId)
-            #expect(rowAfter == queued.originalRow, "\(outcome.rawValue): the original must stay byte-identical")
-            let operationsAfter = try Self.operationCount(pool)
-            #expect(operationsAfter == queued.operations, "\(outcome.rawValue): no operation may be queued")
+            let cancelled = try await Self.cancel(
+                pool: pool, outboxId: queued.outboxId, failedFirst: outcome == .discardedAfterFailure)
+            #expect(cancelled.revertedOriginalHeaderId == originalId,
+                    "\(outcome.rawValue): the removal must report the original it restored")
+            let tags = try Self.queuedTags(pool)
+            let wantTags: [String?] = restoresTag ? [ActionTag.reply.rawValue] : []
+            #expect(tags == wantTags, "\(outcome.rawValue): the restored Reply goes to the server: \(tags)")
+            let marks = try Self.queuedCount(pool, isForward ? .markForwarded : .markReplied)
+            #expect(marks == 0, "\(outcome.rawValue): no server mark for a send that never went out")
         case .completed:
-            try await Self.complete(pool: pool, outboxId: outboxId)
+            try await Self.complete(pool: pool, outboxId: queued.outboxId)
             let opType = isForward ? OperationType.markForwarded : OperationType.markReplied
-            let serverOps = try await pool.read { db in
-                try PendingOperation.filter(Column("type") == opType.rawValue).fetchCount(db)
-            }
+            let serverOps = try Self.queuedCount(pool, opType)
             #expect(serverOps == 1, "the completed send must queue the server's \(opType.rawValue)")
+            let tags = try Self.queuedTags(pool)
+            let wantTags: [String?] = restoresTag ? [ActionTag.none.rawValue] : []
+            #expect(tags == wantTags, "the completion sends Send's tag clear to the server: \(tags)")
         }
         let afterOutcome = try Self.marks(pool, headerId: originalId)
         let want = Self.expected(before: before, isForward: isForward, outcome: outcome)
@@ -279,7 +376,7 @@ struct SendReplyMarksTests {
 
     // MARK: - Gmail
 
-    @Test("Gmail: the original's marks change only when the send goes out, and the passes keep them",
+    @Test("Gmail: Send marks the original, the passes keep it, and only a send that went out keeps it",
           arguments: [false, true], Outcome.allCases)
     func gmail(isForward: Bool, outcome: Outcome) async throws {
         let seed = GmailDeltaApplyInvariantTests.seed("marks-1", labels: ["INBOX", "UNREAD"])
@@ -290,9 +387,18 @@ struct SendReplyMarksTests {
             try await Self.tagReply(w.pool, headerId: original.id)
             let before = try Self.marks(w.pool, headerId: original.id)
 
-            try await Self.queueThen(
-                outcome, pool: w.pool, accountId: w.accountId, original: original,
-                isForward: isForward, before: before)
+            let queued = try await Self.queueAndCheckHeld(
+                pool: w.pool, accountId: w.accountId, original: original, isForward: isForward, before: before)
+            let held = Self.held(before: before, isForward: isForward)
+            try await w.delta()
+            let heldAfterDelta = try Self.marks(w.pool, headerId: original.id)
+            #expect(heldAfterDelta == held, "a change pass during the hold: \(heldAfterDelta)")
+            try await w.foregroundPassWithFullSyncDue()
+            let heldAfterFull = try Self.marks(w.pool, headerId: original.id)
+            #expect(heldAfterFull == held, "a full pass during the hold: \(heldAfterFull)")
+
+            try await Self.apply(
+                outcome, queued: queued, pool: w.pool, original: original, isForward: isForward, before: before)
             let want = Self.expected(before: before, isForward: isForward, outcome: outcome)
 
             try await w.delta()
@@ -301,7 +407,8 @@ struct SendReplyMarksTests {
             try await w.foregroundPassWithFullSyncDue()
             let afterFull = try Self.marks(w.pool, headerId: original.id)
             #expect(afterFull == want, "after a full pass: \(afterFull)")
-            if outcome == .completed { try await Self.retireCompletionOps(w.pool) }
+            try await Self.retireMarkOps(
+                w.pool, expected: Self.expectedMarkOps(before: before, isForward: isForward, outcome: outcome))
             w.server.applyLabelChange(providerMessageId: "marks-1", remove: ["UNREAD"])
             try await w.delta()
             let afterReread = try Self.marks(w.pool, headerId: original.id)
@@ -313,7 +420,7 @@ struct SendReplyMarksTests {
 
     // MARK: - Outlook
 
-    @Test("Outlook: the original's marks change only when the send goes out, and the passes keep them",
+    @Test("Outlook: Send marks the original, the passes keep it, and only a send that went out keeps it",
           arguments: [false, true], Outcome.allCases)
     func outlook(isForward: Bool, outcome: Outcome) async throws {
         let seed = OutlookChangeReadingTests.seed("marks-1", in: OutlookChangeReadingTests.inbox)
@@ -325,9 +432,18 @@ struct SendReplyMarksTests {
             try await Self.tagReply(w.pool, headerId: original.id)
             let before = try Self.marks(w.pool, headerId: original.id)
 
-            try await Self.queueThen(
-                outcome, pool: w.pool, accountId: w.accountId, original: original,
-                isForward: isForward, before: before)
+            let queued = try await Self.queueAndCheckHeld(
+                pool: w.pool, accountId: w.accountId, original: original, isForward: isForward, before: before)
+            let held = Self.held(before: before, isForward: isForward)
+            try await w.delta()
+            let heldAfterDelta = try Self.marks(w.pool, headerId: original.id)
+            #expect(heldAfterDelta == held, "a change pass during the hold: \(heldAfterDelta)")
+            try await w.foregroundPass()
+            let heldAfterFull = try Self.marks(w.pool, headerId: original.id)
+            #expect(heldAfterFull == held, "a full pass during the hold: \(heldAfterFull)")
+
+            try await Self.apply(
+                outcome, queued: queued, pool: w.pool, original: original, isForward: isForward, before: before)
             let want = Self.expected(before: before, isForward: isForward, outcome: outcome)
 
             try await w.delta()
@@ -336,7 +452,8 @@ struct SendReplyMarksTests {
             try await w.foregroundPass()
             let afterFull = try Self.marks(w.pool, headerId: original.id)
             #expect(afterFull == want, "after a full pass: \(afterFull)")
-            if outcome == .completed { try await Self.retireCompletionOps(w.pool) }
+            try await Self.retireMarkOps(
+                w.pool, expected: Self.expectedMarkOps(before: before, isForward: isForward, outcome: outcome))
             w.server.setFlagFromOtherClient(providerMessageId: "marks-1", isFlagged: true)
             try await w.delta()
             let afterReread = try Self.marks(w.pool, headerId: original.id)
@@ -348,7 +465,7 @@ struct SendReplyMarksTests {
 
     // MARK: - IMAP
 
-    @Test("IMAP: the original's marks change only when the send goes out, and the passes keep them",
+    @Test("IMAP: Send marks the original, the passes keep it, and only a send that went out keeps it",
           arguments: [false, true], Outcome.allCases)
     func imap(isForward: Bool, outcome: Outcome) async throws {
         let server = FakeIMAPServer(
@@ -398,9 +515,18 @@ struct SendReplyMarksTests {
         try await Self.tagReply(pool, headerId: original.id)
         let before = try Self.marks(pool, headerId: original.id)
 
-        try await Self.queueThen(
-            outcome, pool: pool, accountId: accountId, original: original,
-            isForward: isForward, before: before)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: isForward, before: before)
+        let held = Self.held(before: before, isForward: isForward)
+        _ = try await engine.performDeltaSync(account: try account(), provider: provider)
+        let heldAfterDelta = try Self.marks(pool, headerId: original.id)
+        #expect(heldAfterDelta == held, "a change pass during the hold: \(heldAfterDelta)")
+        try await fullPass()
+        let heldAfterFull = try Self.marks(pool, headerId: original.id)
+        #expect(heldAfterFull == held, "a full pass during the hold: \(heldAfterFull)")
+
+        try await Self.apply(
+            outcome, queued: queued, pool: pool, original: original, isForward: isForward, before: before)
         let want = Self.expected(before: before, isForward: isForward, outcome: outcome)
 
         _ = try await engine.performDeltaSync(account: try account(), provider: provider)
@@ -409,7 +535,8 @@ struct SendReplyMarksTests {
         try await fullPass()
         let afterFull = try Self.marks(pool, headerId: original.id)
         #expect(afterFull == want, "after a full pass: \(afterFull)")
-        if outcome == .completed { try await Self.retireCompletionOps(pool) }
+        try await Self.retireMarkOps(
+            pool, expected: Self.expectedMarkOps(before: before, isForward: isForward, outcome: outcome))
         server.setFlags(["\\Flagged"], in: Self.imapPath, uid: 1)
         _ = try await engine.performDeltaSync(account: try account(), provider: provider)
         let afterReread = try Self.marks(pool, headerId: original.id)
@@ -421,19 +548,324 @@ struct SendReplyMarksTests {
         await engine.remove(accountId: accountId)
     }
 
-    // MARK: - Queuing alone
+    // MARK: - What Send marks
 
-    @Test("Queuing a reply or forward writes nothing to the original and queues no operation",
-          arguments: [false, true])
-    func queueingWritesNothingToTheOriginal(isForward: Bool) async throws {
+    /// Send marks only an original the server can be asked to mark (the same
+    /// admission the completion's server op needs), so the local mark never
+    /// claims a flag the server will not get. A reply's Reply tag is local, so
+    /// it is cleared either way, and the completion sends that clear.
+    @Test("Send marks only an addressable original, clears a reply's Reply tag either way, and the completion sends what Send changed",
+          arguments: [false, true], [false, true])
+    func sendMarksOnlyAnAddressableOriginal(isForward: Bool, addressable: Bool) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        let accountId = try Self.localIMAPAccount(pool, prefix: "marks-queue")
+        let accountId = try Self.localAccount(pool, prefix: "marks-admit")
         let original = try Self.storedOriginal(
-            pool, accountId: accountId, rfc: "queue-parent@example.com", tag: .reply)
+            pool, accountId: accountId, rfc: "admit-parent@example.com",
+            observed: addressable ? Self.imapEpoch : nil, tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
 
-        // `queue` checks that the original's row is unchanged and no operation was queued.
-        _ = try await Self.queue(pool: pool, accountId: accountId, original: original, isForward: isForward)
+        let queued = try await Self.queue(pool: pool, accountId: accountId, original: original, isForward: isForward)
+        var recorded: OutboxMessage.QueuedOriginalChanges = []
+        var held = before
+        if addressable { recorded.insert(.setMark) }
+        if isForward {
+            held.isForwarded = addressable
+        } else {
+            held.isReplied = addressable
+            held.actionTag = ActionTag.none
+            recorded.insert(.clearedReplyTag)
+        }
+        let heldNow = try Self.marks(pool, headerId: original.id)
+        #expect(heldNow == held, "Send: \(heldNow), want \(held)")
+        let changes = queued.row.queuedOriginalChanges
+        #expect(changes == recorded, "recorded \(changes.rawValue), want \(recorded.rawValue)")
+        let reported = queued.changedOriginalHeaderId
+        if recorded.isEmpty {
+            #expect(reported == nil, "Send changed nothing, so it reports no original")
+            let rowAfter = try Self.rowSnapshot(pool, headerId: original.id)
+            #expect(rowAfter == queued.originalRow, "Send changed nothing, so the original stays byte-identical")
+        } else {
+            #expect(reported == original.id, "Send must report the original it changed")
+        }
+
+        try await Self.complete(pool: pool, outboxId: queued.outboxId)
+        let after = try Self.marks(pool, headerId: original.id)
+        #expect(after == held, "the completion keeps what Send wrote: \(after), want \(held)")
+        let serverMarks = try Self.queuedCount(pool, isForward ? .markForwarded : .markReplied)
+        #expect(serverMarks == (addressable ? 1 : 0), "the server's mark is queued exactly when it can be addressed")
+        let tags = try Self.queuedTags(pool)
+        let wantTags: [String?] = isForward ? [] : [ActionTag.none.rawValue]
+        #expect(tags == wantTags, "the completion sends Send's tag clear whatever the admission: \(tags)")
+    }
+
+    // MARK: - The production entry points
+
+    /// How the user removes a send that has not gone out.
+    enum Removal: String, CaseIterable, Sendable {
+        /// The toast's Undo (`PendingSendService.undo`), which returns the kept
+        /// draft to Drafts in the same write.
+        case undoToDrafts
+        /// The Outbox's discard of a held send (`discardOutboxMessageConfirmed`).
+        case outboxDiscard
+        /// The Outbox's discard of a send that failed.
+        case outboxDiscardAfterFailure
+    }
+
+    /// The whole path: Send through `queueSend`, then each production removal.
+    /// Both tell the open email screen and the inbox that the original changed,
+    /// since it shows the mark at once and loses it again.
+    @MainActor
+    @Test("Send refreshes the original's screen, and every unsent removal takes back its mark and Reply tag and refreshes it again",
+          arguments: Removal.allCases)
+    func productionRemovalsTakeBackTheMarks(_ removal: Removal) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            PendingSendService.shared.dismiss()
+            PendingSendService.shared.dismissUndoFailure()
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let accountId = try Self.localAccount(pool, prefix: "marks-entry")
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Drafts", role: .drafts, pool: pool, lastKnownUidValidity: 1)
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: "entry-parent@example.com", tag: .reply)
+        let originalId = original.id
+        let before = try Self.marks(pool, headerId: originalId)
+        let draftId = "reply:\(accountId):\(original.stableId)"
+        try await pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: accountId,
+                toJSON: Draft.encodeStringArray(["sender@example.com"]), ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Original", body: "Answer", replyToId: originalId,
+                isForward: false, editHistoryJSON: nil,
+                createdAt: Date().timeIntervalSince1970,
+                updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = Self.draftEpoch
+            try draft.insert(db)
+        }
+
+        let posts = Mutex(0)
+        let token = NotificationCenter.default.addObserver(
+            forName: .messageDataDidChange, object: nil, queue: nil
+        ) { note in
+            if note.object as? String == originalId { posts.withLock { $0 += 1 } }
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        let stored = try await pool.read { db in try Account.fetchOne(db, key: accountId) }
+        let account = try #require(stored)
+        let message = try await Self.outgoing(pool: pool, accountId: accountId, original: original, isForward: false)
+        let queued = try await AccountManager.shared.queueSend(
+            draft: message, from: account, replyToHeaderId: originalId,
+            draftId: draftId, instanceEpoch: Self.draftEpoch)
+        let heldNow = try Self.marks(pool, headerId: originalId)
+        let held = Self.held(before: before, isForward: false)
+        #expect(heldNow == held, "Send marks the original at once: \(heldNow)")
+        let postedAtSend = posts.withLock { $0 }
+        #expect(postedAtSend >= 1, "Send must tell the open email screen its message changed")
+        posts.withLock { $0 = 0 }
+
+        switch removal {
+        case .undoToDrafts:
+            PendingSendService.shared.present(
+                outboxId: queued.outboxId, draftId: draftId, instanceEpoch: Self.draftEpoch,
+                toSummary: "To: sender@example.com", holdUntil: queued.holdUntil)
+            let snapshot = PendingSendService.shared.undo()
+            #expect(snapshot != nil, "precondition: the Undo was confirmed")
+        case .outboxDiscard, .outboxDiscardAfterFailure:
+            if removal == .outboxDiscardAfterFailure {
+                try await pool.write { db in
+                    try db.execute(
+                        sql: "UPDATE outboxMessage SET status = ? WHERE id = ?",
+                        arguments: [OutboxStatus.failed.rawValue, queued.outboxId])
+                }
+            }
+            let discarded = AccountManager.shared.discardOutboxMessageConfirmed(queued.outboxId)
+            #expect(discarded, "precondition: the discard was confirmed")
+        }
+
+        let remaining = try await pool.read { db in try OutboxMessage.fetchOne(db, key: queued.outboxId) }
+        #expect(remaining == nil, "precondition: the send was removed")
+        let after = try Self.marks(pool, headerId: originalId)
+        #expect(after == before, "\(removal.rawValue): \(after), want \(before)")
+        let tags = try Self.queuedTags(pool)
+        #expect(tags == [ActionTag.reply.rawValue], "\(removal.rawValue): the restored Reply goes to the server: \(tags)")
+        let postedAtRemoval = posts.withLock { $0 }
+        #expect(postedAtRemoval >= 1, "\(removal.rawValue): the open email screen must be told its message changed back")
+    }
+
+    // MARK: - A tag set after Send
+
+    /// What the tag became after Send cleared it.
+    enum LaterTag: String, CaseIterable, Sendable {
+        /// The user filed it.
+        case archive
+        /// The user's Reply again, or the server's Reply a pass wrote back.
+        case reply
+        /// The user's own none, a gesture after Send.
+        case userNone
+    }
+
+    /// A tag set after Send is a newer intention than Send's clear: an Undo
+    /// keeps it, and the completion sends no clear for it (a Reply is still
+    /// cleared, as any completed reply clears one).
+    @Test("A tag set after Send is kept by an unsent removal, and the completion sends no clear of its own for it",
+          arguments: LaterTag.allCases, [Outcome.undone, .completed])
+    func laterTagWins(_ later: LaterTag, outcome: Outcome) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-later")
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: "later-parent@example.com", tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: false, before: before)
+
+        let tag: ActionTag = switch later {
+        case .archive: .archive
+        case .reply: .reply
+        case .userNone: ActionTag.none
+        }
+        let laterStamp = queued.row.createdAt.addingTimeInterval(1)
+        let originalId = original.id
+        var retagged = try Self.header(pool, headerId: originalId)
+        retagged.setActionTag(tag, at: laterStamp)
+        let retaggedRow = retagged
+        try await pool.write { db in try retaggedRow.update(db) }
+
+        switch outcome {
+        case .completed:
+            try await Self.complete(pool: pool, outboxId: queued.outboxId)
+            let after = try Self.marks(pool, headerId: originalId)
+            let wantTag: ActionTag = later == .reply ? ActionTag.none : tag
+            #expect(after == Marks(isReplied: true, isForwarded: false, actionTag: wantTag), "\(after)")
+            let tags = try Self.queuedTags(pool)
+            let wantTags: [String?] = later == .reply ? [ActionTag.none.rawValue] : []
+            #expect(tags == wantTags, "only a Reply is cleared on the server: \(tags)")
+            let serverMarks = try Self.queuedCount(pool, .markReplied)
+            #expect(serverMarks == 1)
+        case .undone, .discardedAfterFailure:
+            let cancelled = try await Self.cancel(pool: pool, outboxId: queued.outboxId)
+            #expect(cancelled.revertedOriginalHeaderId == originalId, "the mark was taken back")
+            let after = try Self.marks(pool, headerId: originalId)
+            #expect(after == Marks(isReplied: false, isForwarded: false, actionTag: tag),
+                    "the later tag stays, the mark goes: \(after)")
+            let tags = try Self.queuedTags(pool)
+            #expect(tags.isEmpty, "nothing restores a tag set after Send: \(tags)")
+        }
+    }
+
+    // MARK: - A second reply
+
+    /// An original already replied (by another device, or an earlier send) is
+    /// not marked again, so an Undo of a second reply leaves it replied. Send's
+    /// Reply tag clear is still its own, and goes back.
+    @Test("Undo of a second reply to an already-replied original leaves it replied",
+          arguments: [AccountProvider.gmail, .imap], [false, true])
+    func undoOfASecondReplyLeavesTheOriginalReplied(provider: AccountProvider, reTagged: Bool) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-second", provider: provider)
+        let original = try Self.storedOriginal(
+            pool, accountId: accountId, rfc: "second-parent@example.com",
+            tag: reTagged ? .reply : nil, isReplied: true)
+        let before = try Self.marks(pool, headerId: original.id)
+
+        let queued = try await Self.queue(pool: pool, accountId: accountId, original: original, isForward: false)
+        let changes = queued.row.queuedOriginalChanges
+        let recorded: OutboxMessage.QueuedOriginalChanges = reTagged ? [.clearedReplyTag] : []
+        #expect(changes == recorded, "Send records no mark it did not set: \(changes.rawValue)")
+        let held = try Self.marks(pool, headerId: original.id)
+        #expect(held == Marks(isReplied: true, isForwarded: false, actionTag: reTagged ? ActionTag.none : nil), "\(held)")
+
+        try await Self.cancel(pool: pool, outboxId: queued.outboxId)
+        let after = try Self.marks(pool, headerId: original.id)
+        #expect(after == before, "the Undo leaves the original replied: \(after), want \(before)")
+        if !reTagged {
+            let rowAfter = try Self.rowSnapshot(pool, headerId: original.id)
+            #expect(rowAfter == queued.originalRow, "Send and its Undo changed nothing")
+        }
+    }
+
+    // MARK: - Two pending replies
+
+    /// Each unsent removal takes back exactly what its own row recorded. The
+    /// first reply marks the original and clears its tag; the second finds it
+    /// marked and records nothing. Undoing the first therefore leaves no reply
+    /// arrow while the second is still pending (a registered gap: the second's
+    /// completion marks it again).
+    @Test("Two pending replies: undoing the first takes back its own changes; the second's Undo or completion settles the original",
+          arguments: [Outcome.undone, .completed])
+    func twoPendingReplies(second: Outcome) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-two")
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: "two-parent@example.com", tag: .reply)
+        let before = try Self.marks(pool, headerId: original.id)
+
+        let first = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: false, before: before)
+        let replyB = try await Self.queue(
+            pool: pool, accountId: accountId, original: original, isForward: false, draftId: "reply-b-\(accountId)")
+        let secondChanges = replyB.row.queuedOriginalChanges
+        #expect(secondChanges.isEmpty, "the second reply finds the original marked: \(secondChanges.rawValue)")
+        #expect(replyB.changedOriginalHeaderId == nil)
+
+        try await Self.cancel(pool: pool, outboxId: first.outboxId)
+        let gap = try Self.marks(pool, headerId: original.id)
+        #expect(gap == before, "undoing the first takes back its changes, the second still pending: \(gap)")
+
+        switch second {
+        case .completed:
+            try await Self.complete(pool: pool, outboxId: replyB.outboxId)
+            let after = try Self.marks(pool, headerId: original.id)
+            #expect(after == Marks(isReplied: true, isForwarded: false, actionTag: ActionTag.none),
+                    "the second reply went out: marked, its tag cleared: \(after)")
+            let tags = try Self.queuedTags(pool)
+            #expect(tags == [ActionTag.reply.rawValue, ActionTag.none.rawValue],
+                    "the server's tag ends cleared, after the first Undo's restore: \(tags)")
+            let serverMarks = try Self.queuedCount(pool, .markReplied)
+            #expect(serverMarks == 1)
+        case .undone, .discardedAfterFailure:
+            let cancelled = try await Self.cancel(pool: pool, outboxId: replyB.outboxId)
+            #expect(cancelled.revertedOriginalHeaderId == nil, "the second recorded nothing to take back")
+            let after = try Self.marks(pool, headerId: original.id)
+            #expect(after == before, "both undone: the original is as it was: \(after), want \(before)")
+            let tags = try Self.queuedTags(pool)
+            #expect(tags == [ActionTag.reply.rawValue], "\(tags)")
+        }
+    }
+
+    // MARK: - A send queued before Send marked the original
+
+    /// A row queued by an earlier version recorded nothing (NULL): Send did not
+    /// mark the original then, so its removal changes nothing.
+    @Test("Removing a send queued before this version changes nothing on its original")
+    func removalOfAnOlderRowChangesNothing() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = try Self.localAccount(pool, prefix: "marks-older")
+        let parentRfc = "older-parent@example.com"
+        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: parentRfc, tag: .reply)
+        var older = OutboxMessage(
+            accountId: accountId,
+            draft: DraftMessage(
+                to: ["sender@example.com"], subject: "Re: Original", body: "text",
+                inReplyTo: "<\(parentRfc)>", references: [parentRfc]),
+            originalMessageHeaderId: original.id)
+        older.holdUntil = Date().addingTimeInterval(SyncConfig.outboxUndoHoldSeconds)
+        #expect(older.originalChangesAtQueue == nil, "precondition: the row recorded nothing")
+        let olderRow = older
+        try await pool.write { db in try olderRow.insert(db) }
+        let rowBefore = try Self.rowSnapshot(pool, headerId: original.id)
+        let operationsBefore = try Self.operationCount(pool)
+
+        let cancelled = try await Self.cancel(pool: pool, outboxId: olderRow.id)
+        #expect(cancelled.revertedOriginalHeaderId == nil)
+        let rowAfter = try Self.rowSnapshot(pool, headerId: original.id)
+        #expect(rowAfter == rowBefore, "the original stays byte-identical")
+        let operationsAfter = try Self.operationCount(pool)
+        #expect(operationsAfter == operationsBefore, "no operation may be queued")
     }
 
     // MARK: - The open email screen
@@ -451,16 +883,17 @@ struct SendReplyMarksTests {
     }
 
     /// The email screen re-reads its message only on a `.messageDataDidChange`
-    /// naming it (`MessageDetailViewModel`). The replied/forwarded mark is written
-    /// only when the send completes, so the completion must post it whenever it
-    /// changed the original: a mark (reply, reply-all, forward), or only the
-    /// cleared Reply tag. When it changed nothing it must not post.
+    /// naming it (`MessageDetailViewModel`). A send queued before this version
+    /// (no record, inserted here directly) marks its original only when it
+    /// completes, so the completion must post whenever it changed the original:
+    /// a mark (reply, reply-all, forward), or only the cleared Reply tag. When it
+    /// changed nothing it must not post.
     @Test("Completing a send refreshes the original's open screen exactly when it changed the original",
           arguments: CompletionChange.allCases)
     func completionRefreshesTheOpenOriginal(_ change: CompletionChange) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        let accountId = try Self.localIMAPAccount(pool, prefix: "marks-post")
+        let accountId = try Self.localAccount(pool, prefix: "marks-post")
         let addressable = change == .reply || change == .replyAll || change == .forward
         let parentRfc = "post-parent@example.com"
         let parent = try Self.storedOriginal(
@@ -520,17 +953,22 @@ struct SendReplyMarksTests {
         }
     }
 
-    // MARK: - A Reply tag written while the send is held
+    // MARK: - An AI tag written while the send is held
 
-    /// The AI tags an email Reply unless it is already replied. While a reply is
-    /// held the original is not marked yet, so the AI's Reply lands; the completion
-    /// reads the row as it is then and clears it.
-    @Test("A Reply tag the AI writes while the reply is held is cleared when the send goes out")
-    func aiReplyTagWrittenDuringTheHoldIsClearedByCompletion() async throws {
+    /// The AI tags an email Reply unless it is already replied. Send marks an
+    /// addressable original replied, so the AI writes none during the hold and
+    /// the completion has nothing to clear. An original the server cannot be
+    /// asked to mark is not marked, so the AI's Reply lands and the completion
+    /// clears it.
+    @Test("An AI tag written while the reply is held: none on a marked original, a Reply the completion clears on an unmarked one",
+          arguments: [true, false])
+    func aiTagWrittenDuringTheHold(addressable: Bool) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        let accountId = try Self.localIMAPAccount(pool, prefix: "marks-ai")
-        let original = try Self.storedOriginal(pool, accountId: accountId, rfc: "ai-parent@example.com")
+        let accountId = try Self.localAccount(pool, prefix: "marks-ai")
+        let original = try Self.storedOriginal(
+            pool, accountId: accountId, rfc: "ai-parent@example.com",
+            observed: addressable ? Self.imapEpoch : nil)
         let queued = try await Self.queue(pool: pool, accountId: accountId, original: original, isForward: false)
 
         // The AI's action write, through the guarded write, with the AI queue's rule:
@@ -546,29 +984,34 @@ struct SendReplyMarksTests {
         }
         #expect(outcome == .written, "precondition: the AI write landed")
         let held = try Self.marks(pool, headerId: original.id)
-        #expect(held == Marks(isReplied: false, isForwarded: false, actionTag: .reply),
-                "the original is not replied while the send is held, so the AI's Reply lands: \(held)")
+        let wantHeld = Marks(
+            isReplied: addressable, isForwarded: false, actionTag: addressable ? ActionTag.none : .reply)
+        #expect(held == wantHeld, "during the hold: \(held), want \(wantHeld)")
 
         try await Self.complete(pool: pool, outboxId: queued.outboxId)
         let after = try Self.marks(pool, headerId: original.id)
-        #expect(after == Marks(isReplied: true, isForwarded: false, actionTag: ActionTag.none),
-                "the completion must clear the Reply tag written during the hold: \(after)")
+        #expect(after == Marks(isReplied: addressable, isForwarded: false, actionTag: ActionTag.none),
+                "the completion leaves no Reply tag: \(after)")
+        let tags = try Self.queuedTags(pool)
+        let wantTags: [String?] = addressable ? [] : [ActionTag.none.rawValue]
+        #expect(tags == wantTags, "only the AI's Reply is cleared on the server: \(tags)")
     }
 
     // MARK: - The original moved before the send went out
 
     /// TODAY'S BEHAVIOUR, pinned so that a change to it is deliberate. Archiving
     /// the original while the reply is held gives it a new address (on IMAP a UID
-    /// in Archive; the row is re-keyed when the move lands). The queued row still
-    /// names the old address, so the completion finds no original: no mark, no
-    /// server op, and the Reply tag stays. Once the Sent copy is synced,
-    /// `ReplyParentResolver` finds the moved original by its Message-ID, marks it
-    /// replied and clears its Reply tag. The server's `\Answered` is not set.
-    @Test("A reply whose original is archived before the send goes out: the completion finds no original, and the Sent copy's sync marks it")
-    func originalArchivedBeforeTheSendGoesOut() async throws {
+    /// in Archive; the row is re-keyed when the move lands), and the moved row
+    /// keeps the marks Send wrote. The queued row still names the old address, so
+    /// neither the completion nor an Undo finds the original: a completed send
+    /// queues no server mark, and an Undo leaves the moved original marked
+    /// (#1479).
+    @Test("A reply whose original is archived while it is held: the moved original keeps Send's marks, and neither the completion nor an Undo finds it",
+          arguments: [Outcome.completed, .undone])
+    func originalArchivedWhileTheSendIsHeld(outcome: Outcome) async throws {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-        let accountId = try Self.localIMAPAccount(pool, prefix: "marks-moved")
+        let accountId = try Self.localAccount(pool, prefix: "marks-moved")
         let archivePath = "Archive"
         let archiveEpoch = Self.imapEpoch + 1
         try FolderEpochTestFixture.insertFolder(
@@ -576,7 +1019,9 @@ struct SendReplyMarksTests {
             lastKnownUidValidity: archiveEpoch)
         let parentRfc = "moved-parent@example.com"
         let original = try Self.storedOriginal(pool, accountId: accountId, rfc: parentRfc, tag: .reply)
-        let queued = try await Self.queue(pool: pool, accountId: accountId, original: original, isForward: false)
+        let before = try Self.marks(pool, headerId: original.id)
+        let queued = try await Self.queueAndCheckHeld(
+            pool: pool, accountId: accountId, original: original, isForward: false, before: before)
 
         // The archive gesture moves the row locally; it keeps its key until the move lands ...
         let archiveFolderId = MessageIdentity.folderId(accountId: accountId, folderPath: archivePath)
@@ -599,27 +1044,27 @@ struct SendReplyMarksTests {
         #expect(finished.applied.count == 1, "precondition: the move re-keyed the original")
         let movedId = MessageIdentity.headerId(accountId: accountId, folderPath: archivePath, messageId: "9")
         let moved = try Self.marks(pool, headerId: movedId)
-        #expect(moved == Marks(isReplied: false, isForwarded: false, actionTag: .reply), "precondition: \(moved)")
+        let held = Self.held(before: before, isForward: false)
+        #expect(moved == held, "the moved original keeps Send's marks: \(moved)")
 
-        let disposition = try await Self.complete(pool: pool, outboxId: queued.outboxId)
-        #expect(disposition.changedOriginalHeaderId == nil, "the queued row names the address the original left")
-        let afterSend = try Self.marks(pool, headerId: movedId)
-        #expect(afterSend == Marks(isReplied: false, isForwarded: false, actionTag: .reply),
-                "the completion cannot find the moved original: \(afterSend)")
-        let serverMarks = try await pool.read { db in
-            try PendingOperation.filter(Column("type") == OperationType.markReplied.rawValue).fetchCount(db)
+        switch outcome {
+        case .completed:
+            let disposition = try await Self.complete(pool: pool, outboxId: queued.outboxId)
+            #expect(disposition.changedOriginalHeaderId == nil, "the queued row names the address the original left")
+            let serverMarks = try Self.queuedCount(pool, .markReplied)
+            #expect(serverMarks == 0, "no server mark is queued for an original the completion cannot find")
+            // The Sent copy's sync names the original by its Message-ID; it is already marked.
+            let marked = try await pool.write { db in
+                try ReplyParentResolver.markParentsReplied(
+                    sentCopies: [.init(inReplyTo: "<\(parentRfc)>", subject: "Re: Original")], folderRole: .sent,
+                    accountId: accountId, db: db)
+            }
+            #expect(marked.isEmpty, "the moved original is already marked replied")
+        case .undone, .discardedAfterFailure:
+            let cancelled = try await Self.cancel(pool: pool, outboxId: queued.outboxId)
+            #expect(cancelled.revertedOriginalHeaderId == nil, "the Undo cannot find the moved original")
         }
-        #expect(serverMarks == 0, "no server mark is queued for an original the completion cannot find")
-
-        // The Sent copy's sync names the original by its Message-ID.
-        let marked = try await pool.write { db in
-            try ReplyParentResolver.markParentsReplied(
-                sentCopies: [.init(inReplyTo: "<\(parentRfc)>", subject: "Re: Original")], folderRole: .sent,
-                accountId: accountId, db: db)
-        }
-        #expect(marked == [movedId])
-        let healed = try Self.marks(pool, headerId: movedId)
-        #expect(healed == Marks(isReplied: true, isForwarded: false, actionTag: ActionTag.none),
-                "the Sent copy's sync marks the moved original replied and clears its Reply tag: \(healed)")
+        let after = try Self.marks(pool, headerId: movedId)
+        #expect(after == held, "\(outcome.rawValue): the moved original keeps Send's marks: \(after)")
     }
 }

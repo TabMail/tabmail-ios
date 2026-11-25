@@ -18,7 +18,8 @@ import Testing
 /// Each test queues the send as Send does (the production thread-header
 /// builder), renders the message with the provider's own wire builder, puts that
 /// copy in the server's Sent folder and runs the provider's sync. The completion
-/// is not run, so what the original shows comes from the Sent copy alone.
+/// is not run, so what the original shows comes from Send's own mark (#1490) and
+/// the Sent copy.
 ///
 /// Outlook's sync reads no In-Reply-To (`GraphParse.parseMessage` sets it nil),
 /// so an Outlook Sent copy marks nothing for a reply or a forward; its marks come
@@ -26,11 +27,12 @@ import Testing
 extension SendReplyMarksTests {
 
     /// The original's marks after its Sent copy synced, with the send not yet
-    /// completed: a reply's copy marks it replied and clears its Reply tag; a
-    /// forward's copy leaves it as it was.
+    /// completed. Send marked it (#1490): a reply replied with its Reply tag
+    /// cleared, a forward forwarded. A forward's copy must leave it unreplied
+    /// with its Reply tag.
     static func expectedAfterSentCopy(isForward: Bool) -> Marks {
         isForward
-            ? Marks(isReplied: false, isForwarded: false, actionTag: .reply)
+            ? Marks(isReplied: false, isForwarded: true, actionTag: .reply)
             : Marks(isReplied: true, isForwarded: false, actionTag: ActionTag.none)
     }
 

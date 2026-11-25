@@ -106,6 +106,11 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 > In-Reply-To marks it replied when its subject does not start with `Fwd:` or `Fw:` (an edited subject,
 > or a localized or `VS:` prefix); and `IOS-OUTBOX-009`, what Apple Mail and Outlook write on a forward
 > is not measured.
+
+> **Current tracker census (2026-11-25, #1490): unchanged at 6 `open` records.** Adds two
+> `accepted` records: `IOS-OUTBOX-010`, while a reply is held a change pass can bring the server's
+> Reply tag back onto the original until the reply goes out; `IOS-OUTBOX-011`, with two replies to one
+> original waiting to go out, undoing the first leaves no reply arrow until the second is sent.
 >
 > *Preserved:* **Current tracker census (2026-11-24, #1400): unchanged at 6 `open` records.** Adds one
 > `accepted` record, `IOS-BODY-007`: each body queue's refill now admits the newest window of the rows
@@ -362,6 +367,8 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 |---|---|---|
 | [IOS-OUTBOX-008](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-008.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1492).** A forward sent from another mail app that names its original in In-Reply-To (Thunderbird does) is read as a forward only when its subject starts with `Fwd:` or `Fw:`; with an edited subject, a localized prefix (`WG:`, `TR:`, `RV:`) or the ambiguous `VS:`, the original is marked replied and its Reply tag cleared. Tagging it Reply again restores the tag. |
 | [IOS-OUTBOX-009](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-009.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1492).** Not measured: whether Apple Mail and Outlook set In-Reply-To on a forward, and which prefix they write in each language. Only an In-Reply-To with a prefix outside `Fwd:`/`Fw:` gives a wrong mark (IOS-OUTBOX-008). |
+| [IOS-OUTBOX-010](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-010.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1490).** Send clears a reply's Reply tag on this device at once and tells the server only when the reply goes out, so an Undo has nothing to take back there. While the reply is held, a change pass that reads the original writes the server's Reply tag back (its reply detection runs only when the server newly reports the message replied); the completion clears it again, locally and on the server, and a full pass during the hold clears it before that. An Undo in that state keeps the Reply tag the user had before Send. Rare (a server-side Reply tag, a server change to the message and a change pass inside the hold); recovers by itself |
+| [IOS-OUTBOX-011](Companion/Process/Current/KnownIssues/Amendments/ios-outbox-011.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-25, #1490).** Each unsent removal (Undo, Undo to Drafts, the Outbox discard) undoes exactly what its own Send recorded and reads no other outbox row, which keeps a scan out of the synchronous Undo write. With two replies to one original waiting to go out, the first marked it and cleared its Reply tag and the second recorded nothing, so undoing the first leaves the Reply tag and no reply arrow until the second is sent; its completion marks the original and clears the tag, and undoing the second instead leaves the original as it was before both. Rare; recovers by itself |
 
 ### TEST (1)
 
