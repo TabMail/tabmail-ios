@@ -809,6 +809,42 @@ struct OutboxCompletionMarksOriginalTests {
         #expect(disposition.changedOriginalHeaderId == nil)
     }
 
+    /// A reply names its original by In-Reply-To, not by its last References id.
+    /// The two differ when the original's own References already listed another
+    /// message after its id, so a reply read from References would miss it.
+    @Test("A reply whose last References id is not the original still marks the original replied")
+    func replyWhoseLastReferenceIsNotTheOriginalMarksReplied() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "230", rfc822MessageId: "<reply-target@example.com>", actionTag: .reply)
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: "Re: Test",
+                inReplyTo: "reply-target@example.com",
+                references: ["reply-target@example.com", "other@example.com"]),
+            originalMessageHeaderId: header.id,
+            isForward: false)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        let disposition = try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
+        }
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(updated?.isReplied == true)
+        #expect(updated?.isForwarded == false)
+        #expect(updated?.actionTag == ActionTag.none)
+        let markRepliedOps = try Self.opCount(db, .markReplied)
+        #expect(markRepliedOps == 1)
+        #expect(disposition.changedOriginalHeaderId == header.id)
+    }
+
     @Test("Completing a reply keeps a tag other than Reply")
     func replyCompletionKeepsOtherTags() throws {
         let db = try TestDatabase.make()
