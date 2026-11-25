@@ -503,7 +503,7 @@ struct ChatNewThreadScreenTests {
                     let stored = copy
                     try await fixture.pool.write { try stored.insert($0) }
 
-                    func isThread() -> Bool {
+                    @MainActor func isThread() -> Bool {
                         let ids = HostedAccessibility.identifiers(in: screen.view)
                         return ids.contains(ChatThreadView.forwardId) && Self.labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
                     }
