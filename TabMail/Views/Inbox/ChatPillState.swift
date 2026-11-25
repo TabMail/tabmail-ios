@@ -75,10 +75,16 @@ final class ChatPillState {
     /// mode flip would execute its remaining tools on the WRONG side of the
     /// demo/real boundary (e.g. a demo-authored compose resolving the real
     /// account after exit). Resume checkpoints are dropped with the session.
+    /// A cancelled turn is no longer counted as working, as `endSession` ends one: the turn
+    /// returns on cancel without clearing its mark, and a chat opened again under the same key
+    /// (the demo's chats, on the next run) would read as working.
     func removeAllSessions() {
         let count = sessions.count
-        for (_, session) in sessions {
-            session.activeChatTask?.cancel()
+        for (key, session) in sessions {
+            if let task = session.activeChatTask {
+                task.cancel()
+                ActiveAgentTracker.shared.clearWorking(key)
+            }
             session.activeChatTask = nil
             session.pendingResume = nil
         }
