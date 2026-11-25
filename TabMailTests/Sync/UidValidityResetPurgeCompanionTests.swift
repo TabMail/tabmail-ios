@@ -993,6 +993,14 @@ struct UidValidityResetPurgeCompanionTests {
         // Control: Archive 4203 to Sent 4301, nowhere near INBOX.
         let controlOld = id("Archive", "4203")
         let controlNew = id("Sent", "4301")
+        // Controls at the folder's edges: the same path in another account, and
+        // a ':'-nested folder under INBOX, neither of which the reset reissued.
+        let otherAccountOld = MessageIdentity.headerId(
+            accountId: "t4s4-handoff-other", folderPath: "INBOX", messageId: "4103")
+        let otherAccountNew = MessageIdentity.headerId(
+            accountId: "t4s4-handoff-other", folderPath: "Archive", messageId: "4204")
+        let nestedOld = id("INBOX:Sub", "4104")
+        let nestedNew = id("Archive", "4205")
         try pool.write { db in
             MessageHeaderRekey.publishAddressHandoffsAfterCommit([
                 HeaderRekeyRecord(oldHeaderId: leftInbox, newHeaderId: archived,
@@ -1000,7 +1008,11 @@ struct UidValidityResetPurgeCompanionTests {
                 HeaderRekeyRecord(oldHeaderId: leftArchive, newHeaderId: returned,
                                   newProviderMessageId: "4102", newObservedUidValidity: Self.oldEpoch),
                 HeaderRekeyRecord(oldHeaderId: controlOld, newHeaderId: controlNew,
-                                  newProviderMessageId: "4301")
+                                  newProviderMessageId: "4301"),
+                HeaderRekeyRecord(oldHeaderId: otherAccountOld, newHeaderId: otherAccountNew,
+                                  newProviderMessageId: "4204"),
+                HeaderRekeyRecord(oldHeaderId: nestedOld, newHeaderId: nestedNew,
+                                  newProviderMessageId: "4205")
             ], in: db)
         }
         let seededOut = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: leftInbox)
@@ -1068,6 +1080,25 @@ struct UidValidityResetPurgeCompanionTests {
         let followedControl = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: controlOld)
         #expect(followedControl == controlNew,
                 "the reset forgot a link with no end in INBOX, so it forgets more than the addresses the server reissued")
+        let followedOtherAccount = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: otherAccountOld)
+        #expect(followedOtherAccount == otherAccountNew,
+                "the reset forgot another account's link at the same folder path")
+        let followedNested = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: nestedOld)
+        #expect(followedNested == nestedNew,
+                "the reset forgot a link from a folder nested under INBOX, which was not reset")
+
+        // The forgotten link's address is linked again (the email now at INBOX
+        // 4101 is moved later): it is one link, counted once.
+        let movedAgain = id("Archive", "4206")
+        try pool.write { db in
+            MessageHeaderRekey.publishAddressHandoffsAfterCommit([
+                HeaderRekeyRecord(oldHeaderId: leftInbox, newHeaderId: movedAgain,
+                                  newProviderMessageId: "4206", newObservedUidValidity: Self.newEpoch)
+            ], in: db)
+        }
+        let predecessors = MessageHeaderRekey.predecessorHeaderIds(leadingTo: movedAgain)
+        #expect(predecessors == [leftInbox],
+                "a forgotten link left its order entry behind, so a link made again at that address is counted twice: \(predecessors)")
 
         await Self.resetProcessGlobals()
     }
