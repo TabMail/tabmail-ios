@@ -996,7 +996,7 @@ struct OutboxOptimisticReplyFlagTests {
         }
 
         // Nothing was resolved, so nothing downstream of the resolve may have run.
-        #expect(disposition.replyDetectHeaderId == nil)
+        #expect(disposition.changedOriginalHeaderId == nil)
 
         let after = try db.read { try MessageHeader.fetchOne($0, key: bystander.id) }
         #expect(after?.isReplied == false)
