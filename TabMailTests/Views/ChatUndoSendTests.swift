@@ -329,7 +329,7 @@ struct ChatUndoSendTests {
         let reply = "<p@example.com>"
         #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: reply))
         #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: nil, inReplyTo: reply),
-                "a reply from a compose another screen opened (the Drafts list, the compose an Undo reopens)")
+                "a reply from a compose another screen opened (the Drafts list, the compose the toast's Undo reopens)")
         #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, openedOn: .chat, inReplyTo: reply))
         #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: nil))
         // Of all eight combinations, only the first has the bubble.
