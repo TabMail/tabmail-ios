@@ -34,7 +34,10 @@ tag cleared.
 
 A reply the user sends from another client while TabMail's reply waits is not one either. The revert of
 a reply that set the mark asks whether a reply to the original is stored in a Sent folder of the account
-(`ReplyParentResolver.hasStoredReply`) and keeps the mark and the cleared tag when it is. If the
+(`ReplyParentResolver.hasStoredReply`) and keeps the mark and the cleared tag when it is. A forward
+another app stored there is no reply, though it may name the original in In-Reply-To (Thunderbird's
+does): `ReplyParentResolver.SentCopy.isForward`, the rule that marks the original forwarded instead,
+leaves it out, so the revert goes ahead unless a reply is stored beside it. If the
 removal comes before that copy syncs, `ReplyParentResolver` marks the original and clears the tag when
 it does. Graph stores no In-Reply-To, so on Outlook neither step finds the reply; there a reply from
 another client reaches the original only through the server's last-verb properties (memory 151).
@@ -60,4 +63,4 @@ leaves the original exactly as it was before both. Nothing is lost.
 Outbox; reply; two pending replies; second reply; undo; Undo to Drafts; Outbox discard;
 `cancelHeldOutboxRow`; `revertQueuedOriginalChanges`; `markOriginalAtQueue`; `originalChangesAtQueue`;
 `setMark`; reply arrow missing; `isReplied`; `deleteCompletedSendAtomic`; `IOS-OUTBOX-003`;
-IOS-OUTBOX-006; failed send discarded after a re-send; reply from another client; Gmail web reply; `ReplyParentResolver.hasStoredReply`; `messageHeader_inReplyTo`; forward from another client; `$Forwarded`; #1490.
+IOS-OUTBOX-006; failed send discarded after a re-send; reply from another client; Gmail web reply; `ReplyParentResolver.hasStoredReply`; `messageHeader_inReplyTo`; forward from another client; `$Forwarded`; `SentCopy.isForward`; forward with In-Reply-To; #1490.

@@ -31,6 +31,13 @@ enum ReplyParentResolver {
     struct SentCopy: Sendable {
         let inReplyTo: String?
         let subject: String
+
+        /// Whether this copy is a forward, not a reply: its subject starts with a
+        /// forward prefix (`ThreadUtils.hasForwardPrefix`), whatever its
+        /// `In-Reply-To` says. The one rule every reader of a stored Sent copy
+        /// applies: `markParentsReplied` marks such a copy's parent forwarded
+        /// instead of replied, and `hasStoredReply` does not count it as a reply.
+        var isForward: Bool { ThreadUtils.hasForwardPrefix(subject) }
     }
 
     /// Within an open write transaction, mark the local parent messages the
@@ -40,7 +47,7 @@ enum ReplyParentResolver {
     /// when folder is not Sent: early returns without touching the DB.
     ///
     /// A copy whose subject starts with a forward prefix
-    /// (`ThreadUtils.hasForwardPrefix`) is a forward even though it names its
+    /// (`SentCopy.isForward`) is a forward even though it names its
     /// original in `In-Reply-To`: Thunderbird sets `In-Reply-To` on every forward
     /// (it derives it from References whatever the compose kind). Its original is
     /// marked forwarded, never replied, and keeps its "Reply" tag: the user has not
@@ -69,7 +76,7 @@ enum ReplyParentResolver {
             guard let raw = copy.inReplyTo else { continue }
             let parent = EmailFilter.normalizeMessageId(raw)
             guard !parent.isEmpty else { continue }
-            if ThreadUtils.hasForwardPrefix(copy.subject) {
+            if copy.isForward {
                 forwarded.insert(parent)
             } else {
                 replied.insert(parent)
@@ -215,17 +222,21 @@ enum ReplyParentResolver {
     }
 
     /// Whether a reply to the message whose Message-ID is `rfc822MessageId` is
-    /// stored in a Sent folder of `accountId`: the evidence the two functions
-    /// above mark a parent replied by. The unsent-removal revert asks it
+    /// stored in a Sent folder of `accountId`: a copy there that names it in
+    /// `In-Reply-To` and is not a forward (`SentCopy.isForward`), the evidence
+    /// the two functions above mark a parent replied by. Another app's forward
+    /// that names the message in `In-Reply-To` marks it forwarded there, so it
+    /// is no reply here either. The unsent-removal revert asks it
     /// (`AccountManager.revertQueuedOriginalChanges`, #1490) so a reply the user
     /// sent from another client while TabMail's reply waited keeps the original
     /// replied. It only ever stops a change, so a Message-ID shared by several
     /// messages never chooses one to change (ADR-IOS-068 D4).
     ///
     /// Forced onto `messageHeader_inReplyTo`, it visits only the stored rows
-    /// replying to this one Message-ID (that message's replies, in any account
-    /// or folder: a number that does not grow with the mailbox) and stops at the
-    /// first one in this account's Sent. Every writer stores In-Reply-To
+    /// naming this one Message-ID in `In-Reply-To` (that message's replies and
+    /// the forwards that name it, in any account or folder: a number that does
+    /// not grow with the mailbox) and reads the subjects of those in this
+    /// account's Sent, since the forward rule is Swift's. Every writer stores In-Reply-To
     /// normalized (Gmail and RFC 822 parsing through
     /// `EmailFilter.extractFirstMessageId`; IMAP's envelope mapping and the
     /// extension's `IMAPFetchMapping` through `EmailFilter.normalizeMessageId`;
@@ -238,14 +249,13 @@ enum ReplyParentResolver {
     ) throws -> Bool {
         let normalized = rfc822MessageId.map(EmailFilter.normalizeMessageId) ?? ""
         guard !normalized.isEmpty else { return false }
-        return try Bool.fetchOne(db, sql: """
-            SELECT EXISTS (
-                SELECT 1
-                FROM messageHeader r INDEXED BY messageHeader_inReplyTo
-                JOIN folder f ON f.id = r.folderId
-                WHERE r.inReplyTo = ? AND r.accountId = ? AND f.role = ?
-            )
-            """, arguments: [normalized, accountId, FolderRole.sent.rawValue]) ?? false
+        let subjects = try String.fetchAll(db, sql: """
+            SELECT r.subject
+            FROM messageHeader r INDEXED BY messageHeader_inReplyTo
+            JOIN folder f ON f.id = r.folderId
+            WHERE r.inReplyTo = ? AND r.accountId = ? AND f.role = ?
+            """, arguments: [normalized, accountId, FolderRole.sent.rawValue])
+        return subjects.contains { !SentCopy(inReplyTo: normalized, subject: $0).isForward }
     }
 
     /// The set lookup executed by `markParentsReplied`, named so plan coverage

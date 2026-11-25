@@ -1080,36 +1080,49 @@ struct SendReplyMarksTests {
         case drafts
         /// In another account's Sent folder.
         case otherAccountSent
+        /// In the account's Sent folder, but a forward: another app's forward
+        /// that names the original in In-Reply-To too (as Thunderbird's does).
+        case sentForward
+        /// In the account's Sent folder, that forward stored first and a reply
+        /// after it.
+        case sentForwardAndReply
     }
 
-    /// A reply to `inReplyTo`, stored in the folder at `path` of `accountId`
-    /// (a folder with `role` is added for it when `path` is not the INBOX).
+    /// A message per subject in `subjects`, each naming `inReplyTo` in its
+    /// In-Reply-To, stored in the folder at `path` of `accountId` in that order
+    /// (a folder with `role` is added for them when `path` is not the INBOX).
     static func storeReply(
-        _ pool: DatabasePool, accountId: String, path: String, role: FolderRole = .sent, inReplyTo: String?
+        _ pool: DatabasePool, accountId: String, path: String, role: FolderRole = .sent, inReplyTo: String?,
+        subjects: [String] = ["Re: Original"]
     ) throws {
         if path != Self.imapPath {
             try FolderEpochTestFixture.insertFolder(
                 accountId: accountId, path: path, role: role, pool: pool,
                 lastKnownUidValidity: Self.imapEpoch + 2)
         }
-        var reply = MessageHeader(
-            messageId: "90", subject: "Re: Original", from: "Me",
-            fromAddress: "me@example.com", to: "sender@example.com", date: Date(),
-            snippet: "reply",
-            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: path),
-            accountId: accountId, folderPath: path, isInInbox: path == Self.imapPath)
-        reply.rfc822MessageId = "stored-reply-\(accountId)@example.com"
-        reply.inReplyTo = inReplyTo
-        reply.headerComplete = true
-        let row = reply
-        try pool.write { db in try row.insert(db) }
+        for (index, subject) in subjects.enumerated() {
+            var reply = MessageHeader(
+                messageId: "\(90 + index)", subject: subject, from: "Me",
+                fromAddress: "me@example.com", to: "sender@example.com", date: Date(),
+                snippet: "reply",
+                folderId: MessageIdentity.folderId(accountId: accountId, folderPath: path),
+                accountId: accountId, folderPath: path, isInInbox: path == Self.imapPath)
+            reply.rfc822MessageId = "stored-reply-\(index)-\(accountId)@example.com"
+            reply.inReplyTo = inReplyTo
+            reply.headerComplete = true
+            let row = reply
+            try pool.write { db in try row.insert(db) }
+        }
     }
 
     /// A reply already in the account's Sent folder (sent from another client
     /// while TabMail's reply waited) keeps the original replied and its Reply tag
     /// cleared when TabMail's reply is removed unsent. Only a reply in Sent, in
-    /// the same account, counts. A forward has no such evidence, and its mark
-    /// goes back as before.
+    /// the same account, counts. Another app's forward there, which names the
+    /// original in In-Reply-To as a reply does, is no reply (the rule
+    /// `ReplyParentResolver` marks the original forwarded by), so alone it keeps
+    /// nothing; stored before a reply, it does not hide that reply. A forward
+    /// from TabMail asks for no such evidence, and its mark goes back as before.
     @Test("A reply the user sent elsewhere keeps the original replied when TabMail's reply is removed unsent",
           arguments: StoredReply.allCases, [false, true])
     func storedReplyKeepsTheMark(_ storedReply: StoredReply, isForward: Bool) async throws {
@@ -1133,12 +1146,17 @@ struct SendReplyMarksTests {
         case .otherAccountSent:
             let otherAccountId = try Self.localAccount(pool, prefix: "marks-other")
             try Self.storeReply(pool, accountId: otherAccountId, path: "Sent", inReplyTo: rfc)
+        case .sentForward:
+            try Self.storeReply(pool, accountId: accountId, path: "Sent", inReplyTo: rfc, subjects: ["Fwd: Original"])
+        case .sentForwardAndReply:
+            try Self.storeReply(
+                pool, accountId: accountId, path: "Sent", inReplyTo: rfc, subjects: ["Fwd: Original", "Re: Original"])
         }
 
         let cancelled = try await Self.cancel(pool: pool, outboxId: queued.outboxId, failedFirst: true)
         let after = try Self.marks(pool, headerId: originalId)
         let tags = try Self.queuedTags(pool)
-        let keeps = !isForward && storedReply == .sent
+        let keeps = !isForward && (storedReply == .sent || storedReply == .sentForwardAndReply)
         if keeps {
             #expect(cancelled.revertedOriginalHeaderId == nil, "the stored reply keeps what Send changed")
             let want = Self.held(before: before, isForward: false)

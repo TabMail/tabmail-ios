@@ -1525,12 +1525,14 @@ extension AccountManager {
     /// (`deleteCompletedSendAtomic`). One sent from another client is found by
     /// its copy in Sent (`ReplyParentResolver.hasStoredReply`; not on Outlook,
     /// where Graph gives no In-Reply-To), asked only by a reply that set the
-    /// mark: its original was unreplied at Send, so a stored reply is news. A
-    /// reply that found the original already replied gives back the Reply tag
+    /// mark: its original was unreplied at Send, so a stored reply is news.
+    /// Another app's forward stored there does not count, though it may name
+    /// the original in In-Reply-To (`ReplyParentResolver.SentCopy.isForward`).
+    /// A reply that found the original already replied gives back the Reply tag
     /// the user had.
     ///
     /// Kept to primary-key reads, that one indexed read (it visits only the
-    /// stored replies to one Message-ID), one update and at most one op insert:
+    /// stored copies naming one Message-ID), one update and at most one op insert:
     /// Undo runs this synchronously inside the hold's deadline.
     ///
     /// Returns the original's id when its row changed.
