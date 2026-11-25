@@ -614,7 +614,8 @@ struct SendReplyMarksTests {
         // The Sent copy's sync names the original by its Message-ID.
         let marked = try await pool.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["<\(parentRfc)>"], folderRole: .sent, accountId: accountId, db: db)
+                sentCopies: [.init(inReplyTo: "<\(parentRfc)>", subject: "Re: Original")], folderRole: .sent,
+                accountId: accountId, db: db)
         }
         #expect(marked == [movedId])
         let healed = try Self.marks(pool, headerId: movedId)

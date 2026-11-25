@@ -19,6 +19,11 @@ struct ReplyParentResolverTests {
 
     // MARK: - Fixture helpers
 
+    /// Sent copies that answer the given In-Reply-To values, each with a reply's subject.
+    static func replies(_ inReplyTos: [String?]) -> [ReplyParentResolver.SentCopy] {
+        inReplyTos.map { ReplyParentResolver.SentCopy(inReplyTo: $0, subject: "Re: Original") }
+    }
+
     /// Build a Folder with a given role. `id` defaults to `accountId:path`
     /// so it matches the production folderId convention.
     private func folder(role: FolderRole, accountId: String = "acc1", path: String = "Sent") -> Folder {
@@ -35,6 +40,7 @@ struct ReplyParentResolverTests {
         folderPath: String = "INBOX",
         folderRole: FolderRole = .inbox,
         isReplied: Bool = false,
+        isForwarded: Bool = false,
         actionTag: ActionTag? = nil,
         messageId: String? = nil
     ) throws -> MessageHeader {
@@ -66,6 +72,7 @@ struct ReplyParentResolverTests {
         )
         header.rfc822MessageId = rfc822
         header.isReplied = isReplied
+        header.isForwarded = isForwarded
         header.actionTag = actionTag
         if let tag = actionTag { header.tagSortOrder = tag.sortOrder }
         try db.write { try header.insert($0) }
@@ -74,15 +81,18 @@ struct ReplyParentResolverTests {
 
     // MARK: - 0. Parent side: an inserted parent whose reply is stored in Sent
 
-    /// Store a reply in `folderRole`'s folder of `accountId` whose In-Reply-To is `parent`.
+    /// Store a reply in `folderRole`'s folder of `accountId` whose In-Reply-To is `parent`
+    /// (a forward when `subject` starts with a forward prefix).
     private func insertReply(
         _ db: DatabaseQueue, uid: String, to parent: String,
-        accountId: String = "acc1", folderPath: String = "Sent", folderRole: FolderRole = .sent
+        accountId: String = "acc1", folderPath: String = "Sent", folderRole: FolderRole = .sent,
+        subject: String = "Original"
     ) throws {
         let reply = try insertParent(db, rfc822: "reply-\(uid)@x", accountId: accountId,
                                      folderPath: folderPath, folderRole: folderRole, messageId: uid)
         try db.write { db in
-            try db.execute(sql: "UPDATE messageHeader SET inReplyTo = ? WHERE id = ?", arguments: [parent, reply.id])
+            try db.execute(sql: "UPDATE messageHeader SET inReplyTo = ?, subject = ? WHERE id = ?",
+                           arguments: [parent, subject, reply.id])
         }
     }
 
@@ -145,7 +155,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x"],
+                sentCopies: Self.replies(["a@x"]),
                 folderRole: .inbox, // <-- not Sent
                 accountId: "acc1",
                 db: db
@@ -168,7 +178,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x"],
+                sentCopies: Self.replies(["a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -192,7 +202,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["  <a@x>  "], // whitespace + angle brackets
+                sentCopies: Self.replies(["  <a@x>  "]), // whitespace + angle brackets
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -212,7 +222,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["unknown@x"],
+                sentCopies: Self.replies(["unknown@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -231,7 +241,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x"],
+                sentCopies: Self.replies(["a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -254,7 +264,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: [],
+                sentCopies: Self.replies([]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -275,7 +285,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: [nil, nil, nil],
+                sentCopies: Self.replies([nil, nil, nil]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -296,7 +306,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["", "  ", "<>", " <> "],
+                sentCopies: Self.replies(["", "  ", "<>", " <> "]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -317,7 +327,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x", "a@x", "a@x"],
+                sentCopies: Self.replies(["a@x", "a@x", "a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -338,7 +348,7 @@ struct ReplyParentResolverTests {
 
         try db.write { db in
             _ = try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x", "a@x"],
+                sentCopies: Self.replies(["a@x", "a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -362,7 +372,7 @@ struct ReplyParentResolverTests {
 
         try db.write { db in
             _ = try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x"],
+                sentCopies: Self.replies(["a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -399,7 +409,7 @@ struct ReplyParentResolverTests {
 
         try db.write { db in
             _ = try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x"],
+                sentCopies: Self.replies(["a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -426,7 +436,7 @@ struct ReplyParentResolverTests {
 
         try db.write { db in
             _ = try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x"],
+                sentCopies: Self.replies(["a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -454,7 +464,7 @@ struct ReplyParentResolverTests {
 
         try db.write { db in
             _ = try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["shared@x"],
+                sentCopies: Self.replies(["shared@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -477,7 +487,7 @@ struct ReplyParentResolverTests {
 
         try db.write { db in
             _ = try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x"],
+                sentCopies: Self.replies(["a@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -706,7 +716,7 @@ struct ReplyParentResolverTests {
 
         let updated = try db.write { db in
             try ReplyParentResolver.markParentsReplied(
-                inReplyTos: ["a@x", "b@x", "c@x"],
+                sentCopies: Self.replies(["a@x", "b@x", "c@x"]),
                 folderRole: .sent,
                 accountId: "acc1",
                 db: db
@@ -734,4 +744,207 @@ struct ReplyParentResolverTests {
         #expect(setTagOps.count == 1)
         #expect(setTagOps.first?.messageIds.contains(p2.stableId) == true)
     }
+
+    // MARK: - 16. Forward copies: In-Reply-To with a forward subject (#1492)
+
+    /// A Sent copy naming `inReplyTo`, with the given subject.
+    static func copy(_ inReplyTo: String?, subject: String) -> ReplyParentResolver.SentCopy {
+        ReplyParentResolver.SentCopy(inReplyTo: inReplyTo, subject: subject)
+    }
+
+    /// The parent's marks, tag and stamp, and the queued ops.
+    private func state(_ db: DatabaseQueue, _ id: String) throws -> (MessageHeader, [PendingOperation]) {
+        let (row, ops) = try db.read { db in
+            (try MessageHeader.fetchOne(db, key: id), try PendingOperation.fetchAll(db))
+        }
+        let header = try #require(row, "the parent row exists")
+        return (header, ops)
+    }
+
+    @Test("A forward copy marks its original forwarded, never replied, keeps its Reply tag and queues no op")
+    func forwardCopyMarksForwardedKeepsReplyTag() throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", actionTag: .reply)
+        let before = try state(db, parent.id).0
+
+        let updated = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy(" <a@x> ", subject: "Fwd: Original")],
+                folderRole: .sent, accountId: "acc1", db: db)
+        }
+
+        #expect(updated == [parent.id], "a forwarded parent is reported for the change notification")
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isForwarded == true)
+        #expect(after.isReplied == false, "a forward is not a reply")
+        #expect(after.actionTag == .reply, "the user has not answered it")
+        #expect(after.tagSortOrder == before.tagSortOrder)
+        #expect(after.actionTagSetAt == before.actionTagSetAt)
+        #expect(after.isRead == before.isRead && after.isFlagged == before.isFlagged)
+        #expect(ops.isEmpty, "queued ops: \(ops.map { ($0.type, $0.messageIds) })")
+    }
+
+    @Test("A copy whose subject starts with a forward prefix marks forwarded", arguments: forwardSubjects)
+    func forwardSubjectMarksForwarded(subject: String) throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", actionTag: .reply)
+        _ = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("a@x", subject: subject)], folderRole: .sent, accountId: "acc1", db: db)
+        }
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isForwarded == true && after.isReplied == false && after.actionTag == .reply,
+                "\(subject): forwarded \(after.isForwarded), replied \(after.isReplied), tag \(String(describing: after.actionTag))")
+        #expect(ops.isEmpty)
+    }
+
+    @Test("A copy whose subject does not start with a forward prefix marks replied", arguments: nonForwardSubjects)
+    func nonForwardSubjectMarksReplied(subject: String) throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", actionTag: .reply)
+        _ = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("a@x", subject: subject)], folderRole: .sent, accountId: "acc1", db: db)
+        }
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isReplied == true && after.isForwarded == false && after.actionTag == ActionTag.none,
+                "\(subject): replied \(after.isReplied), forwarded \(after.isForwarded), tag \(String(describing: after.actionTag))")
+        #expect(ops.count == 1 && ops.first?.type == .setTag)
+    }
+
+    @Test("A forward copy outside a Sent folder, or with no In-Reply-To, marks nothing")
+    func forwardCopyGates() throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", actionTag: .reply)
+        let updated = try db.write { db -> [String] in
+            var ids = try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("a@x", subject: "Fwd: Original")], folderRole: .inbox, accountId: "acc1", db: db)
+            ids += try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy(nil, subject: "Fwd: Original"), Self.copy("  ", subject: "Fwd: Original")],
+                folderRole: .sent, accountId: "acc1", db: db)
+            ids += try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("a@x", subject: "Fwd: Original")], folderRole: .sent, accountId: "acc2", db: db)
+            return ids
+        }
+        #expect(updated.isEmpty)
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isForwarded == false && after.isReplied == false && after.actionTag == .reply)
+        #expect(ops.isEmpty)
+    }
+
+    @Test("A reply and a forward of one original in one batch mark it both ways, clear its tag once, report it once")
+    func replyAndForwardInOneBatch() throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", actionTag: .reply)
+        let updated = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("a@x", subject: "Fwd: Original"), Self.copy("<a@x>", subject: "Re: Original"),
+                             Self.copy("a@x", subject: "FW: Original")],
+                folderRole: .sent, accountId: "acc1", db: db)
+        }
+        #expect(updated == [parent.id])
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isReplied == true && after.isForwarded == true && after.actionTag == ActionTag.none)
+        #expect(ops.count == 1 && ops.first?.type == .setTag && ops.first?.messageIds.contains(parent.stableId) == true,
+                "queued ops: \(ops.map { ($0.type, $0.messageIds) })")
+    }
+
+    @Test("Forward and reply copies of different originals in one batch mark each its own way")
+    func forwardAndReplyOfDifferentParents() throws {
+        let db = try TestDatabase.make()
+        let forwarded = try insertParent(db, rfc822: "f@x", actionTag: .reply)
+        let replied = try insertParent(db, rfc822: "r@x", actionTag: .reply)
+        let updated = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("f@x", subject: "Fwd: Original"), Self.copy("r@x", subject: "Re: Original")],
+                folderRole: .sent, accountId: "acc1", db: db)
+        }
+        #expect(Set(updated) == [forwarded.id, replied.id] && updated.count == 2)
+        let (f, ops) = try state(db, forwarded.id)
+        let r = try state(db, replied.id).0
+        #expect(f.isForwarded == true && f.isReplied == false && f.actionTag == .reply)
+        #expect(r.isReplied == true && r.isForwarded == false && r.actionTag == ActionTag.none)
+        #expect(ops.count == 1 && ops.first?.messageIds.contains(replied.stableId) == true
+                && ops.first?.messageIds.contains(forwarded.stableId) == false)
+    }
+
+    @Test("A forward copy of an original already marked forwarded changes nothing")
+    func forwardOfForwardedParentIsNoOp() throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", isForwarded: true, actionTag: .reply)
+        let updated = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("a@x", subject: "Fwd: Original")], folderRole: .sent, accountId: "acc1", db: db)
+        }
+        #expect(updated.isEmpty)
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isForwarded == true && after.isReplied == false && after.actionTag == .reply)
+        #expect(ops.isEmpty)
+    }
+
+    @Test("A forward copy of an original already replied marks it forwarded too")
+    func forwardOfRepliedParentMarksForwarded() throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", isReplied: true, actionTag: .archive)
+        let updated = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: [Self.copy("a@x", subject: "Fwd: Original")], folderRole: .sent, accountId: "acc1", db: db)
+        }
+        #expect(updated == [parent.id])
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isForwarded == true && after.isReplied == true && after.actionTag == .archive)
+        #expect(ops.isEmpty)
+    }
+
+    @Test("A reply copy of an original already forwarded still marks it replied and clears its Reply tag")
+    func replyOfForwardedParentMarksReplied() throws {
+        let db = try TestDatabase.make()
+        let parent = try insertParent(db, rfc822: "a@x", isForwarded: true, actionTag: .reply)
+        let updated = try db.write { db in
+            try ReplyParentResolver.markParentsReplied(
+                sentCopies: Self.replies(["a@x"]), folderRole: .sent, accountId: "acc1", db: db)
+        }
+        #expect(updated == [parent.id])
+        let (after, ops) = try state(db, parent.id)
+        #expect(after.isReplied == true && after.isForwarded == true && after.actionTag == ActionTag.none)
+        #expect(ops.count == 1 && ops.first?.type == .setTag)
+    }
+
+    @Test("Parent side: an inserted original whose forward is stored in Sent is marked forwarded and keeps its Reply tag")
+    func insertedParentOfStoredForward() throws {
+        let db = try TestDatabase.make()
+        let forwardedOnly = try insertParent(db, rfc822: "f@x", actionTag: .reply)
+        let both = try insertParent(db, rfc822: "b@x", actionTag: .reply)
+        try insertReply(db, uid: "r1", to: "f@x", subject: "Fwd: Original")
+        try insertReply(db, uid: "r2", to: "b@x", subject: "FW: Original")
+        try insertReply(db, uid: "r3", to: "b@x", subject: "Re: Original")
+        // A reply stored in another account's Sent names f@x too; it marks nothing here.
+        try insertReply(db, uid: "r4", to: "f@x", accountId: "acc2", subject: "Re: Original")
+
+        let updated = try db.write { db in
+            try ReplyParentResolver.markInsertedParentsOfStoredReplies(
+                insertedRfc822Ids: ["f@x", "<b@x>"], accountId: "acc1", db: db)
+        }
+
+        #expect(Set(updated) == [forwardedOnly.id, both.id] && updated.count == 2)
+        let (f, ops) = try state(db, forwardedOnly.id)
+        let b = try state(db, both.id).0
+        #expect(f.isForwarded == true && f.isReplied == false && f.actionTag == .reply,
+                "forwarded \(f.isForwarded), replied \(f.isReplied), tag \(String(describing: f.actionTag))")
+        #expect(b.isForwarded == true && b.isReplied == true && b.actionTag == ActionTag.none)
+        #expect(ops.count == 1 && ops.first?.messageIds.contains(both.stableId) == true,
+                "queued ops: \(ops.map { ($0.type, $0.messageIds) })")
+    }
 }
+
+/// Subjects a forward's Sent copy starts with (file scope: a `@Test` trait cannot
+/// name a static member of its own type).
+private let forwardSubjects = ["Fwd: Original", "FWD: Original", "fwd:Original", "Fw: Original",
+                               "FW: Original", "  Fwd: Original", "\tFW: Original", "Fwd: Re: Original"]
+
+/// Subjects that are not a forward's: a reply's, a reply to a forward, the
+/// ambiguous Vs, localized forward prefixes outside the list, and lookalikes.
+private let nonForwardSubjects = ["Re: Original", "Re: Fwd: Original", "RE: FW: Original", "VS: Original",
+                                  "Vs: Original", "AW: Original", "SV: Original", "WG: Original", "TR: Original",
+                                  "RV: Original", "Fwd Original", "Forward: Original", "Original Fwd: x",
+                                  "Original", ""]

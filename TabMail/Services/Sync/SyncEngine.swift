@@ -1225,7 +1225,7 @@ actor SyncEngine {
 
                 // Sent-folder reply discovery — no-op when folder.role != .sent.
                 var discovered = try ReplyParentResolver.markParentsReplied(
-                    inReplyTos: headers.map(\.inReplyTo),
+                    sentCopies: headers.map { .init(inReplyTo: $0.inReplyTo, subject: $0.subject) },
                     folderRole: folder.role,
                     accountId: folder.accountId,
                     db: db

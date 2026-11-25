@@ -10,6 +10,9 @@ import GRDB
 /// some other client (TB, Gmail web, native Mail). The parent's `isReplied`
 /// must be flipped locally so the inbox row shows the curl-arrow indicator,
 /// the "Reply" action tag clears, and the LLM tool readers see "replied: yes".
+/// A copy whose subject starts with a forward prefix is a forward, not a reply
+/// (some apps set In-Reply-To on a forward): its parent gets `isForwarded`
+/// instead, and keeps its "Reply" tag (`markParentsReplied`).
 ///
 /// Server-side `\Answered` is intentionally NOT written back — the reply
 /// already exists on the server, whichever client sent it had its own chance
@@ -23,38 +26,62 @@ import GRDB
 /// regress us from `true` back to `false`.
 enum ReplyParentResolver {
 
-    /// Within an open write transaction, mark local parent messages as replied
-    /// when the just-inserted batch represents outgoing replies. Caller passes
-    /// raw `In-Reply-To` values from the batch — the helper normalizes, dedups,
-    /// and gates on folder role. Cheap when folder is not Sent: early returns
-    /// without touching the DB.
+    /// A message synced into a Sent folder, as the resolver reads it: the message
+    /// its `In-Reply-To` names, and its subject.
+    struct SentCopy: Sendable {
+        let inReplyTo: String?
+        let subject: String
+    }
+
+    /// Within an open write transaction, mark the local parent messages the
+    /// just-inserted Sent copies answer: replied for a reply, forwarded for a
+    /// forward. Caller passes the batch's raw `In-Reply-To` values with their
+    /// subjects — the helper normalizes, dedups, and gates on folder role. Cheap
+    /// when folder is not Sent: early returns without touching the DB.
+    ///
+    /// A copy whose subject starts with a forward prefix
+    /// (`ThreadUtils.hasForwardPrefix`) is a forward even though it names its
+    /// original in `In-Reply-To`: Thunderbird sets `In-Reply-To` on every forward
+    /// (it derives it from References whatever the compose kind). Its original is
+    /// marked forwarded, never replied, and keeps its "Reply" tag: the user has not
+    /// answered it. TabMail's own forwards carry no `In-Reply-To`
+    /// (`ThreadUtils.outgoingThreadHeaders`), so this reads other apps' copies.
     ///
     /// Returns the list of parent header IDs that were updated, for caller-side
     /// `.messageDataDidChange` notification fan-out AFTER the transaction commits.
     static func markParentsReplied(
-        inReplyTos: [String?],
+        sentCopies: [SentCopy],
         folderRole: FolderRole,
         accountId: String,
         db: Database
     ) throws -> [String] {
         guard folderRole == .sent else { return [] }
-        guard !inReplyTos.isEmpty else { return [] }
+        guard !sentCopies.isEmpty else { return [] }
 
         // Normalize defensively. IMAPProvider normalizes at the boundary
         // (`IMAPProvider.mapMessageInfo`) but Gmail/Exchange providers pass raw
         // metadata through — `normalizeMessageId` is idempotent so this costs
         // nothing when the value was already normalized.
-        let normalized: Set<String> = Set(
-            inReplyTos
-                .compactMap { $0.map(EmailFilter.normalizeMessageId) }
-                .filter { !$0.isEmpty }
-        )
+        var replied = Set<String>()
+        var forwarded = Set<String>()
+        for copy in sentCopies {
+            guard let raw = copy.inReplyTo else { continue }
+            let parent = EmailFilter.normalizeMessageId(raw)
+            guard !parent.isEmpty else { continue }
+            if ThreadUtils.hasForwardPrefix(copy.subject) {
+                forwarded.insert(parent)
+            } else {
+                replied.insert(parent)
+            }
+        }
+        let normalized = replied.union(forwarded)
         guard !normalized.isEmpty else { return [] }
 
         // One SELECT for all candidate parents in this account that aren't
-        // already marked. The `isReplied = 0` filter avoids no-op writes and
-        // prevents re-firing the tag-clear PendingOperation on already-marked
-        // rows. Index-backed: the production statement's explicit `INDEXED BY`
+        // already marked both ways. The `isReplied = 0 OR isForwarded = 0` filter
+        // and the per-row checks below avoid no-op writes and prevent re-firing
+        // the tag-clear PendingOperation on already-marked rows. Index-backed:
+        // the production statement's explicit `INDEXED BY`
         // forces `messageHeader_rfc822MessageId` (`rfc822MessageId=?`) regardless
         // of statistics; the planner cannot substitute the date, account, or
         // folder indexes.
@@ -79,6 +106,28 @@ enum ReplyParentResolver {
             let parentAccountId: String = row["accountId"]
             let actionTagRaw: String? = row["actionTag"]
             let actionTag = actionTagRaw.flatMap(ActionTag.init(rawValue:))
+            let wasReplied: Bool = row["isReplied"]
+            let wasForwarded: Bool = row["isForwarded"]
+
+            // The row matched one of `normalized` by rfc822MessageId.
+            let marksReplied = !wasReplied && rowRfc822.map(replied.contains) == true
+            let marksForwarded = !wasForwarded && rowRfc822.map(forwarded.contains) == true
+            guard marksReplied || marksForwarded else { continue }
+
+            if marksForwarded {
+                // A forward leaves the original's replied mark and "Reply" tag alone.
+                try db.execute(
+                    sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?",
+                    arguments: [id]
+                )
+                if DebugModeManager.isLoggingEnabled() {
+                    print("[ReplyDetect] SentDiscover: marked parent \(id) as forwarded")
+                }
+            }
+            guard marksReplied else {
+                updated.append(id)
+                continue
+            }
 
             // Mirror MessageHeader.stableId: prefer rfc822 for numeric UIDs (IMAP),
             // else messageId (Gmail/Exchange already have stable IDs).
@@ -130,13 +179,14 @@ enum ReplyParentResolver {
     }
 
     /// Within an open write transaction, after a batch of rows was inserted in
-    /// any folder: mark the inserted rows that a reply already stored in a Sent
-    /// folder of the same account answers. This is the parent-side direction of
-    /// `markParentsReplied` (which runs when the reply is inserted): a parent
+    /// any folder: mark the inserted rows that a reply or forward already stored in
+    /// a Sent folder of the same account answers. This is the parent-side direction
+    /// of `markParentsReplied` (which runs when the copy is inserted): a parent
     /// that loads after its reply shows as replied too, as on Gmail. The marking
-    /// itself (`isReplied`, the `.reply` tag clear, the queued `setTag`) is
-    /// `markParentsReplied`'s, fed the replies' `inReplyTo` values. No query runs
-    /// when nothing was inserted. Index-backed by `messageHeader_inReplyTo`.
+    /// itself (`isReplied`, the `.reply` tag clear, the queued `setTag`, or
+    /// `isForwarded` for a forward) is `markParentsReplied`'s, fed the stored
+    /// copies' `inReplyTo` values and subjects. No query runs when nothing was
+    /// inserted. Index-backed by `messageHeader_inReplyTo`.
     ///
     /// Returns the parent header IDs updated, for `postParentNotifications`.
     static func markInsertedParentsOfStoredReplies(
@@ -148,19 +198,19 @@ enum ReplyParentResolver {
         guard !normalized.isEmpty else { return [] }
         let chunkSize = SyncConfig.backfillInsertChunkSize
         let ids = Array(normalized)
-        var repliedTo: [String?] = []
+        var copies: [SentCopy] = []
         for start in stride(from: 0, to: ids.count, by: chunkSize) {
             let slice = Array(ids[start..<min(start + chunkSize, ids.count)])
             let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
             var args: [any DatabaseValueConvertible] = [accountId, FolderRole.sent.rawValue]
             for value in slice { args.append(value) }
-            repliedTo += try String.fetchAll(db, sql: """
-                SELECT DISTINCT r.inReplyTo
+            copies += try Row.fetchAll(db, sql: """
+                SELECT DISTINCT r.inReplyTo, r.subject
                 FROM messageHeader r JOIN folder f ON f.id = r.folderId
                 WHERE r.accountId = ? AND f.role = ? AND r.inReplyTo IN (\(placeholders))
-                """, arguments: StatementArguments(args)).map { Optional($0) }
+                """, arguments: StatementArguments(args)).map { SentCopy(inReplyTo: $0["inReplyTo"], subject: $0["subject"]) }
         }
-        return try markParentsReplied(inReplyTos: repliedTo, folderRole: .sent, accountId: accountId, db: db)
+        return try markParentsReplied(sentCopies: copies, folderRole: .sent, accountId: accountId, db: db)
     }
 
     /// The set lookup executed by `markParentsReplied`, named so plan coverage
@@ -171,11 +221,11 @@ enum ReplyParentResolver {
         // messageId is a numeric UID, else messageId) — fetch the inputs and
         // recompute in Swift rather than rely on a SQL column.
         return """
-            SELECT id, messageId, rfc822MessageId, folderPath, accountId, actionTag
+            SELECT id, messageId, rfc822MessageId, folderPath, accountId, actionTag, isReplied, isForwarded
             FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
             WHERE accountId = ?
               AND rfc822MessageId IN (\(placeholders))
-              AND isReplied = 0
+              AND (isReplied = 0 OR isForwarded = 0)
             """
     }
 
