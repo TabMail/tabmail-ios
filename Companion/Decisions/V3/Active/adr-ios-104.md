@@ -17,6 +17,8 @@ pass's full sync while another pass's delta was in flight, and both write the ac
    run their whole pass inside it. A pass that arrives while another of the same account runs waits its
    turn and then runs; a caller's timeout includes the wait. The turn is released on every exit, a throw
    included, and handed straight to the oldest waiter, so a later arrival cannot overtake.
+   *(Amended 2026-11-25, #1360, at the end of this ADR: the follow-up stage 2 joins the line right before
+   the first catch-up slice waiting, so it overtakes the slices; the turn goes to the first waiter in line.)*
 2. **A pass never acts on account sync state read before its turn** (owner, 2026-11-10, choosing the fix
    at the cause over blessing the gap). The pass's first step inside its turn re-reads the account row
    (`SyncEngine.accountAtTurnStart`), and the pass bodies (`foregroundPass`, `backgroundDeltaPass`) take
@@ -393,3 +395,50 @@ scheduler's `foregroundWorkHook` (DEBUG) records the start's work instead of run
 poll are offered at the entry of `syncStartup` and `poll`, so a record means the start reached them.
 `addIMAPAccount`'s provider takes the factory's TLS test override (nil in production) so the add can reach
 the plain-TCP fake server.
+
+**Amended 2026-11-25 (tabmail-ios #1360): new mail goes ahead of the background chunks
+waiting for the turn.** With folder work an account has several background readers that each take the
+turn one catch-up slice at a time (`runCatchUpRun`: the older-mail catch-up of the backfill worker, the
+access runs of #1109, and later the other-folder runs of #1110). Each slice holds the turn for about 2 s,
+at most about 5 s with a request's timeout. Before this amendment the follow-up stage 2 (item 3 of the
+2026-11-23 amendment) joined the back of the line, so a new-mail read could wait for the running slice
+and then for every other reader's slice already in line.
+1. **A place in the one line, not a second queue.** `oneSyncAtATime` takes a place (`SyncTurnPlace`):
+   `.arrivalOrder` (the default, every caller but two), `.backgroundChunk` (a catch-up slice, marked on
+   its waiter, `SyncTurnWaiter.isBackgroundChunk`) and `.aheadOfBackgroundChunks` (the follow-up,
+   `followUpPass`). `waitForSyncTurn` puts the follow-up right before the first waiting background chunk,
+   and at the back when none waits; every other waiter joins the back as before. `handOverSyncPass` is
+   unchanged: the turn goes to the first waiter in line. No new queue, gate, timer or layer (ADR-IOS-009's
+   one gate).
+2. **What it guarantees.** Once the follow-up is in line, only the work holding the turn is ahead of it,
+   never another reader's slice that queued before it. The slices keep their order among themselves;
+   slices that join later queue behind the follow-up; a slice that takes the turn inside its pacing window
+   returns at once and joins the back again. Work that is not a slice (a listing, `sync(account:)`, a
+   Settings reset) and joined before the first waiting slice stays ahead of the follow-up.
+3. **Every foreground trigger.** A push with the app open, IMAP IDLE, the poll, pull to refresh's change
+   read and a return to the app all reach the turn through the one follow-up when the account is busy, so
+   this one change covers each of them. The follow-up's first steps (the first paint, the account read,
+   the connection check) are unchanged: work that takes the turn before the follow-up is in line still goes
+   first (#1329).
+4. **Open questions, not decided here:** a silent push in a background wake, where no follow-up
+   runs (item 4 of the 2026-11-23 amendment); whether the follow-up should also pass a listing or a Settings
+   pass queued behind the first waiting slice; whether pull to refresh's listing of the folder on screen
+   should take the follow-up's place.
+
+**Cost:** one bool per waiter and one scan of the waiting line when a follow-up joins it (a handful of
+waiters at most). Nothing on the startup, resume, push or IDLE paths changes; a debug-gated
+`[SyncTurn] … follow-up goes ahead of N waiting catch-up slice(s)` line records each overtake.
+**Rejected:** a priority queue or a second line for new mail (a new layer); the follow-up taking or flagging
+the turn like a trigger (rejected in the 2026-11-23 amendment: back-to-back slices beat it at every release).
+
+Superseded wording, kept: in decision 1, "handed straight to the oldest waiter, so a later arrival cannot
+overtake" (the follow-up overtakes waiting slices); in the 2026-11-23 amendment item 8, "What still waits
+(first in first out, item 4)" (first in first out except the follow-up's place ahead of the slices).
+
+Tests: `NewMailFirstTests.newMailReadsAheadOfQueuedSlices` (for a push, IDLE and the poll each: a trigger
+during a running catch-up slice, with two other readers' slices in line, reads right after the running
+slice and ahead of both, which then run in their order) and
+`followUpTakesItsPlaceBeforeTheFirstWaitingSlice` (a listing that joined before the first waiting slice
+stays ahead of the follow-up; a slice that joins after it queues behind it; with no slice waiting it joins
+the back). `OneSyncAtATimeTests.waitingPassesRunOneAtATimeInArrivalOrder` still pins arrival order for
+every other pass.

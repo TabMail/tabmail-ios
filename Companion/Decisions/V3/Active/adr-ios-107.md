@@ -157,7 +157,10 @@ The owner's rulings of 2026-11-09:
        end of this ADR: the slice's clock starts when its provider work starts, at its slot of the
        provider work queue, not at its turn.)* A push or silent-push delta (or a foreground
        pass) that arrives during the catch-up therefore waits at most one slice, and the turn is FIFO,
-       so it runs before the run's next slice. A slice never throws.
+       so it runs before the run's next slice. *(Amended 2026-11-25, #1360, ADR-IOS-104: the turn is
+       first in first out except for the follow-up stage 2, which joins the line ahead of every catch-up
+       slice waiting, this run's and other readers' alike, so it still waits at most the running slice.)*
+       A slice never throws.
      - **How many slices.** A foreground cycle (no deadline) runs ONE slice. The background job runs
        slices until its deadline (`SyncConfig.backgroundBackfillDeadlineSeconds`, 5 minutes, which
        also bounds the walk; formerly the literal `5 * 60` in `SyncScheduler`). Either stops after a

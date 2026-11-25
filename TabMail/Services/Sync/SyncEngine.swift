@@ -91,7 +91,8 @@ actor SyncEngine {
     var deletionReconcileInFlight: Set<String> = []
 
     /// The accounts with a sync pass running, and for each the passes waiting
-    /// their turn, oldest first (`oneSyncAtATime`).
+    /// their turn, in turn order (`oneSyncAtATime`): oldest first, except a
+    /// follow-up, which stands ahead of the catch-up slices waiting (#1360).
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
     /// For each account whose turn is held, where the pass holding it was
@@ -815,7 +816,9 @@ actor SyncEngine {
     /// SyncEngineOneSyncAtATime.swift). Unlike a trigger it waits in line for the
     /// account's turn, so it starts as soon as the work holding the turn ends,
     /// even when that work takes the turn again at once (a catch-up's next
-    /// slice). It runs stage 2 only if the flag is still set when it gets the
+    /// slice). It joins the line ahead of every catch-up slice waiting
+    /// (`SyncTurnPlace.aheadOfBackgroundChunks`, #1360), so other readers'
+    /// slices queued before it never read first. It runs stage 2 only if the flag is still set when it gets the
     /// turn, and returns nil, doing nothing, when a stage 2 that ran in between
     /// served it: two asks for one flag run one stage 2. `mayStart` is the
     /// scheduler's follow-up gate (`SyncScheduler.followUpMayStart`: foreground
@@ -834,7 +837,7 @@ actor SyncEngine {
     ) async throws -> Bool? {
         guard let queue = workQueues[accountId] else { return nil }
         let provider = queue.provider
-        return try await oneSyncAtATime(accountId: accountId) {
+        return try await oneSyncAtATime(accountId: accountId, place: .aheadOfBackgroundChunks) {
             guard self.syncFollowUpWanted.contains(accountId) else {
                 BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): served by an earlier stage 2")
                 return nil

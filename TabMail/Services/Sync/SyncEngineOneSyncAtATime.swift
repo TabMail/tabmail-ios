@@ -50,6 +50,14 @@ import Synchronization
 //   account read and the connection check) goes first (#1329). It runs only if
 //   the flag is still set when it gets the turn: a stage 2 that ran in between
 //   served it.
+// - New mail goes first (#1360): the follow-up joins the line right before the
+//   first catch-up slice waiting (the older-mail catch-up, an access run), so
+//   once it is in line only the running work is ahead of it, never other
+//   readers' slices that queued before it. The slices keep their order; work
+//   that is not a slice and queued before the first slice stays ahead of it.
+//   This is a place in the one line (`SyncTurnPlace`), not a second queue.
+//   Before #1360 it joined the back of the line, behind every slice already
+//   waiting, about 5 s each.
 // - Only an account that is free takes the quick-sync-only route.
 // - In the background a set flag waits for the next opening of the app: stage 2
 //   never starts in the background. The follow-up checks this when it is asked
@@ -77,7 +85,9 @@ import Synchronization
 // - Code: `oneSyncAtATimeOrFollowUp` sets the flag and asks for the follow-up
 //   when it sets it; `handOverSyncPass` asks again each time the account becomes
 //   free while the flag is set (a flag set in the background, whose ask started
-//   nothing); `followUpPass` waits for the turn and runs stage 2 if the flag is
+//   nothing); `followUpPass` waits for the turn, ahead of the waiting catch-up
+//   slices (`SyncTurnPlace.aheadOfBackgroundChunks`; each slice waits as
+//   `.backgroundChunk`), and runs stage 2 if the flag is
 //   still set and the app is still in the foreground; `foregroundPass` clears
 //   the flag when it starts; `SyncScheduler.runSyncFollowUp` runs the follow-up,
 //   in the foreground only.
@@ -115,11 +125,27 @@ import Synchronization
 // - 2026-11-10 (v1.11.4): one sync at a time per account (#575), which made the
 //   wait for a turn count against the caller's limit (#1289).
 
+/// Where a pass waits in an account's turn line (`oneSyncAtATime`; #1360).
+enum SyncTurnPlace: Sendable {
+    /// At the back, in arrival order: every pass but the two below.
+    case arrivalOrder
+    /// At the back, marked as a background chunk: a catch-up slice
+    /// (`runCatchUpRun`: the older-mail catch-up, an access run). An owed
+    /// new-mail follow-up goes ahead of it.
+    case backgroundChunk
+    /// The follow-up stage 2 an owed new-mail read asks for (`followUpPass`):
+    /// right before the first background chunk waiting, else at the back.
+    case aheadOfBackgroundChunks
+}
+
 /// One pass waiting for an account's sync turn.
 struct SyncTurnWaiter {
     let id: UInt64
     /// Where the waiting pass was started (`caller:line`), for the debug log.
     let caller: String
+    /// A catch-up slice (`SyncTurnPlace.backgroundChunk`): a follow-up that
+    /// joins the line goes ahead of it.
+    let isBackgroundChunk: Bool
     let continuation: CheckedContinuation<Void, Never>
 }
 
@@ -127,12 +153,18 @@ extension SyncEngine {
     /// Runs `pass` as the account's only sync pass, so a delta and a full sync
     /// of one account never run at the same time. A pass that arrives while
     /// another runs waits its turn, in arrival order, and then runs; nothing is
-    /// joined. Only work that is not a sync trigger waits here (a listing, a
+    /// joined. The one exception is `place`: the follow-up stage 2
+    /// (`.aheadOfBackgroundChunks`) joins the line right before the first
+    /// catch-up slice waiting (`.backgroundChunk`), so once it is in line only
+    /// the running work is ahead of it (#1360). Only work that is not a sync
+    /// trigger waits here (a listing, a
     /// catch-up slice, a Settings reset, stage 2 from Settings or a new account);
     /// none of them has a time limit that counts the wait. A trigger never waits:
     /// it uses `oneSyncAtATimeOrFollowUp`. The pass's first step
     /// inside its turn is `accountAtTurnStart`. The turn is released on every
-    /// exit, a throw included, and handed straight to the oldest waiter.
+    /// exit, a throw included, and handed straight to the first waiter in line.
+    /// *Superseded (#1360):* "handed straight to the oldest waiter": a
+    /// follow-up can stand ahead of older catch-up slices.
     /// A waiter whose task was cancelled still takes its turn, and its pass
     /// stops at its first cancellation-aware step (the turn-start read, else its
     /// first work-queue call).
@@ -146,7 +178,8 @@ extension SyncEngine {
     /// Only that task: a task spawned inside the turn inherits the task-local
     /// but is a different task, so it waits for the turn like any other.
     func oneSyncAtATime<T>(
-        accountId: String, caller: String = #fileID, line: Int = #line, _ pass: () async throws -> T
+        accountId: String, place: SyncTurnPlace = .arrivalOrder,
+        caller: String = #fileID, line: Int = #line, _ pass: () async throws -> T
     ) async rethrows -> T {
         let task = Self.currentTaskIdentity()
         if let task, Self.heldSyncTurn[accountId] == task { return try await pass() }
@@ -157,7 +190,7 @@ extension SyncEngine {
             // turn when it got in line. With it off, nothing is read or timed.
             let trace: (behind: String, start: ContinuousClock.Instant)? = DebugModeManager.isLoggingEnabled()
                 ? (syncTurnHolders[accountId] ?? "unknown", ContinuousClock.now) : nil
-            let ownsTurn = await waitForSyncTurn(accountId: accountId, caller: "\(caller):\(line)")
+            let ownsTurn = await waitForSyncTurn(accountId: accountId, caller: "\(caller):\(line)", place: place)
             if let trace {
                 let waited = trace.start.duration(to: .now)
                 BackgroundSyncLogger.logDebug("[SyncTurnWait] \(accountId.prefix(8)): \(caller):\(line) waitedMs=\(MigrationTimingLedger.wholeMilliseconds(waited)) behind=\(trace.behind)")
@@ -201,8 +234,13 @@ extension SyncEngine {
     }
 
     /// Waits for the account's turn; false only when the test harness released
-    /// a wait that overran `SyncConfig.syncTurnWaitTestBoundSeconds`.
-    private func waitForSyncTurn(accountId: String, caller: String) async -> Bool {
+    /// a wait that overran `SyncConfig.syncTurnWaitTestBoundSeconds`. The waiter
+    /// joins the back of the line, except a follow-up
+    /// (`.aheadOfBackgroundChunks`), which joins it right before the first
+    /// catch-up slice waiting (#1360): the slices keep their order among
+    /// themselves, a pass that is not a slice and joined before the first one
+    /// stays ahead, and everything that joins later queues behind.
+    private func waitForSyncTurn(accountId: String, caller: String, place: SyncTurnPlace) async -> Bool {
         syncTurnWaiterSerial += 1
         let id = syncTurnWaiterSerial
         #if DEBUG
@@ -217,7 +255,19 @@ extension SyncEngine {
         defer { watcher?.cancel() }
         #endif
         await withCheckedContinuation {
-            syncPassWaiters[accountId, default: []].append(SyncTurnWaiter(id: id, caller: caller, continuation: $0))
+            let waiter = SyncTurnWaiter(
+                id: id, caller: caller, isBackgroundChunk: place == .backgroundChunk, continuation: $0)
+            var waiting = syncPassWaiters[accountId, default: []]
+            if place == .aheadOfBackgroundChunks, let firstChunk = waiting.firstIndex(where: \.isBackgroundChunk) {
+                if DebugModeManager.isLoggingEnabled() {
+                    let passed = waiting[firstChunk...].filter(\.isBackgroundChunk).count
+                    BackgroundSyncLogger.logDebug("[SyncTurn] \(accountId.prefix(8)): follow-up goes ahead of \(passed) waiting catch-up slice(s) (\(caller))")
+                }
+                waiting.insert(waiter, at: firstChunk)
+            } else {
+                waiting.append(waiter)
+            }
+            syncPassWaiters[accountId] = waiting
         }
         return overrunSyncTurnWaiters.remove(id) == nil
     }
@@ -295,7 +345,10 @@ extension SyncEngine {
     }
     #endif
 
-    /// Ends a pass: the oldest waiter takes the turn, or the account is free.
+    /// Ends a pass: the first waiter in line takes the turn, or the account is
+    /// free. The first in line is the oldest waiter, except that a follow-up
+    /// joined the line ahead of the catch-up slices waiting (`waitForSyncTurn`,
+    /// #1360). *Superseded (#1360):* "the oldest waiter takes the turn".
     /// Once it is free with the flag still set, it asks for the follow-up stage 2
     /// again (`followUpPass`, which clears the flag when it takes the turn). A
     /// foreground flag's follow-up is usually already waiting, so the turn went
