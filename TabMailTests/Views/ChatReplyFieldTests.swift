@@ -321,12 +321,19 @@ struct ChatReplyFieldTests {
 
     // MARK: - 3. No message to the agent
 
-    @Test("The field's words reach the agent only from the open panel, with no reply-field nudge")
+    @Test("A reply's words reach the agent only from the open panel, with no reply-field nudge; only a new email's chat keeps its own")
     func noAgentNudge() throws {
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         let field = try Self.source("TabMail/Views/Chat/ChatReplyField.swift")
-        #expect(Self.count("agentMessage", in: island) == 0 && Self.count("agentMessage", in: field) == 0)
+        #expect(Self.count("ChatReplyField.agentMessage", in: island + field) == 0, "the reply field's nudge is gone")
+        #expect(Self.count("agentMessage(emailNumericId", in: island + field) == 0)
         #expect(Self.count("typed in its reply field", in: island + field) == 0)
+        // A new email's chat still sends its words to the agent with its own nudge, until it
+        // composes directly too (ADR-IOS-114 decision 10).
+        #expect(Self.count("static func agentMessage(", in: field) == 1, "only the new email's")
+        #expect(Self.count("static func agentMessage(to people: [ChatThread.Person], text: String) -> String {", in: field) == 1)
+        #expect(Self.count("agentMessage(", in: island) == 1)
+        #expect(Self.count("enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text)", in: island) == 1)
     }
 
     // MARK: - 4. The status line
