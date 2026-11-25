@@ -2782,7 +2782,6 @@ extension AccountManager {
                 folderPath = try await draftsFolderPath(accountId: accountId)
             }
             let deletedAttachmentDir = try await dbPool.write { db -> String? in
-                let folderId = "\(accountId):\(folderPath)"
                 let (encodedId, addressKind, mintedUidValidity) = try Self.validatedDraftAddress(
                     identity, accountId: accountId, folderPath: folderPath, db: db)
 
