@@ -230,6 +230,8 @@ struct ChatSwipeReveal: ViewModifier {
     private static let spring = Animation.spring(response: ChatViewLayout.swipeSpringResponse, dampingFraction: 0.86)
     private static let iconSpring = Animation.spring(response: ChatViewLayout.swipeFullIconSpringResponse,
                                                      dampingFraction: ChatViewLayout.swipeFullIconSpringDamping)
+    /// How far the grown edge icon reaches above and below its round button.
+    private static let iconRoom = ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2
 
     func body(content: Content) -> some View {
         content
@@ -244,10 +246,13 @@ struct ChatSwipeReveal: ViewModifier {
                     }
                     // Room above and below for the edge icon grown past the full-swipe point, so
                     // the clip (which keeps the buttons inside the revealed width) never flattens it.
-                    .padding(.vertical, ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2)
+                    .padding(.vertical, Self.iconRoom)
                     .frame(width: abs(drag.offset), alignment: edge == .trailing ? .leading : .trailing)
                     .clipped()
-                    .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(ChatSwipeOpen.space)) } action: {
+                    // The buttons' own frame, without that room: a tap beside them only closes.
+                    .onGeometryChange(for: CGRect.self) {
+                        $0.frame(in: .named(ChatSwipeOpen.space)).insetBy(dx: 0, dy: Self.iconRoom)
+                    } action: {
                         buttonsFrame = $0
                         open.moved(id, frame: frame, buttons: $0)
                     }

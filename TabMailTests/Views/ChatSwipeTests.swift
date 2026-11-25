@@ -327,8 +327,11 @@ struct ChatSwipeTests {
                 "only the edge button's icon grows, and only past the point")
         #expect(text.contains("HStack(alignment: .top, spacing: 0) { ForEach(buttons) { button in buttonView(button) } }"),
                 "the round buttons sit in one row")
-        #expect(text.contains(".padding(.vertical, ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2) .frame(width: abs(drag.offset), alignment: edge == .trailing ? .leading : .trailing) .clipped()"),
+        #expect(text.contains("private static let iconRoom = ChatViewLayout.swipeCircleSize * (ChatViewLayout.swipeFullIconScale - 1) / 2"))
+        #expect(text.contains(".padding(.vertical, Self.iconRoom) .frame(width: abs(drag.offset), alignment: edge == .trailing ? .leading : .trailing) .clipped()"),
                 "the clip leaves room for the grown icon above and below, never flattening it")
+        #expect(text.contains("$0.frame(in: .named(ChatSwipeOpen.space)).insetBy(dx: 0, dy: Self.iconRoom) } action: { buttonsFrame = $0"),
+                "the open reveal owns its buttons' frame for taps, never that room")
         #expect(text.contains(".lineLimit(1) .minimumScaleFactor(ChatViewLayout.swipeLabelMinScale)"), "a label never wraps")
         #expect(!text.contains(".lineLimit(2)"))
         #expect(ChatViewLayout.swipeFullIconScale > 1)

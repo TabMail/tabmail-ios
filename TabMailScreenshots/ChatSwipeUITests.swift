@@ -58,6 +58,19 @@ final class ChatSwipeUITests: XCTestCase {
         XCTAssertTrue(bubbleActionsShow(app), "the actions stay open")
     }
 
+    /// The open bubble owns only its buttons: a tap just above them, inside the room the clip leaves
+    /// for the grown icon, only closes it, as a tap anywhere else does.
+    func testOwnActionsOpenTapJustAboveTheButtonsOnlyCloses() {
+        let app = launchIntoChat()
+        openBubble(2, in: app)
+        let move = app.buttons["Move"]
+        // 3 pt above the round button: inside that room, outside the button.
+        tap(atY: move.frame.minY - 3, dx: move.frame.midX / app.frame.width, in: app)
+        XCTAssertTrue(move.waitForNonExistence(timeout: 3), "the tap only closed the open actions")
+        XCTAssertFalse(app.buttons["Sheet Grabber"].waitForExistence(timeout: 2), "and opened no card")
+        XCTAssertTrue(isInChat(app), "the chat stays")
+    }
+
     func testOpenActionsOwnButtonStillWorks() {
         let app = launchIntoChat()
         openBubble(2, in: app)
