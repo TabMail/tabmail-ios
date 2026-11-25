@@ -342,10 +342,13 @@ struct SuggestionRewriteRouteTests {
         let email = try await row(fixture.db, fixture.header.id)
         let envelope = ChatReplyCompose.suggestionEnvelope(for: email, accounts: [])
         let refusal = ComposeOutcome.failed("the account was removed").describeForLLM
-        let output = await EmailReplyTool.finishSuggestionEdit(
+        let written = await EmailReplyTool.finishSuggestionEdit(
             Self.edit(subject: "Re: New plan"), shown: Self.shownReply, start: envelope, suggestionEnvelope: envelope,
             email: email, rewritesInPlace: true, store: Self.store(fixture.db),
-            openCard: { @Sendable _, _ in refusal })
+            openCard: { @Sendable _, _ in .card(.failed("the account was removed")) })
+        let output = written.text
+        // A card that never opened wrote nothing: the closed field keeps its words.
+        if case .done = written { Issue.record("a refused card is nothing written: \(output)") }
         #expect(output.hasSuffix(refusal), "the card's own outcome is what the agent reads: \(output)")
         #expect(!output.localizedCaseInsensitiveContains("opened"), "nothing claims the card opened: \(output)")
         let stored = try await row(fixture.db, fixture.header.id).suggestion
@@ -1097,8 +1100,8 @@ struct SuggestionRewriteRouteTests {
             rewritesInPlace: true, store: Self.store(fixture.db),
             openCard: { @Sendable opening, _ in
                 card.withLock { $0 = opening }
-                return "cancelled"
-            })
+                return .card(.cancelled)
+            }).text
         let opened = card.withLock { $0 }
         let stored = try await row(fixture.db, fixture.header.id).suggestion
         let edited = ReplyResult(body: Self.editedBody, textMessage: Self.editedText, changeCommand: Self.editedCommand)

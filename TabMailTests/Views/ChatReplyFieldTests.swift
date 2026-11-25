@@ -294,10 +294,11 @@ struct ChatReplyFieldTests {
         #expect(ChatSuggestionWorkingBubble.bubbleId != ChatSuggestionBubble.bubbleId, "its own identifier")
     }
 
-    @Test("The placeholder offers a reply only when the sender takes replies")
+    @Test("The closed field says it writes the reply; the open panel says it asks TabMail")
     func placeholder() {
-        #expect(ChatReplyField(example: nil, isNoReply: false).placeholder == "Reply or ask anything")
-        #expect(ChatReplyField(example: nil, isNoReply: true).placeholder == "Ask anything")
+        #expect(ChatReplyField(example: nil).placeholder == "Write your reply")
+        #expect(ChatReplyField.writePlaceholder == "Write your reply")
+        #expect(ChatReplyField.panelPlaceholder == "Ask TabMail")
     }
 
     // MARK: - 2. The "e.g." line
@@ -318,18 +319,21 @@ struct ChatReplyFieldTests {
         #expect(ChatSuggestionConfig.statusLine == "AI Suggestion · Tap to use")
     }
 
-    // MARK: - 3. The agent's message
+    // MARK: - 3. No message to the agent
 
-    @Test("Words for the agent name the email and say where they came from")
-    func agentMessage() {
-        let reply = ChatReplyField.agentMessage(emailNumericId: 42, text: "say yes", isNoReply: false)
-        #expect(reply == "Regarding [Email](42) (typed in its reply field; if what I want is unclear, I am replying to it): say yes")
-
-        let noReply = ChatReplyField.agentMessage(emailNumericId: 7, text: "what is this", isNoReply: true)
-        #expect(noReply.hasPrefix("Regarding [Email](7) ("))
-        #expect(noReply.hasSuffix("): what is this"))
-        #expect(noReply.contains("no-reply address, so do not write a reply"))
-        #expect(!noReply.contains("I am replying to it"))
+    @Test("A reply's words reach the agent only from the open panel, with no reply-field nudge; only a new email's chat keeps its own")
+    func noAgentNudge() throws {
+        let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
+        let field = try Self.source("TabMail/Views/Chat/ChatReplyField.swift")
+        #expect(Self.count("ChatReplyField.agentMessage", in: island + field) == 0, "the reply field's nudge is gone")
+        #expect(Self.count("agentMessage(emailNumericId", in: island + field) == 0)
+        #expect(Self.count("typed in its reply field", in: island + field) == 0)
+        // A new email's chat still sends its words to the agent with its own nudge, until it
+        // composes directly too (ADR-IOS-114 decision 10).
+        #expect(Self.count("static func agentMessage(", in: field) == 1, "only the new email's")
+        #expect(Self.count("static func agentMessage(to people: [ChatThread.Person], text: String) -> String {", in: field) == 1)
+        #expect(Self.count("agentMessage(", in: island) == 1)
+        #expect(Self.count("enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text)", in: island) == 1)
     }
 
     // MARK: - 4. The status line
@@ -338,6 +342,7 @@ struct ChatReplyFieldTests {
     func statusLine() throws {
         let writing = try #require(ToolRegistry.activityLabels["email_reply"])
         #expect(ChatReplyField.statusLine(writing) == "Writing your email")
+        #expect(ChatReplyField.writingStatus == "Writing your email")
         #expect(ChatReplyField.statusLine("Searching email") == "Searching email")
     }
 
@@ -364,15 +369,6 @@ struct ChatReplyFieldTests {
     private static let david = ChatThread.Person(address: "david@example.com", name: "David Kim")
     private static let sarah = ChatThread.Person(address: "sarah@example.com", name: "Sarah Chen")
     private static let sam = ChatThread.Person(address: "sam@example.com", name: "Sam Lee")
-
-    @Test("The agent's message names the people a reply goes only to")
-    func agentMessageOnlyTo() {
-        let message = ChatReplyField.agentMessage(
-            emailNumericId: 3, text: "say yes", isNoReply: false, onlyTo: [Self.david, Self.sam])
-        #expect(message == "Regarding [Email](3) (typed in its reply field; if what I want is unclear, I am replying to it; a reply goes only to David Kim <david@example.com>, Sam Lee <sam@example.com>): say yes")
-        #expect(ChatReplyField.agentMessage(emailNumericId: 3, text: "x", isNoReply: false, onlyTo: [])
-                == ChatReplyField.agentMessage(emailNumericId: 3, text: "x", isNoReply: false))
-    }
 
     @Test("Everyone on the newest email ticked, nobody added, is Reply All; anything else is only them")
     func replyTarget() {
@@ -723,7 +719,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldFill.apply(", in: text) == 10)
     }
 
-    @Test("The field's Send sends the words to the agent; a new email's chat's own Send first says who it is to, or asks and stops there; nothing in the field opens compose")
+    @Test("The closed field's Send writes the email from the words and never reaches the agent; a new email's chat's own Send first says who it is to, or asks and stops there")
     func fieldSendWiring() throws {
         let text = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         // Collapsed, the reply field's Send takes the field's route; the open sheet keeps the chat's.
@@ -733,15 +729,23 @@ struct ChatReplyFieldTests {
         let send = try Self.body(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {", in: text)
         // A new email's chat's own Send runs first: with nobody picked it asks and the send stops
         // there; with people picked their addresses go on with the words to the agent (what its
-        // Send does is driven in ChatNewThreadScreenTests). Every other send goes to the agent.
-        #expect(send.contains("var newEmailTo: [ChatThread.Person]? if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people } isTextFieldFocused = false"),
+        // Send does is driven in ChatNewThreadScreenTests). Every other send from the field writes
+        // the reply.
+        #expect(send.contains("var newEmailTo: [ChatThread.Person]? if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people } else if message == nil { return } isTextFieldFocused = false"),
                 "a new email's chat takes its own Send, first")
-        #expect(Self.count("return", in: send) == 1, "every other send from the field goes to the agent")
+        #expect(Self.count("return", in: send) == 2, "every other send from the field writes the reply")
         #expect(Self.count("onSendReadyReply", in: text) == 0 && Self.count("ChatReplyField.route", in: text) == 0)
         #expect(Self.count("onFieldSend?(text)", in: send) == 1)
-        #expect(Self.count("sendAgentChat(text, field: send, newEmailTo: newEmailTo)", in: send) == 1)
+        // ADR-IOS-114 decision 10 (amended 2026-11-25): the UI state decides, never the agent. Only
+        // a new email's chat still sends its words to the agent, with its own nudge (ChatNewThreadTests).
+        #expect(Self.count("sendAgentChat", in: send) == 1, "only a new email's chat reaches the agent")
+        #expect(Self.count("if let newEmailTo { Task { @MainActor in MessageChatCollapseTip.hasStartedMessageChat = true sendAgentChat(text, newEmailTo: newEmailTo) } } else if let message {", in: send) == 1)
+        #expect(Self.count("composeFromField(text, ChatFieldSend(message: message, onlyTo: field.onlyTo, suggestion: field.suggestion))", in: send) == 1)
+        let compose = try Self.body(of: "private func composeFromField(_ text: String, _ send: ChatFieldSend) {", in: text)
+        #expect(Self.count("sendAgentChat", in: compose) == 0 && Self.count("sendChatMessage", in: compose) == 0)
+        #expect(Self.count("let written = await EmailReplyTool.composeWithRegisteredTool(text, invocation: invocation)", in: compose) == 1)
+        #expect(Self.count("enqueueStatus(ChatReplyField.writingStatus)", in: compose) == 1)
         #expect(Self.count("sendFromReplyField(", in: text) == 2, "Send reaches it")
-        #expect(Self.count("enrichedText = ChatReplyField.agentMessage( emailNumericId: numericId, text: text, isNoReply: field.isNoReply, onlyTo: field.onlyTo)", in: text) == 1)
         #expect(Self.count("enqueueStatus(isReplyField ? ChatReplyField.statusLine(label) : label)", in: text) == 1)
     }
 
@@ -1500,15 +1504,15 @@ struct ChatReplyFieldTests {
         // One helper, only while the panel is closed.
         #expect(Self.count("func showChatAction(_ showChat: (() -> Void)?, isExpanded: Bool) -> some View { accessibilityActions { if let showChat, !isExpanded { Button(ChatViewConfig.showChatActionName) { showChat() } } } }", in: bar) == 1)
         // On the text field, and on the sent words while the agent works (the drag stays on then).
-        #expect(Self.count("inputField(placeholder: hasTabMailSession ? field.placeholder : \"Sign in to reply or ask\", showChat: field.showChat, focus: .replyField)", in: bar) == 1)
+        #expect(Self.count("inputField(placeholder: hasTabMailSession ? field.placeholder : \"Sign in to reply\", showChat: field.showChat, focus: .replyField)", in: bar) == 1)
         #expect(Self.count(".opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1) // The drag stays on while the agent works: so does its VoiceOver action. .showChatAction(field.showChat, isExpanded: isExpanded)", in: bar) == 1)
         // While dictating, VoiceOver cannot reach the hidden text field: the waveform carries it.
         let pill = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(Self.count(".accessibilityHidden(dictation.isActive) .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
         #expect(Self.count(".onTapGesture { dictation.finish() } .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
         // A field built without the action offers none (the panel open, the tutorial).
-        #expect(ChatReplyField(example: nil, isNoReply: false).showChat == nil)
-        #expect(ChatReplyField(example: nil, isNoReply: false, showChat: {}).showChat != nil)
+        #expect(ChatReplyField(example: nil).showChat == nil)
+        #expect(ChatReplyField(example: nil, showChat: {}).showChat != nil)
         // The reply field and the panel's input are two text fields, each with its own focus value,
         // and the panel opening moves a typed-in field's keyboard to the panel's input (mock v15
         // H2; on screen: `ChatSwipeUITests`, the drags that open the panel from the focused field).
@@ -1617,7 +1621,7 @@ struct ChatReplyFieldTests {
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         // The field itself; the suggestion's rule takes them too (`shownSuggestion`, pinned above).
-        #expect(Self.count("isNoReply: isNoReply, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
+        #expect(Self.count("configured: example), onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
         // Both reply cards open through the one helper, read as the card opens: Reply All exactly
         // when the reply goes to everyone, and the recipients with it.
         #expect(Self.count("agentCompose = req", in: chat) == 1,
@@ -1651,13 +1655,14 @@ struct ChatReplyFieldTests {
                 "a new newest email resets the choice, even one whose UID matches the last")
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(Self.count("let send = message.map { ChatFieldSend(message: $0, onlyTo: field.onlyTo, isNoReply: field.isNoReply, suggestion: field.suggestion) }", in: island) == 1,
+        #expect(Self.count("composeFromField(text, ChatFieldSend(message: message, onlyTo: field.onlyTo, suggestion: field.suggestion))", in: island) == 1,
                 "the people chosen are read once, as the field's send starts")
         #expect(Self.count("let fieldReply = field?.fieldReply", in: island) == 1)
         #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: sessionKey, fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey)", in: island) == 1,
                 "and travel with the request to the agent's tools")
         // With the chat that asked, read as the send starts; the field's request belongs to the chat view.
-        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)", in: island) == 1)
+        // The pill's send and the closed field's compose both read it.
+        #expect(Self.count("let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)", in: island) == 2)
         #expect(Self.count("return ComposeOrigin(sessionKey: sessionKey, screen: fieldReply != nil ? .chat : screen, fromAccountId: composeFromAccountId)", in: island) == 1)
         // A covered screen does not take: the pill takes only while its screen shows and nothing covers it.
         #expect(Self.count("let host = (composeHostShown ?? composeHostAppeared) && !composeHostCovered", in: island) == 1)
@@ -1667,7 +1672,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("uiSink: SessionUISink(session: session, fieldWordsKey: resume.fieldWordsKey), sessionKey: sessionKey, fieldReply: resume.fieldReply, composeOrigin: origin, fieldWordsKey: resume.fieldWordsKey)", in: island) == 1)
         // A resume continues its turn: the origin the turn started with, from any screen of the thread.
         #expect(Self.count("let origin = resume.origin", in: island) == 1)
-        #expect(Self.count("composeOrigin(sessionKey: capturedSessionKey,", in: island) == 1, "only the send reads the pill's origin")
+        #expect(Self.count("composeOrigin(sessionKey: capturedSessionKey,", in: island) == 2,
+                "only the send and the closed field's compose read the pill's origin")
         // No screen takes another screen's compose request: no global slot is left to race for.
         for path in ["TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Inbox/InboxView.swift", "TabMail/Views/Message/MessageDetailView.swift"] {
             let text = try Self.source(path)
@@ -1713,9 +1719,11 @@ struct ChatReplyFieldTests {
     }
 
     /// ADR-IOS-053 Phase 2: the census of the turns that can reach a compose tool. Every invocation
-    /// the app builds is one of three: the pill's send and its resume, which name the screen that
-    /// asked (every send, retry, resend, rewind and tutorial prompt goes through `sendAgentChat`),
-    /// and the compose editor's chat, whose host is a compose window and opens no agent card, so a
+    /// the app builds is one of four: the pill's send and its resume, which name the screen that
+    /// asked (every send, retry, resend, rewind and tutorial prompt goes through `sendAgentChat`);
+    /// the chat view's closed field, whose compose names the chat view
+    /// (`EmailReplyTool.composeFromField`, ADR-IOS-114 decision 10 amended 2026-11-25); and the
+    /// compose editor's chat, whose host is a compose window and opens no agent card, so a
     /// compose tool there fails fast. Every other caller (reply precompute, inline edit, the BYOK
     /// check) runs `.noninteractive`, where a compose tool fails fast too. A new turn that builds
     /// its own invocation fails here until it names its screen or is added with its reason.
@@ -1732,19 +1740,21 @@ struct ChatReplyFieldTests {
             let count = Self.count("ToolInvocation(", in: text)
             if count > 0 { built[url.lastPathComponent] = count }
         }
-        #expect(built == ["DynamicIslandChatButton.swift": 3], "only the pill builds invocations: \(built)")
+        #expect(built == ["DynamicIslandChatButton.swift": 4], "only the pill builds invocations: \(built)")
 
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
-        #expect(Self.count("composeOrigin: origin, fieldWordsKey:", in: island) == 2, "the send and the resume name the screen that asked")
+        #expect(Self.count("composeOrigin: origin, fieldWordsKey:", in: island) == 3,
+                "the send, the closed field's compose and the resume name the screen that asked")
         #expect(Self.count("invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey) )", in: island) == 1,
                 "the compose editor's chat, which opens no card, names none")
         #expect(Self.count("guard onAgentCompose != nil, composeContext == nil else { return nil }", in: island) == 1,
                 "a compose editor's pill has no compose screen")
-        // Every turn of the pill starts in one of the two.
-        // A fresh send names its screen; a resume reuses the origin its turn started with.
-        #expect(Self.count("let origin = composeOrigin(", in: island) == 1)
+        // Every turn of the pill starts in one of these.
+        // A fresh send and the closed field's compose name their screen; a resume reuses the origin
+        // its turn started with.
+        #expect(Self.count("let origin = composeOrigin(", in: island) == 2)
         #expect(Self.count("let origin = resume.origin", in: island) == 1)
         #expect(Self.count("activeChatTask = Task {", in: island) == Self.count("let origin = composeOrigin(", in: island) + Self.count("let origin = resume.origin", in: island) + 1,
-                "one turn task per send and per resume, and the compose editor's")
+                "one task per send, per field compose and per resume, and the compose editor's")
     }
 }

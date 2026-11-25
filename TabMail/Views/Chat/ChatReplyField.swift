@@ -8,14 +8,15 @@ import GRDB
 /// The chat's reply field (ADR-IOS-114 decision 10): the pill on the newest email becomes
 /// [mic] [field] [Send]. The field holds only the user's words: the ready AI Suggestion waits as a
 /// ghost bubble in the chat (`ChatSuggestionBubble`), and a tap on it opens the compose card.
-/// Everything the user says or types goes to the agent on the newest email, as today's Chat pill
-/// on that email. Under the empty field an "e.g." line shows a change the user could ask for
-/// (`example`); a tap puts it in the field and never sends it.
+/// What the words mean is decided by where they are sent, never by the AI guessing (decision 10,
+/// amended 2026-11-25): Send in the closed field writes the email to the people of this chat, a
+/// compose edit with the words as its request (`EmailReplyTool.composeFromField`), never a message
+/// to the agent; the words typed in the open TabMail panel go to the agent. Under the empty field
+/// an "e.g." line shows a change the user could ask for (`example`); a tap puts it in the field and
+/// never sends it.
 struct ChatReplyField {
     /// The change the "e.g." line offers; nil shows no line.
     let example: String?
-    /// The newest email is from a no-reply address.
-    let isNoReply: Bool
     /// The reply goes only to these people; nil for Reply All.
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, what the read-only field holds and sends (part 2); nil holds nothing.
@@ -43,9 +44,14 @@ struct ChatReplyField {
     }
 
     var placeholder: String {
-        if newEmail != nil { return ChatNewEmailField.placeholder }
-        return isNoReply ? "Ask anything" : "Reply or ask anything"
+        newEmail != nil ? ChatNewEmailField.placeholder : Self.writePlaceholder
     }
+
+    /// The closed field's hint: what its Send does, write the email to the people (a no-reply
+    /// sender's too; the chat says replies won't be read).
+    static let writePlaceholder = "Write your reply"
+    /// The open TabMail panel's hint in a chat: its words go to TabMail, about this chat.
+    static let panelPlaceholder = "Ask TabMail"
 
     /// The ready AI Suggestion of the thread's newest email, the one value the ghost bubble, the
     /// "e.g." line and the field's edit all read (`MessageHeader.suggestion`): shown while its full
@@ -95,30 +101,15 @@ struct ChatReplyField {
         return .writing
     }
 
-    /// The agent's message for words typed or said in the field: today's Chat pill message on the
-    /// newest email (`Regarding [Email](N): …`), with a nudge that the words came from this
-    /// email's reply field, so an unclear request is a reply to it. For a no-reply
-    /// sender the nudge says it takes no replies.
-    /// With recipients chosen in Reply to the nudge names them: a reply goes only to them.
-    static func agentMessage(
-        emailNumericId: Int, text: String, isNoReply: Bool, onlyTo: [ChatThread.Person]? = nil
-    ) -> String {
-        var nudge = isNoReply
-            ? "typed in its reply field; the sender is a no-reply address, so do not write a reply to it"
-            : "typed in its reply field; if what I want is unclear, I am replying to it"
-        if let onlyTo, !onlyTo.isEmpty {
-            let people = onlyTo.map { "\($0.name) <\($0.address)>" }.joined(separator: ", ")
-            nudge += "; a reply goes only to \(people)"
-        }
-        return "Regarding [Email](\(emailNumericId)) (\(nudge)): \(text)"
-    }
-
     /// The line above the field while the agent works: the agent's own labels, except that
-    /// writing a reply, or a new email's chat's email, reads "Writing your email".
+    /// writing a reply, or a new email's chat's email, reads "Writing your email" (`writingStatus`).
     static func statusLine(_ label: String) -> String {
         label == ToolRegistry.activityLabels["email_reply"] || label == ToolRegistry.activityLabels["email_compose"]
-            ? "Writing your email" : label
+            ? writingStatus : label
     }
+
+    /// The line above the closed field while its Send writes the email.
+    static let writingStatus = "Writing your email"
 }
 
 /// The field of a new email's chat (`ChatNewThreadView`): no email to reply to, so Send goes to the
@@ -174,7 +165,6 @@ struct ChatNewEmailField {
     /// they are what to write in a new email to `people`, so the agent writes it (`email_compose`,
     /// the words as its request). The field's words are always what to write, decided by where
     /// they were typed, never by guessing intent: a question in them is one to ask the people.
-    /// The sibling of `ChatReplyField.agentMessage`.
     static func agentMessage(to people: [ChatThread.Person], text: String) -> String {
         let recipients = people.map { "\($0.name) <\($0.address)>" }.joined(separator: ", ")
         return "New email to \(recipients) (typed in its field: my words are what to write to them, "
@@ -247,13 +237,18 @@ struct ChatFieldFill: Equatable {
         /// The open send completed (its compose card's reply went out): it empties the words only
         /// if a send is open and they are still the words sent, or none.
         case completed
-        /// The agent answered the field's send: `completed`, unless a compose card opened for it and
-        /// closed unsent; then the words are the user's again, kept and not emptied.
+        /// The field's send finished with something written (its compose card closed, or the AI
+        /// Suggestion changed in place), or the agent answered it (the tutorial's scripted request):
+        /// `completed`, unless a compose card opened for it and closed unsent; then the words are
+        /// the user's again, kept and not emptied.
         case answered
         /// A compose card opened for the field's send (`composing`).
         case composeOpened
         /// A confirmation card opened the sheet: the same check, and the send is still open.
         case confirmationCard
+        /// The field's Send wrote nothing (no compose card opened, nothing stored): the send ends
+        /// and its words are the user's again, kept.
+        case notWritten
     }
 
     /// The words to keep for the chat (`ChatFieldWords`): the words, except a send's still in
@@ -328,6 +323,11 @@ struct ChatFieldFill: Equatable {
                 words = ""
                 holdsSentWords = false
             }
+        case .notWritten:
+            atSend = nil
+            holdsSentWords = false
+            sentWordsTaken = false
+            composing = false
         }
         if words != before { changes += 1 }
     }
@@ -390,13 +390,11 @@ struct ChatFieldReply: Sendable, Equatable {
     }
 }
 
-/// A send from the chat's reply field, read once as it starts: the email it is about, who the user
-/// chose in Reply to, and whether that email takes replies. The send's words and its request are
-/// built from it, and a resume or a retry of that send carries it, so neither reads the field again.
+/// A send from the chat's reply field, read once as it starts: the email it is about and who the
+/// user chose in Reply to. The send's request is built from it, so nothing reads the field again.
 struct ChatFieldSend {
     let message: MessageHeader
     let onlyTo: [ChatThread.Person]?
-    let isNoReply: Bool
     /// The AI Suggestion showing as the send started (`ChatReplyField.suggestion`).
     var suggestion: ReplyResult? = nil
 

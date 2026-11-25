@@ -76,8 +76,9 @@ struct ThreadChatTests {
 
     /// The fake backend: answers each chat request "Answer N" (N counts the answers), or, for a
     /// request whose words contain `cardWords`, raises a template card first and answers
-    /// "Template saved." once it is answered. `hold` keeps the first round until signalled;
-    /// `holdAnswers` keeps every plain answer until signalled (`asked` says it arrived).
+    /// "Template saved." once it is answered; a compose edit (the chat view's closed field) is
+    /// answered with `composed`. `hold` keeps the first round until signalled; `holdAnswers` keeps
+    /// every plain answer and compose edit until signalled (`asked` says it arrived).
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         let asked = DispatchSemaphore(value: 0)
@@ -95,7 +96,17 @@ struct ThreadChatTests {
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 record.bodies.withLock { $0.append(body) }
                 let final: [String: Any]
-                if let cardWords, body.contains(cardWords), !body.contains("conversation_state") {
+                if body.contains(Backend.composeEditPrompt) {
+                    // The chat view's closed field: its words are the reply's compose edit, held as
+                    // the answers are.
+                    if holdAnswers {
+                        asked.signal()
+                        _ = proceed.wait(timeout: .now() + 20)
+                    }
+                    final = ["assistant": ComposeEditJSON.make(
+                        response: "Done.", subject: "", body: Backend.composed.body,
+                        textMessage: Backend.composed.textMessage ?? "", changeCommand: Backend.composed.changeCommand ?? "")]
+                } else if let cardWords, body.contains(cardWords), !body.contains("conversation_state") {
                     asked.signal()
                     if hold { _ = proceed.wait(timeout: .now() + 20) }
                     let arguments: [String: Any] = [
@@ -128,6 +139,10 @@ struct ThreadChatTests {
         var service: AIService {
             AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
         }
+
+        static let composeEditPrompt = "system_prompt_compose_interactive"
+        /// The reply the compose edit writes.
+        static let composed = ReplyResult(body: "Hi,\n\nFriday works.\n\nMe", textMessage: "Friday works.", changeCommand: "suggest Monday")
 
         /// The request bodies, in order.
         var bodies: [String] { record.bodies.withLock { $0 } }
@@ -176,7 +191,7 @@ struct ThreadChatTests {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
                 replyField: inChatView && host.message != nil
-                    ? ChatReplyField(example: nil, isNoReply: false) : nil)
+                    ? ChatReplyField(example: nil) : nil)
             .environment(\.hasTabMailSession, true)
         }
     }
@@ -237,6 +252,23 @@ struct ThreadChatTests {
         return view.subviews.contains { type(words, in: $0) }
     }
 
+    /// Opens the chat view's TabMail panel as VoiceOver's "Show TabMail chat" does: the panel's
+    /// words go to the agent, while the closed field writes the reply (ADR-IOS-114 decision 10,
+    /// amended 2026-11-25).
+    static func openPanel(in view: UIView) async throws {
+        let name = ChatViewConfig.showChatActionName
+        let actions = HostedAccessibility.elements(under: view)
+            .compactMap { $0.accessibilityCustomActions?.first { $0.name == name } }
+        let action = try #require(actions.first, "control: the closed field offers the panel")
+        let handler = try #require(action.actionHandler, "control: a SwiftUI action has a handler")
+        let ran = handler(action)
+        #expect(ran, "control: the action runs")
+        try await wait { HostedAccessibility.identifiers(in: view).contains("chatClose") }
+        let opened = HostedAccessibility.identifiers(in: view).contains("chatClose")
+        #expect(opened, "control: the panel opened")
+        try await Task.sleep(for: .milliseconds(600))
+    }
+
     /// Asks `words` in the mounted pill, through its Send, and waits for the answer.
     static func ask(_ words: String, in view: UIView, backend: Backend, answered: Bool = true) async throws {
         let before = backend.bodies.count
@@ -290,6 +322,10 @@ struct ThreadChatTests {
         let backend = Backend(cardWords: "Make it a template", templateName: templateName, hold: true)
         try await Self.withBackend(backend, chatView: true) {
             try await Self.withPill(first, inChatView: true) { host, view in
+                // The TabMail panel opens over the field: its words go to the agent (the closed field
+                // writes the reply instead, ADR-IOS-114 decision 10 amended 2026-11-25).
+                host.expanded = true
+                try await Task.sleep(for: .milliseconds(600))
                 // The request goes out about the newest email, email 1.
                 try await Self.ask("Make it a template", in: view, backend: backend, answered: false)
                 let asked = await Task.detached { Self.waited(for: backend.asked) }.value
@@ -301,7 +337,7 @@ struct ThreadChatTests {
                 backend.proceed.signal()
 
                 try await Self.wait { Self.shows("Create", in: view) }
-                #expect(host.expanded, "the card opens the sheet")
+                #expect(host.expanded, "the sheet stays open with the card")
                 #expect(Self.shows("Create", in: view), "the card is shown: \(Self.labels(view).prefix(30))")
                 let create = HostedAccessibility.elements(under: view).first { $0.accessibilityLabel == "Create" }
                 #expect(create?.accessibilityActivate() == true, "Create takes a tap")
@@ -343,6 +379,9 @@ struct ThreadChatTests {
         let backend = Backend()
         try await Self.withBackend(backend, chatView: true) {
             try await Self.withPill(first, inChatView: true) { host, view in
+                // Asked in the open TabMail panel, where the words go to the agent.
+                host.expanded = true
+                try await Task.sleep(for: .milliseconds(600))
                 try await Self.ask("Where do we meet", in: view, backend: backend)
                 try Self.insert(newer, pool: pool)
                 host.message = newer
@@ -442,6 +481,8 @@ struct ThreadChatTests {
             try await Self.mount(chat) { view in
                 try await Self.wait { Self.shows("Bea Example", in: view) }
                 try await Self.settle()
+                // Asked in the open TabMail panel, where the words go to the agent.
+                try await Self.openPanel(in: view)
                 try await Self.ask("Is it confirmed", in: view, backend: backend)
             }
         }

@@ -66,7 +66,7 @@ struct ChatReplyFieldRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
-                replyField: ChatReplyField(example: host.example, isNoReply: false),
+                replyField: ChatReplyField(example: host.example),
                 onFieldSend: { host.fieldSends.append($0) })
             .environment(\.hasTabMailSession, host.signedIn)
         }
@@ -414,8 +414,8 @@ struct ChatReplyFieldRuntimeTests {
         let island = try Self.source("TabMail/Views/Inbox/DynamicIslandChatButton.swift")
         #expect(!island.contains("fieldFill.apply(.completed)") && !island.contains("fieldFill.apply(.confirmationCard)"),
                 "the pill never applies a request's transition to the chat it shows")
-        #expect(island.components(separatedBy: "ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)").count == 3,
-                "a send's and a resume's answer complete on the key captured at send")
+        #expect(island.components(separatedBy: "ChatFieldWords.shared.apply(.answered, to: fieldWordsKey)").count == 4,
+                "a send's, a resume's and the closed field's compose's answer complete on the key captured at send")
         let router = try Self.source("TabMail/Services/AI/AgentToolRouter.swift")
         #expect(router.contains("if case .sent = outcome, let fieldWordsKey { ChatFieldWords.shared.apply(.completed, to: fieldWordsKey) }"))
         let sink = try Self.source("TabMail/Services/AI/Tools/ToolInvocation.swift")

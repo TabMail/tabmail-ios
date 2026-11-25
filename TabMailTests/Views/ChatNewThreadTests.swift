@@ -348,17 +348,14 @@ struct ChatNewThreadTests {
 
     // MARK: - The field and the header
 
-    @Test("The new email's field has its own placeholder; every other field keeps its own")
+    @Test("The new email's field has its own placeholder; a thread's field keeps its own")
     func fieldPlaceholder() {
         let field = Self.newEmailField()
-        let newEmail = ChatReplyField(example: nil, isNoReply: false, newEmail: field)
-        let noReplyNewEmail = ChatReplyField(example: nil, isNoReply: true, newEmail: field)
-        let reply = ChatReplyField(example: nil, isNoReply: false)
-        let noReply = ChatReplyField(example: nil, isNoReply: true)
+        let newEmail = ChatReplyField(example: nil, newEmail: field)
+        let reply = ChatReplyField(example: nil)
         #expect(newEmail.placeholder == "Message or ask anything")
-        #expect(noReplyNewEmail.placeholder == ChatNewEmailField.placeholder)
-        #expect(reply.placeholder == "Reply or ask anything")
-        #expect(noReply.placeholder == "Ask anything")
+        #expect(newEmail.placeholder == ChatNewEmailField.placeholder)
+        #expect(reply.placeholder == "Write your reply")
         #expect(reply.newEmail == nil)
     }
 
@@ -590,8 +587,9 @@ struct ChatNewThreadTests {
         let intercept = try #require(pill.range(of: "if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people }", range: send.upperBound..<pill.endIndex))
         let sent = try #require(pill.range(of: "fieldFill.apply(.sentFromField)", range: send.upperBound..<pill.endIndex))
         #expect(intercept.lowerBound < sent.lowerBound, "its Send is the chat's, before any agent send")
-        // With people picked, the words go to the agent as a reply's do, with the new email's nudge.
-        #expect(Self.count("sendAgentChat(text, field: send, newEmailTo: newEmailTo)", in: pill) == 1)
+        // With people picked, the words go to the agent with the new email's nudge. A new email's
+        // chat has no email to reply to, so its send carries no reply field.
+        #expect(Self.count("sendAgentChat(text, newEmailTo: newEmailTo)", in: pill) == 1)
         #expect(Self.count("} else if let newEmailTo { enrichedText = ChatNewEmailField.agentMessage(to: newEmailTo, text: text) } else {", in: pill) == 1)
         #expect(Self.count(".task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }", in: pill) == 1)
         #expect(Self.count(".onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }", in: pill) == 1)

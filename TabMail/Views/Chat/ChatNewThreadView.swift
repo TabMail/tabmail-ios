@@ -253,7 +253,7 @@ struct ChatNewThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    example: example, isNoReply: false,
+                    example: example,
                     newEmail: ChatNewEmailField(
                         startWords: model.startWords,
                         sessionKey: model.sessionKey,
