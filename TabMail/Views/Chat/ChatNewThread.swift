@@ -476,7 +476,10 @@ final class ChatNewThreadModel: Hashable {
     /// After the card's Send has its durable outbox row: this chat's saved draft, if it has one,
     /// is discarded through compose's own Discard (`ComposeDraftDiscard`, which also removes the
     /// server's copy), after any save of it in flight. With no saved draft there is nothing to do.
+    /// A draft whose attachments could not be read stays as it is, as the chat said when it
+    /// opened: its files are not in the email sent, and they may be only in that draft.
     func discardSavedDraft() async -> ComposeDraftDiscard.Outcome {
+        guard !attachmentLoadFailed else { return .refused(Self.attachmentLoadMessage) }
         while let running = inFlight { _ = await running.value }
         return await ComposeDraftDiscard.run(
             .wholeDraft, draftId: draftId, epoch: cursor.newEpoch, readState: .loaded,

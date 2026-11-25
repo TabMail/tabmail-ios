@@ -131,7 +131,9 @@ struct ChatNewThreadView: View {
             }
         }
         .undoOutcomesPresented(by: modalId)
-        .task(id: sendKey) { await followSend() }
+        // Followed only until the chat is the sent email's thread, by either swap: then its read of
+        // the Sent folder's headers ends (memory 021).
+        .task(id: threadId == nil ? sendKey : nil) { await followSend() }
         .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
         .onAppear { opened() }
         // The camera's cover hides this screen without closing it.
@@ -346,9 +348,10 @@ struct ChatNewThreadView: View {
     /// Follows the card's send (`sendKey`): its bubble while its row is in the outbox, then the
     /// sent email's thread once its Sent copy is read (`swapToThread`). The email the row names
     /// goes into the key, so the copy is found after the row has gone, and a send again from the
-    /// compose its Undo reopened (a new row, the same draft) is followed too.
+    /// compose its Undo reopened (a new row, the same draft) is followed too. Once the chat is the
+    /// thread, nothing here reads the send again, so the follow ends.
     private func followSend() async {
-        guard let key = sendKey else { return }
+        guard threadId == nil, let key = sendKey else { return }
         do {
             for try await found in ChatNewEmailSend.changes(key) {
                 cardSend = found

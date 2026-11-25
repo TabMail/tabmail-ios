@@ -5,6 +5,7 @@
 import Foundation
 import GRDB
 import SwiftUI
+import Synchronization
 import Testing
 import UIKit
 @testable import TabMail
@@ -547,24 +548,11 @@ struct ChatNewThreadScreenTests {
                     try await Self.waitUntil { Self.hasUndo(screen) }
                     #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
                     let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
-                    var copy = MessageHeader(
-                        messageId: "screen-sent-copy", subject: "Lunch", from: "me@example.com", fromAddress: "me@example.com",
-                        to: "maria@example.com", date: Date(), snippet: "Lunch on Friday?",
-                        folderId: MessageIdentity.folderId(accountId: Self.accountId, folderPath: "Sent"),
-                        accountId: Self.accountId, folderPath: "Sent", isInInbox: false)
-                    copy.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
-                    copy.headerComplete = true
-                    copy.bodyComplete = true
-                    copy.isRead = true
-                    let stored = copy
-                    try await fixture.pool.write { try stored.insert($0) }
+                    let copy = Self.sentFolderHeader("screen-sent-copy", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    try await fixture.pool.write { try copy.insert($0) }
 
-                    @MainActor func isThread() -> Bool {
-                        let ids = HostedAccessibility.identifiers(in: screen.view)
-                        return ids.contains(ChatThreadView.forwardId) && Self.labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
-                    }
-                    try await Self.waitUntil { isThread() }
-                    #expect(isThread(), "the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    #expect(Self.isThread(screen), "the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
                     #expect(HostedAccessibility.identifiers(in: screen.view).contains(ChatNewThreadView.backId), "with the chat's own Back")
                     #expect(screen.stage.pushed != nil, "control: still open")
 
@@ -576,11 +564,83 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("Once the chat is the sent email's thread, new mail in the Sent folder no longer reads the send: its follow has ended")
+    func threadEndsTheSendFollow() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        // The send's read of its Sent copy (`ChatNewEmailSend.sentCopy`), and no other statement.
+        let reads = StatementCount("INDEXED BY messageHeader_rfc822MessageId WHERE folderId")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend(counting: reads) { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    try await Self.settle()
+                    let following = reads.count
+                    #expect(following > 0, "control: the follow reads the send's Sent copy")
+                    let before = Self.sentFolderHeader("screen-sent-before", rfc822MessageId: "before@example.com")
+                    try await fixture.pool.write { try before.insert($0) }
+                    try await Self.waitUntil { reads.count > following }
+                    #expect(reads.count > following, "control: while the chat follows the send, new mail in Sent reads it again")
+
+                    let copy = Self.sentFolderHeader("screen-sent-copy", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    try await fixture.pool.write { try copy.insert($0) }
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    #expect(Self.isThread(screen), "control: the chat is the sent email's thread")
+                    try await Self.settle()
+                    let atThread = reads.count
+                    let after = Self.sentFolderHeader("screen-sent-after", rfc822MessageId: "after@example.com")
+                    try await fixture.pool.write { try after.insert($0) }
+                    for _ in 0..<3 { try await Self.settle() }
+                    #expect(reads.count == atThread, "the thread's chat reads the send no more: \(reads.count - atThread) reads after it")
+                    #expect(Self.isThread(screen), "control: still the thread")
+                }
+            }
+        }
+    }
+
+    @Test("A reopened draft whose attachments could not be read is kept when the card sends its email: those files were not in it")
+    func unreadableAttachmentsDraftKeptBySend() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                let reopening: @MainActor (Fixture) async throws -> Draft = { fixture in
+                    try await self.savedDraft(fixture, body: "", unreadableAttachment: true)
+                }
+                try await withCardSend(reopening: reopening) { fixture, model, screen in
+                    #expect(model.attachmentLoadFailed, "control: the attachments could not be read")
+                    let savedRow = try await row(fixture, model.draftId)
+                    let saved = try #require(savedRow, "control: the draft is saved")
+                    #expect(saved.attachmentsDirName != nil, "control: the draft names its attachments")
+                    try await Self.waitUntil { Self.alert(screen)?.title == ChatNewThreadView.attachmentLoadTitle }
+                    let alert = try #require(Self.alert(screen), "control: the chat says so as it opens")
+                    try Self.press("OK", on: alert)
+                    try await Self.waitUntil { Self.alert(screen) == nil }
+
+                    let sent = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    #expect(sent.draftId != model.draftId, "control: the card sent from its own draft")
+                    try await Self.waitUntil { !DraftSessionRegistry.shared.isActive(model.draftId) }
+                    #expect(!DraftSessionRegistry.shared.isActive(model.draftId), "control: the chat is done with the sent email's draft")
+                    let kept = try await row(fixture, model.draftId)
+                    #expect(kept != nil, "the saved draft is kept")
+                    #expect(kept?.attachmentsDirName == saved.attachmentsDirName, "with its attachments named as before")
+                }
+            }
+        }
+    }
+
     /// The new email's chat, to Maria, with a fake backend that writes the email the field's words
     /// ask for (the field's compose edit) on no real network, the account's Sent and Drafts folders, and the
-    /// consent held off so no send reaches a real summary call (`SentEmailSummary.mayRun`).
-    private func withCardSend(_ body: @MainActor (Fixture, ChatNewThreadModel, Screen) async throws -> Void) async throws {
-        let fixture = try fixture()
+    /// consent held off so no send reaches a real summary call (`SentEmailSummary.mayRun`). With
+    /// `counting`, the database counts the statements it names; with `reopening`, the chat is that
+    /// saved draft's, reopened.
+    private func withCardSend(
+        counting statements: StatementCount? = nil,
+        reopening makeDraft: (@MainActor (Fixture) async throws -> Draft)? = nil,
+        _ body: @MainActor (Fixture, ChatNewThreadModel, Screen) async throws -> Void
+    ) async throws {
+        let fixture = try statements.map { try self.fixture(counting: $0) } ?? self.fixture()
         defer { finish(fixture) }
         try FolderEpochTestFixture.insertFolder(accountId: Self.accountId, path: "Sent", role: .sent, pool: fixture.pool)
         try FolderEpochTestFixture.insertFolder(accountId: Self.accountId, path: "Drafts", role: .drafts, pool: fixture.pool)
@@ -603,7 +663,12 @@ struct ChatNewThreadScreenTests {
         }
         service.dismiss()
         while service.reopenSnapshot != nil { service.finishReopen() }
-        let model = ChatNewThreadModel(account: fixture.account)
+        let model: ChatNewThreadModel
+        if let draft = try await makeDraft?(fixture) {
+            model = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { _, _ in true })
+        } else {
+            model = ChatNewThreadModel(account: fixture.account)
+        }
         model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
         try await withScreen(model) { screen in try await body(fixture, model, screen) }
     }
@@ -647,6 +712,12 @@ struct ChatNewThreadScreenTests {
     /// The Sending bubble's Undo is on screen.
     private static func hasUndo(_ screen: Screen) -> Bool {
         HostedAccessibility.identifiers(in: screen.view).contains(ChatUndoSendStatus.undoId)
+    }
+
+    /// The chat is the sent email's thread: the thread's Forward shows, the new email's hint does not.
+    private static func isThread(_ screen: Screen) -> Bool {
+        HostedAccessibility.identifiers(in: screen.view).contains(ChatThreadView.forwardId)
+            && labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
     }
 
     @Test("With someone picked, the header's sheet lists who is picked, and the user's own addresses (every account's) typed there are not added")
@@ -1136,6 +1207,39 @@ struct ChatNewThreadScreenTests {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         let account = try FolderEpochTestFixture.makeAccount(id: Self.accountId, provider: .imap, pool: pool)
         return Fixture(pool: pool, directory: directory, previous: previous, account: account)
+    }
+
+    /// The fixture, its database counting the statements `statements` names.
+    private func fixture(counting statements: StatementCount) throws -> Fixture {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB(trace: { statements.record($0) })
+        let account = try FolderEpochTestFixture.makeAccount(id: Self.accountId, provider: .imap, pool: pool)
+        return Fixture(pool: pool, directory: directory, previous: previous, account: account)
+    }
+
+    /// How many statements the database ran that contain `marker`, on any connection.
+    private final class StatementCount: Sendable {
+        private let marker: String
+        private let seen = Mutex(0)
+        init(_ marker: String) { self.marker = marker }
+        func record(_ sql: String) {
+            guard sql.contains(marker) else { return }
+            seen.withLock { $0 += 1 }
+        }
+        var count: Int { seen.withLock { $0 } }
+    }
+
+    /// A header in the account's Sent folder, as a sync or the send's optimistic copy writes it.
+    private static func sentFolderHeader(_ id: String, rfc822MessageId: String) -> MessageHeader {
+        var copy = MessageHeader(
+            messageId: id, subject: "Lunch", from: "me@example.com", fromAddress: "me@example.com",
+            to: "maria@example.com", date: Date(), snippet: "Lunch on Friday?",
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: "Sent"),
+            accountId: accountId, folderPath: "Sent", isInInbox: false)
+        copy.rfc822MessageId = rfc822MessageId
+        copy.headerComplete = true
+        copy.bodyComplete = true
+        copy.isRead = true
+        return copy
     }
 
     private func finish(_ fixture: Fixture) {
