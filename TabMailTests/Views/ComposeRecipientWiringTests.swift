@@ -135,8 +135,8 @@ struct ComposeRecipientWiringTests {
         let start = try #require(text.range(of: "private func recomputeReply() {"))
         let end = try #require(text[start.upperBound...].range(of: "// MARK: - "))
         let action = String(text[start.upperBound..<end.lowerBound])
-        #expect(Self.count("guard !Task.isCancelled else { return } shownSuggestion = result }", in: action) == 1,
-                "the new reply replaces the suggestion; no reply keeps it")
+        #expect(Self.count("guard !Task.isCancelled else { return } shownSuggestion = result writtenEmail = result }", in: action) == 1,
+                "the new reply replaces the suggestion, and is the email written in the card; no reply keeps both")
         #expect(Self.count("shownSuggestion", in: action) == 1, "nothing else changes the suggestion")
         #expect(Self.count("isRecomputing = true", in: action) == 1)
         #expect(Self.count("isRecomputing = false", in: action) == 1)
