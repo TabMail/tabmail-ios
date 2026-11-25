@@ -1023,8 +1023,10 @@ final class MessageDetailViewModel {
                     self.pendingRefreshIds.insert(updatedId)
                     return
                 }
-                applyOverlay(to: &updated)
-                self.message = updated
+                if storedRowIsShownMessage(held: self.message, stored: updated) {
+                    applyOverlay(to: &updated)
+                    self.message = updated
+                }
             }
         }
 
@@ -1042,7 +1044,8 @@ final class MessageDetailViewModel {
                 // shrink `threadMessages` during the suspension — a stale
                 // index would subscript out of bounds or overwrite the wrong
                 // row.
-                if let idx = self.threadMessages.firstIndex(where: { $0.id == updatedId }) {
+                if let idx = self.threadMessages.firstIndex(where: { $0.id == updatedId }),
+                   storedRowIsShownMessage(held: self.threadMessages[idx], stored: updated) {
                     // Field-level move preserve: AI/display fields always flow
                     // from the fresh row; local folder fields survive only
                     // while the move op is in flight (see preservingLocalMove).
@@ -1052,6 +1055,24 @@ final class MessageDetailViewModel {
                 }
             }
         }
+    }
+
+    /// Whether a per-row refresh may replace the row the screen holds with the row
+    /// stored under its id (tabmail-ios #1138). After a mailbox reset (a UIDVALIDITY
+    /// change) a different email can be stored under an id the screen still holds,
+    /// and swapping it in would let the chat's actions and Undo act on, or record, an
+    /// email the screen never loaded. `ExpectedMessageIdentity` only refuses: on a
+    /// different Message-ID, or, when the held row has none, a different proven
+    /// epoch. A held row with no witness, or no held row, never refuses. It never
+    /// picks a row, so ADR-IOS-068 D4 holds. A refused refresh leaves the held row
+    /// as it is; the next thread load decides what the screen shows.
+    private func storedRowIsShownMessage(held: MessageHeader?, stored: MessageHeader) -> Bool {
+        guard let held, let identity = ExpectedMessageIdentity(header: held) else { return true }
+        if identity.matches(stored) { return true }
+        if DebugModeManager.isLoggingEnabled() {
+            BackgroundSyncLogger.logDebug("[DetailRender] refresh KEPT the shown row \(stored.id.prefix(40)): the row stored under its id is a different message")
+        }
+        return false
     }
 
     /// Field-level preserve for a locally-moved thread bubble
