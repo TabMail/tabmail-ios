@@ -295,36 +295,12 @@ extension AccountManager {
                     return (existing.id, true, nil, existing.holdUntil)
                 }
                 try outboxToInsert.insert(db)
-                // Optimistic isReplied/isForwarded — matches markRead/archive pattern.
-                // Server state overwrites on next sync (~90s). No rollback needed.
-                guard let originalId = replyToHeaderId else {
-                    return (outboxToInsert.id, false, nil, outboxToInsert.holdUntil)
-                }
-                guard let original = try resolveOriginalMessage(
-                    originalId: originalId,
-                    inReplyTo: inReplyTo,
-                    accountId: accountId,
-                    db: db
-                ) else { return (outboxToInsert.id, false, nil, outboxToInsert.holdUntil) }
-                if isForward {
-                    try db.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [original.id])
-                } else {
-                    try db.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [original.id])
-                    // Clear "Reply" action tag — user already committed to replying.
-                    // PendingOperation(.setTag) for server sync stays in finalizeOutboxMessage.
-                    if original.actionTag == .reply {
-                        // Raw SQL (not `MessageHeader.setActionTag`) because this
-                        // path deliberately updates by id without materialising the
-                        // row — so it stamps `actionTagSetAt` explicitly to keep
-                        // `actionTag != nil ⇒ actionTagSetAt != nil`. `ActionTag.none`
-                        // here is the real tag VALUE "none", not Optional.none.
-                        try db.execute(
-                            sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ?, actionTagSetAt = ? WHERE id = ?",
-                            arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, Date(), original.id]
-                        )
-                    }
-                }
-                return (outboxToInsert.id, false, original.id, outboxToInsert.holdUntil)
+                // No mark on the original here. Its replied/forwarded mark and the cleared
+                // Reply tag are written when the send goes out (deleteCompletedSendAtomic),
+                // together with the server ops, so an Undo inside the hold leaves the
+                // original exactly as it was. Sync never clears isReplied, so an early
+                // mark here outlived every undone send (#1468).
+                return (outboxToInsert.id, false, nil, outboxToInsert.holdUntil)
             }
             // Deduped → the attachments dir we just wrote (named by the discarded
             // new outbox.id) is orphaned; clean it up. The kept (existing) row owns
