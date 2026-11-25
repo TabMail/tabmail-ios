@@ -1001,7 +1001,7 @@ struct UidValidityResetPurgeCompanionTests {
             accountId: "t4s4-handoff-other", folderPath: "Archive", messageId: "4204")
         let nestedOld = id("INBOX:Sub", "4104")
         let nestedNew = id("Archive", "4205")
-        try pool.write { db in
+        try await pool.write { db in
             MessageHeaderRekey.publishAddressHandoffsAfterCommit([
                 HeaderRekeyRecord(oldHeaderId: leftInbox, newHeaderId: archived,
                                   newProviderMessageId: "4201", newObservedUidValidity: Self.oldEpoch),
@@ -1090,7 +1090,7 @@ struct UidValidityResetPurgeCompanionTests {
         // The forgotten link's address is linked again (the email now at INBOX
         // 4101 is moved later): it is one link, counted once.
         let movedAgain = id("Archive", "4206")
-        try pool.write { db in
+        try await pool.write { db in
             MessageHeaderRekey.publishAddressHandoffsAfterCommit([
                 HeaderRekeyRecord(oldHeaderId: leftInbox, newHeaderId: movedAgain,
                                   newProviderMessageId: "4206", newObservedUidValidity: Self.newEpoch)
