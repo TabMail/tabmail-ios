@@ -625,7 +625,7 @@ struct AICacheExpiryTests {
         let inboxKey = try insertEntry(env, rfc: "inbox@example.com", updatedAt: expired)
 
         await SyncEngine.runWALMaintenance(
-            dbPool: pool(env), includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
+            dbPool: pool(env), prune: nil, undoProtectedBodyIds: [], pruneOrder: [:])
 
         let after = try entries(env)
         #expect(after[archivedKey] == nil, "maintenance left an archived message's expired entry")

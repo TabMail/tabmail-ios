@@ -415,7 +415,7 @@ actor SyncEngine {
     /// - BodyAssetStore steps read a NON-WAL App-Group `DatabaseQueue` whose read lock
     ///   cannot be aborted at process suspension (`0xdead10cc`) → foreground-only.
     /// See ADR-IOS-046.
-    func scheduleMaintenanceInBackground(includePrune: Bool = false) {
+    func scheduleMaintenanceInBackground(prune: StorageEstimator.PruneGate?) {
         maintenanceTask?.cancel()
         let pool = AppDatabase.backgroundPool
         let pruneOrder = pruneOrderByAccount()
@@ -425,10 +425,10 @@ actor SyncEngine {
                 Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
             }
             await SyncEngine.runWALMaintenance(
-                dbPool: pool, includePrune: includePrune,
+                dbPool: pool, prune: prune,
                 undoProtectedBodyIds: undoProtectedBodyIds, pruneOrder: pruneOrder
             )
-            await SyncEngine.checkpointWALThrottled(truncate: includePrune)
+            await SyncEngine.checkpointWALThrottled(truncate: prune != nil)
             await SyncEngine.runBodyAssetMaintenance()
         }
     }
@@ -463,19 +463,24 @@ actor SyncEngine {
     /// expiry is async as well, only so it can await a WAL checkpoint between its
     /// batches; its reads and writes stay synchronous. The stale-body evict awaits
     /// the throttled WAL checkpoint between its pages (#1354); its page writes stay
-    /// the pass-through write. Every other step here is unchanged and still
-    /// synchronous. Both callers already run inside detached tasks, so this adds no
-    /// new concurrency.
+    /// the pass-through write. The storage prune awaits its in-use measure and each
+    /// header batch's release (#1437); its reads and writes stay the pass-through
+    /// ones. Every other step here is unchanged and still synchronous. Both callers
+    /// already run inside detached tasks, so this adds no new concurrency.
+    ///
+    /// `prune` is which storage prune runs first, if any: `.foreground` from the
+    /// foreground poll, `.overnight` from the background processing job
+    /// (`StorageEstimator.PruneGate`, #1437).
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
-        includePrune: Bool,
+        prune: StorageEstimator.PruneGate?,
         undoProtectedBodyIds: Set<String>,
         pruneOrder: [String: StaleWindowMode]
     ) async {
         func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
         let t0 = CFAbsoluteTimeGetCurrent()
-        if includePrune && shouldRun() {
-            runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder)
+        if let prune, shouldRun() {
+            await runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder, gate: prune)
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
@@ -522,7 +527,7 @@ actor SyncEngine {
             await runRefreshPlannerStatisticsIfStale(dbPool: dbPool)
         }
         let t5 = CFAbsoluteTimeGetCurrent()
-        if includePrune {
+        if prune != nil {
             BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuildAndAnalyze=\(Int((t5-t4)*1000))ms")
         } else {
             BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuildAndAnalyze=\(Int((t5-t4)*1000))ms")

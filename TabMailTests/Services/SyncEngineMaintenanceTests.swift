@@ -453,6 +453,42 @@ struct SyncEngineMaintenanceTests {
                 "each step's parameter with its default and its one call, and no caller passing another: \(uses)")
     }
 
+    /// The storage prune's checkpoint after each batch (#1437): its default is the
+    /// throttled `PASSIVE` checkpoint, as the evict step's is, and both its passes
+    /// call it. The tests that run the prune pass their own, so only the source
+    /// shows which one production runs.
+    @Test("Production's storage prune checkpoints after each batch with the throttled PASSIVE checkpoint, its default, and no caller passes another")
+    func storagePruneCheckpointsWithTheThrottledCheckpoint() {
+        let uses = Self.productionCodeLines()
+            .filter { $0.code.contains("afterEachBatch") }
+            .map { "\($0.file): \($0.code)" }
+            .sorted()
+        let expected = [
+            "SyncEngineMaintenance.swift: afterEachBatch: () async -> Void",
+            "SyncEngineMaintenance.swift: afterEachBatch: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }",
+            "SyncEngineMaintenance.swift: afterEachBatch: afterEachBatch)",
+            "SyncEngineMaintenance.swift: await afterEachBatch()",
+            "SyncEngineMaintenance.swift: await afterEachBatch()",
+        ].sorted()
+        #expect(uses == expected,
+                "the prune's parameter with its default, the body pass's, its two calls, and no caller passing another: \(uses)")
+    }
+
+    /// The storage prune and the older-mail walk walk the storage folder only
+    /// through `StorageEstimator.SpaceSource.app`, once per run, never in a write
+    /// (#1437); until #1437 both called the walk before every folder, page or row.
+    @Test("Neither the storage prune nor the older-mail walk walks the storage folder itself")
+    func thePruneAndTheWalkMeasureOnlyThroughTheSpaceSource() {
+        let files: Set = ["SyncEngineMaintenance.swift", "SyncEngineBackfillWalk.swift"]
+        let lines = Self.productionCodeLines().filter { files.contains($0.file) }
+        let read = Set(lines.map { $0.file })
+        #expect(read == files, "setup: the files read: \(read)")
+        let walks = lines
+            .filter { $0.code.contains("totalSizeMB(") || $0.code.contains("allocatedSizeMB(") || $0.code.contains("isOverBudget(") }
+            .map { "\($0.file): \($0.code)" }
+        #expect(walks.isEmpty, "a walk of the storage folder outside SpaceSource.app: \(walks)")
+    }
+
     /// Every line of production code under `TabMail/`, trimmed, with its file's
     /// name. Comment lines are left out.
     static func productionCodeLines() -> [(file: String, code: String)] {

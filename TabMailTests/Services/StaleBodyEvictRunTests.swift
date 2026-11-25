@@ -220,7 +220,7 @@ struct StaleBodyEvictRunTests {
         let unpairedBefore = try await fixture.pool.read { db in try Int.fetchOne(db, sql: unpaired) ?? 0 }
 
         await SyncEngine.runWALMaintenance(
-            dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
+            dbPool: dbPool, prune: nil, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterFirstPass = try Hold.bodyIds(fixture)
         let firstPass = try await fixture.pool.read { db in
             (built: try Int.fetchOne(
@@ -242,7 +242,7 @@ struct StaleBodyEvictRunTests {
         #expect(analyzedBodies == seeded.count, "setup: the first pass analyzed every body: \(firstPass.bodyStatistics)")
 
         await SyncEngine.runWALMaintenance(
-            dbPool: dbPool, includePrune: false, undoProtectedBodyIds: [], pruneOrder: [:])
+            dbPool: dbPool, prune: nil, undoProtectedBodyIds: [], pruneOrder: [:])
         let afterSecondPass = try Hold.bodyIds(fixture)
         let bodyStatisticsAfterSecondPass = try await fixture.pool.read { db in
             try String.fetchAll(db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = 'messageBody' ORDER BY idx")

@@ -26,7 +26,7 @@ import Synchronization
 /// unlinked once, on the first launch after upgrade, by
 /// `StartupMigrations.deleteLegacyLogFiles(in:)` — stranded, they would still
 /// count toward `StorageEstimator`'s budget and could buy their size in pruned
-/// mail. CONDITIONALLY: `isOverBudget()` is
+/// mail. CONDITIONALLY: `isOverBudget()` (the check before #1437) was
 /// `budgetMB != Int.max && totalSizeMB() >= budgetMB` and `defaultBudgetMB` is
 /// `Int.max`, so that consequence exists only for a user who has configured a
 /// finite budget. Stating it categorically is wrong.

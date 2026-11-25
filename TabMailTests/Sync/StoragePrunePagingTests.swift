@@ -113,6 +113,18 @@ struct StoragePrunePagingTests {
             let result = try body()
             return (result, state.withLock { $0.recorded }.filter(\.readsHeaders))
         }
+
+        /// `headerReads` for an async `body` (the prune passes are async since #1437).
+        /// A name of its own: as an overload, a closure passed in an async test would
+        /// bind it, and GRDB's async `read` inside that closure with it.
+        func asyncHeaderReads<T>(
+            isolation: isolated (any Actor)? = #isolation, _ body: () async throws -> T
+        ) async rethrows -> (result: T, reads: [StatementPages]) {
+            state.withLock { $0.recording = true; $0.recorded = [] }
+            defer { state.withLock { $0.recording = false } }
+            let result = try await body()
+            return (result, state.withLock { $0.recorded }.filter(\.readsHeaders))
+        }
     }
 
     struct Fixture {
@@ -209,6 +221,12 @@ struct StoragePrunePagingTests {
                 SELECT id, '<p>body</p>', NULL, ?, NULL FROM messageHeader WHERE rowid % 5 != 0
                 """, arguments: [Date()])
         }
+    }
+
+    /// `fixture.pool.read`'s synchronous overload, for an async test: from an async
+    /// context Swift binds GRDB's async `read`, which takes only `@Sendable` closures.
+    static func readNow<T>(_ fixture: Fixture, _ value: (Database) throws -> T) throws -> T {
+        try fixture.pool.read(value)
     }
 
     static func bodyIds(_ fixture: Fixture) throws -> Set<String> {
@@ -328,7 +346,7 @@ struct StoragePrunePagingTests {
 
     @Test("The body pass deletes the former walk's bodies page by page and stops where it stopped",
           arguments: Shape.all)
-    func theBodyPassTakesTheFormerPages(_ shape: Shape) throws {
+    func theBodyPassTakesTheFormerPages(_ shape: Shape) async throws {
         let fixture = try Self.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         try Self.seedHeaders(fixture, path: "Archive", rows: shape.rows())
@@ -336,7 +354,7 @@ struct StoragePrunePagingTests {
         try Self.seedHeaders(fixture, path: "INBOX", rows: Shape(mode: shape.mode, count: 120, ties: [], pages: 2).rows())
         let folderId = fixture.folderId("Archive")
 
-        let allPages = try fixture.pool.read { db in
+        let allPages = try Self.readNow(fixture) { db in
             try Self.formerPages(db, folderId: folderId, mode: shape.mode, isOverBudget: { true })
         }
         #expect(allPages.count == shape.pages, "setup: the former walk takes \(allPages.count) pages, not \(shape.pages)")
@@ -348,15 +366,16 @@ struct StoragePrunePagingTests {
             try Self.resetBodies(fixture)
             let before = try Self.bodyIds(fixture)
             let formerBudget = ScriptedBudget(allowed: allowed)
-            let pages = try fixture.pool.read { db in
+            let pages = try Self.readNow(fixture) { db in
                 try Self.formerPages(db, folderId: folderId, mode: shape.mode, isOverBudget: formerBudget.isOverBudget)
             }
             let expectedDeleted = before.intersection(pages.flatMap { $0 })
 
             let budget = ScriptedBudget(allowed: allowed)
-            let removed = SyncEngine.pruneFolderBodies(
+            let removed = await SyncEngine.pruneFolderBodies(
                 dbPool: fixture.database, folderId: folderId, mode: shape.mode,
-                floor: Self.floor, chunkSize: Self.chunk, isOverBudget: budget.isOverBudget)
+                floor: Self.floor, chunkSize: Self.chunk, aboveTarget: { budget.isOverBudget() },
+                afterEachBatch: {})
             let after = try Self.bodyIds(fixture)
 
             #expect(budget.calls == formerBudget.calls,
@@ -498,7 +517,7 @@ struct StoragePrunePagingTests {
 
     @Test("A body-pass page costs the same at the end of a large folder as at its start, and each check is bounded",
           arguments: [StaleWindowMode.uid, .date])
-    func aPageCostsTheSameWhereverItLies(_ mode: StaleWindowMode) throws {
+    func aPageCostsTheSameWhereverItLies(_ mode: StaleWindowMode) async throws {
         let fixture = try Self.makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
         try Self.seedHeaders(fixture, path: "Archive", rows: Shape(mode: mode, count: Self.largeFolder, ties: [], pages: 0).rows())
@@ -538,10 +557,10 @@ struct StoragePrunePagingTests {
         #expect(formerLast - formerFirst > Self.growthMargin,
                 "setup: the meter does not see the former page grow: \(formerFirst) pages at the folder's start, \(formerLast) at its end")
 
-        let run = fixture.meter.headerReads {
-            SyncEngine.pruneFolderBodies(
+        let run = await fixture.meter.asyncHeaderReads {
+            await SyncEngine.pruneFolderBodies(
                 dbPool: fixture.database, folderId: fixture.folderId("Archive"), mode: mode,
-                floor: Self.floor, chunkSize: Self.chunk, isOverBudget: { true })
+                floor: Self.floor, chunkSize: Self.chunk, aboveTarget: { true }, afterEachBatch: {})
         }
         let pages = run.reads.filter { !$0.isCount }.map(\.pages)
         let checks = run.reads.filter(\.isCount).map(\.pages)

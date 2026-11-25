@@ -764,6 +764,18 @@ actor SearchIndex {
         return rowid
     }
 
+    #if DEBUG
+    /// TEST ONLY: the columns the unchanged check of `indexHeaders(_:skippingUnchanged:)`
+    /// compares (`HeaderEntryWrite`): the shard row's, then the `message_meta` row's.
+    static var unchangedCheckColumnsForTesting: (shard: [String], meta: [String]) {
+        let key = ContentKey(rawValue: "account:INBOX:1")
+        let record = FTSHeaderRecord(contentKey: key, headerId: key.rawValue, messageId: "1",
+                                     subject: "", from: "", to: "", dateMs: 0)
+        let write = HeaderEntryWrite(record, year: 2000, body: "")
+        return (write.shard.map(\.name), write.meta.map(\.name))
+    }
+    #endif
+
     /// TEST ONLY: the stored CREATE statement for a year shard.
     func testShardCreateSQL(year: Int) async throws -> String? {
         guard let dbPool else { return nil }
@@ -1032,7 +1044,92 @@ actor SearchIndex {
     private enum HeaderUpsertResult {
         case inserted
         case updated
+        /// The entry already held every value the write sets, and the caller asked
+        /// to leave such an entry alone (`indexHeaders(_:skippingUnchanged:)`).
+        case unchanged
         case refusedOlderGeneration
+    }
+
+    /// The columns `upsertHeader` sets on an entry already at its content key, each
+    /// with the value it sets. The shard and `message_meta` writes are built from
+    /// these two lists, and the unchanged check compares the stored rows with the
+    /// same lists, so it checks every column the write sets.
+    /// `SearchIndexHeaderSkipTests` fails if the upsert sets any other column.
+    private struct HeaderEntryWrite {
+        typealias Column = (name: String, value: DatabaseValue)
+
+        /// The shard row's columns, the body included.
+        let shard: [Column]
+        /// The `message_meta` row's columns.
+        let meta: [Column]
+
+        /// What the upsert writes for `record` into the shard of `year`, with `body`
+        /// (the stored body it keeps, or the empty body it clears to).
+        init(_ record: FTSHeaderRecord, year: Int, body: String) {
+            shard = [
+                ("msgId", record.messageId.databaseValue),
+                ("subject", record.subject.databaseValue),
+                ("from_", record.from.databaseValue),
+                ("to_", record.to.databaseValue),
+                ("cc", record.cc.databaseValue),
+                ("bcc", record.bcc.databaseValue),
+                ("body", body.databaseValue),
+            ]
+            meta = [
+                ("dateMs", record.dateMs.databaseValue),
+                ("accountId", SearchIndex.accountId(of: record.contentKey).databaseValue),
+                ("shardYear", year.databaseValue),
+                ("folderId", record.folderId.databaseValue),
+                ("identityTokenVersion", SearchIndex.identityTokenVersion.databaseValue),
+                ("identityRfc822MessageId", record.rfc822MessageId.databaseValue),
+                ("identityUidValidity", record.uidValidity.databaseValue),
+                ("identityResetAtMs", record.resetAtMs.databaseValue),
+                ("identityStableProvider",
+                 record.contentKeySpace.map { $0 == .stableProviderId }.databaseValue),
+            ]
+        }
+
+        /// `name = ?` for each column, comma-separated, for an UPDATE's SET.
+        static func assignments(_ columns: [Column]) -> String {
+            columns.map { "\($0.name) = ?" }.joined(separator: ", ")
+        }
+
+        /// Whether `shardRow` and `metaRow` already hold every value this write sets.
+        func isStored(shardRow: Row, metaRow: Row) -> Bool {
+            Self.holds(shardRow, shard) && Self.holds(metaRow, meta)
+        }
+
+        /// Whether `row` holds each of `columns` exactly as the write would store it.
+        /// A column the row lacks counts as different.
+        private static func holds(_ row: Row, _ columns: [Column]) -> Bool {
+            columns.allSatisfy { column in
+                guard row.hasColumn(column.name) else { return false }
+                let stored: DatabaseValue = row[column.name]
+                return sameStoredValue(stored, column.value)
+            }
+        }
+
+        /// Equal only when SQLite holds the same value: the same storage class, and
+        /// text compared byte for byte. (`DatabaseValue`'s `==` compares text with
+        /// Swift's `String` equality, which also treats two Unicode forms of the same
+        /// text as equal; skipping on that would keep the stored form where the write
+        /// stores the other.)
+        private static func sameStoredValue(_ stored: DatabaseValue, _ written: DatabaseValue) -> Bool {
+            switch (stored.storage, written.storage) {
+            case (.null, .null):
+                return true
+            case let (.int64(lhs), .int64(rhs)):
+                return lhs == rhs
+            case let (.double(lhs), .double(rhs)):
+                return lhs == rhs
+            case let (.string(lhs), .string(rhs)):
+                return lhs.utf8.elementsEqual(rhs.utf8)
+            case let (.blob(lhs), .blob(rhs)):
+                return lhs == rhs
+            default:
+                return false
+            }
+        }
     }
 
     /// What a header write may do to the CONTENT (indexed body + embedding) already
@@ -1112,7 +1209,13 @@ actor SearchIndex {
     /// `SyncEngineBackfillDeep`, `AccountManagerActions`, `AccountManagerOutbox`,
     /// `DemoModeService`. All nine pass a real `folderId`, which is why the meta
     /// UPDATE below may refresh that column without blanking a correct one.
-    func indexHeaders(_ records: [FTSHeaderRecord]) throws -> Int {
+    ///
+    /// `skippingUnchanged`: leave alone an entry that already holds every value the
+    /// write would set (`HeaderEntryWrite`), with its body and embedding kept. The
+    /// index ends exactly as the write would leave it, without rewriting the entry.
+    /// Only the bulk index walk asks for it: it re-indexes every header of an
+    /// account, nearly all of them held already (`SyncEngine.bulkIndexWritePage`).
+    func indexHeaders(_ records: [FTSHeaderRecord], skippingUnchanged: Bool = false) throws -> Int {
         ensureReady()
         guard let dbPool, !records.isEmpty else { return 0 }
 
@@ -1122,13 +1225,13 @@ actor SearchIndex {
             // LOOP VARIANT: the number of elements of `records` not yet visited,
             // which strictly decreases by exactly one per iteration and is bounded
             // below by 0. `continue` advances to the next element like any other
-            // arm — no arm re-enters an element, and none of the three results can
+            // arm — no arm re-enters an element, and none of the four results can
             // extend the sequence — so the refusal arm cannot hang the loop.
             for record in records {
-                switch try upsertHeader(record, db: db) {
+                switch try upsertHeader(record, skippingUnchanged: skippingUnchanged, db: db) {
                 case .inserted:
                     inserted += 1
-                case .updated:
+                case .updated, .unchanged:
                     break
                 case .refusedOlderGeneration:
                     continue
@@ -1144,17 +1247,18 @@ actor SearchIndex {
     ///
     /// PORT (`v2final:SearchIndex.upsertLiveHeader`, `486bafd4b`), keyed by
     /// `ContentKey` rather than the reference's raw `headerId` string.
+    ///
+    /// Both reads take the whole row (`meta.*`, `*`): the unchanged check compares
+    /// every column the write sets, and each row is read by key either way.
     private func upsertHeader(
         _ record: FTSHeaderRecord,
+        skippingUnchanged: Bool,
         db: Database
     ) throws -> HeaderUpsertResult {
         guard let mapping = try Row.fetchOne(
             db,
             sql: """
-                SELECT mi.rowid, meta.shardYear, meta.identityTokenVersion,
-                       meta.identityRfc822MessageId,
-                       meta.identityUidValidity, meta.identityResetAtMs,
-                       meta.identityStableProvider
+                SELECT mi.rowid, meta.*
                 FROM message_ids mi
                 JOIN message_meta meta ON meta.rowid = mi.rowid
                 WHERE mi.headerId = ?
@@ -1170,7 +1274,7 @@ actor SearchIndex {
         let oldTable = ftsTableName(year: oldYear)
         guard let oldFTS = try Row.fetchOne(
             db,
-            sql: "SELECT body FROM \(oldTable) WHERE rowid = ?",
+            sql: "SELECT * FROM \(oldTable) WHERE rowid = ?",
             arguments: [rowid]
         ) else {
             // Dangling mapping — id + meta rows with no shard row behind them.
@@ -1205,32 +1309,28 @@ actor SearchIndex {
         }
 
         let newYear = yearFromDateMs(record.dateMs)
+        let write = HeaderEntryWrite(record, year: newYear, body: body)
+        // Only a kept entry is skipped: clearing also deletes the embedding, which
+        // the column lists do not cover. A kept entry's body is the stored body, so
+        // only its header columns and its meta row can differ.
+        if skippingUnchanged, case .preserveAndAdopt = disposition,
+           write.isStored(shardRow: oldFTS, metaRow: mapping) {
+            return .unchanged
+        }
+
         if newYear == oldYear {
             try db.execute(
-                sql: """
-                    UPDATE \(oldTable)
-                    SET msgId = ?, subject = ?, from_ = ?, to_ = ?,
-                        cc = ?, bcc = ?, body = ?
-                    WHERE rowid = ?
-                    """,
-                arguments: [
-                    record.messageId, record.subject, record.from, record.to,
-                    record.cc, record.bcc, body, rowid,
-                ]
+                sql: "UPDATE \(oldTable) SET \(HeaderEntryWrite.assignments(write.shard)) WHERE rowid = ?",
+                arguments: StatementArguments(write.shard.map(\.value) + [rowid.databaseValue])
             )
         } else {
             try ensureShard(year: newYear, db: db)
             let newTable = ftsTableName(year: newYear)
+            let names = write.shard.map(\.name).joined(separator: ", ")
+            let placeholders = Array(repeating: "?", count: write.shard.count).joined(separator: ", ")
             try db.execute(
-                sql: """
-                    INSERT OR REPLACE INTO \(newTable)
-                        (rowid, msgId, subject, from_, to_, cc, bcc, body)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                arguments: [
-                    rowid, record.messageId, record.subject, record.from,
-                    record.to, record.cc, record.bcc, body,
-                ]
+                sql: "INSERT OR REPLACE INTO \(newTable) (rowid, \(names)) VALUES (?, \(placeholders))",
+                arguments: StatementArguments([rowid.databaseValue] + write.shard.map(\.value))
             )
             try db.execute(
                 sql: "DELETE FROM \(oldTable) WHERE rowid = ?",
@@ -1249,24 +1349,9 @@ actor SearchIndex {
             )
         }
 
-        let stableProvider: Bool? = record.contentKeySpace.map {
-            $0 == .stableProviderId
-        }
         try db.execute(
-            sql: """
-                UPDATE message_meta
-                SET dateMs = ?, accountId = ?, shardYear = ?, folderId = ?,
-                    identityTokenVersion = ?, identityRfc822MessageId = ?,
-                    identityUidValidity = ?, identityResetAtMs = ?,
-                    identityStableProvider = ?
-                WHERE rowid = ?
-                """,
-            arguments: [
-                record.dateMs, Self.accountId(of: record.contentKey), newYear,
-                record.folderId, Self.identityTokenVersion,
-                record.rfc822MessageId, record.uidValidity, record.resetAtMs,
-                stableProvider, rowid,
-            ]
+            sql: "UPDATE message_meta SET \(HeaderEntryWrite.assignments(write.meta)) WHERE rowid = ?",
+            arguments: StatementArguments(write.meta.map(\.value) + [rowid.databaseValue])
         )
         return .updated
     }
@@ -2825,6 +2910,24 @@ actor SearchIndex {
             try db.execute(sql: "VACUUM")
         }
         BackgroundSyncLogger.logDebug("[SearchIndex] VACUUM complete")
+    }
+
+    /// The search database's pages and empty pages (`StorageEstimator.PageTotals`),
+    /// whose data the Email Index Limit's measure counts together with the email
+    /// database's (#1437). nil when the database cannot be opened or read.
+    func pageTotals() -> StorageEstimator.PageTotals? {
+        ensureReady()
+        guard let dbPool else { return nil }
+        return (try? dbPool.read { db in try StorageEstimator.PageTotals.read(db) }) ?? nil
+    }
+
+    /// The allocated size of the search database file and its WAL file, in bytes
+    /// (#1437): the storage measure counts the database's data instead
+    /// (`StorageEstimator.SpaceMeter`), as it does the email database's.
+    func databaseFileBytes() -> Int64 {
+        ensureReady()
+        guard let dbPool else { return 0 }
+        return StorageEstimator.databaseFileBytes(ofDatabaseAt: dbPool.path)
     }
 
 

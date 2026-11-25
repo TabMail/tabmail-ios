@@ -652,7 +652,7 @@ final class SyncScheduler {
                     // BGProcessing housekeeping write be taken ahead of a user-action
                     // write already queued in `DatabaseWriteQueue`.
                     await SyncEngine.runWALMaintenance(
-                        dbPool: AppDatabase.backgroundPool, includePrune: true,
+                        dbPool: AppDatabase.backgroundPool, prune: .overnight,
                         undoProtectedBodyIds: undoIds, pruneOrder: pruneOrder
                     )
                 }.value
@@ -1249,7 +1249,7 @@ final class SyncScheduler {
         }
 
         // Run maintenance once per poll cycle (not per account).
-        await manager.syncEngine.scheduleMaintenanceInBackground(includePrune: true)
+        await manager.syncEngine.scheduleMaintenanceInBackground(prune: .foreground)
 
         let pd0 = CFAbsoluteTimeGetCurrent()
         await manager.drainPendingQueue()
