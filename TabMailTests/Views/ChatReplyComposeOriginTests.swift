@@ -179,10 +179,11 @@ struct ChatReplyComposeOriginTests {
 
     /// Runs the agent's reply tool on `arguments`, holding its compose card behind a compose already
     /// on screen; `whileHeld` runs before the card is let through. Returns the card's recipients by
-    /// field, read from the compose the chat opens.
+    /// field, read from the compose the chat opens once its `fields` all show addresses (a check
+    /// that reads a field passes it: the card's rows join the accessibility tree one by one, #1498).
     private static func heldReply(
         in chat: Chat, run: @escaping @MainActor () async throws -> String,
-        whileHeld: @MainActor () async throws -> Void = {}
+        whileHeld: @MainActor () async throws -> Void = {}, showing fields: [String] = ["to"]
     ) async throws -> [String: String] {
         let router = AgentToolRouter.shared
         // A compose on screen holds the agent's request in the queue (ADR-IOS-030).
@@ -196,7 +197,7 @@ struct ChatReplyComposeOriginTests {
         var recipients: [String: String] = [:]
         try await waitUntil {
             recipients = composeRecipients(chat.controller.presentedViewController?.view)
-            return recipients["to"]?.isEmpty == false
+            return fields.allSatisfy { recipients[$0]?.isEmpty == false }
         }
         return recipients
     }
@@ -254,7 +255,7 @@ struct ChatReplyComposeOriginTests {
                 }, whileHeld: {
                     NotificationCenter.default.post(name: .emailPillTapped, object: nil)
                     try await Task.sleep(for: .milliseconds(500))
-                })
+                }, showing: ["to", "cc"])
                 #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"],
                         "the agent's To, not the chat's choice: \(card)")
                 #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "the agent's Cc stays: \(card)")
@@ -328,7 +329,7 @@ struct ChatReplyComposeOriginTests {
                     try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
                 }, whileHeld: {
                     try await Self.replyOnly(untick: ["alex@example.com", "sam@example.com"], in: chat)
-                })
+                }, showing: ["to", "cc"])
                 #expect(Self.addresses(card["to"]) == ["alex@example.com", "david@example.com"], "everyone, as when sent: \(card)")
                 #expect(Self.addresses(card["cc"]) == ["sam@example.com"], "\(card)")
             }
