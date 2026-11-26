@@ -565,8 +565,8 @@ struct ChatNewThreadScreenTests {
     }
 
     @Test("From the Sending bubble to the sent email's thread, every frame shows the email: the new email with its Sending bubble, then the whole thread with its header, its field and the email on the user's side, never a thread still loading or still reading who the user is",
-          arguments: [true, false])
-    func sentCopyTurnsIntoTheThreadWithNoBlink(copyHasItsBody: Bool) async throws {
+          arguments: zip([true, true, false, false, false, false, false, false], 0..<8))
+    func sentCopyTurnsIntoTheThreadWithNoBlink(copyHasItsBody: Bool, attempt: Int) async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation {
             try await Self.withChatView(true) {
@@ -592,7 +592,7 @@ struct ChatNewThreadScreenTests {
                     try await Self.waitUntil { frames.frames.last?.isThread == true }
                     try await Self.settle()
                     frames.stop()
-                    print("[SwapFrames] body=\(copyHasItsBody) \(frames.summary)")
+                    print("[SwapFrames] body=\(copyHasItsBody) attempt=\(attempt) \(frames.summary)")
 
                     let last = frames.frames.last
                     #expect(last?.isThread == true, "control: the chat ends as the whole thread: \(String(describing: last))")
