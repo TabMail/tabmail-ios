@@ -921,6 +921,24 @@ same AI result, kept as long as the email itself is shown.
    as opening it does); Unread stays on the newest email.
    **Product choices of the swipes:** Unread from here skips the user's own emails. Decided
    2026-11-15. A bubble has no full swipe: this follows the 2026-11-04 swipe rules.
+   *Amended 2026-11-25 (simulator check of the whole branch):* a bubble has a full swipe, which
+   replaces the earlier "a bubble has no full swipe" (decided at that check). A long
+   right swipe opened the buttons and stopped there (`allowsFullSwipe: false`, and the clamp held the
+   drag at the buttons' width), so it never ran the read action and read as broken beside the left
+   swipe's full Archive. The read action is the right swipe's edge button, so a full right swipe runs
+   Unread from here or Read up to here. Both swipes show the full-swipe point: past it the edge
+   button's round icon grows (`ChatViewLayout.swipeFullIconScale`, spring
+   `swipeFullIconSpringResponse`), and the system haptic (`.sensoryFeedback(.impact)`) fires once as
+   the drag crosses it; a full swipe that runs its button fires `.success`. The hint and the let-go
+   read one rule (`ChatSwipe.isPastFull`, which `settle` uses). The clip that keeps the buttons inside
+   the revealed width leaves room above and below for the grown icon, and the frame an open reveal
+   owns for taps stays the buttons' row, so a tap above or below them still only closes. The swipe stays custom: SwiftUI's
+   `.swipeActions` exist only on `List` rows. A label stays on one line, shrinking to
+   `ChatViewLayout.swipeLabelMinScale`, and the round buttons are top-aligned in one row: "Unread
+   from here" wrapped onto two lines and lifted its button above Move's. Tests:
+   `ChatSwipeTests.fullSwipeHintMatchesTheLetGo`, `fullSwipeFeelWiring`, `bubbleSwipeWiring`;
+   `ChatSwipeUITests.testFullRightSwipeOnABubbleRunsUnreadFromHere`,
+   `testOwnActionsOpenTapJustAboveTheButtonsOnlyCloses`.
    **Decided 2026-11-06:** a whole-chat action leaves the user's sent copies and
    drafts where they are (a draft must stay in Drafts to stay editable; on Gmail a sent copy is the
    same email as its other labels).
@@ -1092,6 +1110,18 @@ same AI result, kept as long as the email itself is shown.
    action, its Send tapped); `TutorialChatViewContentTests` (`fieldMoves`, `panelAndInboxChatPrompts`,
    `dragHint`, `chatCards`, `welcomeAndRecap`); `TutorialChatViewWiringTests.fieldAndPanelWiring`;
    `ChatReplyFieldTests` (the drag's `opensPanel`); `ChatThreadContextTests.opensInChat`.
+
+   *Amended 2026-11-25 (simulator check of the whole branch):* the panel's card is no longer above its
+   input. It sits at the panel's top, directly under the email card ("Re: ... / sender"), so it never
+   covers the conversation or the Create card's buttons; this holds for both panel cards (the request,
+   then Create). And compose's practice reply has a new stage after "Make it shorter": the card says
+   that Send sends the AI Suggestion as it is and asks for a tap on Send, which in the tutorial sends
+   nothing, opens no undo window and turns the page (`TutorialCoordinator.practiceSendIsNoOp`,
+   `sendAsIsTapped`); the next card asks for Use Suggestion, an edit by hand if wanted, then Send, the
+   practice send as before. Use Suggestion is locked until that tap. Part 2 stays "2 of 3"; Skip works
+   from every stage. Detail in ADR-IOS-038's amendment of the same day. Tests:
+   `TutorialTests.composeFollowsTheSuggestion` (the stage order), `skipFromTheSendAsIsStageResetsIt`,
+   `TutorialChatViewWiringTests.composeSendAsIsWiring` and the placement check in `fieldAndPanelWiring`.
 
 14. **One TabMail chat per thread (amendment 2026-11-16).** An email's TabMail chat belongs to its
    thread, with the chat view on or off. Decided 2026-11-16: "per-mail chat sessions now should be
@@ -1560,7 +1590,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 
 21. **Drag the field up to open the TabMail chat (amendment 2026-11-20).** Until now the panel
    opened only on an agent answer, a confirmation card or `.openMessageWithChat`. A drag up on the
-   collapsed reply field now opens it too, and the field itself swells into the panel: while the
+   collapsed reply field now opens it too (a new email's field takes the same drag since
+   2026-11-25, decision 24), and the field itself swells into the panel: while the
    finger moves, the field's top follows it (`ChatReplyField.drag`, `ChatFieldDrag.swell`, at most
    `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
    swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
@@ -1859,7 +1890,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `ChatNewEmailField`) with "Message or ask anything", an "e.g." line from its own config set
      (`ChatSuggestionConfig.newEmailExamples`), focus as it opens, and a paperclip at the end of the
      text (Photos, Camera, Files; `ChatPaperclipButton`, sized by `FieldButtonSlot`); the row's mic,
-     text and Send keep their places. `DynamicIslandChat.isInboxChat` is false for it, so none of
+     text and Send keep their places. Its field takes the same drag up as a thread's (decision 21:
+     `ChatFieldPan`, `ChatFieldDrag`, VoiceOver "Show TabMail chat") to open the TabMail chat, since
+     its Send writes the email itself and the drag is the way to ask TabMail to do something.
+     `DynamicIslandChat.isInboxChat` is false for it, so none of
      the inbox chat's history, reminders or idle clear applies.
    - *Add recipient.* The header's tap opens the "Reply to" sheet titled "Add recipient"
      (`ChatReplyToSheet(title:)`), starting from the people already picked (none at first) with its
@@ -2058,7 +2092,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        and agent session of its own (`ChatNewThreadModel.init(after:)`; left as it is, it saves
        nothing, and the sent email's discarded generation is never written again). The sent email's
        chat draft, if it was saved, is discarded through compose's own Discard after any save in
-       flight (`ChatNewThreadModel.discardSavedDraft`, `ComposeDraftDiscard`, which removes the
+       flight, except a reopened draft whose attachments could not be read: it is kept as it is, as
+       its save is refused, since those files were not in the email sent and may exist only in that
+       draft (`ChatNewThreadModel.discardSavedDraft`, `ComposeDraftDiscard`, which removes the
        server's copy too), and its session ends. The field starts each new email from that email's
        own words, once per session key (`DynamicIslandChat.startNewEmail`), so the sent words go.
      - The chat shows the email's Sending bubble (`ChatUnsentReplyBubble`: the fill, "Sending · Undo
@@ -2085,7 +2121,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        or the server's, read by folder and Message-ID through `messageHeader_rfc822MessageId`), the
        chat is that email's thread for good (`ChatThreadView(messageId:)` on the Sent copy): later
        replies land there, and the chat's own Back closes it. The change waits while anything is open
-       over the new email (a card, a picker, "Add recipient"), which it would take down. The new
+       over the new email (a card, a picker, "Add recipient", and since 2026-11-25 the TabMail panel,
+       which the field's drag opens at will), which it would take down; it happens as the last of
+       them closes. The panel is not part of `newEmailCovered`, which also decides whether a compose
+       card may present (the panel's own cards present over it). The new
        email and the thread share one container (a `ZStack`, never a `Group`: a Group gives its
        modifiers to each child, so the change would run the screen's close and open and take down
        what it presents, a reopened compose included).
@@ -2093,7 +2132,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        chat's cover hides until it closes.
    Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
    reopen route, the source wiring, including the camera's cover not closing the screen, which is
-   checked only in the source: the simulator has no camera), `ChatNewThreadScreenTests` (the whole
+   checked only in the source: the simulator has no camera; since 2026-11-25 `fieldDragWiring`, the
+   field's drag up, its freeze and the swap's wait for the panel, in the source because a hosted
+   test can neither move the pan nor find it: SwiftUI keeps a representable's recognizer out of the
+   views' `gestureRecognizers`), `ChatNewThreadScreenTests` (since 2026-11-25 `fieldOpensThePanel`,
+   VoiceOver's Show TabMail chat, offered on the drag's condition, opening the panel and not offered
+   over it, and `sentCopyWaitsForTheOpenPanel`, the swap to the thread waiting for the open panel; the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
    row and the opens from Drafts, since 2026-11-22 a link's chat saving on background only once

@@ -481,6 +481,14 @@ struct DynamicIslandChat: View {
                     .padding(.horizontal, 14)
                 }
 
+                if TutorialCoordinator.shared.isRunning, let cardAction = replyField?.tutorialPanelCard {
+                    // Part 2 in Priya's chat: the open panel covers the chat's own card, so the
+                    // panel shows it at its top, under the email card, where it never covers the
+                    // conversation or the Create card's buttons.
+                    TutorialCoachView(host: .chatPanel, onAction: cardAction)
+                        .padding(.top, 6)
+                        .layoutPriority(1)
+                }
                 chatMessagesView
                     .transition(.opacity)
                     .layoutPriority(0)
@@ -490,12 +498,6 @@ struct DynamicIslandChat: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 4)
-                if TutorialCoordinator.shared.isRunning, let cardAction = replyField?.tutorialPanelCard {
-                    // Part 2 in Priya's chat: the open panel covers the chat's own card.
-                    TutorialCoachView(host: .chatPanel, onAction: cardAction)
-                        .padding(.bottom, 6)
-                        .layoutPriority(1)
-                }
                 Divider()
                 if !hasTabMailSession {
                     signInBar
@@ -1846,8 +1848,8 @@ struct DynamicIslandChat: View {
     static let newEmailNotWrittenNote = "Couldn't write your email. Your words are still in the field."
 
     /// A new email's chat opening: its draft's words, once, then its reply field takes the
-    /// keyboard (`InputFocus.replyField`: the panel, which `isTextFieldFocused` focuses, never
-    /// opens in a new email's chat). The next new email after a send (a new session, the chat
+    /// keyboard (`InputFocus.replyField`: the panel, which `isTextFieldFocused` focuses, is closed
+    /// as a new email's chat opens). The next new email after a send (a new session, the chat
     /// already open) starts with its own words, none, in place of the sent email's; the keyboard
     /// is left as it is.
     private func startNewEmail() {

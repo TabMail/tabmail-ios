@@ -34,6 +34,11 @@ struct ChatNewThreadView: View {
     @State private var chatWorking = false
     /// What the agent is doing about a Send from the field, shown above it (`ChatFieldStatusKey`).
     @State private var fieldStatus: String?
+    /// A drag up on the collapsed field, which opens the TabMail panel as a thread's field does
+    /// (`ChatFieldDrag`, `ChatFieldPan`); read only in modifiers, never in this body.
+    @State private var fieldDrag = ChatFieldDrag.Model()
+    /// Cuts off a drag on the field the panel opened under (`ChatFieldPan.Cut`).
+    @State private var fieldPanCut = ChatFieldPan.Cut()
     @State private var showsAddRecipient = false
     @State private var asksForRecipient = false
     /// A save that did not happen, Back's or the background's: shown until the user chooses.
@@ -131,8 +136,12 @@ struct ChatNewThreadView: View {
             }
         }
         .undoOutcomesPresented(by: modalId)
-        .task(id: sendKey) { await followSend() }
+        // Followed only until the chat is the sent email's thread, by either swap: then its read of
+        // the Sent folder's headers ends (memory 021).
+        .task(id: threadId == nil ? sendKey : nil) { await followSend() }
         .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
+        // The TabMail panel closing lets a waiting swap to the sent email's thread happen.
+        .onChange(of: chatExpanded) { _, open in if !open { swapToThread() } }
         .onAppear { opened() }
         // The camera's cover hides this screen without closing it.
         .onDisappear { if !showsCamera { closed() } }
@@ -245,7 +254,9 @@ struct ChatNewThreadView: View {
 
     /// The attachments waiting, then the field: the chat's bottom bar.
     private var bottomBar: some View {
-        VStack(spacing: ChatViewLayout.traySpacing) {
+        // The field's Send writes the email itself; asking TabMail is the drag up, as in a thread.
+        let opensPanel = !chatExpanded
+        return VStack(spacing: ChatViewLayout.traySpacing) {
             if !model.attachments.isEmpty {
                 ChatAttachmentTray(attachments: model.attachments) { model.removeAttachment(at: $0) }
             }
@@ -260,6 +271,9 @@ struct ChatNewThreadView: View {
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
                     example: example,
+                    drag: fieldDrag,
+                    // The drag's VoiceOver equivalent, as in a thread's chat; not over the panel.
+                    showChat: opensPanel ? { withAnimation(.spring(ChatThreadView.pillSpringModel)) { chatExpanded = true } } : nil,
                     newEmail: ChatNewEmailField(
                         startWords: model.startWords,
                         sessionKey: model.sessionKey,
@@ -274,6 +288,18 @@ struct ChatNewThreadView: View {
             .onPreferenceChange(ChatFieldStatusKey.self) { status in
                 withAnimation(.spring(ChatThreadView.pillSpringModel)) { fieldStatus = status }
             }
+            // Drag the field up: it swells under the finger and opens the TabMail panel, as a
+            // thread's field does (`ChatThreadView`). The swell grows the field's glass upward and
+            // is taken back out of the layout here, so nothing moves under the drag.
+            .modifier(ChatFieldDrag.Swell(model: fieldDrag, sign: -1))
+            .gesture(ChatFieldPan(isEnabled: opensPanel,
+                                  cut: fieldPanCut, moved: fieldDragMoved, ended: fieldDragEnded))
+            .modifier(ChatFieldDrag.Watch(model: fieldDrag) { fieldDragChanged($0) })
+            // The panel opening under a held drag (the agent answering) cuts that drag off.
+            .onChange(of: chatExpanded) { _, expanded in if expanded { fieldPanCut() } }
+            // The field gone mid-drag (the swap to the sent email's thread, the screen closing):
+            // its drag's freeze ends with it.
+            .onDisappear { ChatSwipeHold.shared.releaseNow(ChatThreadView.fieldDragHoldId) }
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier(Self.fieldId)
         }
@@ -293,6 +319,35 @@ struct ChatNewThreadView: View {
         case .write:
             return model.people
         }
+    }
+
+    /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
+    private func fieldDragMoved(_ drag: ChatHorizontalPan.Sample) {
+        fieldDrag.progress = ChatFieldDrag.progress(translation: drag.travel)
+    }
+
+    /// The drag up let go, or was cancelled: the swell springs back however it ended, and a
+    /// finished drag that reaches the open distance (or a flick's predicted one) opens the panel in
+    /// the same transaction, as in a thread's chat (`ChatThreadView.fieldDragEnded`).
+    private func fieldDragEnded(_ drag: ChatHorizontalPan.Sample, finished: Bool) {
+        let opens = finished && ChatFieldDrag.opens(letGo: drag)
+        withAnimation(.spring(ChatThreadView.pillSpringModel)) {
+            fieldDrag.progress = ChatFieldDrag.Progress()
+            if opens { chatExpanded = true }
+        }
+    }
+
+    /// A drag on the field began or ended: it holds the interaction freeze from its start, and
+    /// after its let-go while the swell settles and the freeze rule's cooldown, under the thread's
+    /// field drag's id, as there (`ChatThreadView.fieldDragChanged`). A drag also ends the drag tip.
+    private func fieldDragChanged(_ dragging: Bool) {
+        if dragging {
+            ChatSwipeHold.shared.begin(ChatThreadView.fieldDragHoldId)
+            ChatFieldDragTip.close()
+            return
+        }
+        ChatSwipeHold.shared.release(
+            ChatThreadView.fieldDragHoldId, after: ChatThreadView.fieldDragSettle + ChatViewLayout.freezeCooldown)
     }
 
     /// The compose card this chat's field (or, with the panel open, its agent) asked for, taken by
@@ -325,8 +380,9 @@ struct ChatNewThreadView: View {
     /// The card has gone. Sent: the email is in the outbox, shown as this chat's bubble
     /// (`sendKey`), and the chat goes on as the next new email to the same people with an empty
     /// field (`ChatNewThreadModel.init(after:)`), in a draft and agent session of its own; the
-    /// sent email's saved draft is discarded through compose's Discard. Closed unsent: the words
-    /// and attachments are still here.
+    /// sent email's saved draft is discarded through compose's Discard, unless its attachments
+    /// could not be read, when it is kept (`discardSavedDraft`). Closed unsent: the words and
+    /// attachments are still here.
     private func cardClosed() {
         guard cardSent else { return }
         cardSent = false
@@ -346,9 +402,10 @@ struct ChatNewThreadView: View {
     /// Follows the card's send (`sendKey`): its bubble while its row is in the outbox, then the
     /// sent email's thread once its Sent copy is read (`swapToThread`). The email the row names
     /// goes into the key, so the copy is found after the row has gone, and a send again from the
-    /// compose its Undo reopened (a new row, the same draft) is followed too.
+    /// compose its Undo reopened (a new row, the same draft) is followed too. Once the chat is the
+    /// thread, nothing here reads the send again, so the follow ends.
     private func followSend() async {
-        guard let key = sendKey else { return }
+        guard threadId == nil, let key = sendKey else { return }
         do {
             for try await found in ChatNewEmailSend.changes(key) {
                 cardSend = found
@@ -366,10 +423,11 @@ struct ChatNewThreadView: View {
     }
 
     /// The sent email's copy is in the Sent folder: the chat becomes its thread for good, once
-    /// nothing is open over the new email (a card, a picker or "Add recipient"), which the change
-    /// would take down.
+    /// nothing is open over the new email (a card, a picker, "Add recipient" or the TabMail panel,
+    /// which the field's drag opens at will), which the change would take down. The panel is kept
+    /// out of `newEmailCovered`, which also decides whether a compose card may present.
     private func swapToThread() {
-        guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered else { return }
+        guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return }
         threadId = copy
     }
 
