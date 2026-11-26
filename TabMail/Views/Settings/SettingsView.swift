@@ -23,6 +23,8 @@ struct SettingsView: View {
     @AppStorage(SyncScheduler.wifiOnlyKey) private var backgroundSyncWiFiOnly = true
     @AppStorage("isLargeInbox") private var isLargeInbox = false
     @State private var storageBudgetMB: Int = StorageEstimator.budgetMB
+    /// "Email Index Used", measured off the main thread, and the Optimize Storage row (#1448).
+    @State private var optimizer = StorageOptimizer()
     @State private var attachmentsBudgetMB: Int = BodyAssetStore.attachmentsBudgetMB
     @State private var showAttachmentsWipeConfirm = false
     @State private var isWipingAttachments = false
@@ -241,8 +243,18 @@ struct SettingsView: View {
                 }
 
                 LabeledContent("Email Index Used") {
-                    Text(storageUsageText)
-                        .foregroundStyle(.secondary)
+                    if let usedBytes = optimizer.measure?.usedBytes {
+                        Text(storageUsageText(usedBytes: usedBytes))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ProgressView()
+                    }
+                }
+
+                if let row = optimizer.row {
+                    OptimizeStorageRow(row: row, format: formatStorageBytes) {
+                        Task { await optimizer.tap() }
+                    }
                 }
 
                 Button {
@@ -449,6 +461,13 @@ struct SettingsView: View {
         .task {
             await loadOldMessageCount()
         }
+        .task { await optimizer.refresh() }
+        // The tap's steps run only while Settings shows the row.
+        .onDisappear { optimizer.stop() }
+        .onChange(of: DatabaseUpgrade.shared.isPresented) { _, isPresented in
+            // The upgrade's screen closed: measure again (its VACUUM gives the empty pages back).
+            if !isPresented { Task { await optimizer.refresh() } }
+        }
         .alert("Archive Old Emails?", isPresented: $showArchiveConfirm) {
             Button("Continue") {
                 showArchiveFinalConfirm = true
@@ -619,14 +638,15 @@ struct SettingsView: View {
         // The VACUUM above and the search database's new file are INCREMENTAL, so
         // the one-time upgrade's banner goes when both now are (ADR-IOS-121).
         await DatabaseUpgrade.shared.refresh()
+        // "Email Index Used" and the Optimize Storage row measure again (#1448).
+        await optimizer.refresh()
 
         // 5. `defer` restarts sync — fresh backfill from top — on every exit.
         BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")
     }
 
-    private var storageUsageText: String {
-        let usedMB = StorageEstimator.totalSizeMB()
-        let used = formatStorageMB(usedMB)
+    private func storageUsageText(usedBytes: Int64) -> String {
+        let used = formatStorageBytes(usedBytes)
         if storageBudgetMB == Int.max {
             return "\(used) (unlimited)"
         }
@@ -812,6 +832,10 @@ struct SettingsView: View {
             return String(format: "%.1f GB", mb / 1024)
         }
         return String(format: "%.0f MB", mb)
+    }
+
+    private func formatStorageBytes(_ bytes: Int64) -> String {
+        formatStorageMB(Double(bytes) / (1024 * 1024))
     }
 
     private func formatCount(_ n: Int) -> String {

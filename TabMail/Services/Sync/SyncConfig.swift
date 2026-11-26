@@ -625,6 +625,11 @@ enum SyncConfig {
     /// its notice, shown by itself once, wait (`DatabaseUpgrade.checkAfterLaunch`):
     /// not during startup.
     static let databaseUpgradeNoticeQuietDelaySeconds: Double = 3
+    /// Settings shows its Optimize Storage row (`StorageOptimizer`, #1448) only while
+    /// the email and search databases' empty pages come to at least this much: below it
+    /// a tap would give back too little to see in "Email Index Used", and the
+    /// background job gives it back anyway.
+    static let optimizeStorageMinimumGainBytes: Int64 = 50 * 1024 * 1024
     /// Entries of `bodyAssetPendingDelete` per batch of the pending-delete worker
     /// (`BodyAssetMaintenance.processPendingDeletes`): one manifest read, one
     /// main-database read and one main-database write per batch (#1376).
