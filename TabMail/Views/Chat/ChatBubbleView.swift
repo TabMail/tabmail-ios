@@ -193,57 +193,47 @@ struct ChatSuggestionBubble: View {
     let text: String
     /// The tutorial's move is this tap: a pulse ring marks it.
     var pulses = false
-    /// The closed field's Send is writing the email that replaces it (`ChatFieldWriting`): the
-    /// bubble pulses as the working bubble's dots do, "AI Suggestion · Writing" is under it, and
-    /// nothing is tapped.
-    var writing = false
     let onTap: () -> Void
 
     var body: some View {
         // One button, bubble and caption, so the caption's "Tap to use" is a tap target too.
         Button(action: onTap) {
             VStack(alignment: .trailing, spacing: 4) {
-                // Paused, the timeline draws once and the bubble is at full opacity.
-                TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval, paused: !writing)) { context in
-                    Text(text)
-                        .font(.body)
-                        .foregroundStyle(Palette.chatSuggestionText)
-                        .multilineTextAlignment(.leading)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 9)
-                        .background(
-                            RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
-                                .fill(Palette.chatSuggestionFill)
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
-                                .stroke(Palette.chatSuggestionStroke, style: StrokeStyle(
-                                    lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))
-                        )
-                        .opacity(writing
-                            ? ChatSuggestionWorkingBubble.dotOpacity(at: context.date.timeIntervalSinceReferenceDate) : 1)
-                }
-                .overlay {
-                    if pulses {
-                        TutorialPulseRing(shape: RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius))
+                Text(text)
+                    .font(.body)
+                    .foregroundStyle(Palette.chatSuggestionText)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background(
+                        RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                            .fill(Palette.chatSuggestionFill)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                            .stroke(Palette.chatSuggestionStroke, style: StrokeStyle(
+                                lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))
+                    )
+                    .overlay {
+                        if pulses {
+                            TutorialPulseRing(shape: RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius))
+                        }
                     }
-                }
-                Text(writing ? ChatSuggestionConfig.writingLine : ChatSuggestionConfig.statusLine)
+                Text(ChatSuggestionConfig.statusLine)
                     .font(.caption2)
                     .foregroundStyle(Theme.textSecondary)
             }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .allowsHitTesting(!writing)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(writing ? "\(ChatSuggestionConfig.writingLine): \(text)" : "\(ChatSuggestionConfig.label): \(text)")
-        .accessibilityHint(writing ? "" : "Opens the email, ready to review and send")
-        .accessibilityAddTraits(writing ? [] : .isButton)
+        .accessibilityLabel("\(ChatSuggestionConfig.label): \(text)")
+        .accessibilityHint("Opens the email, ready to review and send")
+        .accessibilityAddTraits(.isButton)
         // The combined element ignores the Button inside it, so its activation is its own:
         // without this, VoiceOver's double tap opened nothing.
-        .accessibilityAction { if !writing { onTap() } }
-        .accessibilityIdentifier(writing ? ChatSuggestionWorkingBubble.bubbleId : Self.bubbleId)
+        .accessibilityAction { onTap() }
+        .accessibilityIdentifier(Self.bubbleId)
         .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
             width * ChatViewLayout.bubbleMaxWidthFraction
         }
@@ -253,6 +243,44 @@ struct ChatSuggestionBubble: View {
 
     /// The ghost, as tests find it.
     static let bubbleId = "chat.aiSuggestion"
+}
+
+/// The user's own message from the closed field (`ChatFieldMessage`): their words, verbatim, in
+/// their own blue bubble where the reply lands once sent. It pulses, as the working bubble's dots
+/// do, while the email that says them is written (the line above the field says what is
+/// happening); still once it is written and while its compose card is up. Nothing to tap.
+struct ChatFieldMessageBubble: View {
+    let text: String
+    var pulses = false
+
+    var body: some View {
+        // Paused, the timeline draws once and the bubble is at full opacity.
+        TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval, paused: !pulses)) { context in
+            Text(text)
+                .font(.body)
+                .foregroundStyle(Color.white)
+                .multilineTextAlignment(.leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(
+                    RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                        .fill(Theme.accent)
+                )
+                .opacity(pulses ? ChatSuggestionWorkingBubble.dotOpacity(at: context.date.timeIntervalSinceReferenceDate) : 1)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(pulses ? "You said: \(text), writing your email" : "You said: \(text)")
+        .accessibilityIdentifier(pulses ? Self.writingId : Self.bubbleId)
+        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
+            width * ChatViewLayout.bubbleMaxWidthFraction
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
+    }
+
+    /// The bubble, as tests find it: while its email is written, and once it is.
+    static let writingId = "chat.fieldMessage.writing"
+    static let bubbleId = "chat.fieldMessage"
 }
 
 /// The AI Suggestion while it is written: the ghost's dashed bubble holding three pulsing dots,

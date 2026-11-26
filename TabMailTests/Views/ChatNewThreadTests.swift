@@ -338,15 +338,15 @@ struct ChatNewThreadTests {
 
     // MARK: - The field and the header
 
-    @Test("The new email's field has its own placeholder; a thread's field keeps its own")
-    func fieldPlaceholder() {
-        let field = Self.newEmailField()
-        let newEmail = ChatReplyField(example: nil, newEmail: field)
-        let reply = ChatReplyField(example: nil)
-        #expect(newEmail.placeholder == "Message or ask anything")
-        #expect(newEmail.placeholder == ChatNewEmailField.placeholder)
-        #expect(reply.placeholder == "Write your reply")
-        #expect(reply.newEmail == nil)
+    @Test("A new email's field asks for the user's own message, as a thread's does")
+    func fieldPlaceholder() throws {
+        let newEmail = ChatReplyField(alternative: nil, newEmail: Self.newEmailField())
+        #expect(newEmail.newEmail != nil && ChatReplyField(alternative: nil).newEmail == nil)
+        #expect(ChatReplyField.writePlaceholder == "Write your message")
+        // One hint for both: the field's input reads no per-field placeholder.
+        let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
+        #expect(Self.count("inputField(placeholder: hasTabMailSession ? ChatReplyField.writePlaceholder : \"Sign in to reply\",", in: bar) == 1)
+        #expect(Self.count("field.placeholder", in: bar) == 0 && Self.count("Message or ask anything", in: bar) == 0)
     }
 
     @Test("Each new email's chat has its own in-memory session, never the inbox's, kept by its chat for as long as it is open")
@@ -398,25 +398,6 @@ struct ChatNewThreadTests {
         let images = ChatNewEmailField.AttachSource.allCases.map(\.systemImage)
         #expect(titles == ["Photos", "Camera", "Files"])
         #expect(Set(images).count == images.count)
-    }
-
-    @Test("The new email's e.g. line comes from its own config set")
-    func examples() {
-        let examples = ChatSuggestionConfig.newEmailExamples
-        #expect(examples == [
-            "ask for the Q2 numbers",
-            "invite them to lunch on Friday",
-            "thank them for yesterday's meeting",
-            "ask when they are free next week",
-            "send them the slides from today",
-            "ask how the launch went",
-            "remind them about Thursday's review",
-            "introduce yourself and ask for a call",
-        ], "the decided set: each is an email to write, none a reply")
-        #expect(Set(examples).isDisjoint(with: ChatSuggestionConfig.replyExamples))
-        let picked = ChatSuggestionConfig.randomExample(from: examples)
-        let isMember = picked.map(examples.contains) ?? false
-        #expect(isMember)
     }
 
     @Test("The sheet is titled Add recipient for a new email, Reply to otherwise; the header's hint says which")
@@ -574,17 +555,18 @@ struct ChatNewThreadTests {
         let inboxAt = try #require(pill.range(of: "return \"inbox\""))
         #expect(sessionAt.lowerBound < inboxAt.lowerBound, "its own session, before the inbox's")
         let send = try #require(pill.range(of: "private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {"))
-        let intercept = try #require(pill.range(of: "if let newEmail = field.newEmail { guard let people = newEmail.send(text) else { return } newEmailTo = people }", range: send.upperBound..<pill.endIndex))
+        let intercept = try #require(pill.range(of: "if let newEmail = field.newEmail { guard let write = newEmail.send(text) else { return } newEmailWrite = write }", range: send.upperBound..<pill.endIndex))
         let sent = try #require(pill.range(of: "fieldFill.apply(.sentFromField)", range: send.upperBound..<pill.endIndex))
         #expect(intercept.lowerBound < sent.lowerBound, "its Send is the chat's, before any agent send")
-        // With people picked, the words are the request of the new email's compose edit, and never
-        // reach the agent (ADR-IOS-114 decision 10, amended 2026-11-25); the nudge that once sent
-        // them to the agent is gone. A new email's chat has no email to reply to, so its send
-        // carries no reply field and keeps its words itself.
-        #expect(Self.count("if let newEmailTo { composeNewEmailFromField(text, to: newEmailTo) } else if let message {", in: pill) == 1)
-        #expect(Self.count("private func composeNewEmailFromField(_ text: String, to people: [ChatThread.Person]) { // As mailboxes with their names, so the email written can greet them by name. let to = ChatNewDraft.toEntries(people: people, authored: [], leftovers: []) runFieldCompose(fieldReply: nil, fieldWordsKey: nil) { invocation in await EmailComposeTool.composeWithRegisteredTool(text, to: to, invocation: invocation) }", in: pill) == 1)
-        #expect(Self.count("EmailComposeTool.composeWithRegisteredTool(", in: pill) == 1)
-        #expect(Self.count("newEmailTo", in: pill) == 4, "only the field's own Send names the people")
+        // With people picked, the words are the user's own message, which the new email to them
+        // says, under the subject the chat shows, and never reach the agent (ADR-IOS-114 decision
+        // 10, amended 2026-11-26). A new email's chat has no email to reply to, so its send carries
+        // no reply field and keeps its words itself.
+        #expect(Self.count("if let newEmailWrite { composeNewEmailFromField(text, newEmailWrite) } else if let message {", in: pill) == 1)
+        #expect(Self.count("private func composeNewEmailFromField(_ text: String, _ write: ChatNewEmailField.Write) { // As mailboxes with their names, so the email written can greet them by name. let to = ChatNewDraft.toEntries(people: write.people, authored: [], leftovers: []) runFieldCompose(fieldReply: nil, fieldWordsKey: nil) { invocation in await ChatFieldCompose().newEmail(text, to: to, subject: write.subject, invocation: invocation) }", in: pill) == 1)
+        #expect(Self.count("ChatFieldCompose().newEmail(", in: pill) == 1)
+        #expect(Self.count("EmailComposeTool", in: pill) == 0, "the agent's compose tool is the agent's alone")
+        #expect(Self.count("newEmailWrite", in: pill) == 4, "only the field's own Send names the people")
         #expect(Self.count("agentMessage", in: pill) == 0)
         #expect(Self.count(".task(id: replyField?.newEmail?.sessionKey) { startNewEmail() }", in: pill) == 1)
         #expect(Self.count(".onChange(of: inputText) { _, words in replyField?.newEmail?.wordsChanged(words) }", in: pill) == 1)

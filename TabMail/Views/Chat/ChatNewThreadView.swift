@@ -9,7 +9,7 @@ import SwiftUI
 /// compose button, a contact pill, a `mailto:` link, with what the request brought), and a saved
 /// draft of one reopens it. The header is where every chat's header is, with one empty
 /// avatar and "Add recipient" until people are picked; the chat area says what to do; the field is
-/// the chat's reply field with "Message or ask anything" and a paperclip at the text's end;
+/// the chat's reply field with "Write your message" and a paperclip at the text's end;
 /// attachments wait above the field, each with an x. Nothing is asked when leaving: Back and the
 /// app going to the background save the draft when there is something to keep
 /// (`ChatNewDraft.needsSave`), and Back leaves once that save is durable. The screen going away
@@ -26,8 +26,6 @@ struct ChatNewThreadView: View {
     /// The new email the chat writes: the one it opened with, then the next one after each send.
     @State private var model: ChatNewThreadModel
 
-    /// The field's "e.g." example, picked once as the chat opens, from the new-email set.
-    @State private var example = ChatSuggestionConfig.randomExample(from: ChatSuggestionConfig.newEmailExamples)
     @State private var ownAddresses: Set<String> = []
     @State private var chatExpanded = false
     @State private var chatInputFocused = false
@@ -62,6 +60,12 @@ struct ChatNewThreadView: View {
     @State private var agentCompose: AgentCard?
     /// A card opened for the field's latest Send: the agent's closing words then open nothing.
     @State private var cardOpened = false
+    /// The user's own message the field's Send put up at the bottom of the chat (`ChatFieldMessage`):
+    /// from Send until its card is taken or the send ends.
+    @State private var fieldMessage: ChatFieldMessage?
+    /// That message held while its card is up, and after the card's Send until the send shows
+    /// (`ChatHeldGhost`).
+    @State private var heldMessage: ChatHeldGhost?
     /// The card's Send has a durable outbox row: once the card has gone, the chat goes on as the
     /// next new email (`cardClosed`).
     @State private var cardSent = false
@@ -140,6 +144,11 @@ struct ChatNewThreadView: View {
         // the Sent folder's headers ends (memory 021).
         .task(id: threadId == nil ? sendKey : nil) { await followSend() }
         .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
+        // A held message whose card sent waits for the send to show, then goes.
+        .onChange(of: cardSendShows) { _, _ in endHeldMessageIfDone() }
+        // The field's Send ended with no card up (nothing written, or Stop): the user's bubble
+        // goes, and its words are back in the field.
+        .onChange(of: chatWorking) { _, working in if !working { fieldMessage = nil } }
         // The TabMail panel closing lets a waiting swap to the sent email's thread happen.
         .onChange(of: chatExpanded) { _, open in if !open { swapToThread() } }
         .onAppear { opened() }
@@ -173,6 +182,15 @@ struct ChatNewThreadView: View {
                 if let reply = cardSend?.reply {
                     ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() },
                                           undo: { reply.undo(on: .newEmailChat) })
+                }
+                // The field's Send: the user's own message, up at once, pulsing while its email is
+                // written, then held while its card is up.
+                if let held = heldMessage {
+                    ChatFieldMessageBubble(text: held.text, pulses: false)
+                        .transition(.opacity)
+                } else if let message = fieldMessage {
+                    ChatFieldMessageBubble(text: message.text, pulses: message.pulses)
+                        .transition(.opacity)
                 }
             }
         }
@@ -270,7 +288,8 @@ struct ChatNewThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    example: example,
+                    // A new email has no AI Suggestion, so no "alt: " line.
+                    alternative: nil,
                     drag: fieldDrag,
                     // The drag's VoiceOver equivalent, as in a thread's chat; not over the panel.
                     showChat: opensPanel ? { withAnimation(.spring(ChatThreadView.pillSpringModel)) { chatExpanded = true } } : nil,
@@ -280,7 +299,8 @@ struct ChatNewThreadView: View {
                         wordsChanged: { model.words = $0 },
                         send: { _ in send() },
                         attach: attach)),
-                onFieldSend: { _ in cardOpened = false },
+                onFieldSend: { fieldSent($0) },
+                onFieldWritten: { await fieldMessageWritten() },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: model.account?.id,
                 composeHostCovered: newEmailCovered)
@@ -308,17 +328,46 @@ struct ChatNewThreadView: View {
     }
 
     /// Send: with nobody to send to, ask, and the words stay. With people picked, the people the
-    /// field's words write the email to: they are the request of its compose edit, never a turn
-    /// for the agent, and the compose card opens with the email written (`openAgentCompose`), as a
-    /// reply sent from a chat's field does. The words and attachments stay until the card's Send.
-    private func send() -> [ChatThread.Person]? {
+    /// field's words write the email to, under the subject the chat shows: the words are the user's
+    /// own message, never a turn for the agent, and the compose card opens with the email written
+    /// (`openAgentCompose`), as a reply sent from a chat's field does. The words and attachments stay
+    /// until the card's Send.
+    private func send() -> ChatNewEmailField.Write? {
         switch model.sendAction {
         case .askForRecipient:
             asksForRecipient = true
             return nil
         case .write:
-            return model.people
+            return ChatNewEmailField.Write(people: model.people, subject: model.carried.shownSubject ?? "")
         }
+    }
+
+    /// The field's Send: the words go up at once, verbatim, as the user's own bubble at the bottom
+    /// of the chat (`ChatFieldMessage`), pulsing while the email that says them is written.
+    private func fieldSent(_ text: String) {
+        cardOpened = false
+        fieldMessage = ChatFieldMessage(text: text)
+    }
+
+    /// The email the field's Send wrote is ready: the user's bubble stops pulsing and stays
+    /// `ChatSuggestionConfig.writtenHold` to be read before the card opens
+    /// (`ToolInvocation.fieldWritten`). Stop ends the hold early, and no card opens.
+    private func fieldMessageWritten() async {
+        guard fieldMessage != nil else { return }
+        fieldMessage?.written = true
+        try? await Task.sleep(for: .seconds(ChatSuggestionConfig.writtenHold))
+    }
+
+    /// The card's send shows in the chat: its outbox bubble, or its Sent copy.
+    private var cardSendShows: Bool {
+        cardSend?.reply != nil || cardSend?.sentCopyId != nil
+    }
+
+    /// The held message goes once its card has closed: at once when nothing was sent, else once
+    /// the send shows.
+    private func endHeldMessageIfDone() {
+        guard let held = heldMessage, held.ends(replyShows: cardSendShows) else { return }
+        heldMessage = nil
     }
 
     /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.
@@ -357,6 +406,11 @@ struct ChatNewThreadView: View {
     private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
         guard AgentToolRouter.shared.canOpen(req, accounts: accounts) else { return }
         cardOpened = true
+        // The field's own card: its Send's message is held in its place while the card is up.
+        if let message = fieldMessage {
+            heldMessage = ChatHeldGhost(text: message.text, isMessage: true, showsBubble: true)
+            fieldMessage = nil
+        }
         agentCompose = AgentCard(request: req)
     }
 
@@ -372,6 +426,7 @@ struct ChatNewThreadView: View {
         return model.card(for: req, account: account, draftId: card.draftId) { outcome in
             req.onOutcome(outcome)
             guard case .sent = outcome else { return }
+            heldMessage?.sent = true
             cardSent = true
             sendKey = ChatNewEmailSend.Key(draftId: card.draftId)
         }
@@ -384,6 +439,8 @@ struct ChatNewThreadView: View {
     /// could not be read, when it is kept (`discardSavedDraft`). Closed unsent: the words and
     /// attachments are still here.
     private func cardClosed() {
+        heldMessage?.cardClosed = true
+        endHeldMessageIfDone()
         guard cardSent else { return }
         cardSent = false
         let sent = model

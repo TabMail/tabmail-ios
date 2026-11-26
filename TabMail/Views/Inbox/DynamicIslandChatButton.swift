@@ -61,12 +61,13 @@ struct DynamicIslandChat: View {
     /// The chat view's reply field (`ChatReplyField`): collapsed, this pill is [mic] [field] [Send]
     /// on the thread's newest email instead of the Chat capsule.
     let replyField: ChatReplyField?
-    /// The user's own words went from the field to the agent.
+    /// The closed field's Send: the user's own words, verbatim, go up as their bubble in the host's
+    /// chat (`ChatFieldMessage`) while the email that says them is written.
     var onFieldSend: ((String) -> Void)?
-    /// The closed field's Send wrote the email: its text version lands in the host's AI
-    /// Suggestion bubble, and returns once it has been there long enough to read, before its
-    /// compose card opens (`ToolInvocation.landWritten`). Nil: the card opens at once.
-    var onFieldWritten: (@MainActor @Sendable (String) async -> Void)?
+    /// The closed field's Send wrote its email: the host's bubble stops pulsing, and this returns
+    /// once it has stayed up long enough to read, before the compose card opens
+    /// (`ToolInvocation.fieldWritten`). Nil: the card opens at once.
+    var onFieldWritten: (@MainActor @Sendable () async -> Void)?
     /// The host presents the agent's compose cards that this pill's chat asked for (ADR-IOS-053
     /// Phase 2): the pill takes them from the router while it is on screen and hands each one
     /// here. Nil: the host presents none, and this pill's turns can open no compose card.
@@ -86,8 +87,8 @@ struct DynamicIslandChat: View {
     /// The pill has appeared and not disappeared since.
     @State private var composeHostAppeared = false
     @Environment(\.hasTabMailSession) var hasTabMailSession
-    /// Reply field: the words sent to the agent, shown pulsing while it works.
-    @State var fieldSentText: String?
+    /// Reply field: a Send's email is being written, its words up as the user's bubble in the chat.
+    @State var fieldSending = false
     /// The input's words and the reply field's state. `ChatFieldFill.apply` is the only way the words
     /// change; no AI text is ever written into them (`ChatFieldFill`). A pill about an email changes
     /// its chat's one fill, which every pill on the chat shares (`ChatFieldWords`, ADR-IOS-117); the
@@ -102,7 +103,6 @@ struct DynamicIslandChat: View {
         guard composeContext == nil, let message else { return nil }
         return ChatFieldWords.key(for: message)
     }
-    @State var fieldPulse = false
     /// The new email whose words the field took as it started (`ChatNewEmailField.startWords`), by
     /// its session.
     @State private var newEmailSession: String?
@@ -343,7 +343,7 @@ struct DynamicIslandChat: View {
         onAgentReply: ((String) -> Void)? = nil,
         replyField: ChatReplyField? = nil,
         onFieldSend: ((String) -> Void)? = nil,
-        onFieldWritten: (@MainActor @Sendable (String) async -> Void)? = nil,
+        onFieldWritten: (@MainActor @Sendable () async -> Void)? = nil,
         onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)? = nil,
         composeFromAccountId: String? = nil,
         composeHostCovered: Bool = false,
@@ -793,21 +793,12 @@ struct DynamicIslandChat: View {
         }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
-            fieldSentText = nil
+            fieldSending = false
             withAnimation(expandSpring) { isExpanded = true }
-        }
-        .onChange(of: isWorking && fieldSentText != nil) { _, pulsing in
-            if pulsing {
-                withAnimation(.easeInOut(duration: ChatViewLayout.fieldPulseDuration).repeatForever(autoreverses: true)) {
-                    fieldPulse = true
-                }
-            } else {
-                withAnimation(.easeInOut(duration: 0.3)) { fieldPulse = false }
-            }
         }
         .onChange(of: isWorking) { wasWorking, nowWorking in
             if wasWorking && !nowWorking {
-                fieldSentText = nil
+                fieldSending = false
             }
             if DebugModeManager.isLoggingEnabled() {
                 BackgroundSyncLogger.logDebug("[DynamicIslandChat] dictation-auto-restart onChange(isWorking) fired: wasWorking=\(wasWorking) nowWorking=\(nowWorking)")
@@ -999,9 +990,9 @@ struct DynamicIslandChat: View {
         Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })
     }
 
-    /// The "e.g." line's change, put in the field for the user to send or edit; never sent here.
-    func putExample(_ example: String) {
-        fieldFill.apply(.put(example))
+    /// The "alt: " line's reply, put in the field for the user to send or edit; never sent here.
+    func putAlternative(_ alternative: String) {
+        fieldFill.apply(.put(alternative))
         inputSelection = .init(insertionPoint: inputText.endIndex)
     }
 
@@ -1729,46 +1720,47 @@ struct DynamicIslandChat: View {
     }
 
     /// Send in the chat's reply field with the TabMail panel closed (ADR-IOS-114 decision 10,
-    /// amended 2026-11-25): the words write the email to the people of this chat, never a message
-    /// to the agent (`composeFromField`). They stay in the field, pulsing, while it is written. The
-    /// field empties when the reply goes out, or when an edit stored in place has no card to open; a
-    /// compose card closed unsent, or nothing written, leaves the words.
+    /// amended 2026-11-25 and 2026-11-26): the words are the user's own message. They go up at
+    /// once, verbatim, as the user's bubble in the chat (`onFieldSend`, `ChatFieldMessage`), and the
+    /// email that says them is written to the people of this chat, never a message to the agent
+    /// (`composeFromField`). The field shows only its hint meanwhile. The field empties when the
+    /// email goes out; a compose card closed unsent, nothing written, or Stop puts the words back.
     private func sendFromReplyField(_ text: String, _ field: ChatReplyField) {
         // A new email's chat decides what its Send does: with nobody to send to it asks, and the
-        // words stay as they are; with people picked, the words write the email to them (they
-        // stay, pulsing, while it is written). A new email's chat has no email to reply to; every
-        // other Send writes the reply to the chat's email.
-        var newEmailTo: [ChatThread.Person]?
+        // words stay as they are; with people picked, the words are the message of the email
+        // written to them. A new email's chat has no email to reply to; every other Send writes the
+        // reply to the chat's email.
+        var newEmailWrite: ChatNewEmailField.Write?
         if let newEmail = field.newEmail {
-            guard let people = newEmail.send(text) else { return }
-            newEmailTo = people
+            guard let write = newEmail.send(text) else { return }
+            newEmailWrite = write
         } else if message == nil {
             return
         }
         isTextFieldFocused = false
         fieldFill.apply(.sentFromField)
         dictation.inputSent(inputText)
-        fieldSentText = text
+        fieldSending = true
         onFieldSend?(text)
-        if let newEmailTo {
-            composeNewEmailFromField(text, to: newEmailTo)
+        if let newEmailWrite {
+            composeNewEmailFromField(text, newEmailWrite)
         } else if let message {
-            // Who the reply goes to and the AI Suggestion showing, as they are now, travel with the
-            // send, whatever the chat shows when its compose card arrives.
-            composeFromField(text, ChatFieldSend(message: message, onlyTo: field.onlyTo, suggestion: field.suggestion))
+            // Who the reply goes to, as it is now, travels with the send, whatever the chat shows
+            // when its compose card arrives.
+            composeFromField(text, ChatFieldSend(message: message, onlyTo: field.onlyTo))
         }
     }
 
-    /// The closed field's Send: a compose edit with the words as its request
-    /// (`EmailReplyTool.composeFromField`). It edits the AI Suggestion showing, or writes the
-    /// reply, and the compose card opens with the email written and its text version.
-    /// Written: the send completes on its chat key as an answer does (`ChatFieldFill.answered`).
-    /// Nothing written: the words are the user's again (`notWritten`), and a note says so. Stop
-    /// cancels it as it cancels the agent, and the words are the user's again too.
+    /// The closed field's Send in a thread's chat: the reply that says the user's words
+    /// (`ChatFieldCompose.reply`), and the compose card opens with the email written,
+    /// the words as its text version. Written: the send completes on its chat key as an answer does
+    /// (`ChatFieldFill.answered`). Nothing written: the words are the user's again (`notWritten`),
+    /// and a note says so. Stop cancels it as it cancels the agent, and the words are the user's
+    /// again too.
     private func composeFromField(_ text: String, _ send: ChatFieldSend) {
         let fieldWordsKey = ChatFieldWords.key(for: send.message)
         runFieldCompose(fieldReply: send.fieldReply, fieldWordsKey: fieldWordsKey) { invocation in
-            await EmailReplyTool.composeWithRegisteredTool(text, invocation: invocation)
+            await ChatFieldCompose().reply(text, invocation: invocation)
         } ended: { written in
             switch written {
             case .done?, .sent?:
@@ -1782,19 +1774,19 @@ struct DynamicIslandChat: View {
         }
     }
 
-    /// A new email's chat's closed field's Send (ADR-IOS-114 decision 10, amended 2026-11-25): a
-    /// compose edit of a new email to `people` with the words as its request
-    /// (`EmailComposeTool.composeFromField`), and the new email's compose card opens with the
-    /// email written and its text version. The chat keeps its words itself (no `ChatFieldWords`
+    /// A new email's chat's closed field's Send (ADR-IOS-114 decision 10, amended 2026-11-25 and
+    /// 2026-11-26): the new email to the people picked that says the user's words
+    /// (`ChatFieldCompose.newEmail`), and the new email's compose card opens with the
+    /// email written, the words as its text version. The chat keeps its words itself (no `ChatFieldWords`
     /// key): its card decides what becomes of them. Sent, they empty as the card reports the send
     /// (`ChatFieldFill.completed`), and the chat goes on as the next new email with that email's
     /// own words (`startNewEmail`); closed unsent, nothing written, or Stop,
     /// the send ends and they are the user's again, and nothing written shows a note.
-    private func composeNewEmailFromField(_ text: String, to people: [ChatThread.Person]) {
+    private func composeNewEmailFromField(_ text: String, _ write: ChatNewEmailField.Write) {
         // As mailboxes with their names, so the email written can greet them by name.
-        let to = ChatNewDraft.toEntries(people: people, authored: [], leftovers: [])
+        let to = ChatNewDraft.toEntries(people: write.people, authored: [], leftovers: [])
         runFieldCompose(fieldReply: nil, fieldWordsKey: nil) { invocation in
-            await EmailComposeTool.composeWithRegisteredTool(text, to: to, invocation: invocation)
+            await ChatFieldCompose().newEmail(text, to: to, subject: write.subject, invocation: invocation)
         } ended: { written in
             // Sent: the card reports it before it closes, so the words go now, as the card
             // closes, never back into the field under it first.
@@ -1809,12 +1801,13 @@ struct DynamicIslandChat: View {
 
     /// The closed field's compose run, for a reply and a new email alike: "Writing your email"
     /// above the field while `compose` writes, with nothing sent to the agent and no chat turn
-    /// added. `ended` gets what it wrote, or nil when Stop cancelled it (Stop has already cleaned
-    /// up the pill).
+    /// added; once written, the host's bubble stays up to be read before the card opens
+    /// (`ToolInvocation.fieldWritten`). `ended` gets what it wrote, or nil when Stop cancelled it
+    /// (Stop has already cleaned up the pill).
     private func runFieldCompose(
         fieldReply: ChatFieldReply?, fieldWordsKey: String?,
-        compose: @escaping @MainActor (ToolInvocation) async -> EmailReplyTool.Written,
-        ended: @escaping @MainActor (EmailReplyTool.Written?) -> Void
+        compose: @escaping @MainActor (ToolInvocation) async -> ChatFieldCompose.Written,
+        ended: @escaping @MainActor (ChatFieldCompose.Written?) -> Void
     ) {
         isWorking = true
         ActiveAgentTracker.shared.setWorking(sessionKey)
@@ -1825,7 +1818,7 @@ struct DynamicIslandChat: View {
         let origin = composeOrigin(sessionKey: capturedSessionKey, fieldReply: fieldReply)
         let invocation = ToolInvocation(
             uiSink: SessionUISink(session: session, fieldWordsKey: fieldWordsKey), sessionKey: capturedSessionKey,
-            fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey, landWritten: onFieldWritten)
+            fieldReply: fieldReply, composeOrigin: origin, fieldWordsKey: fieldWordsKey, fieldWritten: onFieldWritten)
         activeChatTask = Task {
             let written = await compose(invocation)
             if Task.isCancelled {
@@ -1833,7 +1826,7 @@ struct DynamicIslandChat: View {
                 return
             }
             ended(written)
-            fieldSentText = nil
+            fieldSending = false
             activeChatTask = nil
             isWorking = false
             ActiveAgentTracker.shared.clearWorking(capturedSessionKey)
