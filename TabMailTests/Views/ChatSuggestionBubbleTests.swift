@@ -321,6 +321,11 @@ struct ChatSuggestionBubbleTests {
             #expect(Self.ghost(in: chat.view) == nil && Self.suggestionBubble(in: chat.view) == nil,
                     "the user's bubble replaces the AI Suggestion")
             #expect(!Self.fieldTexts(chat.view).contains(words), "the words left the field: \(Self.fieldTexts(chat.view))")
+            // "Writing your email" is the bubble's own line, under it (2026-11-26), never a line of
+            // its own above the field.
+            let labels = HostedAccessibility.labels(in: chat.view)
+            #expect(!labels.contains(ChatReplyField.writingStatus), "no status line above the field: \(labels)")
+            let writingFrame = bubble?.accessibilityFrame ?? .null
 
             // Written: the same words, still, there to be read before the card opens.
             backend.release.signal()
@@ -329,6 +334,12 @@ struct ChatSuggestionBubbleTests {
             #expect(chat.controller.presentedViewController == nil, "its card waits while the message is there to read")
             try await Self.openCard(chat)
             #expect(Self.messageBubble(in: chat.view)?.accessibilityLabel == written, "the message stays in its place behind its card")
+            // Held behind its card the bubble has no line: while written it was the same bubble with
+            // the line under it, at the same right edge.
+            let heldFrame = Self.messageBubble(in: chat.view)?.accessibilityFrame ?? .null
+            #expect(!writingFrame.isNull && !heldFrame.isNull, "control: both frames read")
+            #expect(writingFrame.height > heldFrame.height + 8, "the line under the bubble while written: \(writingFrame) vs \(heldFrame)")
+            #expect(abs(writingFrame.maxX - heldFrame.maxX) < 1, "right-aligned with the bubble: \(writingFrame) vs \(heldFrame)")
 
             // The request: the words verbatim, as the compose text's user text.
             let sent = backend.messages

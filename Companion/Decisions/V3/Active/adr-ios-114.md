@@ -534,6 +534,20 @@ same AI result, kept as long as the email itself is shown.
      `parseInlineEditResponse`): recipient changes apply only when the answer gives them
      (`ChatFieldCompose.envelope`), a thread's subject stays, a new email takes the chat's subject
      or the one written.
+     *Amended 2026-11-26 (on the simulator: "it starts pulsing too quickly ...
+     so that it doesn't seem like blinking. perhaps make it pulse a bit less strongly. also,
+     shouldn't writing your email be at where the "sent" is? aligned more with the bubble?"):* the
+     bubble stays at full for `ChatSuggestionConfig.fieldMessagePulseDelay` after it goes up, then
+     pulses from full, smoothly (a cosine), down to `fieldMessageDimOpacity` and back over each
+     `fieldMessagePulsePeriod` (`ChatFieldMessageBubble.pulseOpacity`, timed from the bubble's own
+     appearance); before, it pulsed at once, from whatever phase the clock was in, down to the
+     working dots' 0.3. "Writing your email" is the bubble's own line, under it at its right edge
+     in the look of "Sent" (`ChatFieldMessageBubble.status`), for as long as the field's message is
+     up (the pulse and the written hold); none while it is held behind its card. The status line
+     above the field is deleted (`ChatFieldStatusLine`, `ChatFieldStatusKey`, the screens'
+     `fieldStatus`): every Send from the closed field is this compose, so the line had no other use.
+     Tests: `ChatReplyFieldTests.fieldMessagePulse`, `writingLineUnderTheBubble`;
+     `ChatSuggestionBubbleTests.fieldSendShowsTheUsersMessage` (the line inside the bubble's frame).
    - **Written.** The bubble stops pulsing and stays `ChatSuggestionConfig.writtenHold` to be read
      (`ToolInvocation.fieldWritten`, `ChatThreadView.fieldMessageWritten`); then the card opens with
      the email, its text version the words themselves (`ReplyResult.textMessage`), so the sent email
@@ -1650,6 +1664,14 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    Suggestion's working bubble (decision 16) stays the chat's own row. `statusLinePadding`, which
    pinned the line's padding inside the glass, is replaced by
    `ChatReplyFieldTests.statusLineAboveTheField` and `statusKeyKeepsTheFirst`.
+
+   **Amendment 2026-11-26: no status line above the field.** Since decision 10's 2026-11-26
+   amendment every Send from the closed field is the compose-text request, so the only status the
+   line showed was "Writing your email". It is now the user's bubble's own line, under it at its
+   right edge (decision 10, `ChatFieldMessageBubble.status`); `ChatFieldStatusLine`,
+   `ChatFieldStatusKey` and the screens' `fieldStatus` are deleted, and the bar no longer grows on
+   a Send. `statusLineAboveTheField` and `statusKeyKeepsTheFirst` are replaced by
+   `ChatReplyFieldTests.writingLineUnderTheBubble`.
 
 20. **The field is the chat's bottom bar (amendment 2026-11-20).** The reply field is the scroll
    view's `.safeAreaBar(edge: .bottom, spacing: 0)`, as the header is its top bar (decision 15), so
