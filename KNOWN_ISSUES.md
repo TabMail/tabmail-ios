@@ -106,8 +106,10 @@ The full records are split into [`Companion/Process/Current/KnownIssues/`](Compa
 > forward whose subject does not start with `Fwd:` or `Fw:`, an email stored after a newer one of its
 > chain, a rewritten forward stored by the sync rather than the send, and forwards stored before #1555
 > can still show with the email they forward; on Outlook a forward stands alone, apart from its
-> replies; a reply whose subject starts with `Fwd:` shows apart; a staged email can show across a
-> forward until the merge stores it. Display and grouping only.
+> replies, which group with the source (#1559); a reply whose subject starts with `Fwd:` shows apart;
+> a staged email can show across a forward until the merge stores it; a forward stored before #1555
+> hides its thread from an email of the conversation in another thread, and a forward in Trash or
+> Junk (or past the 100-email cap) leaves its replies in the source's view. Display and grouping only.
 
 > **Current tracker census (2026-11-25, #1500): unchanged at 6 `open` records.** Narrows the
 > `accepted` record `IOS-OUTBOX-012`: a Gmail original archived while its reply or forward waits is
@@ -400,7 +402,7 @@ above, whose bytes cannot change. For example `IOS-OUTBOX-007` still reads `acce
 
 | ID | Class | Executive statement |
 |---|---|---|
-| [IOS-THREAD-002](Companion/Process/Current/KnownIssues/Amendments/ios-thread-002.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-26, #1555).** A forward starts its own thread on the device: one TabMail's send stored as a forward, or a stored email whose subject starts with `Fwd:` or `Fw:`. Still shown with the email it forwards: a forward with a rewritten or localized subject (a rewritten one sent from TabMail when the sync, not the send, stored it), a forward or source stored after a newer email of its chain (older mail loaded later, as on a first sync), and forwards stored before #1555. On Outlook a forward stands alone: its replies group by conversation id, apart from it. A reply whose subject starts with `Fwd:` shows apart from its thread. A staged email (before the merge) can show across a forward until it is stored. Display and grouping only; the stored grouping is not repaired later. |
+| [IOS-THREAD-002](Companion/Process/Current/KnownIssues/Amendments/ios-thread-002.md) | `accepted` | 📋 **ACCEPTED LIMITATION (2026-11-26, #1555).** A forward starts its own thread on the device: one TabMail's send stored as a forward, or a stored email whose subject starts with `Fwd:` or `Fw:`. Still shown with the email it forwards: a forward with a rewritten or localized subject (a rewritten one sent from TabMail when the sync, not the send, stored it), a forward or source stored after a newer email of its chain (older mail loaded later, as on a first sync), and forwards stored before #1555. On Outlook a forward stands alone: its replies group by conversation id with the source, apart from it (#1559). A forward stored before #1555 hides its thread from an email of the same conversation in another thread; a forward the related-emails search leaves out (Trash, Junk, past its 100-email cap) leaves its replies in the source's view. A reply whose subject starts with `Fwd:` shows apart from its thread. A staged email (before the merge) can show across a forward until it is stored. Display and grouping only; the stored grouping is not repaired later. |
 
 ### TEST (1)
 

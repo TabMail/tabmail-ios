@@ -178,10 +178,10 @@ enum ThreadDetection {
     /// - a forward in another thread than `msg`'s: that thread is left out;
     /// - a forward in `msg`'s thread (`msg` is it, or is a reply to it): the
     ///   threads of the emails it forwards are left out.
-    /// A forward stored before the split shares its source's thread, so nothing
-    /// is left out for it: it shows with its source, as it always did. An email
-    /// not stored yet (opened from its notification before the merge) has no
-    /// thread to stand on, so nothing is left out for it either.
+    /// A forward stored before the split shares its source's thread and shows with
+    /// it; seen from another thread of the conversation it is a forward elsewhere and
+    /// its whole thread is left out (IOS-THREAD-002). An email not stored yet (opened
+    /// from its notification before the merge) has no thread, so nothing is left out.
     static func excludeAcrossForwards(_ results: [MessageHeader], of msg: MessageHeader) -> [MessageHeader] {
         let own = msg.computedThreadId
         guard !own.isEmpty else { return results }
@@ -199,7 +199,7 @@ enum ThreadDetection {
             } else {
                 let sources = (forward.inReplyTo.map { [$0] } ?? []) + forward.references
                 for source in sources {
-                    if let thread = threadByMessageId[source], thread != own { excluded.insert(thread) }
+                    if let thread = threadByMessageId[source], !thread.isEmpty, thread != own { excluded.insert(thread) }
                 }
             }
         }

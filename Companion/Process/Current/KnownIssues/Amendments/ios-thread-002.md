@@ -20,7 +20,8 @@ reverse probe; lateral probe; `messageReference`; `ThreadDetection.excludeAcross
 `computedThreadId`; `ThreadGroupBuilder`; staged row; `InboxListComposer.adoptThreadId`;
 notification tap; `seedFromStagedPublish`; Outlook `conversationId`; `GraphParse.parseMessage`;
 `Fwd:`; `Fw:`; localized forward prefix; rewritten subject; first sync; older mail; UIDVALIDITY
-reset; account reset; another device; #1555; IOS-THREAD-001; IOS-OUTBOX-008.
+reset; account reset; another device; Trash; Junk; `SyncConfig.threadQueryLimit`; In-Reply-To on
+Outlook; #1555; #1559; IOS-THREAD-001; IOS-OUTBOX-008.
 
 ## The behaviour
 
@@ -41,13 +42,18 @@ failing that, a stored email that names it (the reverse and lateral probes, unch
    the forward, with no stored ancestor or copy of its own, joins the forward's thread through the
    forward's References (or In-Reply-To, which Thunderbird writes on a forward); a forward stored
    after a reply to it joins that reply's thread, which is the source's when the reply was stored
-   before the forward. Either way the two show together, as before #1555.
+   before the forward. Either way the two show together, as before #1555. This is common, not rare:
+   an account's first sync, and every load of older mail, stores newest first, so on a newly added
+   account most forwards whose source is also stored show with it.
 4. **Outlook accounts: a forward stands alone.** The Microsoft Graph sync reads no In-Reply-To or
    References (`GraphParse.parseMessage`), so an Outlook email joins a thread only by another copy of
    itself or by Outlook's conversation id, which a forward never takes. A forward on an Outlook
    account therefore never groups with its replies, received or sent: they group by Outlook's
    conversation id, apart from the forward (before #1555 the forward took that id and grouped with
-   them).
+   them). Those replies group with the SOURCE: in the inbox a reply to the user's forward shows with
+   the email that was forwarded; the source's conversation view lists that reply but not the
+   forward, and the forward's lists the source and the reply. Filed on its own as #1559 (whether
+   the Graph sync can carry In-Reply-To, and at what cost).
 5. **A forward sent from TabMail whose subject the user rewrote** is split only when TabMail's send
    stores its Sent row, since only the send knows it is a forward. When the row is stored by the sync
    instead, it joins its source through its References: the sync stored the Sent copy before the
@@ -66,13 +72,21 @@ failing that, a stored email that names it (the reverse and lateral probes, unch
    the merge stores it with the forward, and then moves (ADR-IOS-055: the reconcile corrects a staged
    guess). A staged reply to a staged forward does the same: a staged forward adopts no thread.
 8. **Forwards stored before #1555** keep the thread they were given, their source's (no migration).
+   Seen from an email of the same conversation that sits in another thread (a reply stored before
+   its parent on IMAP and kept apart, see IOS-THREAD-001), such a forward still reads as a forward in
+   another thread, so its whole thread, the source included, is left out of that email's
+   conversation view.
+9. **A forward the related-emails search does not return** (in Trash or Junk, which the search
+   leaves out, or past its 100-email cap, `SyncConfig.threadQueryLimit`) leaves nothing out, so the
+   replies to it show in the source's conversation view.
 
 ## When it happens
 
 Cases 1 and 2 depend on what other people's mail apps write. Case 3 needs the older email stored
-after the newer one. Case 4 is every forward on an Outlook account. Case 5 needs a rewritten subject
+after the newer one, which a first sync does for most of an account. Case 4 is every forward on an Outlook account. Case 5 needs a rewritten subject
 on a forward. Cases 6 and 7 need a notification that arrives before the merge. Case 8 is every
-forward already on the device.
+forward already on the device, and its view gap needs a conversation already split across threads.
+Case 9 needs the forward in Trash or Junk, or a conversation of over 100 emails.
 
 ## Recoverability
 

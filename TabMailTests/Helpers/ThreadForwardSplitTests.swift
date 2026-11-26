@@ -128,6 +128,7 @@ struct AssignComputedThreadIdForwardSplitTests {
             make(messageId: "uid-forward-copy", subject: "Fwd: Plans", rfc822: Self.forward, references: [Self.source]),
             nativeThreadId: Self.sourceThread, in: db)
         #expect(copy.computedThreadId == f.computedThreadId)
+        #expect(copy.computedThreadId != Self.sourceThread)
     }
 
     @Test("an email joins its own stored copy first: the sync's copy of a sent forward whose subject was rewritten")
@@ -241,19 +242,19 @@ struct ThreadDetectionForwardSplitTests {
     @Test("from the source: the forward and the replies to it are left out")
     func fromSource() {
         let kept = ThreadDetection.excludeAcrossForwards([sourceReply, forward, forwardReply], of: source)
-        #expect(kept.map(\.id) == ["s2"])
+        #expect(kept.map(\.messageId) == ["s2"])
     }
 
     @Test("from the forward: the source's thread is left out, the replies to it stay")
     func fromForward() {
         let kept = ThreadDetection.excludeAcrossForwards([source, sourceReply, forwardReply], of: forward)
-        #expect(kept.map(\.id) == ["r1"])
+        #expect(kept.map(\.messageId) == ["r1"])
     }
 
     @Test("from a reply to the forward: the source's thread is left out, the forward stays")
     func fromForwardReply() {
         let kept = ThreadDetection.excludeAcrossForwards([source, sourceReply, forward], of: forwardReply)
-        #expect(kept.map(\.id) == ["f1"])
+        #expect(kept.map(\.messageId) == ["f1"])
     }
 
     @Test("an email not stored yet (no thread) keeps every related email, forwards and their sources")
@@ -261,7 +262,15 @@ struct ThreadDetectionForwardSplitTests {
         let staged = header("n1", subject: "Re: Plans", rfc822: "n1@example.com", thread: "",
                             inReplyTo: "s2@example.com", references: ["s1@example.com", "s2@example.com"], minutesAgo: 1)
         let kept = ThreadDetection.excludeAcrossForwards([source, sourceReply, forward, forwardReply], of: staged)
-        #expect(kept.map(\.id) == ["s1", "s2", "f1", "r1"])
+        #expect(kept.map(\.messageId) == ["s1", "s2", "f1", "r1"])
+    }
+
+    @Test("a source with no thread leaves no email out: emails with no thread always stay")
+    func sourceWithNoThreadLeavesNothingOut() {
+        let unthreadedSource = header("s1", subject: "Plans", rfc822: "s1@example.com", thread: "", minutesAgo: 30)
+        let unthreadedOther = header("u1", subject: "Lunch", rfc822: "u1@example.com", thread: "", minutesAgo: 15)
+        let kept = ThreadDetection.excludeAcrossForwards([unthreadedSource, unthreadedOther, forwardReply], of: forward)
+        #expect(kept.map(\.messageId) == ["s1", "u1", "r1"])
     }
 
     @Test("a forward stored before the split shares its source's thread and still shows with it")
@@ -269,9 +278,9 @@ struct ThreadDetectionForwardSplitTests {
         let stored = header("f0", subject: "Fwd: Plans", rfc822: "f0@example.com", thread: "T-source",
                             references: ["s1@example.com"], minutesAgo: 22)
         let fromSource = ThreadDetection.excludeAcrossForwards([sourceReply, stored], of: source)
-        #expect(fromSource.map(\.id) == ["s2", "f0"])
+        #expect(fromSource.map(\.messageId) == ["s2", "f0"])
         let fromStored = ThreadDetection.excludeAcrossForwards([source, sourceReply], of: stored)
-        #expect(fromStored.map(\.id) == ["s1", "s2"])
+        #expect(fromStored.map(\.messageId) == ["s1", "s2"])
     }
 
     // MARK: - The search end to end

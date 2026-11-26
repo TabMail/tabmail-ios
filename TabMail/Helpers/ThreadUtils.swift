@@ -77,8 +77,8 @@ enum ThreadUtils {
     /// The forward probe takes the NEAREST stored email: another copy of this
     /// one first, then its In-Reply-To parent, then its References from the
     /// last (the newest ancestor) to the first. It asks one id at a time with
-    /// `LIMIT 1`, so it reads at most one row per id of `L`, however many
-    /// stored emails share an id. So a reply to a forward joins
+    /// `LIMIT 1`, stopping at the first other stored row with a thread, however
+    /// many stored emails share an id. So a reply to a forward joins
     /// the forward's thread, not the thread the forward came from, though its
     /// References name both. A forward (`isForward`) looks up only its own
     /// Message-ID: its copies, and replies to it already stored, never the
@@ -157,8 +157,8 @@ enum ThreadUtils {
     /// merge Gmail-fragmented threads in historic data.
     ///
     /// Iteration is necessary because `findAdoptableThreadId` returns ONE
-    /// connected ctid (the nearest ancestor's, else the first reverse match,
-    /// no ORDER BY), not the connected set. For a chain M1(T1) ← M2(T2) ←
+    /// connected ctid (a stored copy's, else the nearest ancestor's, else the
+    /// first reverse match, no ORDER BY), not the connected set. For a chain M1(T1) ← M2(T2) ←
     /// M3(T3), the date-ASC pass can leave M1=T2, M2=T3, M3=T3 — fully
     /// merging requires another pass that sees M2's now-adopted T3 and
     /// pulls M1 along. Each pass propagates one hop; realistic email
@@ -169,8 +169,8 @@ enum ThreadUtils {
     ///
     /// ⚠️ KNOWN, DELIBERATELY UNFIXED — `KNOWN_ISSUES.md` `IOS-THREAD-001`.
     /// `merged == 0` is a MUTATION count, not candidate coverage. Because
-    /// `findAdoptableThreadId` answers with ONE connected ctid (its nearest
-    /// ancestor's, else the first reverse match), a row connected to two fragments whose probe
+    /// `findAdoptableThreadId` answers with ONE connected ctid (a stored copy's,
+    /// else its nearest ancestor's, else the first reverse match), a row connected to two fragments whose probe
     /// names the id it already carries never adopts — and the probe is
     /// deterministic on unchanged state, so no later pass changes that answer.
     /// Convergence can therefore be declared with fragments still split.

@@ -3790,8 +3790,8 @@ enum NSEDataBridge {
         // (SyncEngineFullSync computes this on insert). Without this, a
         // pushed message sits in a singleton thread until sync materializes
         // the row again.
-        // Timed: new-header path only. assignComputedThreadId runs up to 3 indexed
-        // IN-probes over messageHeader for reply-chain adoption — fast normally, but
+        // Timed: new-header path only. assignComputedThreadId runs one indexed seek per id of
+        // the email's own Message-ID, In-Reply-To and References, then 2 indexed IN-probes — fast normally, but
         // the other merge-write suspect if the body/snippet marks come back cheap.
         let threadT0 = CFAbsoluteTimeGetCurrent()
         try ThreadUtils.assignComputedThreadId(
