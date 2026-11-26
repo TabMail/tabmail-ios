@@ -7,14 +7,18 @@ import SwiftUI
 /// Settings > Email Index's Optimize Storage row (#1448): the size "Email Index Used"
 /// can drop to, a line under it, and the tap. State and actions are `StorageOptimizer`'s.
 ///
-/// The title stays on one line. The size sits on the title's line, or under the title when
-/// that line cannot hold both (large text sizes). Every line under the title starts where the
-/// title's text does, and the size and the lines are grey, as other values in Settings are.
+/// The title stays on one line, and the size and the lines are grey, as other values in
+/// Settings are. At the usual text sizes the size sits on the title's line and every line under
+/// it starts where the title's text does. At the accessibility sizes a list wraps a label's text
+/// under its icon and `LabeledContent` puts its value under its title, so the size and the lines
+/// go under the title from the row's leading edge, as the rows around it do.
 struct OptimizeStorageRow: View {
     let row: StorageOptimizer.Row
     /// Formats a size as "Email Index Used" shows it.
     let format: (Int64) -> String
     let onTap: () -> Void
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     static let title = "Optimize"
     static let overnightLine = "TabMail does this overnight. Tap to do it now."
@@ -40,26 +44,26 @@ struct OptimizeStorageRow: View {
     var body: some View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 4) {
-                ViewThatFits(in: .horizontal) {
+                if dynamicTypeSize.isAccessibilitySize {
+                    titleLabel
+                    trailing
+                    if let line = Self.line(for: row) {
+                        lineText(line)
+                    }
+                } else {
                     HStack {
                         titleLabel
+                            .layoutPriority(1)
                         Spacer()
                         trailing
                     }
-                    VStack(alignment: .leading, spacing: 4) {
-                        titleLabel
-                        underTitle(trailing)
+                    if let line = Self.line(for: row) {
+                        underTitle(lineText(line))
                     }
-                }
-                if let line = Self.line(for: row) {
-                    underTitle(
-                        Text(line)
-                            .font(.footnote)
-                            .foregroundStyle(Color.secondary)
-                    )
                 }
             }
             .multilineTextAlignment(.leading)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
         .disabled(row == .optimizing)
@@ -70,8 +74,15 @@ struct OptimizeStorageRow: View {
             .lineLimit(1)
     }
 
+    private func lineText(_ line: String) -> some View {
+        Text(line)
+            .font(.footnote)
+            .foregroundStyle(Color.secondary)
+    }
+
     /// `content` in a label whose icon is the row's, hidden, so in the list it starts where
-    /// the title's text does at every text size.
+    /// the title's text does. The content's font is set inside it, never on the result: the
+    /// label's own font sizes the hidden icon, and so the place the content starts.
     private func underTitle(_ content: some View) -> some View {
         Label {
             content
