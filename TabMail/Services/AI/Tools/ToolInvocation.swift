@@ -34,16 +34,23 @@ struct ToolInvocation: Sendable {
     /// the field (a compose card opening, its reply going out) land on this key in
     /// `ChatFieldWords`, never on whichever chat a pill shows by then (ADR-IOS-117).
     let fieldWordsKey: String?
+    /// Set when the chat view's closed reply field sent the request: the text version of the email
+    /// written goes into the AI Suggestion's bubble, and the call returns once it has been there
+    /// long enough to read (`ChatThreadView.landFieldWritten`). The reply tool calls it just before
+    /// it opens the compose card (ADR-IOS-114 decision 10, amended 2026-11-25).
+    let landWritten: (@MainActor @Sendable (String) async -> Void)?
 
     init(
         uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil,
-        composeOrigin: ComposeOrigin? = nil, fieldWordsKey: String? = nil
+        composeOrigin: ComposeOrigin? = nil, fieldWordsKey: String? = nil,
+        landWritten: (@MainActor @Sendable (String) async -> Void)? = nil
     ) {
         self.uiSink = uiSink
         self.sessionKey = sessionKey
         self.fieldReply = fieldReply
         self.composeOrigin = composeOrigin
         self.fieldWordsKey = fieldWordsKey
+        self.landWritten = landWritten
     }
 
     /// The no-UI invocation used by every non-interactive completion caller and

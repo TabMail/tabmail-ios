@@ -52,15 +52,17 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// written. The chat's closed reply field has no agent to tell, so when nothing was written it
     /// keeps the user's words (`DynamicIslandChat.composeFromField`).
     enum Written: Equatable {
-        /// A compose card opened (sent or closed), the AI Suggestion changed, or a reply to the email
-        /// was sent moments ago.
+        /// A compose card opened and closed unsent, or a reply to the email was sent moments ago.
         case done(String)
+        /// The compose card sent the email. The card reports it before it closes, so a field whose
+        /// words the card owns empties them at once (`DynamicIslandChat.composeNewEmailFromField`).
+        case sent(String)
         /// Nothing was written: no card opened and nothing was stored.
         case nothing(String)
 
         var text: String {
             switch self {
-            case .done(let text), .nothing(let text): text
+            case .done(let text), .sent(let text), .nothing(let text): text
             }
         }
 
@@ -71,8 +73,20 @@ struct EmailReplyTool: AgentTool, Sendable {
 
         /// The compose card's outcome: nothing written only when the card never opened.
         static func card(_ outcome: ComposeOutcome) -> Written {
-            if case .failed = outcome { return .nothing(outcome.describeForLLM) }
-            return .done(outcome.describeForLLM)
+            switch outcome {
+            case .failed: .nothing(outcome.describeForLLM)
+            case .sent: .sent(outcome.describeForLLM)
+            case .cancelled: .done(outcome.describeForLLM)
+            }
+        }
+
+        /// The same outcome told with `text`.
+        func retold(_ text: String) -> Written {
+            switch self {
+            case .done: .done(text)
+            case .sent: .sent(text)
+            case .nothing: .nothing(text)
+            }
         }
     }
 
@@ -80,8 +94,10 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// amended 2026-11-25): the words, typed or said, are the request of the reply's compose edit,
     /// as compose's own field takes them, and never reach the agent. The field's send
     /// (`invocation.fieldReply`) names the email as the field showed it and who the reply goes to;
-    /// with its AI Suggestion showing the words edit it, otherwise they write the reply, and the
-    /// compose card opens with the email written and its text version. Every request is the
+    /// with its AI Suggestion showing the words edit it, otherwise they write the reply. Every
+    /// time, the email's text version lands in the AI Suggestion's bubble, stays there to be read
+    /// (`invocation.landWritten`), and then the compose card opens with the email written and its
+    /// text version (amended 2026-11-25: one path, whatever was written). Every request is the
     /// user's own ask, so a reply sent moments ago never stops it, and a compose edit that fails
     /// opens nothing rather than a card without the user's words.
     func composeFromField(_ words: String, invocation: ToolInvocation) async -> Written {
@@ -127,10 +143,10 @@ struct EmailReplyTool: AgentTool, Sendable {
     ///
     /// A request from the field while its AI Suggestion showed (`ChatFieldReply.suggestion`) is a
     /// compose edit of that suggestion, as Thunderbird's inline editor edits the draft it shows
-    /// (`runComposeEdit` with the draft as `body`). `rewritesInPlace` is the one choice of what
-    /// follows (`ChatSuggestionConfig.fieldEditRewritesInPlace`): the edit and its text version
-    /// replace the suggestion, so the ghost shows them and the card stays closed; or the compose
-    /// card opens with the edited email. Internal so tests can take either choice.
+    /// (`runComposeEdit` with the draft as `body`). The compose card then opens with the edited
+    /// email; `rewritesInPlace` is the one choice of whether the edit and its text version also
+    /// replace the stored suggestion first (`ChatSuggestionConfig.fieldEditRewritesInPlace`).
+    /// Internal so tests can take either choice.
     func run(
         arguments: [String: JSONValue], invocation: ToolInvocation, rewritesInPlace: Bool
     ) async throws -> String {
@@ -392,11 +408,21 @@ struct EmailReplyTool: AgentTool, Sendable {
             return .done("Reply to this email was already sent moments ago. No further action needed.")
         }
 
+        let isFieldsOwnReply = invocation.fieldReply?.isOwnReply(to: header) == true
+        // The closed field's own reply: the email written lands in the AI Suggestion's bubble and
+        // stays there to be read before its card opens. Stop during that hold cancels the task,
+        // and the card below then opens nothing (`enqueueComposeAndAwaitOutcome`).
+        if isFieldsOwnReply, let land = invocation.landWritten, let text = suggestion?.textMessage, !text.isEmpty {
+            if DebugModeManager.isLoggingEnabled() {
+                BackgroundSyncLogger.logDebug("[EmailReplyTool] field reply lands in the bubble len=\(text.count), then its card opens")
+            }
+            await land(text)
+        }
+
         // Suspend until the user sends, dismisses, or Stop cancels the task.
         // The helper threads onOutcome + outcomeState into ComposeRequest so
         // the MainActor-isolated ComposeView callback resumes this tool's
         // continuation.
-        let isFieldsOwnReply = invocation.fieldReply?.isOwnReply(to: header) == true
         let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
                 mode: .reply,
@@ -430,14 +456,14 @@ struct EmailReplyTool: AgentTool, Sendable {
     /// `start` (the suggestion's envelope with this call's recipient changes). A subject the edit
     /// writes replaces the start's; with none (the model's subject was blank) the draft keeps the
     /// start's subject, an empty one included. The edit's recipient
-    /// changes apply by the card's own operation (`Recipients.applying`). In place, only when the
-    /// edited draft is still the suggestion's envelope (`ChatReplyCompose.holds`): the edit, its
-    /// text version and change command replace the suggestion through the one writer, over the
-    /// suggestion edited (a newer one stored meanwhile wins), and the ghost shows them; no card
-    /// opens. Otherwise (not in place, or a draft the suggestion cannot hold: another subject,
-    /// sender or audience) the compose card opens with exactly the edited draft and the
-    /// suggestion is unchanged; the card carries the edit whole, its text version included. The
-    /// outcome says which happened, so the agent tells the user what they see.
+    /// changes apply by the card's own operation (`Recipients.applying`). The compose card then
+    /// opens with exactly the edited draft, the edit whole, its text version included, every time
+    /// (amended 2026-11-25). In place, only when the edited draft is still the suggestion's
+    /// envelope (`ChatReplyCompose.holds`): before the card opens, the edit, its text version and
+    /// change command replace the suggestion through the one writer, over the suggestion edited (a
+    /// newer one stored meanwhile wins, and then nothing opens). Otherwise (not in place, or a
+    /// draft the suggestion cannot hold: another subject, sender or audience) the suggestion is
+    /// unchanged. The outcome says which happened.
     static func finishSuggestionEdit(
         _ result: InlineEditResult, shown: ReplyResult, start: ChatReplyCompose,
         suggestionEnvelope: ChatReplyCompose, email: MessageHeader, rewritesInPlace: Bool,
@@ -451,19 +477,20 @@ struct EmailReplyTool: AgentTool, Sendable {
         let staysTheSuggestion = suggestionEnvelope.holds(
             recipients: recipients, subject: subject, accountId: email.accountId, of: email)
         let edit = ReplyResult(body: body, textMessage: textMessage, changeCommand: result.changeCommand)
-        guard rewritesInPlace, staysTheSuggestion else {
-            let why = staysTheSuggestion ? ""
-                : "the edited email has another subject or other recipients, which the AI Suggestion cannot hold; "
-            let outcome = await openCard(suggestionEnvelope.with(recipients: recipients, subject: subject), edit)
-            let text = "The edited email goes to the reply card, not the AI Suggestion (\(why)the AI Suggestion is unchanged). "
-                + "The reply card's outcome: \(outcome.text)"
-            if case .nothing = outcome { return .nothing(text) }
-            return .done(text)
+        let stored = rewritesInPlace && staysTheSuggestion
+        if stored {
+            guard await store(edit, shown, email) == .written else {
+                return .failed("the AI Suggestion could not be stored (it changed meanwhile, or the save failed); this edit was not kept")
+            }
         }
-        guard await store(edit, shown, email) == .written else {
-            return .failed("the AI Suggestion could not be stored (it changed meanwhile, or the save failed); this edit was not kept")
-        }
-        return .done("Changed the AI Suggestion in place (no card opened); it now reads: \(textMessage). "
-            + "Nothing was sent: the user taps the suggestion to review and send it.")
+        let outcome = await openCard(suggestionEnvelope.with(recipients: recipients, subject: subject), edit)
+        let why = staysTheSuggestion ? ""
+            : "the edited email has another subject or other recipients, which the AI Suggestion cannot hold; "
+        let first = stored ? "Changed the AI Suggestion in place; it now reads: \(textMessage). "
+            : "The edited email goes to the reply card, not the AI Suggestion (\(why)the AI Suggestion is unchanged). "
+        let told = outcome.retold(first + "The reply card's outcome: \(outcome.text)")
+        // Stored in place, the edit was written even when its card never opened.
+        if stored, case .nothing = told { return .done(told.text) }
+        return told
     }
 }

@@ -232,8 +232,8 @@ struct ChatFieldFill: Equatable {
         /// The open send completed (its compose card's reply went out): it empties the words only
         /// if a send is open and they are still the words sent, or none.
         case completed
-        /// The field's send finished with something written (its compose card closed, or the AI
-        /// Suggestion changed in place), or the agent answered it (the tutorial's scripted request):
+        /// The field's send finished with something written (its compose card closed, or an edit
+        /// stored in place whose card never opened), or the agent answered it (the tutorial's scripted request):
         /// `completed`, unless a compose card opened for it and closed unsent; then the words are
         /// the user's again, kept and not emptied.
         case answered
@@ -619,6 +619,26 @@ struct ChatHeldGhost: Equatable {
 
     /// Ending turns the ghost into the sent reply's bubble (else it simply goes).
     var morphs: Bool { sent && showsBubble }
+}
+
+/// The AI Suggestion's bubble while the closed field's Send writes the email (ADR-IOS-114 decision
+/// 10, amended 2026-11-25), one path whatever is written: the suggestion the ghost showed at Send
+/// stays in its place, pulsing (with none, the working bubble shows); the email written lands in
+/// it; it stays there to be read (`ChatSuggestionConfig.writtenHold`); then its compose card opens
+/// and the bubble is held while the card is up (`ChatHeldGhost`). UI only, from Send until the
+/// card is taken or the send ends.
+struct ChatFieldWriting: Equatable {
+    /// The ghost's words as Send was tapped; nil when no suggestion showed.
+    let shown: String?
+    /// The text version of the email written, once it has landed.
+    var written: String?
+
+    /// The bubble's words: the email written once it has landed, else the suggestion shown at
+    /// Send; nil: the working bubble.
+    var text: String? { written ?? shown }
+
+    /// The bubble pulses while the email is written.
+    var pulses: Bool { written == nil }
 }
 
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the

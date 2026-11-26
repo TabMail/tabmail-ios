@@ -245,12 +245,19 @@ enum ChatSuggestionConfig {
     /// The line under the ghost.
     static let statusLine = "\(label) · Tap to use"
     /// What a reply request typed or said in the field does while the AI Suggestion shows: it is
-    /// a compose edit of the suggestion (`EmailReplyTool`), and then either the ghost shows the
-    /// edit in place (true; a tap on it opens the compose card) or the compose card opens with
-    /// the edited email (false). The one place this choice is made.
+    /// a compose edit of the suggestion (`EmailReplyTool`), and the compose card then opens with
+    /// the edited email either way. True: the edit also replaces the stored suggestion first, so
+    /// a card closed unsent leaves the ghost showing the edit; false: the stored suggestion stays
+    /// as it was. The one place this choice is made (amended 2026-11-25: before, true opened no
+    /// card).
     static let fieldEditRewritesInPlace = true
     /// The line under the working bubble while the suggestion is written.
     static let writingLine = "\(label) · Writing"
+    /// How long the email the closed field's Send wrote stays in the AI Suggestion's bubble, once
+    /// it has landed there, before its compose card opens, so it can be read
+    /// (`ChatThreadView.landFieldWritten`). Under Reduce Motion the text lands at once and only
+    /// this hold remains.
+    static let writtenHold: Double = 0.5
     /// The working bubble growing into the ghost, the re-pin scroll in the same transaction.
     static let fillDuration: Double = 0.3
     /// Under Reduce Motion the ghost fades in over this as it replaces the working bubble, the only

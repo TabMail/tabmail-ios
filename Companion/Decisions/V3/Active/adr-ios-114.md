@@ -466,6 +466,35 @@ same AI result, kept as long as the email itself is shown.
    words reach only the compose edit; a failed compose keeps them), `ChatReplyRecoveryTests`
    (an edit in place or on the field's own card asks the agent nothing),
    `ChatFieldWordsRuntimeTests` (sections 9 and 10, the card's Send completes the words).
+   **One path for the closed field's words (amended 2026-11-25).** Until this amendment what a Send
+   showed depended on the edit: an edit of the AI Suggestion that kept its envelope was stored in
+   place and opened no card, while a subject or recipient change, or no suggestion, opened the card
+   at once; and the ghost was hidden while the chat worked, so a suggestion on screen disappeared.
+   Now every Send from the closed field takes one path. The words are written; the AI Suggestion's
+   bubble shows the writing (a suggestion on screen stays in its place and pulses under "Writing",
+   `ChatSuggestionBubble(writing:)`, `ChatFieldWriting`; with none yet, the working bubble,
+   `ChatSuggestionWorkingBubble`); the written text lands in the bubble (`ToolInvocation.landWritten`,
+   called by `EmailReplyTool.openReplyCard` for the field's own reply only, into
+   `ChatThreadView.landFieldWritten`); it stays to be read for `ChatSuggestionConfig.writtenHold`
+   after the fill animation (the hold alone under Reduce Motion); then the field's own card opens,
+   with the landed text held behind it as the ghost (`ChatThreadView.openAgentCompose` hands
+   `fieldWriting` to `heldGhost`). An edit that keeps its envelope is still stored in place first
+   (decision 17). Stop during the hold cancels the request, and no card opens; an edit already
+   stored in place stays the AI Suggestion, as when its card is closed unsent, and the words are
+   back in the field. A new email's card
+   that reports `sent` completes the field's words at once (`EmailReplyTool.Written.sent`,
+   `ChatFieldFill.Change.completed` in `DynamicIslandChat.composeNewEmailFromField`): the card
+   reports `sent` before it closes, so applying `notWritten` there put the words back into the
+   field under the closing card and emptied them a moment later, a visible blink. It is the one
+   completion the pill applies through its own fill: a new email's chat has no `ChatFieldWords`
+   key, so its words are the pill's own, and the send's end holds the pill as it was at Send; a
+   request with a chat key ends on that key. Tests:
+   `SuggestionRewriteRouteTests.writtenLandsBeforeItsCard` and `stopDuringTheHoldOpensNothing`,
+   `ChatSuggestionBubbleTests.fieldSendWritesIntoTheGhost`,
+   `ChatReplyRecoveryTests.heldFieldEditThroughTheGhostAndItsCard`,
+   `ChatReplyFieldTests.fieldWritingBubble` and the new email's `ended` check,
+   `ChatReplyFieldRuntimeTests.clearWiring`,
+   `EmailComposeToolOutcomeTests` (the `sent` outcome).
    **The AI Reply shows only while the field holds no words of the user's, and never on the user's
    turn (decided 2026-11-07):** `ChatFieldFill.offer`. An empty field, or the AI Reply the app itself
    put there, takes the ready reply whenever it arrives, collapsed or in the open sheet; typed or
@@ -1398,6 +1427,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `run(arguments:invocation:rewritesInPlace:)`, so registry dispatch takes the same route.
      A failed edit leaves the suggestion as it was and the agent says so; no fallback.
      TB-parity exception: TB has no ghost, so TB's chat request always opens compose.
+     *Amended 2026-11-25:* the card opens either way. In place still stores the edit first through
+     the same guarded write, and a refused store opens nothing; then the edited email lands in the
+     ghost and, after `ChatSuggestionConfig.writtenHold`, its card opens (decision 10, *One path for
+     the closed field's words*). "No card opens" above is history. The tool's answer still says
+     whether the suggestion was changed in place, then the card's outcome; a card that writes
+     nothing after an in-place store still ends as done, since the edit is kept.
    - **A card edit keeps the ghost.** `ComposeView.writeCachedReplyToDB` stores the edit's text
      version with its body (it cleared `replyTextMessage`); an edit with no text version still clears
      it, so a text never describes another body. Each edit turn records the text version stored with

@@ -15,8 +15,9 @@ import UIKit
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The closed field's Send is the reply's compose edit, never a turn for the agent (ADR-IOS-114
-///     decision 10, amended 2026-11-25): an edit of the AI Suggestion lands in place or opens the
-///     field's own card, and asks the agent nothing; a card closed unsent hands the words back
+///     decision 10, amended 2026-11-25): an edit of the AI Suggestion is written into the ghost
+///     (stored in place first when it keeps its envelope), then opens the field's own card, and
+///     asks the agent nothing; a card closed unsent hands the words back
 ///     (ADR-IOS-117); a compose cut off leaves nothing to resume and keeps the words.
 ///  2. A request the open sheet sends, cut off, is recovered with no field words named, and the
 ///     inbox pill's words typed after a cut-off offer Send.
@@ -420,7 +421,7 @@ struct ChatReplyRecoveryTests {
         try await waitUntil { chat.controller.presentedViewController === card }
     }
 
-    @Test("A field edit of the AI Suggestion, held, lands in place and asks the agent nothing; the ghost's card is the exact Reply All")
+    @Test("A field edit of the AI Suggestion, held: the suggestion stays, pulsing; released, the edit is stored in place, lands in the ghost, then its card opens, and the agent is asked nothing; the ghost's card is the exact Reply All")
     func heldFieldEditThroughTheGhostAndItsCard() async throws {
         // The card's own debug log says what it was given (ComposeView.prepopulate).
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
@@ -448,26 +449,49 @@ struct ChatReplyRecoveryTests {
                 try await Self.waitUntil { Self.type("Make it shorter", in: chat.view) }
                 #expect(Self.type("Make it shorter", in: chat.view), "control: the field takes words")
                 try await Task.sleep(for: .milliseconds(300))
+                // The card the edit opens waits in the queue, so the test reads it before it shows.
+                router.composePresentationDidBegin()
                 #expect(HostedAccessibility.activate("chatSend", in: chat.view),
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { gate.entered == 1 }
                 #expect(gate.entered == 1, "control: the field's Send ran the edit: \(backend.bodies.count) requests")
-                // The ghost steps aside while the chat works and never shows the edit before it is stored.
-                #expect(!Self.ghosts(in: chat.view).contains { $0.text == edited.textMessage },
-                        "while the edit is held the ghost never shows it: \(Self.ghosts(in: chat.view).map(\.text))")
+                // While it is written the suggestion stays in its place, pulsing, and never shows the
+                // edit before it is stored.
+                @MainActor func writing() -> [String] {
+                    HostedAccessibility.elements(under: chat.view).compactMap { element in
+                        HostedAccessibility.identifier(of: element) == ChatSuggestionWorkingBubble.bubbleId
+                            ? element.accessibilityLabel : nil
+                    }
+                }
+                let pulsing = "\(ChatSuggestionConfig.writingLine): \(Self.shownSuggestion.textMessage ?? "")"
+                try await Self.waitUntil { writing() == [pulsing] }
+                let shownWriting = writing()
+                #expect(shownWriting == [pulsing], "while the edit is held the suggestion shown stays, pulsing: \(shownWriting)")
+                let heldGhosts = Self.ghosts(in: chat.view).map(\.text)
+                let heldShowsEdit = heldGhosts.contains { $0 == edited.textMessage }
+                #expect(!heldShowsEdit, "while the edit is held the ghost never shows it: \(heldGhosts)")
                 let held = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
                 #expect(held?.suggestion == Self.shownSuggestion, "nothing is stored while the edit is held")
 
-                // Released: the edit replaces the suggestion in place; no card opens.
+                // Released: the edit replaces the suggestion in place, lands in the ghost, then its card opens.
                 gate.release()
                 try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == edited.textMessage } }
                 #expect(Self.ghosts(in: chat.view).map(\.text) == [edited.textMessage],
                         "the ghost shows the edit: \(Self.ghosts(in: chat.view).map(\.text))")
                 let stored = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
                 #expect(stored?.suggestion == edited, "the edit is stored whole, its command included")
-                #expect(router.composeQueueDepth == 0 && chat.controller.presentedViewController == nil,
-                        "an edit in place opens no card")
+                try await Self.waitUntil { router.composeQueueDepth == 1 }
+                let request = try #require(router.firstQueuedRequestForTesting, "an edit in place opens its card too")
+                #expect(request.isFieldsOwnReply && request.suggestion?.textMessage == edited.textMessage,
+                        "the card is the field's own, with the edit: \(String(describing: request.suggestion?.textMessage))")
                 #expect(backend.bodies.isEmpty, "the closed field asks the agent nothing: \(backend.bodies.count) requests")
+                // The user closes that card; the edit stays the AI Suggestion.
+                request.onOutcome(.cancelled)
+                router.composePresentationDidEnd()
+                try await Self.waitUntil { !ActiveAgentTracker.shared.anyWorking }
+                try await Self.waitUntil { Self.ghosts(in: chat.view).map(\.text) == [edited.textMessage] }
+                #expect(Self.ghosts(in: chat.view).map(\.text) == [edited.textMessage],
+                        "the ghost keeps the edit after its card closed: \(Self.ghosts(in: chat.view).map(\.text))")
 
                 // The ghost's card is the exact Reply All, with the edit.
                 try await Self.openGhostCard(try #require(stored?.suggestion), in: chat)
