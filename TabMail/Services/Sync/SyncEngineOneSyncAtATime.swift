@@ -57,7 +57,9 @@ import Synchronization
 //   that is not a slice and queued before the first slice stays ahead of it.
 //   This is a place in the one line (`SyncTurnPlace`), not a second queue.
 //   Before #1360 it joined the back of the line, behind every slice already
-//   waiting, about 5 s each.
+//   waiting, about 5 s each. The folder view's listing (opening a folder,
+//   pulling to refresh it) takes the same place: the user asked for what is
+//   new in it now.
 // - Only an account that is free takes the quick-sync-only route.
 // - In the background a set flag waits for the next opening of the app: stage 2
 //   never starts in the background. The follow-up checks this when it is asked
@@ -79,15 +81,17 @@ import Synchronization
 //   work on their own, while syncs run. An account it skipped never counts as a
 //   success when the poll clears the inbox error banner.
 // - Work that is not a trigger still waits for its turn: a single-folder
-//   listing (pull to refresh's folders on screen, message detail), a catch-up
-//   slice, a Settings reset, and stage 2 from Settings, a new account or the
-//   epoch rebuild (`sync(account:)`).
+//   listing (the folder view's, at the follow-up's place; message detail,
+//   after a send or a move), a catch-up slice, a Settings reset, and stage 2
+//   from Settings, a new account or the epoch rebuild (`sync(account:)`).
 // - Code: `oneSyncAtATimeOrFollowUp` sets the flag and asks for the follow-up
 //   when it sets it; `handOverSyncPass` asks again each time the account becomes
 //   free while the flag is set (a flag set in the background, whose ask started
 //   nothing); `followUpPass` waits for the turn, ahead of the waiting catch-up
 //   slices (`SyncTurnPlace.aheadOfBackgroundChunks`; each slice waits as
-//   `.backgroundChunk`), and runs stage 2 if the flag is
+//   `.backgroundChunk`; the folder view's listings wait there too:
+//   `InboxViewModel.startSync`/`refreshSync` -> `AccountManager.syncFolders`
+//   -> `syncFolderMessages(place:)`), and runs stage 2 if the flag is
 //   still set and the app is still in the foreground; `foregroundPass` clears
 //   the flag when it starts; `SyncScheduler.runSyncFollowUp` runs the follow-up,
 //   in the foreground only.
@@ -131,10 +135,12 @@ enum SyncTurnPlace: Sendable {
     case arrivalOrder
     /// At the back, marked as a background chunk: a catch-up slice
     /// (`runCatchUpRun`: the older-mail catch-up, an access run). An owed
-    /// new-mail follow-up goes ahead of it.
+    /// new-mail follow-up and the folder view's listing go ahead of it.
     case backgroundChunk
-    /// The follow-up stage 2 an owed new-mail read asks for (`followUpPass`):
-    /// right before the first background chunk waiting, else at the back.
+    /// The follow-up stage 2 an owed new-mail read asks for (`followUpPass`),
+    /// and the folder view's listing (opening a folder, pulling to refresh it:
+    /// `AccountManager.syncFolders`): right before the first background chunk
+    /// waiting, else at the back.
     case aheadOfBackgroundChunks
 }
 
@@ -143,8 +149,8 @@ struct SyncTurnWaiter {
     let id: UInt64
     /// Where the waiting pass was started (`caller:line`), for the debug log.
     let caller: String
-    /// A catch-up slice (`SyncTurnPlace.backgroundChunk`): a follow-up that
-    /// joins the line goes ahead of it.
+    /// A catch-up slice (`SyncTurnPlace.backgroundChunk`): a follow-up or the
+    /// folder view's listing that joins the line goes ahead of it.
     let isBackgroundChunk: Bool
     let continuation: CheckedContinuation<Void, Never>
 }
@@ -153,10 +159,11 @@ extension SyncEngine {
     /// Runs `pass` as the account's only sync pass, so a delta and a full sync
     /// of one account never run at the same time. A pass that arrives while
     /// another runs waits its turn, in arrival order, and then runs; nothing is
-    /// joined. The one exception is `place`: the follow-up stage 2
-    /// (`.aheadOfBackgroundChunks`) joins the line right before the first
-    /// catch-up slice waiting (`.backgroundChunk`), so once it is in line only
-    /// the running work is ahead of it (#1360). Only work that is not a sync
+    /// joined. The one exception is `place`: the follow-up stage 2 and the
+    /// folder view's listing (`.aheadOfBackgroundChunks`) join the line right before
+    /// the first catch-up slice waiting (`.backgroundChunk`), so it passes
+    /// every slice waiting; a pass that is not a slice and joined before the
+    /// first of them stays ahead (#1360). Only work that is not a sync
     /// trigger waits here (a listing, a
     /// catch-up slice, a Settings reset, stage 2 from Settings or a new account);
     /// none of them has a time limit that counts the wait. A trigger never waits:
@@ -235,7 +242,7 @@ extension SyncEngine {
 
     /// Waits for the account's turn; false only when the test harness released
     /// a wait that overran `SyncConfig.syncTurnWaitTestBoundSeconds`. The waiter
-    /// joins the back of the line, except a follow-up
+    /// joins the back of the line, except a follow-up or the folder view's listing
     /// (`.aheadOfBackgroundChunks`), which joins it right before the first
     /// catch-up slice waiting (#1360): the slices keep their order among
     /// themselves, a pass that is not a slice and joined before the first one
@@ -261,7 +268,7 @@ extension SyncEngine {
             if place == .aheadOfBackgroundChunks, let firstChunk = waiting.firstIndex(where: \.isBackgroundChunk) {
                 if DebugModeManager.isLoggingEnabled() {
                     let passed = waiting[firstChunk...].filter(\.isBackgroundChunk).count
-                    BackgroundSyncLogger.logDebug("[SyncTurn] \(accountId.prefix(8)): follow-up goes ahead of \(passed) waiting catch-up slice(s) (\(caller))")
+                    BackgroundSyncLogger.logDebug("[SyncTurn] \(accountId.prefix(8)): \(caller) goes ahead of \(passed) waiting catch-up slice(s)")
                 }
                 waiting.insert(waiter, at: firstChunk)
             } else {

@@ -18,7 +18,9 @@ pass's full sync while another pass's delta was in flight, and both write the ac
    turn and then runs; a caller's timeout includes the wait. The turn is released on every exit, a throw
    included, and handed straight to the oldest waiter, so a later arrival cannot overtake.
    *(Amended 2026-11-25, #1360, at the end of this ADR: the follow-up stage 2 joins the line right before
-   the first catch-up slice waiting, so it overtakes the slices; the turn goes to the first waiter in line.)*
+   the first catch-up slice waiting, so it overtakes the slices; the turn goes to the first waiter in line.
+   Since 2026-11-26 the folder view's listing (opening a folder, pulling to refresh it) takes the same
+   place.)*
 2. **A pass never acts on account sync state read before its turn** (owner, 2026-11-10, choosing the fix
    at the cause over blessing the gap). The pass's first step inside its turn re-reads the account row
    (`SyncEngine.accountAtTurnStart`), and the pass bodies (`foregroundPass`, `backgroundDeltaPass`) take
@@ -406,7 +408,7 @@ and then for every other reader's slice already in line.
 1. **A place in the one line, not a second queue.** `oneSyncAtATime` takes a place (`SyncTurnPlace`):
    `.arrivalOrder` (the default, every caller but two), `.backgroundChunk` (a catch-up slice, marked on
    its waiter, `SyncTurnWaiter.isBackgroundChunk`) and `.aheadOfBackgroundChunks` (the follow-up,
-   `followUpPass`). `waitForSyncTurn` puts the follow-up right before the first waiting background chunk,
+   `followUpPass`; since item 7 also the folder view's listing). `waitForSyncTurn` puts the follow-up right before the first waiting background chunk,
    and at the back when none waits; every other waiter joins the back as before. `handOverSyncPass` is
    unchanged: the turn goes to the first waiter in line. No new queue, gate, timer or layer (ADR-IOS-009's
    one gate).
@@ -425,11 +427,29 @@ and then for every other reader's slice already in line.
    1): no follow-up runs in the background, so it has no place in the line to change.
 5. **Open questions, not decided here:** whether the follow-up should also pass a listing or a Settings
    pass queued behind the first waiting slice; whether pull to refresh's listing of the folder on screen
-   should take the follow-up's place.
+   should take the follow-up's place. *(Both answered by the owner on 2026-11-26, with a third question,
+   whether opening a folder should too: items 6 and 7.)*
+6. **The follow-up's place stays where item 1 puts it (owner, 2026-11-26).** It goes right before the first
+   waiting catch-up slice, and so passes whatever queued behind that slice (a listing, `sync(account:)`, a
+   Settings pass), which waits one more quick check. Work that queued before the first waiting slice stays
+   ahead of it. No wider reorder.
+7. **The folder view's listing takes the follow-up's place (owner, 2026-11-26): pulling to refresh the
+   folders on screen, and opening a folder, so neither waits behind the background readers' slices.**
+   Both run the view's one sync (`InboxViewModel.startSync` and `refreshSync` -> `performSync` ->
+   `AccountManager.syncFolders`, its only caller), which lists each folder with
+   `SyncEngine.syncFolderMessages(place: .aheadOfBackgroundChunks)` -> `oneSyncAtATime(place:)`. Each
+   folder's listing asks for its place when it starts, so only the running work, and a follow-up or
+   listing that took that place before it, are ahead of it. The view's change read is unchanged (a
+   trigger: it takes a free turn or sets the flag), and so is the access run it starts after it (its
+   slices wait as `.backgroundChunk`). The other single-folder listings keep arrival order: an open
+   email's, after a send and after the outbox empties (named by the owner the same day), and after a
+   drain's moves and step 6 of an epoch rebuild.
 
-**Cost:** one bool per waiter and one scan of the waiting line when a follow-up joins it (a handful of
-waiters at most). Nothing on the startup, resume, push or IDLE paths changes; a debug-gated
-`[SyncTurn] … follow-up goes ahead of N waiting catch-up slice(s)` line records each overtake.
+**Cost:** one bool per waiter and one scan of the waiting line when a follow-up or the folder view's
+listing joins it (a handful of waiters at most). Nothing on the startup, resume, push or IDLE paths changes; a
+debug-gated `[SyncTurn] … <caller> goes ahead of N waiting catch-up slice(s)` line records each overtake.
+*Superseded (item 7):* "when a follow-up joins it" and the log text "follow-up goes ahead of N waiting
+catch-up slice(s)".
 **Rejected:** a priority queue or a second line for new mail (a new layer); the follow-up taking or flagging
 the turn like a trigger (rejected in the 2026-11-23 amendment: back-to-back slices beat it at every release).
 
@@ -442,7 +462,11 @@ during a running catch-up slice, with two other readers' slices in line, reads r
 slice and ahead of both, which then run in their order) and
 `followUpTakesItsPlaceBeforeTheFirstWaitingSlice` (a listing that joined before the first waiting slice
 stays ahead of the follow-up; a slice that joins after it queues behind it; with no slice waiting it joins
-the back). `SyncFollowUpTests.fuzzEveryTriggerGetsALaterRead` now runs half its held work as catch-up
+the back). `folderViewListsAheadOfQueuedSlices` (item 7, for opening a folder and for pulling to refresh
+it, each through its `InboxViewModel` entry point: during a running catch-up slice, with two other
+readers' slices in line, the folder is listed right after the running slice and ahead of both) and
+`otherListingsKeepTheirPlace` (item 7: any other single-folder listing, `syncFolderMessages` with its
+default place, waits behind both). `SyncFollowUpTests.fuzzEveryTriggerGetsALaterRead` now runs half its held work as catch-up
 slices, so its invariants (every trigger gets a later read, passes never overlap, the flag ends empty) hold
 with the follow-up overtaking them. `OneSyncAtATimeTests.waitingPassesRunOneAtATimeInArrivalOrder` still
 pins arrival order for every other pass.

@@ -159,7 +159,9 @@ The owner's rulings of 2026-11-09:
        pass) that arrives during the catch-up therefore waits at most one slice, and the turn is FIFO,
        so it runs before the run's next slice. *(Amended 2026-11-25, #1360, ADR-IOS-104: the turn is
        first in first out except for the follow-up stage 2, which joins the line ahead of every catch-up
-       slice waiting, this run's and other readers' alike, so it still waits at most the running slice.)*
+       slice waiting, this run's and other readers' alike, so it still waits at most the running slice.
+       Since 2026-11-26 the folder view's listing (opening a folder, pulling to refresh it) takes the
+       same place.)*
        A slice never throws.
      - **How many slices.** A foreground cycle (no deadline) runs ONE slice. The background job runs
        slices until its deadline (`SyncConfig.backgroundBackfillDeadlineSeconds`, 5 minutes, which

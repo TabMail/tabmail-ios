@@ -24,8 +24,10 @@ import Testing
 /// - poll: `foregroundSyncOne`
 /// The turn is above the provider boundary, so Gmail stands in for IDLE's IMAP
 /// account. A runner stands in for `SyncScheduler.runSyncFollowUp`
-/// (`SyncFollowUpTests.FollowUps`). The last test drives the turn line itself
-/// (`SyncEngine.oneSyncAtATime` with each `SyncTurnPlace`).
+/// (`SyncFollowUpTests.FollowUps`). The folder view's listing takes the same
+/// place (owner 2026-11-26): its test opens and pulls to refresh a folder
+/// through `InboxViewModel` on `AccountManager.shared`. The last test drives
+/// the turn line itself (`SyncEngine.oneSyncAtATime` with each `SyncTurnPlace`).
 @Suite("New mail goes ahead of background chunks waiting for the turn (#1360)", .serialized, .processGlobalState)
 struct NewMailFirstTests {
     typealias O = OneSyncAtATimeTests
@@ -179,6 +181,212 @@ struct NewMailFirstTests {
             #expect(entries.filter { $0 == firstSlice }.count == 1 && entries.filter { $0 == secondSlice }.count == 1,
                     "each queued slice runs once: \(entries)")
         }
+    }
+
+    /// How the folder view syncs the folders on screen. Both run
+    /// `InboxViewModel.performSync` -> `AccountManager.syncFolders`.
+    enum FolderViewSync: String, CaseIterable, Sendable {
+        /// Opening the folder: `InboxView.onAppear` -> `startSync()`, after its debounce.
+        case open
+        /// Pull to refresh: `.refreshable` -> `refreshSync()`.
+        case pull
+    }
+
+    /// THE PROPERTY for the folder view (owner 2026-11-26; sync timing promise
+    /// 7 for the pull): the listing of the folder on screen takes the
+    /// follow-up's place in the turn line, so opening a folder or pulling to
+    /// refresh it during a catch-up slice lists the folder right after that
+    /// slice, ahead of the other readers' slices already waiting, which then
+    /// run in their order. Driven through the view's own entry points on
+    /// `AccountManager.shared`, the app's engine. The scheduler takes the
+    /// follow-up that the view's busy change read asks for and starts nothing:
+    /// this test is about the listing. RED before: the listing joined the back
+    /// of the line, so both queued slices started before it (the log read
+    /// "slice INBOX", "slice SENT", "slice TRASH", "listing"). RED if
+    /// `syncFolders` or `syncFolderMessages` drops the place.
+    @Test("Opening or pulling to refresh a folder during a catch-up slice lists it right after that slice, ahead of the slices already waiting",
+          arguments: FolderViewSync.allCases)
+    @MainActor
+    func folderViewListsAheadOfQueuedSlices(sync: FolderViewSync) async throws {
+        let scheduler = SyncScheduler.shared
+        let savedScheduler = (scheduler.applicationStateForTesting, scheduler.foregroundReadinessHook, scheduler.stageTwoHook)
+        scheduler.applicationStateForTesting = .active
+        scheduler.foregroundReadinessHook = { true }
+        scheduler.stageTwoHook = { _ in }
+        let state = AccountManagerState.shared
+        let savedState = (state.syncErrorBanner, state.lastSyncCompletedAt, state.lastSyncFailed)
+        // Restored only after the account has left the engine (the end of the
+        // body below), so an ask still on its way to the main actor finds no account.
+        defer {
+            scheduler.applicationStateForTesting = savedScheduler.0
+            scheduler.foregroundReadinessHook = savedScheduler.1
+            scheduler.stageTwoHook = savedScheduler.2
+            state.setSyncPhase(nil, forAccount: Self.accountId)
+            state.syncErrorBanner = savedState.0
+            state.lastSyncCompletedAt = savedState.1
+            state.lastSyncFailed = savedState.2
+        }
+        // The app's database, as `O.withAppDB` installs it, here in the test's
+        // own main-actor body (the view model is main-actor isolated).
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+        let account = try O.makeAccount(pool: pool, lastFullSyncAt: Date())
+        let folders = [
+            Folder(name: Self.firstQueuedPath, path: Self.firstQueuedPath, role: .sent, accountId: Self.accountId),
+            Folder(name: Self.secondQueuedPath, path: Self.secondQueuedPath, role: .trash, accountId: Self.accountId),
+        ]
+        try await pool.write { db in for folder in folders { try folder.insert(db) } }
+        let inbox = try await pool.read { db in
+            try Folder.filter(Column("accountId") == Self.accountId && Column("role") == FolderRole.inbox.rawValue)
+                .fetchOne(db)
+        }
+        guard let inbox else {
+            Issue.record("precondition: the account has an Inbox")
+            return
+        }
+        let log = O.PassLog()
+        let scenario = Self.scenario(log: log)
+        defer { scenario.close() }
+        let provider = GmailProvider(
+            userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+        await AccountManager.shared.connectProviderForTesting(account: account, provider: provider)
+        let engine = await AccountManager.shared.syncEngine
+
+        SyncEngine.standaloneListingAfterLookupTestHook.withLock {
+            $0 = { accountId in if accountId == Self.accountId { log.append("listing") } }
+        }
+        let hold = AsyncStream<Void>.makeStream()
+        let slices = await Self.runningSliceAndTwoQueued(
+            engine: engine, account: account, folderIds: (inbox.id, folders[0].id, folders[1].id),
+            log: log, hold: hold.stream)
+
+        let view = InboxViewModel(folders: [inbox])
+        var pull: Task<Void, Never>?
+        switch sync {
+        case .open: view.startSync()
+        case .pull: pull = Task { await view.refreshSync() }
+        }
+        let listingInLine = await O.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 3 }
+        #expect(listingInLine, "precondition: the \(sync)'s listing waits in line")
+
+        hold.continuation.finish()
+        for slice in slices { await slice.value }
+        await pull?.value
+        let viewDone = await O.eventually { !view.isRefreshing && log.snapshot.contains("listing") }
+        let entries = log.snapshot
+        SyncEngine.standaloneListingAfterLookupTestHook.withLock { $0 = nil }
+        await engine.setCatchUpSliceStartHookForTesting(nil)
+        // Also stops the access run the view started after its change read.
+        await AccountManager.shared.disconnectProviderForTesting(accountId: Self.accountId)
+
+        #expect(viewDone, "the \(sync)'s sync never finished: \(entries)")
+        let firstSlice = "slice \(Self.firstQueuedPath)"
+        let secondSlice = "slice \(Self.secondQueuedPath)"
+        guard let listing = entries.firstIndex(of: "listing"),
+              let first = entries.firstIndex(of: firstSlice),
+              let second = entries.firstIndex(of: secondSlice) else {
+            Issue.record("the \(sync)'s listing or a queued slice never happened: \(entries)")
+            return
+        }
+        #expect(Array(entries[..<listing]) == ["slice \(Self.runningPath)"],
+                "only the running slice may be ahead of the \(sync)'s listing: \(entries)")
+        #expect(listing < first && listing < second,
+                "a slice queued before the \(sync)'s listing started before it: \(entries)")
+        #expect(first < second, "the queued slices did not keep their order: \(entries)")
+        #expect(entries.filter { $0 == firstSlice }.count == 1 && entries.filter { $0 == secondSlice }.count == 1,
+                "each queued slice runs once: \(entries)")
+        #expect(entries.filter { $0 == "listing" }.count == 1, "the \(sync) listed the folder once: \(entries)")
+    }
+
+    /// The other single-folder listings keep their place in line (owner
+    /// 2026-11-26): an open email's, after a send, after the outbox empties,
+    /// after a drain's moves, step 6 of an epoch rebuild. Each calls
+    /// `syncFolderMessages` without a place, so its listing during a catch-up
+    /// slice waits behind the slices already waiting. RED if that default were
+    /// the follow-up's place: the listing would then pass both queued slices.
+    @Test("Any other single-folder listing during a catch-up slice waits behind the slices already waiting")
+    func otherListingsKeepTheirPlace() async throws {
+        try await O.withAppDB { pool in
+            let account = try O.makeAccount(pool: pool, lastFullSyncAt: Date())
+            let folders = [
+                Folder(name: Self.firstQueuedPath, path: Self.firstQueuedPath, role: .sent, accountId: Self.accountId),
+                Folder(name: Self.secondQueuedPath, path: Self.secondQueuedPath, role: .trash, accountId: Self.accountId),
+            ]
+            try await pool.write { db in for folder in folders { try folder.insert(db) } }
+            let inbox = try await pool.read { db in
+                try Folder.filter(Column("accountId") == Self.accountId && Column("role") == FolderRole.inbox.rawValue)
+                    .fetchOne(db)
+            }
+            guard let inbox else {
+                Issue.record("precondition: the account has an Inbox")
+                return
+            }
+
+            let log = O.PassLog()
+            let scenario = Self.scenario(log: log)
+            defer { scenario.close() }
+            let provider = GmailProvider(
+                userEmail: account.emailAddress, accessToken: { _ in "fake-access-token" }, session: scenario.session)
+            let engine = await O.engine(provider: provider)
+            SyncEngine.standaloneListingAfterLookupTestHook.withLock {
+                $0 = { accountId in if accountId == Self.accountId { log.append("listing") } }
+            }
+            defer { SyncEngine.standaloneListingAfterLookupTestHook.withLock { $0 = nil } }
+            let hold = AsyncStream<Void>.makeStream()
+            let slices = await Self.runningSliceAndTwoQueued(
+                engine: engine, account: account, folderIds: (inbox.id, folders[0].id, folders[1].id),
+                log: log, hold: hold.stream)
+
+            let listing = Task { _ = try? await engine.syncFolderMessages(folder: inbox, provider: provider) }
+            let listingInLine = await O.eventually { await engine.syncPassWaiters[Self.accountId]?.count == 3 }
+            #expect(listingInLine, "precondition: the listing waits in line")
+
+            hold.continuation.finish()
+            for slice in slices { await slice.value }
+            await listing.value
+            let entries = log.snapshot
+            await engine.remove(accountId: Self.accountId)
+            await MainActor.run { AccountManagerState.shared.setSyncPhase(nil, forAccount: Self.accountId) }
+
+            let expected = ["slice \(Self.runningPath)", "slice \(Self.firstQueuedPath)", "slice \(Self.secondQueuedPath)", "listing"]
+            #expect(Array(entries.prefix(4)) == expected,
+                    "the listing did not wait behind the slices already waiting: \(entries)")
+        }
+    }
+
+    /// The background readers for the folder view's and the other listings'
+    /// tests: the first reader's slice (`folderIds.running`) starts and holds
+    /// the turn until `hold` finishes; two other readers' slices
+    /// (`folderIds.first`, then `folderIds.second`) wait in line behind it.
+    /// Every slice logs the folders it asks as it starts its work. Returns
+    /// the three runs, in that order.
+    private static func runningSliceAndTwoQueued(
+        engine: SyncEngine, account: Account, folderIds: (running: String, first: String, second: String),
+        log: O.PassLog, hold: AsyncStream<Void>
+    ) async -> [Task<Void, Never>] {
+        let pathOf = [
+            folderIds.running: Self.runningPath, folderIds.first: Self.firstQueuedPath, folderIds.second: Self.secondQueuedPath,
+        ]
+        let running = folderIds.running
+        await engine.setCatchUpSliceStartHookForTesting { ids in
+            log.append("slice " + ids.map { pathOf[$0] ?? $0 }.joined(separator: ","))
+            if ids == [running] { for await _ in hold { break } }
+        }
+        var runs = [Task<Void, Never>]()
+        for (index, folderId) in [folderIds.running, folderIds.first, folderIds.second].enumerated() {
+            runs.append(Task { _ = await engine.runCatchUpRun(account: account, run: Self.oneSlice(folderId)) })
+            let ready: Bool
+            if index == 0 {
+                ready = await O.eventually { log.snapshot == ["slice \(Self.runningPath)"] }
+            } else {
+                ready = await O.eventually { await engine.syncPassWaiters[Self.accountId]?.count == index }
+            }
+            #expect(ready, "precondition: slice \(index) holds the turn or waits in line in order: \(log.snapshot)")
+        }
+        return runs
     }
 
     /// A pass that logs its name when it takes the account's turn, waiting at

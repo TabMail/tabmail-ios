@@ -619,7 +619,11 @@ extension SyncEngine {
     /// when the folder's armed turnover reaction ran instead, or when the
     /// account was removed or the folder deleted before the sync turn was
     /// acquired (nothing is listed). Throws only
-    /// `CancellationError`.
+    /// `CancellationError`. `place` is where it waits in the account's turn
+    /// line: at the back, except the folder view's listing (opening a folder,
+    /// pulling to refresh it: `AccountManager.syncFolders`), which waits ahead
+    /// of the catch-up slices already waiting
+    /// (`SyncTurnPlace.aheadOfBackgroundChunks`, #1360).
     #if DEBUG
     /// Test harness only: awaited by a standalone listing after its turn-holder
     /// checks and current-folder lookup, before it reads anything else. Nil in
@@ -628,7 +632,9 @@ extension SyncEngine {
     #endif
 
     @discardableResult
-    func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
+    func syncFolderMessages(
+        folder: Folder, provider: any EmailProvider, place: SyncTurnPlace = .arrivalOrder
+    ) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
         // folder that is neither a favourite nor followed. `fullSync` (after its
         // listing, in the pass's own task) and `imapDeltaSync` both branch into the
@@ -668,7 +674,7 @@ extension SyncEngine {
         // captured IMAP provider would log in again with its retained password.
         // So the turn's holder re-checks the terminal removal fence and the
         // folder's current row, and lists nothing when either is gone.
-        let outcome: ListingOutcome? = await oneSyncAtATime(accountId: folder.accountId) {
+        let outcome: ListingOutcome? = await oneSyncAtATime(accountId: folder.accountId, place: place) {
             guard !AccountManager.shared.isRuntimeRemoved(folder.accountId) else {
                 BackgroundSyncLogger.logDebug("[Sync] \(folder.name): account removed while waiting for the sync turn; listing skipped")
                 return nil

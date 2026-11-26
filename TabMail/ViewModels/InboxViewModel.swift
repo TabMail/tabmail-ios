@@ -1814,7 +1814,8 @@ final class InboxViewModel {
             // (#689). The run's outcome is the one error that reaches this catch.
             // Sync trigger: the pull's change read gives an account another pass
             // holds a follow-up flag, never a wait; the folders on screen still
-            // wait for their turn. Siblings: IDLE, silent push, the open-app push,
+            // wait for their turn, ahead of the catch-up slices already waiting
+            // (#1360). Siblings: IDLE, silent push, the open-app push,
             // the poll, a return (the sync design block in
             // SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
             // An account whose change read found it busy was not read by this pull,
