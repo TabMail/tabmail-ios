@@ -70,8 +70,11 @@ struct ChatNewThreadView: View {
     @State private var sendKey: ChatNewEmailSend.Key?
     /// That send, as last read.
     @State private var cardSend: ChatNewEmailSend?
-    /// The sent email's Sent copy, once read: the chat is its thread from then on, never back.
-    @State private var threadId: String?
+    /// The sent email's thread, read whole (`ChatThreadOpened`): the chat is that thread from then
+    /// on, never back.
+    @State private var thread: ChatThreadOpened?
+    /// The Sent copy whose thread is being read for the swap (`readThread`).
+    @State private var readingCopy: String?
     /// This screen's own id among the chat modals (`undoOutcomesPresented`).
     @State private var modalId = UUID()
     @Environment(\.dismiss) private var dismiss
@@ -115,9 +118,9 @@ struct ChatNewThreadView: View {
         // swap would run this screen's close and open, and take down a cover presented over it
         // (a reopened compose included). The ZStack keeps one host for the whole presentation.
         ZStack {
-            if let threadId {
+            if let thread {
                 // The sent email's thread, with its own header, Forward and reply field.
-                ChatThreadView(messageId: threadId)
+                ChatThreadView(opened: thread)
             } else {
                 newEmail
             }
@@ -138,7 +141,8 @@ struct ChatNewThreadView: View {
         .undoOutcomesPresented(by: modalId)
         // Followed only until the chat is the sent email's thread, by either swap: then its read of
         // the Sent folder's headers ends (memory 021).
-        .task(id: threadId == nil ? sendKey : nil) { await followSend() }
+        .task(id: thread == nil ? sendKey : nil) { await followSend() }
+        .task(id: readingCopy) { await readThread() }
         .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
         // The TabMail panel closing lets a waiting swap to the sent email's thread happen.
         .onChange(of: chatExpanded) { _, open in if !open { swapToThread() } }
@@ -405,7 +409,7 @@ struct ChatNewThreadView: View {
     /// compose its Undo reopened (a new row, the same draft) is followed too. Once the chat is the
     /// thread, nothing here reads the send again, so the follow ends.
     private func followSend() async {
-        guard threadId == nil, let key = sendKey else { return }
+        guard thread == nil, let key = sendKey else { return }
         do {
             for try await found in ChatNewEmailSend.changes(key) {
                 cardSend = found
@@ -425,10 +429,22 @@ struct ChatNewThreadView: View {
     /// The sent email's copy is in the Sent folder: the chat becomes its thread for good, once
     /// nothing is open over the new email (a card, a picker, "Add recipient" or the TabMail panel,
     /// which the field's drag opens at will), which the change would take down. The panel is kept
-    /// out of `newEmailCovered`, which also decides whether a compose card may present.
+    /// out of `newEmailCovered`, which also decides whether a compose card may present. The thread
+    /// is read first (`readThread`), so it shows whole from its first frame.
     private func swapToThread() {
-        guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return }
-        threadId = copy
+        guard thread == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return }
+        readingCopy = copy
+    }
+
+    /// Reads the sent email's thread (`ChatThreadOpened.read`), then becomes it, unless something
+    /// came over the new email while it read: then the next `swapToThread` reads it again.
+    private func readThread() async {
+        guard let copy = readingCopy else { return }
+        let read = await ChatThreadOpened.read(messageId: copy)
+        guard !Task.isCancelled else { return }
+        readingCopy = nil
+        guard thread == nil, !newEmailCovered, !chatExpanded else { return }
+        thread = read
     }
 
     /// Something is open over the new email: a picker, "Add recipient" or a compose card.

@@ -178,6 +178,15 @@ struct ChatThreadView: View {
         self.highlightsOpenedMessage = highlightsOpenedMessage
     }
 
+    /// A thread read before it shows (`ChatThreadOpened`): its first frame has the email, its
+    /// header and the user's own emails on the user's side. Its own load and context reads go on
+    /// as for any open.
+    init(opened: ChatThreadOpened) {
+        self._viewModel = State(initialValue: opened.viewModel)
+        self._context = State(initialValue: opened.context)
+        self.highlightsOpenedMessage = false
+    }
+
     // MARK: - Members
 
     private var members: [MessageHeader] {

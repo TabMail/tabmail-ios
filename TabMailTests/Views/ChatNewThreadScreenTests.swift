@@ -578,11 +578,18 @@ struct ChatNewThreadScreenTests {
                     let before = frames.frames.first
                     #expect(before?.isNewEmail == true, "control: recording starts on the new email with its Sending bubble: \(String(describing: before))")
 
+                    // The copy with its body, as the send's optimistic Sent copy is written
+                    // (`AccountManagerOutbox.insertOptimisticSentHeader`).
                     let copy = Self.sentFolderHeader("screen-sent-copy-frames", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
-                    try await fixture.pool.write { try copy.insert($0) }
+                    let copyBody = MessageBody(contentKey: ContentKey(rawValue: copy.id), htmlContent: "<p>Lunch on Friday?</p>")
+                    try await fixture.pool.write { db in
+                        try copy.insert(db)
+                        try copyBody.save(db)
+                    }
                     try await Self.waitUntil { frames.frames.last?.isThread == true }
                     try await Self.settle()
                     frames.stop()
+                    print("[SwapFrames] \(frames.summary)")
 
                     let last = frames.frames.last
                     #expect(last?.isThread == true, "control: the chat ends as the whole thread: \(String(describing: last))")
@@ -1565,13 +1572,15 @@ private struct SwapFrame: Equatable, CustomStringConvertible {
     var own = false
     /// The thread's reply field.
     var replyField = false
+    /// The field's paperclip (recorded, not required: a thread shows it once its emails are read).
+    var paperclip = false
 
     var isNewEmail: Bool { hint && sending && newField && header }
     var isThread: Bool { !hint && header && bubble && own && replyField }
 
     var description: String {
         let parts = [("hint", hint), ("sending", sending), ("newField", newField), ("header", header),
-                     ("bubble", bubble), ("own", own), ("replyField", replyField)]
+                     ("bubble", bubble), ("own", own), ("replyField", replyField), ("paperclip", paperclip)]
         return "[" + parts.filter { $0.1 }.map { $0.0 }.joined(separator: " ") + "]"
     }
 
@@ -1587,6 +1596,7 @@ private struct SwapFrame: Equatable, CustomStringConvertible {
         bubble = ids.contains(ChatBubbleView.bubbleId) || ids.contains(ChatBubbleView.highlightedBubbleId)
         own = texts.contains("Sent")
         replyField = ids.contains(ChatThreadView.replyPillId)
+        paperclip = ids.contains(ChatPaperclipButton.id)
     }
 }
 
