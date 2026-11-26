@@ -282,7 +282,7 @@ struct StorageOptimizerTests {
         let upgradeFirst = OptimizeStorageRow.line(for: .upgradeFirst(canDropToBytes: 1))
         let optimizing = OptimizeStorageRow.line(for: .optimizing)
 
-        #expect(OptimizeStorageRow.title == "Optimize Storage")
+        #expect(OptimizeStorageRow.title == "Optimize")
         #expect(canDropTo == "Can drop to 1.2 GB")
         #expect(ready == "TabMail does this overnight. Tap to do it now.")
         #expect(failed == "Could not finish now. Nothing was lost. TabMail will try again overnight.")

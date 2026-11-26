@@ -6,13 +6,17 @@ import SwiftUI
 
 /// Settings > Email Index's Optimize Storage row (#1448): the size "Email Index Used"
 /// can drop to, a line under it, and the tap. State and actions are `StorageOptimizer`'s.
+///
+/// The title stays on one line. The size sits on the title's line, or under the title when
+/// that line cannot hold both (large text sizes). Every line under the title starts where the
+/// title's text does, and the size and the lines are grey, as other values in Settings are.
 struct OptimizeStorageRow: View {
     let row: StorageOptimizer.Row
     /// Formats a size as "Email Index Used" shows it.
     let format: (Int64) -> String
     let onTap: () -> Void
 
-    static let title = "Optimize Storage"
+    static let title = "Optimize"
     static let overnightLine = "TabMail does this overnight. Tap to do it now."
     static let upgradeFirstLine = "Needs a one-time database upgrade first. Tap to start."
     static let failedLine = "Could not finish now. Nothing was lost. TabMail will try again overnight."
@@ -31,25 +35,54 @@ struct OptimizeStorageRow: View {
         }
     }
 
+    private static let icon = "internaldrive"
+
     var body: some View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Label(Self.title, systemImage: "internaldrive")
-                    Spacer()
-                    trailing
+                ViewThatFits(in: .horizontal) {
+                    HStack {
+                        titleLabel
+                        Spacer()
+                        trailing
+                    }
+                    VStack(alignment: .leading, spacing: 4) {
+                        titleLabel
+                        underTitle(trailing)
+                    }
                 }
                 if let line = Self.line(for: row) {
-                    Text(line)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                    underTitle(
+                        Text(line)
+                            .font(.footnote)
+                            .foregroundStyle(Color.secondary)
+                    )
                 }
             }
+            .multilineTextAlignment(.leading)
         }
         .buttonStyle(.borderless)
         .disabled(row == .optimizing)
     }
 
+    private var titleLabel: some View {
+        Label(Self.title, systemImage: Self.icon)
+            .lineLimit(1)
+    }
+
+    /// `content` in a label whose icon is the row's, hidden, so in the list it starts where
+    /// the title's text does at every text size.
+    private func underTitle(_ content: some View) -> some View {
+        Label {
+            content
+        } icon: {
+            Image(systemName: Self.icon)
+                .hidden()
+        }
+    }
+
+    /// `Color.secondary`, not the `.secondary` style: inside the button that style is a lighter
+    /// shade of the button's tint, not grey.
     @ViewBuilder
     private var trailing: some View {
         switch row {
@@ -57,11 +90,11 @@ struct OptimizeStorageRow: View {
             HStack(spacing: 6) {
                 ProgressView()
                 Text(Self.optimizingTitle)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Color.secondary)
             }
         case .upgradeFirst(let bytes), .ready(let bytes, _):
             Text(Self.canDropTo(format(bytes)))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color.secondary)
         }
     }
 }
