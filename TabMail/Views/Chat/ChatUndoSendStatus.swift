@@ -4,8 +4,8 @@
 
 import SwiftUI
 
-/// Undo send on the chat's "Sending" bubble (replaces the undo-send toast for a reply sent from a
-/// compose the chat opened, `PendingSendService.sendHasBubbleUndo`). The deadline is the outbox
+/// Undo send on the chat's "Sending" bubble (replaces the undo-send toast for a reply or forward sent
+/// from a compose the chat opened, `PendingSendService.sendHasBubbleUndo`). The deadline is the outbox
 /// row's own, read from the database through `OutboxCancellationPolicy`, so every bubble counts
 /// down from its own send and a chat opened again shows the time that is actually left. Nothing
 /// here starts a timer of its own or adds time.

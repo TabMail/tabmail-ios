@@ -177,9 +177,10 @@ final class PendingSendService {
     /// Whether the send gets a chat bubble with its own Undo, so its toast is not shown. Every send
     /// keeps exactly one visible Undo. With the chat view on (read once at the Send tap), the bubble
     /// offers it for:
-    /// - a reply (the chat shows a send by its In-Reply-To, `ChatUnsentReply`) from a compose the
-    ///   chat opened for one of its own emails (`ComposeScreen.chat`, given as the compose opened):
-    ///   that compose closes back onto the chat that shows the bubble;
+    /// - a reply or a forward (the chat shows a send by its `parent`: a reply's In-Reply-To, or the
+    ///   last References id of a forward, which carries no In-Reply-To, `ChatUnsentReply`) from a
+    ///   compose the chat opened for one of its own emails (`ComposeScreen.chat`, given as the
+    ///   compose opened): that compose closes back onto the chat that shows the bubble;
     /// - a new email from the card its new email's chat opened (`ComposeScreen.newEmailChat`): that
     ///   chat shows the send by the card's draft (`ChatNewEmailSend`), In-Reply-To or not.
     ///
@@ -189,11 +190,11 @@ final class PendingSendService {
     /// reply from a compose opened anywhere else (the Drafts list, the inbox, the compose the toast's
     /// Undo reopens), and a chat's card for an email of another thread, whose screen shows no bubble.
     nonisolated static func sendHasBubbleUndo(
-        chatViewActive: Bool, openedOn: ComposeScreen?, inReplyTo: String?
+        chatViewActive: Bool, openedOn: ComposeScreen?, parent: String?
     ) -> Bool {
         guard chatViewActive else { return false }
         switch openedOn {
-        case .chat: return inReplyTo != nil
+        case .chat: return parent != nil
         case .newEmailChat: return true
         case nil: return false
         }

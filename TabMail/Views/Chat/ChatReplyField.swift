@@ -639,10 +639,11 @@ struct ChatFieldMessage: Equatable {
     var pulses: Bool { !written }
 }
 
-/// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the
-/// bottom of the chat whose email it answers. Read from the database and the chat's own emails,
-/// with nothing kept in memory: every outbox row whose In-Reply-To is the
-/// Message-ID of an email in the chat, from any account (the reply may go out from another account
+/// A reply or forward in the outbox the chat does not show as an email yet, shown as the user's
+/// bubble at the bottom of the chat whose email it answers. Read from the database and the chat's
+/// own emails, with nothing kept in memory: every outbox row whose parent (a reply's In-Reply-To,
+/// or the last References id of a forward, `AccountManager.queuedParentRfc822MessageId`) is the
+/// Message-ID of an email in the chat, from any account (the send may go out from another account
 /// than the email it answers). A failed row reads "Not sent", with Retry and Delete; any other
 /// "Sending". Its text is the email's text version (`SentEmailSummary.textMessage`): the one written
 /// with its body when it was sent unchanged, from its first value; otherwise the summary made at
@@ -687,7 +688,7 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             .order(Column("createdAt"), Column("id"))
             .fetchAll(db)
         return try rows.compactMap { row in
-            guard answers(row.inReplyTo, in: messageIds) else { return nil }
+            guard answers(AccountManager.queuedParentRfc822MessageId(of: row), in: messageIds) else { return nil }
             var filed = false
             if row.sentAt != nil {
                 guard let sentId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
@@ -702,11 +703,12 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
         }
     }
 
-    /// Whether a send with this In-Reply-To shows in the chat whose emails have `messageIds`
-    /// (normalized Message-IDs): it answers one of them. The one rule for which chat shows an outbox
-    /// row (`fetch`), and so for which chat a compose records as its screen (`ChatThreadView.composeScreen`).
-    nonisolated static func answers(_ inReplyTo: String?, in messageIds: Set<String>) -> Bool {
-        guard let parent = inReplyTo.map(EmailFilter.normalizeMessageId) else { return false }
+    /// Whether a send with this parent (a reply's In-Reply-To, a forward's last References id)
+    /// shows in the chat whose emails have `messageIds` (normalized Message-IDs): it answers one of
+    /// them. The one rule for which chat shows an outbox row (`fetch`), and so for which chat a
+    /// compose records as its screen (`ChatThreadView.composeScreen`).
+    nonisolated static func answers(_ parent: String?, in messageIds: Set<String>) -> Bool {
+        guard let parent = parent.map(EmailFilter.normalizeMessageId) else { return false }
         return messageIds.contains(parent)
     }
 

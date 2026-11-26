@@ -507,7 +507,8 @@ struct ChatUndoSendRoutingTests {
                 Self.openAgentCard(card.isForward ? .forward : .reply, for: target, body: "Passing this on.", from: .chat, fixture)
                 let row = try await Self.tapSend(in: chat.controller, presented: true, fixture: fixture)
                 #expect(row.isForward == card.isForward, "control: the card the agent asked for")
-                let answered = row.inReplyTo.map(EmailFilter.normalizeMessageId)
+                #expect(row.isForward ? row.inReplyTo == nil : row.inReplyTo != nil, "control: a forward carries no In-Reply-To")
+                let answered = AccountManager.queuedParentRfc822MessageId(of: row).map(EmailFilter.normalizeMessageId)
                 #expect(answered == target.rfc822MessageId.map(EmailFilter.normalizeMessageId), "control: it answers the email the agent named")
                 if card.answersTheChat {
                     try await chat.expectUndosOnItsOwnHold(row, Undos(bubble: 1, toast: 0), "its bubble's Undo")
@@ -643,7 +644,8 @@ struct ChatUndoSendRoutingTests {
                     in: chat.controller, presented: true, fixture: fixture,
                     beforeTap: { saved.setChatView(on: onAtSend) }, afterTap: { saved.setChatView(on: !onAtSend) })
                 #expect(row.isForward == (gesture == .toolbarForward), "control: the compose the gesture opened")
-                let answered = row.inReplyTo.map(EmailFilter.normalizeMessageId)
+                #expect(row.isForward ? row.inReplyTo == nil : row.inReplyTo != nil, "control: a forward carries no In-Reply-To")
+                let answered = AccountManager.queuedParentRfc822MessageId(of: row).map(EmailFilter.normalizeMessageId)
                 #expect(answered == fixture.parent.rfc822MessageId.map(EmailFilter.normalizeMessageId), "control: about the chat's email")
                 let owner = PendingSendService.shared.undoOwner(for: row.id)
                 #expect(owner == (onAtSend ? .bubble : .toast), "the setting at Send and the chat's own compose decided")
@@ -761,7 +763,8 @@ struct ChatUndoSendRoutingTests {
                 }
                 let row = try await Self.tapSend(in: mounted.controller, presented: true, fixture: fixture)
                 #expect(row.isForward == (card == .forward), "control: the card the agent asked for")
-                let answered = row.inReplyTo.map(EmailFilter.normalizeMessageId)
+                #expect(row.isForward ? row.inReplyTo == nil : row.inReplyTo != nil, "control: a forward carries no In-Reply-To")
+                let answered = AccountManager.queuedParentRfc822MessageId(of: row).map(EmailFilter.normalizeMessageId)
                 #expect(answered == fixture.parent.rfc822MessageId.map(EmailFilter.normalizeMessageId), "control: about the chat's email")
                 let owner = PendingSendService.shared.undoOwner(for: row.id)
                 #expect(owner == .toast, "no chat opened it: the toast offers its Undo")

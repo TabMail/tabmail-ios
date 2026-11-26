@@ -3803,7 +3803,8 @@ struct ComposeView: View {
             isReplyAll: isReplyAll,
             isTutorialPracticeReply: isPracticeReply,
             sendHasBubbleUndo: PendingSendService.sendHasBubbleUndo(
-                chatViewActive: chatViewActive, openedOn: openedOn, inReplyTo: outbound.inReplyTo),
+                chatViewActive: chatViewActive, openedOn: openedOn,
+                parent: isForward ? outbound.references.last : outbound.inReplyTo),
             outbound: outbound)
         // Read with the body above, in the same turn: the text version only of the body sent.
         let textVersion = ComposeDraftGuards.sentTextVersion(authoredBody: snapshot.authoredBody, written: writtenEmail)

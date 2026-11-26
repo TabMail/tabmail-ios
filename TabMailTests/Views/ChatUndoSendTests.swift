@@ -324,35 +324,35 @@ struct ChatUndoSendTests {
 
     // MARK: - 5. Toast or bubble
 
-    @Test("A reply sent with the chat view on from a compose the chat opened has its Undo on the bubble; any other send keeps the toast")
+    @Test("A reply or forward sent with the chat view on from a compose the chat opened has its Undo on the bubble; any other send keeps the toast")
     func toastOrBubble() {
-        let reply = "<p@example.com>"
-        #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: reply))
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: nil, inReplyTo: reply),
+        let parent = "<p@example.com>"
+        #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, parent: parent))
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: nil, parent: parent),
                 "a reply from a compose another screen opened (the Drafts list, the compose the toast's Undo reopens)")
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, openedOn: .chat, inReplyTo: reply))
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: nil))
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, openedOn: .chat, parent: parent))
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, parent: nil))
         // Of all eight combinations, only the first has the bubble.
         var bubbles = 0
         for chatView in [true, false] {
             for openedOn in [ComposeScreen.chat, nil] {
-                for inReplyTo in [reply, nil] {
+                for candidate in [parent, nil] {
                     let bubble = PendingSendService.sendHasBubbleUndo(
-                        chatViewActive: chatView, openedOn: openedOn, inReplyTo: inReplyTo)
+                        chatViewActive: chatView, openedOn: openedOn, parent: candidate)
                     if bubble { bubbles += 1 }
                 }
             }
         }
-        #expect(bubbles == 1, "the bubble needs the chat view, a compose the chat opened, and a reply")
+        #expect(bubbles == 1, "the bubble needs the chat view, a compose the chat opened, and a reply or forward")
     }
 
     @Test("A new email sent from the compose card its own chat opened has its Undo on that chat's bubble with the chat view on, though it has no In-Reply-To")
     func newEmailChatHasTheBubble() {
-        #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .newEmailChat, inReplyTo: nil),
+        #expect(PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .newEmailChat, parent: nil),
                 "the new email's chat shows the send, found by the card's draft")
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, openedOn: .newEmailChat, inReplyTo: nil),
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: false, openedOn: .newEmailChat, parent: nil),
                 "with the chat view off, the toast")
-        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, inReplyTo: nil),
+        #expect(!PendingSendService.sendHasBubbleUndo(chatViewActive: true, openedOn: .chat, parent: nil),
                 "control: a new email from an email's chat keeps the toast")
     }
 
@@ -368,7 +368,7 @@ struct ChatUndoSendTests {
         return (toast ? 1 : 0) + (bubble ? 1 : 0)
     }
 
-    @Test("Every send has exactly one Undo presenter through its window, a reply and a new email, from the chat or another screen, whatever the chat view does after Send")
+    @Test("Every send has exactly one Undo presenter through its window, a reply, a forward and a new email, from the chat or another screen, whatever the chat view does after Send")
     func exactlyOnePresenterAcrossChatViewFlips() async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -383,21 +383,23 @@ struct ChatUndoSendTests {
         let chat: Set<String> = [EmailFilter.normalizeMessageId(try #require(fixture.parent.rfc822MessageId))]
         var n = 0
         for atSend in [true, false] {
-            for isReply in [true, false] {
+            for kind in ["reply", "forward", "new email"] {
                 for openedOn in [ComposeScreen.chat, nil] {
                     n += 1
-                    let row = try await Self.queueReply(fixture, draftId: "draft-flip-\(n)", newEmail: !isReply)
+                    let row = try await Self.queueReply(
+                        fixture, draftId: "draft-flip-\(n)", newEmail: kind == "new email", forward: kind == "forward")
                     let hold = Date().addingTimeInterval(3600)
                     try await Self.setHold(pool, row.id, hold)
                     // Send as ComposeView does: the owner from the setting read at the Send tap and
                     // the screen the compose was opened on.
                     saved.setChatView(on: atSend)
                     let owner: PendingSendService.UndoOwner = PendingSendService.sendHasBubbleUndo(
-                        chatViewActive: ChatViewConfig.isActive, openedOn: openedOn, inReplyTo: row.inReplyTo) ? .bubble : .toast
+                        chatViewActive: ChatViewConfig.isActive, openedOn: openedOn,
+                        parent: AccountManager.queuedParentRfc822MessageId(of: row)) ? .bubble : .toast
                     service.present(outboxId: row.id, draftId: "draft-flip-\(n)", instanceEpoch: "E1",
                                     toSummary: "To: sender@example.com", holdUntil: hold, owner: owner)
                     let screen = openedOn == .chat ? "the chat" : "another screen"
-                    let what = "chat view \(atSend) at Send, \(isReply ? "reply" : "new email") opened on \(screen)"
+                    let what = "chat view \(atSend) at Send, \(kind) opened on \(screen)"
                     #expect(try await Self.presenters(of: row, chat: chat, pool: pool) == 1, "\(what), no flip")
                     // The chat view flips during the window, then flips back.
                     saved.setChatView(on: !atSend)
@@ -627,16 +629,21 @@ struct ChatUndoSendTests {
         #expect(ChatThreadView.composeScreen(answering: email(""), chatMessageIds: chat) == nil,
                 "a blank Message-ID: the send carries no In-Reply-To")
         // One rule: the chat records itself exactly for the sends it shows as its bubbles, judged on the
-        // In-Reply-To the send queues (`ThreadUtils.outgoingThreadHeaders`, as Send builds it).
+        // parent the send queues (`ThreadUtils.outgoingThreadHeaders`, as Send builds it): a reply's
+        // In-Reply-To, or a forward's last References id (a forward carries no In-Reply-To).
         let stored: [String?] = ["<own@example.com>", "own@example.com", "<other-thread@example.com>", "< padded@example.com >", "", nil]
         for id in stored {
-            let target = email(id)
-            let queued = ThreadUtils.outgoingThreadHeaders(
-                replyTo: target, isForward: false, sendAccountId: Self.account, sendSubject: "Re: Lunch plans",
-                providerKind: .gmail).inReplyTo
-            let shown = ChatUnsentReply.answers(queued, in: chat)
-            let recorded = ChatThreadView.composeScreen(answering: target, chatMessageIds: chat) == .chat
-            #expect(recorded == shown, "\(String(describing: id)): the chat records itself only for a send it shows as a bubble")
+            for isForward in [false, true] {
+                let target = email(id)
+                let headers = ThreadUtils.outgoingThreadHeaders(
+                    replyTo: target, isForward: isForward, sendAccountId: Self.account,
+                    sendSubject: isForward ? "Fwd: Lunch plans" : "Re: Lunch plans", providerKind: .gmail)
+                let queued = isForward ? headers.references.last : headers.inReplyTo
+                let shown = ChatUnsentReply.answers(queued, in: chat)
+                let recorded = ChatThreadView.composeScreen(answering: target, chatMessageIds: chat) == .chat
+                #expect(recorded == shown,
+                        "\(String(describing: id)), forward \(isForward): the chat records itself only for a send it shows as a bubble")
+            }
         }
     }
 
@@ -1521,21 +1528,26 @@ struct ChatUndoSendTests {
     }
 
     /// Queues a reply as the compose card does, with an undo hold, and returns its outbox row.
+    /// Queues a reply to the fixture's email, or a forward of it (`forward`: no In-Reply-To, the
+    /// email's Message-ID last in References, as `ThreadUtils.outgoingThreadHeaders` builds it), or a
+    /// new email (`newEmail`).
     private static func queueReply(
-        _ fixture: Fixture, draftId: String, inReplyTo: String? = nil, newEmail: Bool = false, body: String = "Tuesday works"
+        _ fixture: Fixture, draftId: String, inReplyTo: String? = nil, newEmail: Bool = false, forward: Bool = false,
+        body: String = "Tuesday works"
     ) async throws -> OutboxMessage {
+        let parent = newEmail ? nil : (inReplyTo ?? fixture.parent.rfc822MessageId)
         try await fixture.pool.write { db in
             var draft = Draft(
                 id: draftId, accountId: Self.account, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
-                subject: "Re: Lunch plans", body: body, replyToId: nil, isForward: false,
+                subject: "Re: Lunch plans", body: body, replyToId: nil, isForward: forward,
                 editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
             draft.instanceEpoch = "E1"
             try draft.insert(db)
         }
         let queued = try await AccountManager.persistQueuedSend(
             draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: "Tuesday works for me.",
-                                inReplyTo: newEmail ? nil : (inReplyTo ?? fixture.parent.rfc822MessageId)),
-            accountId: Self.account, replyToHeaderId: newEmail ? nil : fixture.parent.id, isForward: false, serverDraftId: nil,
+                                inReplyTo: forward ? nil : parent, references: forward ? (parent.map { [$0] } ?? []) : []),
+            accountId: Self.account, replyToHeaderId: newEmail ? nil : fixture.parent.id, isForward: forward, serverDraftId: nil,
             draftId: draftId, instanceEpoch: "E1", holdsForUndo: true)
         return try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) })
     }
