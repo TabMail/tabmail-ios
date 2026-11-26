@@ -570,7 +570,7 @@ struct SuggestionRewriteRouteTests {
 
     /// THE SYSTEM PROPERTY: an accepted card edit of the shown suggestion becomes the AI Suggestion
     /// WHOLE (body, text message and change command as the edit returned them), in the header and
-    /// the cache, and the chat's ghost and its "e.g." line show it. Through the card's own
+    /// the cache, and the chat's ghost and its "alt: " line show it. Through the card's own
     /// transition (`ComposeView.suggestionEdit`, what `applyInlineEdit` builds and stores), twice:
     /// the second edit compares against the first, so the card's shown value must advance.
     @Test("A card's edits become the whole AI Suggestion in header and cache, and the ghost shows each")
@@ -602,8 +602,8 @@ struct SuggestionRewriteRouteTests {
             #expect(try await cachedSuggestion(fixture.db, header) == expected, "edit \(index): the cache holds the whole edit")
             let ghost = ChatReplyField.shown(newest: row, usersTurn: false, onlyTo: nil)
             #expect(ghost == expected, "edit \(index): the ghost shows the edit")
-            #expect(ChatReplyField.example(shown: ghost, configured: nil) == step.command,
-                    "edit \(index): the example is the edit's change command")
+            #expect(ChatReplyField.alternative(shown: ghost) == step.command,
+                    "edit \(index): the alt line is the edit's one-line alternative")
         }
     }
 
