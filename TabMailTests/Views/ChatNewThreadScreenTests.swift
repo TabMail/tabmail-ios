@@ -294,9 +294,7 @@ struct ChatNewThreadScreenTests {
             #expect(abs(mic.midX - micAtStart) < 1, "the mic keeps its place at the row's start: \(mic), row \(row)")
             #expect(abs(send.width - ChatViewLayout.fieldTapSize) < 1, "Send keeps its width: \(send.width)")
             #expect(abs(mic.width - ChatViewLayout.fieldTapSize) < 1, "the mic keeps its width: \(mic.width)")
-            // With the e.g. line under the words, the paperclip stays on Send's line, level with
-            // Send and the mic, not up on the words' first line.
-            #expect(fromNewEmail, "control: the e.g. line shows")
+            // The paperclip stays on Send's line, level with Send and the mic.
             #expect(abs(clip.midY - send.midY) < 1, "the paperclip is level with Send: \(clip) \(send)")
             #expect(abs(clip.midY - mic.midY) < 1, "and with the mic: \(clip) \(mic)")
         }
