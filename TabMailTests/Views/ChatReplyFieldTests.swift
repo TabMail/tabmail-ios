@@ -912,7 +912,9 @@ struct ChatReplyFieldTests {
         // held ghost share one id, so the one turns into the other.
         #expect(Self.count("if heldGhost == nil { ForEach(unsentReplies) { reply in", in: text) == 1)
         #expect(Self.count(".matchedGeometryEffect(id: Self.sentMorphId(reply, newest: unsentReplies.last), in: sentMorph)", in: text) == 1)
-        #expect(Self.count("if let held = heldGhost { ChatSuggestionBubble(text: held.text) {} .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)", in: text) == 1)
+        // The held one is the ghost tapped open, or the user's own message the field sent, in the
+        // ghost's look or the message's.
+        #expect(Self.count("if let held = heldGhost { Group { if held.isMessage { ChatFieldMessageBubble(text: held.text, pulses: false) } else { ChatSuggestionBubble(text: held.text) {} } } .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)", in: text) == 1)
         #expect(Self.count("} else if let newest = thread.newest, let suggestion {", in: text) == 1, "the live ghost only when none is held")
     }
 
@@ -954,12 +956,12 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".presentationCompactAdaptation(.popover)", in: text) >= 1, "a pop-up on iPhone too, never a sheet")
     }
 
-    @Test("The ghost is dashed on a faded fill and captioned in one button; the e.g. line hides while dictating; compose's stored edits refresh the chat")
+    @Test("The ghost is dashed on a faded fill and captioned in one button; the alt line hides while dictating; compose's stored edits refresh the chat")
     func suggestionLookWiring() throws {
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
         let ghost = try #require(bubble.range(of: "struct ChatSuggestionBubble: View {")
             .flatMap { start in bubble[start.lowerBound...].range(of: "struct ChatSuggestionWorkingBubble").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
-        let captionText = "Text(writing ? ChatSuggestionConfig.writingLine : ChatSuggestionConfig.statusLine)"
+        let captionText = "Text(ChatSuggestionConfig.statusLine)"
         #expect(Self.count(".stroke(Palette.chatSuggestionStroke, style: StrokeStyle( lineWidth: ChatViewLayout.suggestionStrokeWidth, dash: ChatViewLayout.suggestionDash))", in: ghost) == 1, "a dashed outline")
         #expect(Self.count(".fill(Palette.chatSuggestionFill)", in: ghost) == 1, "on a faded fill")
         #expect(Self.count(".foregroundStyle(Palette.chatSuggestionText)", in: ghost) == 1, "dark-blue text")
@@ -984,7 +986,7 @@ struct ChatReplyFieldTests {
 
         let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
         #expect(Self.count("hasTabMailSession && inputText.isEmpty && !isDictating", in: field) == 1,
-                "the e.g. line shows only on an empty, signed-in field, never while dictating")
+                "the alt line shows only on an empty, signed-in field, never while dictating")
 
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
         #expect(Self.count("if outcome == .written { await postMessageDataDidChange(reply.id) }", in: compose) == 1,
@@ -1032,13 +1034,6 @@ struct ChatReplyFieldTests {
         #expect(control.account?.id == Self.me.id && Self.me.id != second.id, "control: another account given, another From")
     }
 
-    /// Where the agent's reply was asked for: the open sheet, or the reply field with who was
-    /// chosen in Reply to as it was sent (nil: nobody, Reply All).
-    enum Origin {
-        case sheet
-        case field(onlyTo: [String]?)
-    }
-
     @Test("The AI Suggestion opens compose as Reply All, to the whole group")
     func readyReplyToEveryoneIsReplyAll() {
         let email = Self.groupEmail()
@@ -1061,10 +1056,10 @@ struct ChatReplyFieldTests {
         #expect(compose.suggestion == shown, "the card opens on the suggestion as shown: \(String(describing: compose.suggestion))")
     }
 
-    /// The reply request the AI reply tool opens for `arguments`, on an email from
-    /// sender@example.com to the user (test@example.com) and team@example.com.
+    /// The reply request the AI reply tool opens for `arguments`, asked in the chat's sheet, on an
+    /// email from sender@example.com to the user (test@example.com) and team@example.com.
     private static func agentReplyRequest(
-        _ arguments: [String: JSONValue], from origin: Origin
+        _ arguments: [String: JSONValue]
     ) async throws -> (request: AgentToolRouter.ComposeRequest, accounts: [Account]) {
         let db = try TestDatabase.make()
         let translator = MockChatIdTranslator()
@@ -1074,11 +1069,9 @@ struct ChatReplyFieldTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "r1", subject: "Plans", to: "test@example.com, team@example.com")
         await translator.seed(header.id, as: 1)
         let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
-        var fieldReply: ChatFieldReply?
-        if case .field(let onlyTo) = origin { fieldReply = ChatFieldReply(email: header, onlyTo: onlyTo) }
         // Asked in the chat view, which takes the request (ADR-IOS-053 Phase 2).
         let asked = ComposeOrigin(sessionKey: "thread:chat", screen: .chat)
-        let invocation = ToolInvocation(fieldReply: fieldReply, composeOrigin: asked)
+        let invocation = ToolInvocation(composeOrigin: asked)
         let task = Task { @MainActor () -> String in
             try await tool.execute(
                 arguments: ["unique_id": .int(1), "body": .string("Friday works")].merging(arguments) { $1 }, invocation: invocation)
@@ -1097,64 +1090,80 @@ struct ChatReplyFieldTests {
         return (req, [account])
     }
 
-    @Test("A reply the agent writes from the field follows the same rule: Reply All to everyone, a plain reply to the people chosen as it was sent")
-    func agentReplyFromTheFieldFollowsTheTarget() async throws {
-        let widening: [String: JSONValue] = [
-            "add_cc": .array([.string("extra@example.com")]),
-            "add_bcc": .array([.string("hidden@example.com")]),
-        ]
-        let (chosen, chosenAccounts) = try await Self.agentReplyRequest(widening, from: .field(onlyTo: [Self.david.address]))
+    /// The reply request the field's compose opens on the same email, with who was chosen in Reply
+    /// to as it was sent (nil: nobody, Reply All); its email is written by a stand-in request that
+    /// changes no recipients.
+    private static func fieldReplyRequest(
+        onlyTo: [String]?
+    ) async throws -> (request: AgentToolRouter.ComposeRequest, accounts: [Account]) {
+        let db = try TestDatabase.make()
+        let router = AgentToolRouter()
+        let account = try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(db, messageId: "r1", subject: "Plans", to: "test@example.com, team@example.com")
+        let compose = ChatFieldCompose(
+            context: ToolContext(db: db, translator: MockChatIdTranslator(), router: router),
+            composeText: { _, _, _, _ in
+                guard let written = AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                    response: "Done.", subject: "Re: Plans", body: "Hi,\n\nFriday works.\n\nMe",
+                    textMessage: "Friday works", changeCommand: "")) else {
+                    throw InlineEditFailure(message: "control: the stand-in answer parses")
+                }
+                return written
+            })
+        let asked = ComposeOrigin(sessionKey: "thread:chat", screen: .chat)
+        let invocation = ToolInvocation(fieldReply: ChatFieldReply(email: header, onlyTo: onlyTo), composeOrigin: asked)
+        let task = Task { @MainActor in await compose.reply("Friday works", invocation: invocation) }
+        defer { task.cancel() }
+        var pending: AgentToolRouter.ComposeRequest?
+        let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [asked.sessionKey])
+        let deadline = Date().addingTimeInterval(5)
+        while pending == nil, Date() < deadline {
+            pending = router.takeCompose(for: host)
+            await Task.yield()
+        }
+        let req = try #require(pending, "the field's compose opens a reply")
+        req.onOutcome(.cancelled)
+        _ = await task.value
+        return (req, [account])
+    }
+
+    @Test("The field's reply follows the same rule: Reply All to everyone, a plain reply to the people chosen as it was sent")
+    func fieldReplyFollowsTheTarget() async throws {
+        let (chosen, chosenAccounts) = try await Self.fieldReplyRequest(onlyTo: [Self.david.address])
+        #expect(chosen.isFieldsOwnReply, "control: the field's own card")
         #expect(chosen.mode == .reply && !chosen.isReplyAll && chosen.to == [Self.david.address] && chosen.cc.isEmpty && chosen.bcc.isEmpty,
-                "the request itself is the plain reply to David: the agent's added people are not applied")
+                "the request itself is the plain reply to David")
         #expect(chosen.subject == ThreadUtils.replySubject(for: "Plans"), "the reply subject")
         let toChosen = Self.card(agent: chosen, accounts: chosenAccounts)
         #expect(!toChosen.isReplyAll, "Replying only to David is a plain reply")
         #expect(toChosen.prefillTo == [Self.david.address] && toChosen.prefillCc == [] && toChosen.prefillBcc == [],
                 "Replying only to David: nobody else, seen or hidden")
 
-        let (req, accounts) = try await Self.agentReplyRequest(widening, from: .field(onlyTo: nil))
+        let (req, accounts) = try await Self.fieldReplyRequest(onlyTo: nil)
         let toEveryone = Self.card(agent: req, accounts: accounts)
-        #expect(toEveryone.isReplyAll, "nobody chosen, the agent added people but kept everyone: Reply All")
+        #expect(req.isReplyAll && toEveryone.isReplyAll, "nobody chosen: Reply All")
         #expect(toEveryone.prefillTo == req.to && toEveryone.prefillCc == req.cc && toEveryone.prefillBcc == req.bcc,
-                "nobody chosen: the card keeps the agent's recipients")
+                "nobody chosen: the card keeps the request's recipients")
     }
 
-    @Test("A reply the agent writes from the field with nobody chosen is Reply All only when it goes to the whole audience")
-    func agentReplyFromTheFieldIsReplyAllOnlyToTheWholeAudience() async throws {
-        let (everyone, accounts) = try await Self.agentReplyRequest([:], from: .field(onlyTo: nil))
-        let whole = Self.card(agent: everyone, accounts: accounts)
-        #expect(whole.isReplyAll, "the agent's reply goes to the whole audience: Reply All")
-        #expect(whole.prefillTo == everyone.to && whole.prefillCc == everyone.cc)
-
-        let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest(
-            ["remove_recipients": .array([.string("team@example.com")])], from: .field(onlyTo: nil))
-        #expect(narrowed.to == ["sender@example.com"] && narrowed.cc.isEmpty && narrowed.bcc.isEmpty,
-                "the agent itself left team@example.com out")
-        let fewer = Self.card(agent: narrowed, accounts: narrowedAccounts)
-        #expect(!fewer.isReplyAll, "someone left out by the agent: a plain reply, never recorded as Reply All")
-        #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == [] && fewer.prefillBcc == [],
-                "the card goes to the agent's recipients only")
-    }
-
-    @Test("A reply the agent widens is still Reply All: its recipients contain the whole audience, from the field and the sheet")
+    @Test("A reply the agent widens is still Reply All: its recipients contain the whole audience")
     func agentReplyThatAddsPeopleIsStillReplyAll() async throws {
-        for origin in [Origin.field(onlyTo: nil), .sheet] {
-            let (widened, accounts) = try await Self.agentReplyRequest([
-                "add_cc": .array([.string("extra@example.com")]),
-                "add_bcc": .array([.string("hidden@example.com")]),
-            ], from: origin)
-            #expect(widened.to.contains("sender@example.com") && widened.cc.contains("extra@example.com") && widened.bcc == ["hidden@example.com"],
-                    "the agent added a Cc and a Bcc and kept everyone")
-            let compose = Self.card(agent: widened, accounts: accounts)
-            #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, plus people the agent added: Reply All")
-            #expect(compose.prefillTo == widened.to && compose.prefillCc == widened.cc && compose.prefillBcc == widened.bcc,
-                    "the card keeps the agent's recipients")
-        }
+        let (widened, accounts) = try await Self.agentReplyRequest([
+            "add_cc": .array([.string("extra@example.com")]),
+            "add_bcc": .array([.string("hidden@example.com")]),
+        ])
+        #expect(widened.to.contains("sender@example.com") && widened.cc.contains("extra@example.com") && widened.bcc == ["hidden@example.com"],
+                "the agent added a Cc and a Bcc and kept everyone")
+        let compose = Self.card(agent: widened, accounts: accounts)
+        #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, plus people the agent added: Reply All")
+        #expect(compose.prefillTo == widened.to && compose.prefillCc == widened.cc && compose.prefillBcc == widened.bcc,
+                "the card keeps the agent's recipients")
 
         let (widenedNarrowed, otherAccounts) = try await Self.agentReplyRequest([
             "add_cc": .array([.string("extra@example.com")]),
             "remove_recipients": .array([.string("team@example.com")]),
-        ], from: .field(onlyTo: nil))
+        ])
         let swapped = Self.card(agent: widenedNarrowed, accounts: otherAccounts)
         #expect(!swapped.isReplyAll, "someone added but someone dropped: a plain reply")
     }
@@ -1166,30 +1175,28 @@ struct ChatReplyFieldTests {
     @Test("A reply the agent moves someone from To to Cc by name is still Reply All, and the card keeps the name and the Cc")
     func agentReplyThatMovesSomeoneToCcByNameIsStillReplyAll() async throws {
         let teamLead: JSONValue = .dictionary(["name": .string("Team Lead"), "email": .string("team@example.com")])
-        for origin in [Origin.field(onlyTo: nil), .sheet] {
-            let (moved, accounts) = try await Self.agentReplyRequest([
-                "remove_recipients": .array([.string("team@example.com")]),
-                "add_cc": .array([teamLead]),
-            ], from: origin)
-            #expect(moved.to == ["sender@example.com"] && moved.bcc.isEmpty, "control: team@example.com left To")
-            let named = RecipientEntry(moved.cc).recipients
-            let expectedCc = [RecipientEntry.Recipient(address: "team@example.com", name: "Team Lead")]
-            #expect(named == expectedCc, "control: the agent's Cc is the named mailbox, not a bare address")
-            let compose = Self.card(agent: moved, accounts: accounts)
-            #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, one of them by name in Cc: Reply All")
-            #expect(compose.prefillTo == ["sender@example.com"], "the card keeps the To the agent chose")
-            #expect(compose.prefillCc == moved.cc && compose.prefillBcc == moved.bcc,
-                    "the card keeps the agent's Cc as written, and its empty Bcc exactly")
-            let cardCc = RecipientEntry(compose.prefillCc ?? []).recipients
-            #expect(cardCc == expectedCc, "the card's Cc is team@example.com, under its name")
-        }
+        let (moved, accounts) = try await Self.agentReplyRequest([
+            "remove_recipients": .array([.string("team@example.com")]),
+            "add_cc": .array([teamLead]),
+        ])
+        #expect(moved.to == ["sender@example.com"] && moved.bcc.isEmpty, "control: team@example.com left To")
+        let named = RecipientEntry(moved.cc).recipients
+        let expectedCc = [RecipientEntry.Recipient(address: "team@example.com", name: "Team Lead")]
+        #expect(named == expectedCc, "control: the agent's Cc is the named mailbox, not a bare address")
+        let compose = Self.card(agent: moved, accounts: accounts)
+        #expect(compose.isReplyAll, "everyone in the Reply All audience is on it, one of them by name in Cc: Reply All")
+        #expect(compose.prefillTo == ["sender@example.com"], "the card keeps the To the agent chose")
+        #expect(compose.prefillCc == moved.cc && compose.prefillBcc == moved.bcc,
+                "the card keeps the agent's Cc as written, and its empty Bcc exactly")
+        let cardCc = RecipientEntry(compose.prefillCc ?? []).recipients
+        #expect(cardCc == expectedCc, "the card's Cc is team@example.com, under its name")
 
         // The narrowed control: the agent names someone else in Cc and leaves team@example.com out.
         let otherLead: JSONValue = .dictionary(["name": .string("Team Lead"), "email": .string("lead@example.com")])
         let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest([
             "remove_recipients": .array([.string("team@example.com")]),
             "add_cc": .array([otherLead]),
-        ], from: .field(onlyTo: nil))
+        ])
         let fewer = Self.card(agent: narrowed, accounts: narrowedAccounts)
         #expect(!fewer.isReplyAll, "someone of the audience left out, another named instead: a plain reply")
         #expect(fewer.prefillTo == ["sender@example.com"] && fewer.prefillCc == narrowed.cc,
@@ -1324,19 +1331,19 @@ struct ChatReplyFieldTests {
 
     @Test("A reply the agent writes in the open sheet keeps its recipients, and is Reply All only to the whole audience")
     func agentReplyFromTheSheetKeepsItsRecipients() async throws {
-        let (everyone, accounts) = try await Self.agentReplyRequest([:], from: .sheet)
+        let (everyone, accounts) = try await Self.agentReplyRequest([:])
         #expect(everyone.fieldReply == nil, "control: asked for in the sheet, the request carries no field choice")
         let all = Self.card(agent: everyone, accounts: accounts)
         #expect(all.isReplyAll, "the agent's reply goes to the whole audience")
         #expect(all.prefillTo == everyone.to && all.prefillCc == everyone.cc)
 
-        let (widened, widenedAccounts) = try await Self.agentReplyRequest(["add_cc": .array([.string("extra@example.com")])], from: .sheet)
+        let (widened, widenedAccounts) = try await Self.agentReplyRequest(["add_cc": .array([.string("extra@example.com")])])
         let compose = Self.card(agent: widened, accounts: widenedAccounts)
         #expect(compose.isReplyAll, "someone added, everyone kept: Reply All")
         #expect(compose.prefillTo == widened.to && compose.prefillCc == widened.cc, "the open chat keeps everyone the agent chose")
 
         let (narrowed, narrowedAccounts) = try await Self.agentReplyRequest(
-            ["remove_recipients": .array([.string("team@example.com")])], from: .sheet)
+            ["remove_recipients": .array([.string("team@example.com")])])
         let fewer = Self.card(agent: narrowed, accounts: narrowedAccounts)
         #expect(!fewer.isReplyAll, "someone left out: a plain reply")
         #expect(fewer.prefillTo == ["sender@example.com"])

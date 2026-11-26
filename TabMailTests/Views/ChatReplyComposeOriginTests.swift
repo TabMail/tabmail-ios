@@ -9,20 +9,21 @@ import Testing
 import UIKit
 @testable import TabMail
 
-/// ADR-IOS-114 decision 11: who gets a reply the agent opens in the chat.
+/// ADR-IOS-114 decision 11: who gets a reply the chat opens.
 ///
 /// THE SYSTEM PROPERTY pinned here: the compose card the chat opens for the agent's reply goes to
-/// the recipients the agent's request produced, unless that request was sent from the chat's reply
-/// field about the email it replies to; only then does the choice the user made in Reply to apply,
-/// as it was when the request was sent. Whether the chat's sheet is open when the card arrives, and
-/// which chat receives it, never decides who the email goes to.
+/// the recipients the agent's request produced; the reply the chat's field writes
+/// (`ChatFieldCompose`, ADR-IOS-114 decision 10) goes to the choice the user made in Reply to, as it
+/// was when the words were sent. Whether the chat's sheet is open when the card arrives, which chat
+/// receives it, and what Reply to shows by then never decide who the email goes to.
 ///
 /// Each case opens the chat for real in a window, picks who gets the reply through the Reply to
-/// sheet as the user does, holds the agent's real reply request behind a compose already on screen,
+/// sheet as the user does, holds the real reply request behind a compose already on screen,
 /// releases it, and reads the recipients of the compose card the chat opens. Every request is asked
-/// in this chat (`ComposeOrigin`, ADR-IOS-053 Phase 2), so this chat's pill takes it; a request from
-/// the reply field runs the tool with the invocation the field's send builds (`ChatFieldReply`, its
-/// building pinned in `ChatReplyFieldTests.recipientsWiring`).
+/// in this chat (`ComposeOrigin`, ADR-IOS-053 Phase 2), so this chat's pill takes it; the field's
+/// reply runs the field's compose with the invocation the field's send builds (`ChatFieldReply`, its
+/// building pinned in `ChatReplyFieldTests.recipientsWiring`), its email written by a stand-in
+/// request that changes no recipients.
 @Suite("Who gets the agent's reply in the chat", .serialized, .processGlobalState)
 @MainActor
 struct ChatReplyComposeOriginTests {
@@ -177,7 +178,7 @@ struct ChatReplyComposeOriginTests {
         HostedAccessibility.labels(in: view).first { $0.hasPrefix("Replying only to") }
     }
 
-    /// Runs the agent's reply tool on `arguments`, holding its compose card behind a compose already
+    /// Runs a reply request (`run`: the agent's reply tool or the field's compose), holding its compose card behind a compose already
     /// on screen; `whileHeld` runs before the card is let through. Returns the card's recipients by
     /// field, read from the compose the chat opens once its `fields` all show addresses (a check
     /// that reads a field passes it: the card's rows join the accessibility tree one by one, #1498).
@@ -232,6 +233,21 @@ struct ChatReplyComposeOriginTests {
         ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: onlyTo), composeOrigin: chat.asked)
     }
 
+    /// The field's compose on the chat's database, opening its card through the app's router, as in
+    /// the app; the request writes an email and changes no recipients.
+    private static func fieldCompose(in chat: Chat) -> ChatFieldCompose {
+        ChatFieldCompose(
+            context: ToolContext(db: chat.pool, translator: chat.translator, router: AgentToolRouter.shared),
+            composeText: { _, _, _, _ in
+                guard let written = AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                    response: "Done.", subject: "Re: Plans", body: "Hi,\n\nFriday works.\n\nMe",
+                    textMessage: "Friday works", changeCommand: "")) else {
+                    throw InlineEditFailure(message: "control: the stand-in answer parses")
+                }
+                return written
+            })
+    }
+
     /// A request asked in `chat`'s open sheet: no field choice.
     private static func sheet(in chat: Chat) -> ToolInvocation {
         ToolInvocation(composeOrigin: chat.asked)
@@ -281,24 +297,7 @@ struct ChatReplyComposeOriginTests {
         }
     }
 
-    @Test("A request from the field about this chat's email does not choose who gets a reply to another email")
-    func fieldRequestAboutAnotherEmail() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        try await HostedAccessibility.withAutomation {
-            try await withChat { chat in
-                try await Self.replyOnly(untick: ["alex@example.com", "sam@example.com"], in: chat)
-                let tool = chat.tool
-                let invocation = Self.field(chat.email, onlyTo: ["david@example.com"], in: chat)
-                let card = try await Self.heldReply(in: chat, run: {
-                    try await tool.execute(arguments: ["unique_id": .int(2), "body": .string("Lunch works")], invocation: invocation)
-                })
-                #expect(Self.addresses(card["to"]) == ["carol@example.com"], "the other email's own people: \(card)")
-                #expect(Self.addresses(card["cc"]).isEmpty, "\(card)")
-            }
-        }
-    }
-
-    // MARK: - The field's own request applies the choice made when it was sent
+    // MARK: - The field's reply applies the choice made when it was sent
 
     @Test("A reply asked for in the field goes to the people chosen when it was sent, whatever the chat shows when it arrives")
     func fieldRequestUsesItsCapturedChoice() async throws {
@@ -307,10 +306,11 @@ struct ChatReplyComposeOriginTests {
             try await withChat { chat in
                 // Sent replying only to David; the chat is back at everyone when the card arrives.
                 #expect(Self.replyingOnlyTo(in: chat.view) == nil, "control: the chat replies to everyone")
-                let tool = chat.tool
+                let compose = Self.fieldCompose(in: chat)
                 let invocation = Self.field(chat.email, onlyTo: ["david@example.com"], in: chat)
                 let card = try await Self.heldReply(in: chat, run: {
-                    try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
+                    _ = await compose.reply("Friday works", invocation: invocation)
+                    return ""
                 })
                 #expect(Self.addresses(card["to"]) == ["david@example.com"], "only the people chosen: \(card)")
                 #expect(Self.addresses(card["cc"]).isEmpty && Self.addresses(card["bcc"]).isEmpty, "nobody else: \(card)")
@@ -323,10 +323,11 @@ struct ChatReplyComposeOriginTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
         try await HostedAccessibility.withAutomation {
             try await withChat { chat in
-                let tool = chat.tool
+                let compose = Self.fieldCompose(in: chat)
                 let invocation = Self.field(chat.email, onlyTo: nil, in: chat)
                 let card = try await Self.heldReply(in: chat, run: {
-                    try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
+                    _ = await compose.reply("Friday works", invocation: invocation)
+                    return ""
                 }, whileHeld: {
                     try await Self.replyOnly(untick: ["alex@example.com", "sam@example.com"], in: chat)
                 }, showing: ["to", "cc"])

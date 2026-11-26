@@ -29,7 +29,8 @@ import UIKit
 struct ChatThreadLayoutTests {
     nonisolated private static let account = "acc-layout"
 
-    private static func makeParent(_ pool: DatabasePool, earlier: Int = 0) async throws -> MessageHeader {
+    /// `suggestion`: an AI Suggestion on the newest email (its ghost then joins the chat); nil: none.
+    private static func makeParent(_ pool: DatabasePool, earlier: Int = 0, suggestion: ReplyResult? = nil) async throws -> MessageHeader {
         _ = try FolderEpochTestFixture.makeAccount(id: account, provider: .gmail, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: account, path: "INBOX", role: .inbox, pool: pool)
         try await insertEarlier(earlier, pool: pool)
@@ -54,6 +55,12 @@ struct ChatThreadLayoutTests {
         // the field, which is what the layout tests measure.
         header.actionTag = ActionTag.none
         header.cachedReply = ""
+        if let suggestion {
+            header.actionTag = .reply
+            header.cachedReply = suggestion.body
+            header.replyTextMessage = suggestion.textMessage
+            header.replyChangeCommand = suggestion.changeCommand
+        }
         let parent = header
         try await pool.write { db in try parent.insert(db) }
         return parent
@@ -88,6 +95,7 @@ struct ChatThreadLayoutTests {
         textSize: DynamicTypeSize = .large,
         earlier: Int = 0,
         signedIn: Bool = false,
+        suggestion: ReplyResult? = nil,
         _ body: (UIWindow, UIHostingController<AnyView>, MessageHeader) async throws -> Void
     ) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
@@ -97,7 +105,7 @@ struct ChatThreadLayoutTests {
             InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
         }
         saved.setChatView(on: true)
-        let parent = try await makeParent(pool, earlier: earlier)
+        let parent = try await makeParent(pool, earlier: earlier, suggestion: suggestion)
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         let controller = UIHostingController(rootView: AnyView(
@@ -167,7 +175,7 @@ struct ChatThreadLayoutTests {
                 let mic = try #require(HostedAccessibility.elements(under: controller.view)
                     .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame,
                     "labels: \(HostedAccessibility.labels(in: controller.view).prefix(30))")
-                // No TabMail session here, so no "e.g." line: one line.
+                // Not signed in and no AI Suggestion, so no "alt: " line: one line.
                 #expect(abs(field.height - 42) < 1, "one-line field \(field.height)")
                 let lineMid = field.maxY - ChatViewLayout.fieldVerticalPadding - ChatViewLayout.fieldLineHeight / 2
                 #expect(abs(send.midY - lineMid) < 1, "Send \(send) on the line at \(lineMid)")
@@ -209,21 +217,24 @@ struct ChatThreadLayoutTests {
         }
     }
 
-    @Test("Signed in, the empty field shows its \"e.g.\" line: 60 tall, the mic and Send on its last line")
+    @Test("Signed in with an AI Suggestion, the empty field shows its \"alt: \" line: 60 tall, the mic and Send on its last line")
     func signedInEmptyField() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        let suggestion = ReplyResult(
+            body: "Hi,\n\nLunch on Friday works.\n\nMe", textMessage: "Friday works", changeCommand: "Can't make it this week")
         try await HostedAccessibility.withAutomation {
-            try await Self.hosted(signedIn: true) { _, controller, _ in
+            try await Self.hosted(signedIn: true, suggestion: suggestion) { _, controller, _ in
                 let id = ChatThreadView.replyPillId
-                try await Self.waitFor { Self.frame(of: "chatSend", in: controller.view) != nil }
+                try await Self.waitFor { Self.frame(of: DynamicIslandChat.alternativeLineId, in: controller.view) != nil }
                 try await Task.sleep(for: .milliseconds(300))
                 let labels = HostedAccessibility.labels(in: controller.view)
-                #expect(labels.contains { $0.hasPrefix("e.g.") }, "control: the \"e.g.\" line shows: \(labels.prefix(30))")
+                let alt = ChatSuggestionConfig.alternativeLine("Can't make it this week")
+                #expect(labels.contains(alt), "control: the \"alt: \" line shows: \(labels.prefix(30))")
                 let field = try #require(Self.frame(of: id, in: controller.view))
                 let send = try #require(Self.frame(of: "chatSend", in: controller.view))
                 let mic = try #require(HostedAccessibility.elements(under: controller.view)
                     .first { $0.accessibilityLabel == "Dictate" }?.accessibilityFrame)
-                // Option B: the hint line, the "e.g." line under it, 10 above and below. The design
+                // Option B: the hint line, the "alt: " line under it, 10 above and below. The design
                 // mock's 60 assumed a 16-pt caption line; the real caption line at this text size is
                 // 14.33, so the field is 58.33: the padding, one body line, the column's spacing
                 // (`spacing: 2` in `liveReplyFieldBar`), one caption line, the padding.
@@ -236,6 +247,23 @@ struct ChatThreadLayoutTests {
                 let lineMid = field.maxY - ChatViewLayout.fieldVerticalPadding - ChatViewLayout.fieldLineHeight / 2
                 #expect(abs(send.midY - lineMid) < 1, "Send \(send) on the last line at \(lineMid)")
                 #expect(abs(mic.midY - lineMid) < 1, "mic \(mic) on the last line at \(lineMid)")
+            }
+        }
+    }
+
+    @Test("Signed in with no AI Suggestion, the empty field has no \"alt: \" line: one line, 42 tall")
+    func signedInEmptyFieldWithoutSuggestion() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await Self.hosted(signedIn: true) { _, controller, _ in
+                try await Self.waitFor { Self.frame(of: "chatSend", in: controller.view) != nil }
+                try await Task.sleep(for: .milliseconds(300))
+                let labels = HostedAccessibility.labels(in: controller.view)
+                #expect(labels.contains(ChatReplyField.writePlaceholder), "control: signed in, the field invites a message: \(labels.prefix(30))")
+                #expect(Self.frame(of: DynamicIslandChat.alternativeLineId, in: controller.view) == nil, "no \"alt: \" line")
+                #expect(!labels.contains { $0.hasPrefix("alt: ") }, "no \"alt: \" label: \(labels.prefix(30))")
+                let field = try #require(Self.frame(of: ChatThreadView.replyPillId, in: controller.view))
+                #expect(abs(field.height - 42) < 1, "one-line field \(field.height)")
             }
         }
     }

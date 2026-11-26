@@ -1040,10 +1040,10 @@ struct ChatComposeRoutingTests {
         }
     }
 
-    @Test("A narrowed field reply's card is a plain reply with a draft of its own, naming its email; every other reply keeps the usual draft")
-    func narrowedReplyHasADraftOfItsOwn() async throws {
-        // The reply tool builds the card into its request (`ComposeRequest.composeView`, the one
-        // presenter), so the request it queues is what every screen opens.
+    @Test("The field's reply card is a draft of its own naming its email, a plain reply when narrowed; a reply the agent writes keeps the usual draft")
+    func fieldReplyHasADraftOfItsOwn() async throws {
+        // Both build the card into their request (`ComposeRequest.composeView`, the one presenter),
+        // so the request queued is what every screen opens.
         let db = try TestDatabase.make()
         let translator = MockChatIdTranslator()
         try TestDatabase.insertAccount(db)
@@ -1053,40 +1053,68 @@ struct ChatComposeRoutingTests {
         await translator.seed(email.id, as: 1)
         let asked = ComposeOrigin(sessionKey: ChatThreadKey.key(for: email), screen: .chat)
         let host = AgentToolRouter.ComposeHost(screen: .chat, sessionKeys: [asked.sessionKey])
-        func card(_ field: ChatFieldReply?) async -> AgentToolRouter.ComposeRequest? {
+        func taken(_ router: AgentToolRouter) async -> AgentToolRouter.ComposeRequest? {
+            var request: AgentToolRouter.ComposeRequest?
+            let deadline = Date().addingTimeInterval(5)
+            while request == nil, Date() < deadline {
+                request = router.takeCompose(for: host)
+                if request == nil { await Task.yield() }
+            }
+            request?.onOutcome(.cancelled)
+            return request
+        }
+        // The field's Send: its words written into the reply, the request changing no recipients.
+        func fieldCard(onlyTo: [String]?) async -> AgentToolRouter.ComposeRequest? {
+            let router = AgentToolRouter()
+            let compose = ChatFieldCompose(
+                context: ToolContext(db: db, translator: translator, router: router),
+                composeText: { _, _, _, _ in
+                    guard let written = AIService.parseInlineEditResponse(ComposeEditJSON.make(
+                        response: "Done.", subject: "Re: Plans", body: "Hi,\n\nFriday works.\n\nMe",
+                        textMessage: "Friday works", changeCommand: "")) else {
+                        throw InlineEditFailure(message: "control: the stand-in answer parses")
+                    }
+                    return written
+                })
+            let invocation = ToolInvocation(fieldReply: ChatFieldReply(email: email, onlyTo: onlyTo), composeOrigin: asked)
+            let task = Task { @MainActor in await compose.reply("Friday works", invocation: invocation) }
+            let request = await taken(router)
+            if request == nil { task.cancel() }
+            _ = await task.value
+            return request
+        }
+        // A reply the agent writes, asked in the chat's sheet.
+        func agentCard() async -> AgentToolRouter.ComposeRequest? {
             let router = AgentToolRouter()
             let tool = EmailReplyTool(context: ToolContext(db: db, translator: translator, router: router))
-            let invocation = ToolInvocation(fieldReply: field, composeOrigin: asked)
+            let invocation = ToolInvocation(composeOrigin: asked)
             let task = Task { @MainActor in
                 try await tool.execute(arguments: ["unique_id": .int(1), "body": .string("Friday works")], invocation: invocation)
             }
-            var taken: AgentToolRouter.ComposeRequest?
-            let deadline = Date().addingTimeInterval(5)
-            while taken == nil, Date() < deadline {
-                taken = router.takeCompose(for: host)
-                if taken == nil { await Task.yield() }
-            }
-            taken?.onOutcome(.cancelled)
-            if taken == nil { task.cancel() }
+            let request = await taken(router)
+            if request == nil { task.cancel() }
             _ = try? await task.value
-            return taken
+            return request
         }
 
-        let narrowed = try #require(await card(ChatFieldReply(email: email, onlyTo: ["david@example.com"])),
-                                    "control: the narrowed reply's card opened")
+        let narrowed = try #require(await fieldCard(onlyTo: ["david@example.com"]), "control: the narrowed reply's card opened")
+        #expect(narrowed.isFieldsOwnReply, "control: the field's own card")
         #expect(!narrowed.isReplyAll && narrowed.to == ["david@example.com"] && narrowed.cc.isEmpty && narrowed.bcc.isEmpty,
                 "a plain reply to David alone: \(narrowed.to) \(narrowed.cc) \(narrowed.bcc)")
         let draftId = narrowed.draftId ?? ""
         #expect(draftId.hasPrefix(Draft.separateReplyPrefix), "a draft of its own: \(draftId)")
         let named = Draft.replyKeyTail(draftKey: draftId, isForward: false).map(String.init)
         #expect(named == "\(email.accountId):\(email.stableId)", "naming the email it answers")
-        let again = await card(ChatFieldReply(email: email, onlyTo: ["david@example.com"]))
+        let again = await fieldCard(onlyTo: ["david@example.com"])
         #expect(again != nil && again?.draftId != narrowed.draftId, "each card its own draft")
 
-        let everyone = try #require(await card(ChatFieldReply(email: email, onlyTo: nil)), "control: the reply to everyone opened")
-        #expect(everyone.draftId == nil, "a field reply to everyone keeps the reply's usual draft")
-        let sheet = try #require(await card(nil), "control: the sheet's reply opened")
-        #expect(sheet.draftId == nil, "a reply asked in the chat's sheet keeps the reply's usual draft")
+        // To everyone too: a draft of its own, so a reply draft already saved for the email stays.
+        let everyone = try #require(await fieldCard(onlyTo: nil), "control: the reply to everyone opened")
+        #expect(everyone.isReplyAll && everyone.isFieldsOwnReply, "control: the field's Reply All")
+        #expect(everyone.draftId?.hasPrefix(Draft.separateReplyPrefix) == true,
+                "the field's reply to everyone holds a draft of its own: \(String(describing: everyone.draftId))")
+        let sheet = try #require(await agentCard(), "control: the sheet's reply opened")
+        #expect(sheet.draftId == nil, "a reply the agent writes keeps the reply's usual draft")
     }
 
     // MARK: - 9. The inbox says from its navigation whether it shows
