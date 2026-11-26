@@ -1835,8 +1835,8 @@ struct DynamicIslandChat: View {
     static let newEmailNotWrittenNote = "Couldn't write your email. Your words are still in the field."
 
     /// A new email's chat opening: its draft's words, once, then its reply field takes the
-    /// keyboard (`InputFocus.replyField`: the panel, which `isTextFieldFocused` focuses, never
-    /// opens in a new email's chat). The next new email after a send (a new session, the chat
+    /// keyboard (`InputFocus.replyField`: the panel, which `isTextFieldFocused` focuses, is closed
+    /// as a new email's chat opens). The next new email after a send (a new session, the chat
     /// already open) starts with its own words, none, in place of the sent email's; the keyboard
     /// is left as it is.
     private func startNewEmail() {

@@ -862,6 +862,72 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("The sent email's copy arriving while the TabMail panel is open waits for the panel to close, then the chat is that email's thread")
+    func sentCopyWaitsForTheOpenPanel() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    // The user drags the field up to ask TabMail something while the email goes out
+                    // (VoiceOver's equivalent of the drag opens the same panel).
+                    #expect(HostedAccessibility.perform(ChatViewConfig.showChatActionName, in: screen.view), "the panel opens")
+                    try await Self.waitUntil { Self.panelOpen(screen) }
+                    #expect(Self.panelOpen(screen), "control: the panel is open")
+
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let copy = Self.sentFolderHeader("screen-sent-copy-panel", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    try await fixture.pool.write { try copy.insert($0) }
+
+                    // Longer than the swap takes with nothing open (`sentCopyTurnsTheChatIntoItsThread`).
+                    for _ in 0..<30 {
+                        if Self.isThread(screen) || !Self.panelOpen(screen) { break }
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    #expect(!Self.isThread(screen), "the swap waits while the panel is open")
+                    #expect(Self.panelOpen(screen), "the panel the user opened stays")
+
+                    #expect(HostedAccessibility.activate("chatClose", in: screen.view), "the panel's close takes a tap")
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    #expect(Self.isThread(screen), "with the panel closed, the chat is the sent email's thread: \(HostedAccessibility.identifiers(in: screen.view))")
+                    #expect(screen.stage.pushed != nil, "control: still open")
+                }
+            }
+        }
+    }
+
+    /// The drag up itself is pinned in the source (`ChatNewThreadTests.fieldDragWiring`): a hosted test
+    /// can neither move the pan nor find it, since SwiftUI keeps a representable's recognizer out of
+    /// the views' `gestureRecognizers`. Show TabMail chat is offered on the same condition as the drag.
+    @Test("A new email's closed field opens the TabMail panel as a thread's does: VoiceOver's Show TabMail chat, the drag's equivalent, opens the panel and is not offered over it")
+    func fieldOpensThePanel() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await fieldOpensThePanelBody() }
+    }
+
+    private func fieldOpensThePanelBody() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let model = ChatNewThreadModel(account: fixture.account, queueDraftSave: { _, _ in true })
+        let name = ChatViewConfig.showChatActionName
+        try await withScreen(model) { screen in
+            #expect(!Self.panelOpen(screen), "control: the panel starts closed")
+            let closedActions = HostedAccessibility.actionNames(in: screen.view)
+            #expect(closedActions.contains(name), "VoiceOver offers the drag's equivalent: \(closedActions)")
+
+            #expect(HostedAccessibility.perform(name, in: screen.view), "the action runs")
+            try await Self.waitUntil { Self.panelOpen(screen) }
+            #expect(Self.panelOpen(screen), "the panel opened: \(HostedAccessibility.identifiers(in: screen.view))")
+            // The closed field's element may linger through its removal animation.
+            try await Self.waitUntil { !HostedAccessibility.actionNames(in: screen.view).contains(name) }
+            let openActions = HostedAccessibility.actionNames(in: screen.view)
+            #expect(!openActions.contains(name), "not offered over the open panel")
+            #expect(screen.stage.pushed === model, "control: the chat stays")
+        }
+    }
+
     @Test("A reopened draft whose attachments cannot be read says so as the chat opens")
     func unreadableAttachmentsShownAtOpen() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
@@ -1398,6 +1464,11 @@ struct ChatNewThreadScreenTests {
         let session = ChatPillState.shared.session(for: model.sessionKey)
         session.chatMessages.append(ChatMessage(role: .user, content: "marker", timestamp: Date()))
         return session
+    }
+
+    /// The TabMail panel is open over the chat: its close button shows.
+    private static func panelOpen(_ screen: Screen) -> Bool {
+        HostedAccessibility.identifiers(in: screen.view).contains("chatClose")
     }
 
     private static func topPresented(_ screen: Screen) -> UIViewController? {

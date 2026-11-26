@@ -1555,7 +1555,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
 
 21. **Drag the field up to open the TabMail chat (amendment 2026-11-20).** Until now the panel
    opened only on an agent answer, a confirmation card or `.openMessageWithChat`. A drag up on the
-   collapsed reply field now opens it too, and the field itself swells into the panel: while the
+   collapsed reply field now opens it too (a new email's field takes the same drag since
+   2026-11-25, decision 24), and the field itself swells into the panel: while the
    finger moves, the field's top follows it (`ChatReplyField.drag`, `ChatFieldDrag.swell`, at most
    `ChatViewLayout.fieldDragMaxSwell`); on let-go the panel opens with the pill's spring once the
    swell, or a flick's predicted swell, reaches `fieldDragOpenDistance`, and otherwise the field
@@ -1854,7 +1855,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `ChatNewEmailField`) with "Message or ask anything", an "e.g." line from its own config set
      (`ChatSuggestionConfig.newEmailExamples`), focus as it opens, and a paperclip at the end of the
      text (Photos, Camera, Files; `ChatPaperclipButton`, sized by `FieldButtonSlot`); the row's mic,
-     text and Send keep their places. `DynamicIslandChat.isInboxChat` is false for it, so none of
+     text and Send keep their places. Its field takes the same drag up as a thread's (decision 21:
+     `ChatFieldPan`, `ChatFieldDrag`, VoiceOver "Show TabMail chat") to open the TabMail chat, since
+     its Send writes the email itself and the drag is the way to ask TabMail to do something.
+     `DynamicIslandChat.isInboxChat` is false for it, so none of
      the inbox chat's history, reminders or idle clear applies.
    - *Add recipient.* The header's tap opens the "Reply to" sheet titled "Add recipient"
      (`ChatReplyToSheet(title:)`), starting from the people already picked (none at first) with its
@@ -2082,7 +2086,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        or the server's, read by folder and Message-ID through `messageHeader_rfc822MessageId`), the
        chat is that email's thread for good (`ChatThreadView(messageId:)` on the Sent copy): later
        replies land there, and the chat's own Back closes it. The change waits while anything is open
-       over the new email (a card, a picker, "Add recipient"), which it would take down. The new
+       over the new email (a card, a picker, "Add recipient", and since 2026-11-25 the TabMail panel,
+       which the field's drag opens at will), which it would take down; it happens as the last of
+       them closes. The panel is not part of `newEmailCovered`, which also decides whether a compose
+       card may present (the panel's own cards present over it). The new
        email and the thread share one container (a `ZStack`, never a `Group`: a Group gives its
        modifiers to each child, so the change would run the screen's close and open and take down
        what it presents, a reopened compose included).
@@ -2090,7 +2097,12 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        chat's cover hides until it closes.
    Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
    reopen route, the source wiring, including the camera's cover not closing the screen, which is
-   checked only in the source: the simulator has no camera), `ChatNewThreadScreenTests` (the whole
+   checked only in the source: the simulator has no camera; since 2026-11-25 `fieldDragWiring`, the
+   field's drag up, its freeze and the swap's wait for the panel, in the source because a hosted
+   test can neither move the pan nor find it: SwiftUI keeps a representable's recognizer out of the
+   views' `gestureRecognizers`), `ChatNewThreadScreenTests` (since 2026-11-25 `fieldOpensThePanel`,
+   VoiceOver's Show TabMail chat, offered on the drag's condition, opening the panel and not offered
+   over it, and `sentCopyWaitsForTheOpenPanel`, the swap to the thread waiting for the open panel; the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
    row and the opens from Drafts, since 2026-11-22 a link's chat saving on background only once
