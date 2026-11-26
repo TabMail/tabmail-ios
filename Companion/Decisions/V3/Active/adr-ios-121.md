@@ -1,6 +1,7 @@
 ## ADR-IOS-121: Both Databases Move to `auto_vacuum = INCREMENTAL` Through a One-Time Upgrade the User Starts, Then Give Their Empty Pages Back Overnight in Short Steps
 
-**Status:** Active (2026-11-26, #1450). Amends ADR-IOS-006 (its current note of 2026-11-24 left
+**Status:** Active (2026-11-26, #1450; the upgrade's free-space need amended 2026-11-26, #1449 and #1545,
+decision 3 "Room and power"). Amends ADR-IOS-006 (its current note of 2026-11-24 left
 "returning the empty pages to the file system" as separate work) and ADR-IOS-029 (a `VACUUM` carries
 the planner statistics marker). First written 2026-11-25 with an overnight switch the app ran by
 itself; that design was replaced before release (see "Replaced design" at the end).
@@ -56,9 +57,17 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      their entry points must read `DatabaseUpgrade.needsUpgrade`, say the upgrade comes first, and open
      this same notice (`DatabaseUpgrade.openNotice`).
    - **Room and power.** Upgrade now is off while the device lacks
-     `SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple` (2) times a not-yet-upgraded database's size
-     free (`SyncEngine.bytesToFreeForUpgrade`), for the `VACUUM`'s temporary copy and the WAL the copy
-     is written through. The space counted is the space free right now (`volumeAvailableCapacityKey`),
+     `SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple` (2.05) times a not-yet-upgraded database's
+     pages less its empty pages free (`DatabaseVacuum.SpaceState.liveBytes`, the storage measure's
+     count; `SyncEngine.bytesToFreeForUpgrade`). The `VACUUM` copies only the pages that hold data,
+     into its temporary copy and then through the WAL (each page with a 24-byte frame header, so about
+     2.006 times); the rest covers the pointer-map pages the INCREMENTAL copy adds (about one page in
+     820), the WAL index's growth (8 bytes a frame) and the WAL's header, about 2.010 in all, and a
+     copy laid out a little differently. Amended 2026-11-26 (#1449, #1545): the first version asked
+     for 2 times the file's size, empty pages included. On a database with many empty pages, the case
+     of a phone short of space, that asked for far more than the rewrite uses (the file's size over
+     its data, times: four times for a database three quarters empty); on one with almost none, 2 times was a little short, and the rewrite could run out near its
+     end. The space counted is the space free right now (`volumeAvailableCapacityKey`),
      not what iPhone Storage shows as available, which adds space iOS could purge: the `VACUUM` writes at
      once and cannot wait for a purge, and counting purgeable space could fill the disk mid-rewrite,
      the risk of breaking the device that made the upgrade one the user starts (2026-11-26). So the notice says the space must be free right now ("TabMail needs N free
@@ -87,7 +96,8 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      part of the WAL to the later checkpoints (below). No gate is added for this (ADR-IOS-009); the
      exit's start is then a second start, whose timer guard keeps one timer.
    - **The rewrite** (`SyncEngine.runDatabaseUpgrade`): the email database first, then the search
-     database. Each one's free space is checked against its size read just before, so the search
+     database. Each one's free space is checked against its data (its pages less its empty pages)
+     read just before, so the search
      database is measured after the email database's rewrite gave space back. Each gets one `VACUUM`
      (`DatabaseVacuum.switchToIncremental`) and then a TRUNCATE checkpoint. The copy goes to a file
      (`temp_store = FILE` for the switch, the connection's own setting restored after it): the search

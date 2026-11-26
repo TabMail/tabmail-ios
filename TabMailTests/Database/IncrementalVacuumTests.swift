@@ -254,6 +254,11 @@ struct IncrementalVacuumTests {
         (try? URL(fileURLWithPath: path + "-wal").resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0
     }
 
+    /// The size of the WAL index (`-shm`) file.
+    private static func shmBytes(_ path: String) -> Int {
+        (try? URL(fileURLWithPath: path + "-shm").resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) ?? 0
+    }
+
     private static func markerKey() -> String { "incrementalVacuumMarker-\(UUID().uuidString)" }
 
     // MARK: - New files
@@ -408,7 +413,7 @@ struct IncrementalVacuumTests {
         let searchBefore = await index.spaceState()
         let versionBefore = try Self.schemaVersion(email.pool)
         // One byte short of the email database's need.
-        let short = Int64((Double(emailBefore.allBytes) * SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple).rounded(.up)) - 1
+        let short = SyncEngine.bytesNeededForUpgrade(liveBytes: emailBefore.liveBytes) - 1
 
         let steps = await SyncEngine.runDatabaseUpgrade(
             targets: [.email(email.background, markerKey: Self.markerKey(), inboxObserver: nil), searchTarget],
@@ -424,15 +429,82 @@ struct IncrementalVacuumTests {
         #expect(versionAfter == versionBefore, "no VACUUM ran on the email database")
     }
 
-    @Test("The bytes to free: none with the multiple of the database's size free or more, the shortfall below it")
+    @Test("Exactly the need free: an older install's email database of mostly empty pages upgrades with room for about twice its data, far less than twice its file")
+    func roomForTheDataIsEnough() async throws {
+        let email = try makeEmailFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: email.pool, directory: email.directory) }
+        try seedMailThenDeleteMost(email.pool)
+        let beforeRead = try Self.spaceState(email.pool)
+        let before = try #require(beforeRead)
+        let available = SyncEngine.bytesNeededForUpgrade(liveBytes: before.liveBytes)
+
+        let steps = await SyncEngine.runDatabaseUpgrade(
+            targets: [.email(email.background, markerKey: Self.markerKey(), inboxObserver: nil)],
+            availableBytes: { _ in available }, shouldRun: { true })
+        let afterRead = try Self.spaceState(email.pool)
+        let after = try #require(afterRead)
+
+        #expect(before.autoVacuum == DatabaseVacuum.noneMode, "precondition: an older install's database (\(before))")
+        #expect(available < before.allBytes, "precondition: the room is less than the file's own size (\(available) free, \(before))")
+        #expect(steps == [.upgraded("email")], "upgraded: \(steps)")
+        #expect(after.autoVacuum == DatabaseVacuum.incrementalMode, "now INCREMENTAL (\(after))")
+    }
+
+    @Test("On a packed older-install database, the need covers what the VACUUM writes: its temporary copy (the rewritten file's size, its pointer-map pages included), the WAL the copy passes through and the WAL index's growth")
+    func theNeedCoversTheCopyAndItsWAL() throws {
+        let email = try makeEmailFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: email.pool, directory: email.directory) }
+        try seedMail(email.pool)
+        // A plain VACUUM, still on NONE, packs the pages, so the switch copies about
+        // as much as the data it is measured from: the case where the need is tightest.
+        try email.pool.writeWithoutTransaction { db in
+            try db.execute(sql: "VACUUM")
+            _ = try db.checkpoint(.truncate)
+        }
+        let walBefore = Self.walBytes(email.path)
+        let shmBefore = Self.shmBytes(email.path)
+        let beforeRead = try Self.spaceState(email.pool)
+        let before = try #require(beforeRead)
+
+        try email.pool.writeWithoutTransaction { db in try DatabaseVacuum.switchToIncremental(db) }
+        let walAfter = Self.walBytes(email.path)
+        let shmAfter = Self.shmBytes(email.path)
+        let afterRead = try Self.spaceState(email.pool)
+        let after = try #require(afterRead)
+        let written = after.allBytes + Int64(walAfter) + Int64(shmAfter - shmBefore)
+
+        #expect(walBefore == 0, "precondition: an empty WAL, so it measures the VACUUM alone (\(walBefore) bytes)")
+        #expect(before.autoVacuum == DatabaseVacuum.noneMode && before.freePages == 0, "precondition: a packed older-install database (\(before))")
+        #expect(after.autoVacuum == DatabaseVacuum.incrementalMode, "the switch ran (\(after))")
+        #expect(walAfter >= after.allBytes, "the rewritten file passed through the WAL: \(walAfter) bytes for \(after)")
+        #expect(SyncEngine.bytesNeededForUpgrade(liveBytes: before.liveBytes) >= written,
+                "the need of \(before.liveBytes) bytes of data covers the copy, the WAL and the WAL index, \(written) bytes")
+    }
+
+    @Test("The bytes to free: none with the need free or more, the shortfall below it, rounded up; the need covers the copy of the data with its pointer-map pages, the WAL frames of that copy, the WAL's header and the WAL index's growth")
     func bytesToFreeLine() {
-        let databaseBytes: Int64 = 1_000_001
-        let needed = Int64((Double(databaseBytes) * SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple).rounded(.up))
-        #expect(SyncEngine.bytesToFreeForUpgrade(databaseBytes: databaseBytes, availableBytes: needed) == 0)
-        #expect(SyncEngine.bytesToFreeForUpgrade(databaseBytes: databaseBytes, availableBytes: needed + 1) == 0)
-        #expect(SyncEngine.bytesToFreeForUpgrade(databaseBytes: databaseBytes, availableBytes: needed - 1) == 1)
-        #expect(SyncEngine.bytesToFreeForUpgrade(databaseBytes: databaseBytes, availableBytes: 0) == needed)
-        #expect(needed > databaseBytes, "the copy needs more than the database's own size: \(needed)")
+        let pageSize: Int64 = 4_096
+        /// SQLite's header on each WAL frame, on the WAL file, and the WAL index's bytes per frame.
+        let walFrameHeaderBytes: Int64 = 24
+        let walHeaderBytes: Int64 = 32
+        let walIndexBytesPerFrame: Int64 = 8
+        /// Pages one pointer-map page covers: five bytes an entry (SQLite's file format).
+        let pagesPerPointerMapPage = pageSize / 5
+        let liveBytes = 251 * pageSize
+        let needed = SyncEngine.bytesNeededForUpgrade(liveBytes: liveBytes)
+        let exact = Double(liveBytes) * SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple
+        #expect(SyncEngine.bytesToFreeForUpgrade(liveBytes: liveBytes, availableBytes: needed) == 0)
+        #expect(SyncEngine.bytesToFreeForUpgrade(liveBytes: liveBytes, availableBytes: needed + 1) == 0)
+        #expect(SyncEngine.bytesToFreeForUpgrade(liveBytes: liveBytes, availableBytes: needed - 1) == 1)
+        #expect(SyncEngine.bytesToFreeForUpgrade(liveBytes: liveBytes, availableBytes: 0) == needed)
+        #expect(Double(needed) >= exact && Double(needed - 1) < exact, "rounded up, never down: \(needed) for \(exact)")
+        for livePages: Int64 in [251, 100_000] {
+            let copyPages = livePages + (livePages + pagesPerPointerMapPage - 1) / pagesPerPointerMapPage
+            let written = copyPages * pageSize + walHeaderBytes
+                + copyPages * (pageSize + walFrameHeaderBytes + walIndexBytesPerFrame)
+            let need = SyncEngine.bytesNeededForUpgrade(liveBytes: livePages * pageSize)
+            #expect(need >= written, "\(livePages) pages of data: the need \(need) covers \(written) bytes written")
+        }
     }
 
     @Test("Upgrade now asks for power only below the minimum battery level while not charging; an unknown level asks nothing")
@@ -954,8 +1026,12 @@ struct IncrementalVacuumTests {
         var all: [String] { lines.withLock { $0 } }
     }
 
-    /// The size of every fake database: its 1,000 pages of 4,096 bytes.
-    private static let fakeDatabaseBytes: Int64 = 1_000 * 4_096
+    /// Every fake database's pages, of 4,096 bytes each, the empty ones included.
+    private static let fakePageCount: Int64 = 1_000
+
+    /// A fake database's pages less its `freePages` empty ones, in bytes: what its
+    /// upgrade's free-space check measures.
+    private static func fakeLiveBytes(freePages: Int64) -> Int64 { (fakePageCount - freePages) * 4_096 }
 
     /// A database that records its switch, steps and TRUNCATE; each step frees up to
     /// its pages. With `switchThrows` its switch throws and changes nothing; with
@@ -970,7 +1046,7 @@ struct IncrementalVacuumTests {
             name: name, path: "/\(name)",
             state: {
                 DatabaseVacuum.SpaceState(
-                    autoVacuum: database.mode.withLock { $0 }, pageCount: 1_000,
+                    autoVacuum: database.mode.withLock { $0 }, pageCount: Self.fakePageCount,
                     freePages: database.free.withLock { $0 }, pageSize: 4_096)
             },
             switchToIncremental: { _ in
@@ -1170,7 +1246,7 @@ struct IncrementalVacuumTests {
 
     @Test("The first database short of space ends the upgrade with the bytes to free; the later one is not touched")
     func theFirstDatabaseShortOfSpaceEndsTheUpgrade() async {
-        let needed = SyncEngine.bytesToFreeForUpgrade(databaseBytes: Self.fakeDatabaseBytes, availableBytes: 0)
+        let needed = SyncEngine.bytesToFreeForUpgrade(liveBytes: Self.fakeLiveBytes(freePages: 10), availableBytes: 0)
         let emailLog = StepLog()
         let searchLog = StepLog()
         let emailShort = await SyncEngine.runDatabaseUpgrade(

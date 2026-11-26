@@ -17,8 +17,9 @@ import GRDB
 // - The upgrade (`runDatabaseUpgrade`): each database still on NONE, the email
 //   database first, then the search database, gets one `VACUUM`
 //   (`DatabaseVacuum.switchToIncremental`), when the device has
-//   `SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple` times the database's size
-//   free, and then a TRUNCATE checkpoint. It runs in `DatabaseUpgrade`'s upgrade
+//   `SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple` times the database's pages
+//   less its empty pages free (what the `VACUUM` copies, twice: its temporary copy
+//   and the WAL), and then a TRUNCATE checkpoint. It runs in `DatabaseUpgrade`'s upgrade
 //   mode: the spinner over the app, polling and the body, AI and embedding queues
 //   paused; any other write waits behind it. Measured on a Mac at 1.1 GB: the
 //   `VACUUM` 10-15 s, the TRUNCATE checkpoint after it 4-10 s, more on a phone. If
@@ -207,17 +208,20 @@ extension SyncEngine {
         return targets
     }
 
-    /// The free space a switch of a database of `databaseBytes` needs:
-    /// `SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple` times its size, for the
-    /// `VACUUM`'s temporary copy and the WAL the copy passes through.
-    nonisolated static func bytesNeededForUpgrade(databaseBytes: Int64) -> Int64 {
-        Int64((Double(databaseBytes) * SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple).rounded(.up))
+    /// The free space a switch of a database holding `liveBytes` needs (its pages less
+    /// its empty pages, `DatabaseVacuum.SpaceState.liveBytes`): the `VACUUM` copies
+    /// only those, into its temporary copy and then through the WAL, so
+    /// `SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple` times them. The empty
+    /// pages are not copied: on a database with many, the file's size would ask for
+    /// far more than the rewrite uses (#1449).
+    nonisolated static func bytesNeededForUpgrade(liveBytes: Int64) -> Int64 {
+        Int64((Double(liveBytes) * SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple).rounded(.up))
     }
 
-    /// How many more bytes the device needs free to switch a database of
-    /// `databaseBytes` (0: it has room), against `bytesNeededForUpgrade`.
-    nonisolated static func bytesToFreeForUpgrade(databaseBytes: Int64, availableBytes: Int64) -> Int64 {
-        max(0, bytesNeededForUpgrade(databaseBytes: databaseBytes) - availableBytes)
+    /// How many more bytes the device needs free to switch a database holding
+    /// `liveBytes` (0: it has room), against `bytesNeededForUpgrade`.
+    nonisolated static func bytesToFreeForUpgrade(liveBytes: Int64, availableBytes: Int64) -> Int64 {
+        max(0, bytesNeededForUpgrade(liveBytes: liveBytes) - availableBytes)
     }
 
     /// The free space on the volume that holds the file at `path`, in bytes; nil if
@@ -276,7 +280,8 @@ extension SyncEngine {
 
     /// The one-time upgrade (`DatabaseUpgrade`): each target still on NONE, in
     /// order, is switched to INCREMENTAL and its WAL truncated. Its free space is
-    /// checked against the size read just before, so the search database is measured
+    /// checked against its data (its pages less its empty pages) read just before, so
+    /// the search database is measured
     /// after the email database's rewrite gave space back. The first target that
     /// needs space, stops or fails ends the upgrade: the later ones are left on NONE
     /// for the next try. A `VACUUM` that runs out of disk space anyway rolls back,
@@ -323,9 +328,9 @@ extension SyncEngine {
             BackgroundSyncLogger.logDebug("[DatabaseUpgrade] \(target.name): free space unreadable")
             return .failed(target.name)
         }
-        let toFree = bytesToFreeForUpgrade(databaseBytes: state.allBytes, availableBytes: available)
+        let toFree = bytesToFreeForUpgrade(liveBytes: state.liveBytes, availableBytes: available)
         guard toFree == 0 else {
-            BackgroundSyncLogger.logDebug("[DatabaseUpgrade] \(target.name): \(available) bytes free, a \(state.allBytes) byte database needs \(SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple)x; \(toFree) more bytes needed")
+            BackgroundSyncLogger.logDebug("[DatabaseUpgrade] \(target.name): \(available) bytes free, a \(state.allBytes) byte database holding \(state.liveBytes) bytes of data needs \(SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple)x its data; \(toFree) more bytes needed")
             return .needsSpace(target.name, bytesToFree: toFree)
         }
         let t0 = CFAbsoluteTimeGetCurrent()
