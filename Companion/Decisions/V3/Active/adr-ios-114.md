@@ -805,6 +805,14 @@ same AI result, kept as long as the email itself is shown.
    "(replied only to you, David Kim +1)" after the sender's name, or "You (replied only to …)" above
    the user's own bubble; tap for the full list (`ChatPeopleList`). The user is one person whichever
    address an email used. VoiceOver reads it (`ChatBubbleView.accessibilityText`).
+   *Amended 2026-11-26:* a one-to-one chat (`ChatThread.isGroup` false: the header shows one person)
+   carries it on no bubble, so it shows plain bubbles with no name line, as decided for one-to-one
+   chats on 2026-11-04. The label counts everyone ever on an email, while `isGroup` counts the newest
+   email's Reply All people and the senders. So a thread whose first email went to two addresses, and
+   that only one of them answered, showed one person in the header and still put "(replied only to …)"
+   and a name line over the later bubbles. Group chats keep the label unchanged (mock R3). The reply
+   field's "Replying only to" line is a separate rule, unchanged. Test:
+   `ChatThreadTests.oneToOneCarriesNoOnly`.
    **Product choices of who gets the reply, decided 2026-11-08:** an email that only adds someone new is
    not "only" (the new person joins the chat's people), and an email is never "only" for someone who
    joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
