@@ -588,7 +588,7 @@ struct ChatNewThreadTests {
         // The new email and the sent email's thread share one host, so the swap from one to the
         // other neither closes the screen nor takes down what it presents (a Group would give each
         // its own open, close and covers).
-        #expect(Self.count("var body: some View { // One container for both, never a Group: a Group gives its modifiers to each child, so the // swap would run this screen's close and open, and take down a cover presented over it // (a reopened compose included). The ZStack keeps one host for the whole presentation. ZStack { if let threadId { // The sent email's thread, with its own header, Forward and reply field. ChatThreadView(messageId: threadId) } else { newEmail } } // Back saves first", in: view) == 1,
+        #expect(Self.count("var body: some View { // One container for both, never a Group: a Group gives its modifiers to each child, so the // swap would run this screen's close and open, and take down a cover presented over it // (a reopened compose included). The ZStack keeps one host for the whole presentation. ZStack { if let thread { // The sent email's thread, with its own header, Forward and reply field. ChatThreadView(opened: thread) } else { newEmail } } // Back saves first", in: view) == 1,
                 "one host for the new email and its thread")
         #expect(Self.count(".onDisappear { if !showsCamera { closed() } }", in: view) == 1,
                 "the camera's cover hides the screen without closing it")
@@ -649,7 +649,10 @@ struct ChatNewThreadTests {
         #expect(Self.count(".onChange(of: chatExpanded) { _, expanded in if expanded { fieldPanCut() } }", in: view) == 1)
         // The swap to the sent email's thread waits while the panel is open and runs as it closes;
         // the panel stays out of `newEmailCovered`, which also decides whether a compose card presents.
-        #expect(Self.count("guard threadId == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return }", in: view) == 1)
+        #expect(Self.count("guard thread == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return } readingCopy = copy }", in: view) == 1)
+        // The thread is read before the swap, and the swap checks again after the read: the panel or a
+        // cover that opened meanwhile still holds it (`readThread`).
+        #expect(Self.count("guard thread == nil, !newEmailCovered, !chatExpanded else { return } thread = read }", in: view) == 1)
         #expect(Self.count(".onChange(of: chatExpanded) { _, open in if !open { swapToThread() } }", in: view) == 1)
         #expect(Self.count("showsAddRecipient || showsCamera || showsPhotoPicker || showsFilePicker || agentCompose != nil }", in: view) == 1)
     }

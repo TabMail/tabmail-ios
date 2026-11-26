@@ -558,6 +558,80 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("On the sent email's thread, the chat's header is the thread's: its names change who gets the reply and open Reply to")
+    func threadHeaderOpensReplyTo() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.namesHint(screen) == ChatHeaderView.newEmailHint, "control: the new email's header")
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let copy = Self.sentFolderHeader("screen-sent-copy-names", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    try await fixture.pool.write { try copy.insert($0) }
+                    try await Self.waitUntil { Self.isThread(screen) && Self.namesHint(screen) == ChatHeaderView.replyHint }
+                    #expect(Self.isThread(screen), "control: the chat is the sent email's thread")
+                    #expect(Self.namesHint(screen) == ChatHeaderView.replyHint, "the header is the thread's")
+
+                    #expect(HostedAccessibility.activate(ChatHeaderView.namesId, in: screen.view), "the names take a tap")
+                    try await Self.waitUntil { Self.presentedLabels(screen).contains(ChatReplyToSheet.replyToTitle) }
+                    #expect(Self.presentedLabels(screen).contains(ChatReplyToSheet.replyToTitle),
+                            "Reply to opens: \(Self.presentedLabels(screen).prefix(12))")
+                    let ids = Self.topPresented(screen).map { HostedAccessibility.identifiers(in: $0.view) } ?? []
+                    #expect(ids.contains(ChatReplyToSheet.personId), "with the reply's people: \(ids.prefix(12))")
+                    #expect(!Self.presentedLabels(screen).contains(ChatReplyToSheet.addRecipientTitle), "not the new email's Add recipient")
+                    Self.topPresented(screen)?.dismiss(animated: false)
+                    try await Self.waitUntil { Self.topPresented(screen) == nil }
+                }
+            }
+        }
+    }
+
+    @Test("From the Sending bubble to the sent email's thread, every frame shows the email: the new email with its Sending bubble, then the whole thread with its header, its field and the email on the user's side, never a thread still loading or still reading who the user is",
+          arguments: [true, false], 0..<3)
+    func sentCopyTurnsIntoTheThreadWithNoBlink(copyHasItsBody: Bool, attempt: Int) async throws {
+        // Each copy swaps three times: where the swap falls between two frames varies from one
+        // swap to the next.
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let frames = SwapFrames(view: screen.view)
+                    frames.start()
+                    let before = frames.frames.first
+                    #expect(before?.isNewEmail == true, "control: recording starts on the new email with its Sending bubble: \(String(describing: before))")
+
+                    // Two copies: one with its body, as the send's optimistic Sent copy is
+                    // written (`AccountManagerOutbox.insertOptimisticSentHeader`), and one whose
+                    // body is not stored yet, as a copy synced from the server is until its
+                    // body is fetched. The second one's open takes longer to read.
+                    let copy = Self.sentFolderHeader("screen-sent-copy-frames", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    let copyBody = MessageBody(contentKey: ContentKey(rawValue: copy.id), htmlContent: "<p>Lunch on Friday?</p>")
+                    try await fixture.pool.write { db in
+                        try copy.insert(db)
+                        if copyHasItsBody { try copyBody.save(db) }
+                    }
+                    try await Self.waitUntil { frames.frames.last?.isThread == true }
+                    try await Self.settle()
+                    frames.stop()
+                    print("[SwapFrames] body=\(copyHasItsBody) attempt=\(attempt) \(frames.summary)")
+
+                    let last = frames.frames.last
+                    #expect(last?.isThread == true, "control: the chat ends as the whole thread: \(String(describing: last))")
+                    let between = frames.frames.filter { !$0.isNewEmail && !$0.isThread }
+                    #expect(between.isEmpty, "no frame between the new email and the whole thread: \(frames.summary)")
+                    let firstThread = frames.frames.firstIndex { $0.isThread } ?? frames.frames.endIndex
+                    let newEmailAfter = frames.frames[firstThread...].contains { $0.isNewEmail }
+                    #expect(!newEmailAfter, "once the thread shows, the new email never comes back: \(frames.summary)")
+                }
+            }
+        }
+    }
+
     @Test("Once the chat is the sent email's thread, new mail in the Sent folder no longer reads the send: its follow has ended")
     func threadEndsTheSendFollow() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
@@ -1405,6 +1479,11 @@ struct ChatNewThreadScreenTests {
         HostedAccessibility.elements(under: view).first { HostedAccessibility.identifier(of: $0) == ChatHeaderView.namesId }
     }
 
+    /// What the header's names do, as VoiceOver says it: the new email's or a thread's.
+    private static func namesHint(_ screen: Screen) -> String? {
+        names(in: screen.view)?.accessibilityHint
+    }
+
     /// The field's words, nil while there is no editable field.
     private static func fieldText(in view: UIView) -> String? {
         if let text = view as? UITextView, text.isEditable { return text.text }
@@ -1508,5 +1587,100 @@ struct ChatNewThreadScreenTests {
     /// Lets the screen apply what just changed.
     private static func settle() async throws {
         try await Task.sleep(for: .milliseconds(300))
+    }
+}
+
+/// What one frame of the new email's chat shows, read from its accessibility elements.
+private struct SwapFrame: Equatable, CustomStringConvertible {
+    /// The new email's chat area line.
+    var hint = false
+    /// The new email's Sending bubble, by its Undo.
+    var sending = false
+    /// The new email's field.
+    var newField = false
+    /// The header's names.
+    var header = false
+    /// An email's bubble, as a thread shows it.
+    var bubble = false
+    /// "Sent" under a bubble: the email is the user's, on the right.
+    var own = false
+    /// The thread's reply field.
+    var replyField = false
+    /// The field's paperclip (recorded, not required: a thread shows it once its emails are read).
+    var paperclip = false
+
+    var isNewEmail: Bool { hint && sending && newField && header }
+    var isThread: Bool { !hint && header && bubble && own && replyField }
+
+    var description: String {
+        let parts = [("hint", hint), ("sending", sending), ("newField", newField), ("header", header),
+                     ("bubble", bubble), ("own", own), ("replyField", replyField), ("paperclip", paperclip)]
+        return "[" + parts.filter { $0.1 }.map { $0.0 }.joined(separator: " ") + "]"
+    }
+
+    @MainActor
+    init(view: UIView) {
+        let elements = HostedAccessibility.elements(under: view)
+        let ids = Set(elements.compactMap { HostedAccessibility.identifier(of: $0) })
+        let texts = elements.filter { $0.accessibilityTraits.contains(.staticText) }.compactMap(\.accessibilityLabel)
+        hint = ids.contains(ChatNewThreadView.hintId)
+        sending = ids.contains(ChatUndoSendStatus.undoId)
+        newField = ids.contains(ChatNewThreadView.fieldId)
+        header = ids.contains(ChatHeaderView.namesId)
+        bubble = ids.contains(ChatBubbleView.bubbleId) || ids.contains(ChatBubbleView.highlightedBubbleId)
+        own = texts.contains("Sent")
+        replyField = ids.contains(ChatThreadView.replyPillId)
+        paperclip = ids.contains(ChatPaperclipButton.id)
+    }
+}
+
+/// Reads the chat after every Core Animation commit between `start` and `stop`: each frame is the
+/// screen as committed, laid out, so as it is drawn. A display-link tick is not: it can come
+/// between SwiftUI's update and the commit that lays it out, and read a navigation bar whose new
+/// title view has no size yet, while the screen still draws the header before it.
+@MainActor
+private final class SwapFrames {
+    private let view: UIView
+    private var observer: CFRunLoopObserver?
+    private(set) var frames: [SwapFrame] = []
+
+    init(view: UIView) {
+        self.view = view
+    }
+
+    func start() {
+        record()
+        // After Core Animation's own commit observer on the same activities (its order is 2000000).
+        let observer = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue | CFRunLoopActivity.exit.rawValue,
+            true, CFIndex.max
+        ) { [weak self] _, _ in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.record() }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+        self.observer = observer
+    }
+
+    func stop() {
+        if let observer {
+            CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
+            CFRunLoopObserverInvalidate(observer)
+        }
+        observer = nil
+        record()
+    }
+
+    private func record() {
+        frames.append(SwapFrame(view: view))
+    }
+
+    /// The frames in order, each run of equal frames once with its length.
+    var summary: String {
+        var runs: [(SwapFrame, Int)] = []
+        for frame in frames {
+            if let last = runs.last, last.0 == frame { runs[runs.count - 1].1 += 1 } else { runs.append((frame, 1)) }
+        }
+        return runs.map { "\($0.0)x\($0.1)" }.joined(separator: " -> ")
     }
 }

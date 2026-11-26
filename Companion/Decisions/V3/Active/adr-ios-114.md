@@ -2201,7 +2201,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        to the same people, with an empty field.
      - Once the email's copy is in its account's Sent folder (the optimistic copy the send writes,
        or the server's, read by folder and Message-ID through `messageHeader_rfc822MessageId`), the
-       chat is that email's thread for good (`ChatThreadView(messageId:)` on the Sent copy): later
+       chat is that email's thread for good (`ChatThreadView(opened:)` on the Sent copy): later
        replies land there, and the chat's own Back closes it. The change waits while anything is open
        over the new email (a card, a picker, "Add recipient", and since 2026-11-25 the TabMail panel,
        which the field's drag opens at will), which it would take down; it happens as the last of
@@ -2210,6 +2210,26 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        email and the thread share one container (a `ZStack`, never a `Group`: a Group gives its
        modifiers to each child, so the change would run the screen's close and open and take down
        what it presents, a reopened compose included).
+     - *The thread is read before it shows (amended 2026-11-26).* The chat reads the thread first
+       (`ChatThreadOpened.read`) and becomes it only then, if nothing came over the new email
+       meanwhile (else the next close reads it again), so the thread's first frame is the whole
+       thread: its header, its field and the email on the user's side. It reads with the reads the
+       thread makes anyway, in its order: its view model resolves the email
+       (`MessageDetailViewModel.loadBody`, waited for only until `message` or `messageNotFound` is
+       set, never for the body, which may come from the server; the load goes on as for any open),
+       then its context (`ChatThreadContext.load`) tells the user's own emails apart. No new query.
+       The header is the chat's own principal toolbar item, one for the screen's whole life: the
+       new email's header, then the thread's (`ChatThreadHeader`, its people from the read, then
+       kept by the thread, whose names' tap opens the thread's Reply to). A hosted thread
+       (`ChatThreadView(opened:)`) brings no header item of its own. *Superseded (2026-11-26):*
+       each branch's own principal item; the new email's left with it and the thread's came into
+       the navigation bar 1 to 7 commits after the thread's content, so for those commits the bar
+       had no header, on every swap.
+       *Superseded:* "`ChatThreadView(messageId:)` on the Sent copy". Built from the copy's id, the
+       thread read after it showed: a spinner frame with no header, no field and no email, the email
+       fading in on the other person's side, then moving to the user's side once the context was
+       read: a blink between the Sending bubble and the thread, seen in the simulator 2026-11-25 for
+       a new email only (a reply's bubble hands over inside a thread already read).
      - Accepted: a card for another email opened from a new email's chat keeps the toast, which the
        chat's cover hides until it closes.
    Tests: `ChatNewThreadTests` (routing, the pure decisions, the saves against a real database, the
@@ -2219,7 +2239,15 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    test can neither move the pan nor find it: SwiftUI keeps a representable's recognizer out of the
    views' `gestureRecognizers`), `ChatNewThreadScreenTests` (since 2026-11-25 `fieldOpensThePanel`,
    VoiceOver's Show TabMail chat, offered on the drag's condition, opening the panel and not offered
-   over it, and `sentCopyWaitsForTheOpenPanel`, the swap to the thread waiting for the open panel; the whole
+   over it, and `sentCopyWaitsForTheOpenPanel`, the swap to the thread waiting for the open panel; since
+   2026-11-26 `sentCopyTurnsIntoTheThreadWithNoBlink`, every frame from the Sending bubble to the
+   thread read from the screen's accessibility elements, none between the new email and the whole thread,
+   for a Sent copy with its body (as the send's optimistic copy is written) and one without it (as a
+   copy synced from the server is until its body is fetched), three swaps each; a frame is read after
+   each Core Animation commit, never on a display-link tick, which can fall between SwiftUI's update
+   and the commit that lays it out and read a navigation bar whose new title view has no size yet
+   while the screen still draws the header before it; and `threadHeaderOpensReplyTo`, the thread's
+   header in the chat's bar, its names opening Reply to; the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
    row and the opens from Drafts, since 2026-11-22 a link's chat saving on background only once
