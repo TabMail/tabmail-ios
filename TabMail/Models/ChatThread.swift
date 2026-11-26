@@ -44,8 +44,9 @@ struct ChatThread: Equatable {
             return header.summaryBlurb == MessageHeader.noContentSummary ? MessageHeader.noContentSummary : nil
         }
         /// The email did not go to everyone in the chat: who it went to. Nil for an email to
-        /// everyone.
-        let repliedOnlyTo: OnlyTo?
+        /// everyone, and on every bubble of a one-to-one chat (`isGroup` false), which shows plain
+        /// bubbles.
+        var repliedOnlyTo: OnlyTo?
         /// A time stamp goes above this bubble.
         let showsTimeStamp: Bool
         /// The "Unread" line goes above this bubble: the first email unread at open.
@@ -121,17 +122,25 @@ struct ChatThread: Equatable {
                 showsUnreadLine: showsUnread))
             chatPeople.formUnion(Self.audience(of: header, ownAddresses: ownAddresses))
         }
-        self.items = items
 
         var seen = Set<String>()
-        self.replyPeople = (items.last.map { replyAddresses($0.header) } ?? [])
+        let replyPeople = (items.last.map { replyAddresses($0.header) } ?? [])
             .map { $0.lowercased() }
             .filter { !ownAddresses.contains($0) && seen.insert($0).inserted }
             .map { Person(address: $0, name: names[$0] ?? Self.fallbackName($0)) }
 
         var others = Set(replyPeople.map(\.address))
         for item in items where !item.isOwn { others.insert(item.sender.address) }
-        self.isGroup = others.count > 1
+        let isGroup = others.count > 1
+
+        // A one-to-one chat shows plain bubbles: no name and no "replied only to", even when an
+        // earlier email also went to someone the header no longer shows.
+        if !isGroup {
+            for index in items.indices { items[index].repliedOnlyTo = nil }
+        }
+        self.items = items
+        self.replyPeople = replyPeople
+        self.isGroup = isGroup
     }
 
     /// Stands for the user in an audience, whichever of their addresses an email used.
