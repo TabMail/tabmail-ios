@@ -255,6 +255,10 @@ actor SearchIndex {
                 }
             }
 
+            // A new file starts on `auto_vacuum = INCREMENTAL` (ADR-IOS-121): before
+            // WAL mode, which writes the file's first page. Writer only, new file only.
+            try DatabaseVacuum.setIncrementalOnNewFile(db)
+
             // WAL mode + performance pragmas
             try db.execute(sql: "PRAGMA journal_mode = WAL")
             try db.execute(sql: "PRAGMA synchronous = NORMAL")
@@ -2903,13 +2907,71 @@ actor SearchIndex {
         }
     }
 
-    /// Reclaim disk space after bulk deletes.
+    /// Reclaim disk space after bulk deletes (`DatabaseVacuum.vacuum`, which also
+    /// leaves the database on `auto_vacuum = INCREMENTAL`).
     func vacuum() throws {
         guard let dbPool else { return }
         try dbPool.writeWithoutTransaction { db in
-            try db.execute(sql: "VACUUM")
+            try DatabaseVacuum.vacuum(db)
         }
         BackgroundSyncLogger.logDebug("[SearchIndex] VACUUM complete")
+    }
+
+    // MARK: The one-time upgrade and giving empty pages back (ADR-IOS-121,
+    // `SyncEngine.runDatabaseUpgrade`, `SyncEngine.runOvernightSpaceReturn`)
+    //
+    // Each write below goes through GRDB's awaited write, so it does not hold this
+    // actor while it runs. During the upgrade's `VACUUM`, though, any of this actor's
+    // synchronous writes (`indexHeaders`, `updateBody`, `storeEmbeddings` and the
+    // others) would wait for it and hold the actor while it waits; the upgrade pauses
+    // their callers first (`DatabaseUpgrade`'s upgrade mode).
+
+    /// The search database file's path, for the device's free-space read before its
+    /// upgrade to INCREMENTAL. nil when the database cannot be opened.
+    func databasePath() -> String? {
+        ensureReady()
+        return dbPool?.path
+    }
+
+    /// The search database's `auto_vacuum` mode and pages; nil when the database
+    /// cannot be opened or read.
+    func spaceState() -> DatabaseVacuum.SpaceState? {
+        ensureReady()
+        guard let dbPool else { return nil }
+        return (try? dbPool.read { db in try DatabaseVacuum.SpaceState.read(db) }) ?? nil
+    }
+
+    /// The one-time upgrade of the search database to INCREMENTAL
+    /// (`DatabaseVacuum.switchToIncremental`). Throws when the database is not open,
+    /// when the `VACUUM` threw (it then rolled back), or when `shouldRun`, asked again
+    /// once the write has the writer, says no (`SpaceReturnDeferred.mayNotRun`): the
+    /// write can wait behind the database's other writes.
+    func switchToIncrementalVacuum(shouldRun: @escaping @Sendable () -> Bool) async throws {
+        ensureReady()
+        guard let dbPool else { throw SyncEngine.SpaceReturnDeferred.notOpen }
+        try await dbPool.writeWithoutTransaction { db in
+            guard shouldRun() else { throw SyncEngine.SpaceReturnDeferred.mayNotRun }
+            try DatabaseVacuum.switchToIncremental(db)
+        }
+    }
+
+    /// One step of `DatabaseVacuum.giveBackEmptyPages`. Returns the empty pages
+    /// left. SQLite's own autocheckpoint bounds this database's WAL.
+    func giveBackEmptyPages(upTo pages: Int) async throws -> Int {
+        ensureReady()
+        guard let dbPool else { throw SyncEngine.SpaceReturnDeferred.notOpen }
+        return try await dbPool.writeWithoutTransaction { db in
+            try DatabaseVacuum.giveBackEmptyPages(db, upTo: pages)
+        }
+    }
+
+    /// A TRUNCATE checkpoint of the search database. A failure is left to its next
+    /// checkpoint.
+    func truncateWAL() async {
+        guard let dbPool else { return }
+        _ = try? await dbPool.writeWithoutTransaction { db in
+            try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
+        }
     }
 
     /// The search database's pages and empty pages (`StorageEstimator.PageTotals`),

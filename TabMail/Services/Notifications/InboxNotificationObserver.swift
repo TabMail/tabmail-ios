@@ -169,4 +169,14 @@ final class InboxNotificationObserver: TransactionObserver, @unchecked Sendable 
         pendingInsertUpdate.removeAll(keepingCapacity: true)
         pendingDelete.removeAll(keepingCapacity: true)
     }
+
+    /// Empties the map, the state of a fresh launch. Called after the email
+    /// database's `VACUUM` has committed (`SyncEngine.switchEmailDatabaseToIncremental`):
+    /// SQLite documents that a `VACUUM` may renumber the rowids of a table without an
+    /// INTEGER PRIMARY KEY, and the map is keyed by rowid. Call it on the writer
+    /// queue only (inside a write closure), where the callbacks run, which is what
+    /// keeps the map free of a lock.
+    func forgetInboxRows() {
+        currentlyInInbox.removeAll()
+    }
 }

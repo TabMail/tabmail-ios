@@ -581,11 +581,12 @@ struct SettingsView: View {
             BackgroundSyncLogger.logDebug("[NukeDB] Memory index reset failed after GRDB commit: \(error)")
             derivedIndexFailures.append("conversation memory")
         }
-        // 3. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space
+        // 3. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space. The
+        // VACUUM also leaves the database on auto_vacuum = INCREMENTAL (ADR-IOS-121).
         do {
             try await AppDatabase.dbPool.writeWithoutTransaction { db in
                 try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
-                try db.execute(sql: "VACUUM")
+                try DatabaseVacuum.vacuum(db)
             }
         } catch {
             // Compaction is optional after the authoritative rows are gone.
@@ -614,6 +615,10 @@ struct SettingsView: View {
         // them without a manifest write (no rows remain under their keys).
         await BodyAssetMaintenance.wipeAllAfterLocalIndexWipe()
         BackgroundSyncLogger.logDebug("[NukeDB] Wiped BodyAssetStore")
+
+        // The VACUUM above and the search database's new file are INCREMENTAL, so
+        // the one-time upgrade's banner goes when both now are (ADR-IOS-121).
+        await DatabaseUpgrade.shared.refresh()
 
         // 5. `defer` restarts sync — fresh backfill from top — on every exit.
         BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")

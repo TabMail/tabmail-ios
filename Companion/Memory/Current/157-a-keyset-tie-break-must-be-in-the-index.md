@@ -31,9 +31,12 @@ ORDER BY date DESC, rowid DESC LIMIT ?
 
 The plan is `SEARCH ... (folderId=? AND (date,rowid)<(?,?))` with no sort: each page reads only its own rows.
 Keep the cursor's date as the stored `DatabaseValue`, not a `Date` re-encoded. A rowid is stable while its row
-exists (an UPDATE keeps it; a replace or a delete-and-insert gives a new one; a full VACUUM renumbers rows, and
-the app runs one only after deleting all mail), so it suits a cursor that lives for one pass, not one that is
-stored. `INDEXED BY` is needed when another index gives the same order (`messageHeader_date` does), because a
+exists (an UPDATE keeps it; a replace or a delete-and-insert gives a new one; a `VACUUM` keeps the rowids of a
+table with an index, measured, though SQLite documents only that it may renumber a table without an INTEGER
+PRIMARY KEY; an `incremental_vacuum` step moves pages, not rows), so it suits a cursor that lives for one pass, not
+one that is stored. (Corrected 2026-11-25, #1450: this said that a full VACUUM renumbers rows and that the app runs
+one only after deleting all mail; the one-time upgrade the user starts now also runs one per database, to switch it
+to `auto_vacuum = INCREMENTAL`, ADR-IOS-121.) `INDEXED BY` is needed when another index gives the same order (`messageHeader_date` does), because a
 planner that took it would walk every folder to fill one page.
 
 Measure a page's cost from the statement as it ran: SQLite's profile callback (`sqlite3_trace_v2` with

@@ -592,6 +592,32 @@ enum SyncConfig {
     /// (the embedding queue) from over-checkpointing while still bounding the WAL. SQLite
     /// autocheckpoint is disabled (see `AppDatabase.makePool`).
     static let walCheckpointMinIntervalSeconds: TimeInterval = 1.5
+    /// Pages one step of the overnight space return gives back
+    /// (`SyncEngine.runOvernightSpaceReturn`, `DatabaseVacuum.giveBackEmptyPages`,
+    /// ADR-IOS-121): 8 MB at the 4 KB page size. Each step is one write that holds
+    /// the database's writer. Measured on a Mac, 190 MB empty in a 960 MB database:
+    /// 1,024 pages 51 ms a step (median), 2,048 pages 35 ms (one step of 520 ms),
+    /// 4,096 pages 71 ms, 8,192 pages 168 ms. At least 1: SQLite's
+    /// `incremental_vacuum` with 0 or less gives every empty page back in one write.
+    static let incrementalVacuumStepPages = 2048
+    /// Free space the device needs for a database's one-time upgrade to INCREMENTAL,
+    /// as a multiple of the database's size (`SyncEngine.bytesToFreeForUpgrade`): the
+    /// `VACUUM` builds a full copy in a temporary file, then writes every page of it
+    /// through the WAL (measured: a 1.1 GB database left a 965 MB WAL).
+    static let incrementalVacuumSwitchFreeSpaceMultiple: Double = 2
+    /// How long the upgrade waits, at a time, for a planner statistics refresh that
+    /// was already running when it started, a maintenance pass's `ANALYZE`
+    /// (`SyncEngine.runDatabaseUpgrade`): it holds the latch the email database's
+    /// switch takes.
+    static let databaseUpgradeStatisticsWaitMilliseconds = 250
+    /// Battery level under which the upgrade notice asks the user to plug the phone
+    /// in first, when it is not charging (`DatabaseUpgrade`): below it a long rewrite
+    /// risks running the battery out.
+    static let databaseUpgradeMinimumBatteryLevel: Float = 0.2
+    /// How long after the inbox has painted the upgrade's state read (its banner) and
+    /// its notice, shown by itself once, wait (`DatabaseUpgrade.checkAfterLaunch`):
+    /// not during startup.
+    static let databaseUpgradeNoticeQuietDelaySeconds: Double = 3
     /// Entries of `bodyAssetPendingDelete` per batch of the pending-delete worker
     /// (`BodyAssetMaintenance.processPendingDeletes`): one manifest read, one
     /// main-database read and one main-database write per batch (#1376).

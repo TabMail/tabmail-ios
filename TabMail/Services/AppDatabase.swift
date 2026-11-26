@@ -72,6 +72,9 @@ final class AppDatabase: Sendable {
         // ~1-2s PASSIVE checkpoint, seen as the merge "tic" lagging the paint by 1-2s.
         // Now checkpoints land only on `.background`, keeping the foreground path fast.
         config.prepareDatabase { db in
+            // First, before GRDB sets up WAL mode: a new file starts on
+            // `auto_vacuum = INCREMENTAL` (ADR-IOS-121). Writer only, new file only.
+            try DatabaseVacuum.setIncrementalOnNewFile(db)
             try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
             // synchronous=NORMAL: WAL commits no longer fsync (only checkpoints do),
             // removing the per-commit fsync that stalled `merge.phase1` ~5s on cold-disk
@@ -2552,6 +2555,10 @@ final class AppDatabase: Sendable {
             //   measured ~11 s for a 2 GB body table on a Mac — 2–4× worse on
             //   device — needs ≈3× the table free at peak, and leaves the file at
             //   ≈2× until a `VACUUM` the app never runs outside `AppDataWiper`.
+            //   (Since ADR-IOS-121 a one-time upgrade the user starts runs one
+            //   `VACUUM` per database to switch it to INCREMENTAL, and the
+            //   background processing job then gives empty pages back in short
+            //   steps; that does not change this migration's choice.)
             //   That permanent growth feeds `StorageEstimator.totalSizeMB()` →
             //   `isOverBudget()` (the check before #1437) → `SyncEngine.runPruneIfOverBudget`, which deletes
             //   `MessageHeader` ROWS oldest-first: a schema-only migration causing

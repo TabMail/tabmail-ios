@@ -718,8 +718,10 @@ extension SyncEngine {
     /// tie-break on `id`, which is not in this index, read the whole run again for
     /// every page.) A header rewritten during the pass (a replace gives it a new
     /// rowid, a date change moves it) can be skipped or read twice by this pass,
-    /// as with the OFFSET walk before it; VACUUM, which renumbers every row, runs
-    /// only after all mail is deleted.
+    /// as with the OFFSET walk before it. A VACUUM keeps the rowids of a table
+    /// with an index (measured; `IncrementalVacuumTests.theEmailUpgrade` pins it for
+    /// the one-time upgrade to INCREMENTAL, ADR-IOS-121), and an incremental step
+    /// moves pages, not rows.
     ///
     /// `INDEXED BY` because `messageHeader_date` gives the same order: a planner
     /// that took it would walk every folder's headers to fill one page. A
