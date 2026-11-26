@@ -44,6 +44,7 @@ struct SettingsSyncStateResetTests {
         "unreadCount": "display count, refreshed by sync",
         "totalCount": "display count, refreshed by sync",
         "isFavorite": "the user's choice",
+        "isFollowed": "the folders the user's own actions landed in (#1109), as the user's choice; a reset deletes mail, not that",
         "backfillVersion": "row version the trigger owns; never set by hand",
         "lastKnownUidValidity": "the epoch the local UIDs belong to (ADR-IOS-061); a reset does not change the server's numbering",
         "uidValidityResetPendingAt": "the UIDVALIDITY reaction's quarantine flag; only the reaction clears it",
@@ -51,7 +52,7 @@ struct SettingsSyncStateResetTests {
 
     /// Excluded columns a reset must leave exactly as they were. The identity and
     /// display columns are not seeded; `backfillVersion` moves with every reset.
-    static let keptOnPurpose = ["lastKnownUidValidity", "uidValidityResetPendingAt"]
+    static let keptOnPurpose = ["lastKnownUidValidity", "uidValidityResetPendingAt", "isFollowed"]
 
     /// Columns the two resets are known to own. Only a non-vacuity check on the
     /// derived set: the property below never compares against this list.

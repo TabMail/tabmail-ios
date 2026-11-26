@@ -602,7 +602,15 @@ struct OneSyncAtATimeTests {
         var snapshot: [String] { entries.withLock { $0 } }
     }
 
-    static func eventually(seconds: Double = 10, _ condition: () async -> Bool) async -> Bool {
+    /// `isolation: isolated (any Actor)? = #isolation` keeps `condition` on the
+    /// caller's isolation, so a `@MainActor` test can pass a closure that reads
+    /// its own state without sending it across an actor boundary (the target
+    /// builds with `SWIFT_STRICT_CONCURRENCY: complete`).
+    static func eventually(
+        seconds: Double = 10,
+        isolation: isolated (any Actor)? = #isolation,
+        _ condition: () async -> Bool
+    ) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
             if await condition() { return true }
@@ -698,6 +706,66 @@ struct OneSyncAtATimeTests {
         if finished { await first.value; await second.value }
         #expect(await engine.syncPassRunning.isEmpty)
         #expect(await engine.syncPassWaiters.isEmpty)
+    }
+
+    /// The label of the pass holding the turn (`SyncEngine.syncTurnHolders`)
+    /// feeds only the debug line `[SyncTurnWait]`, so it is debug-gated like
+    /// the line. With debug logging off, a pass that takes the turn records no
+    /// label, and none is there once the next pass has it. With it on, the
+    /// label is where the running pass was started, then where the next one
+    /// was (recorded at the handover and again when that pass starts), and a
+    /// free turn has none. With logging switched off while a label is held, the
+    /// label is dropped by the time the next pass has the turn, so a later wait
+    /// never names a holder that has gone. RED with the label stored whatever
+    /// the logging setting, and with a held label kept once logging is off.
+    @Test("The turn holder's label is recorded only with debug logging on; a handover names the next holder")
+    func turnHolderLabelIsDebugGated() async throws {
+        let previous = DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 }
+        defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = previous } }
+        // (logging while the first pass takes the turn, logging from the handover on)
+        for (logging, loggingAtHandover) in [(false, false), (true, true), (true, false)] {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = logging }
+            let engine = SyncEngine()
+            let accountId = Self.accountId
+            let log = PassLog()
+            let first = AsyncStream<Void>.makeStream()
+            let second = AsyncStream<Void>.makeStream()
+            let firstRelease = first.stream
+            let secondRelease = second.stream
+            let passA = Task {
+                await engine.oneSyncAtATime(accountId: accountId, caller: "pass-a", line: 1) {
+                    log.append("start a")
+                    for await _ in firstRelease { break }
+                    log.append("end a")
+                }
+            }
+            let started = await Self.eventually { log.snapshot == ["start a"] }
+            let holderA = await engine.syncTurnHolders[accountId]
+            let passB = Task {
+                await engine.oneSyncAtATime(accountId: accountId, caller: "pass-b", line: 2) {
+                    log.append("start b")
+                    for await _ in secondRelease { break }
+                    log.append("end b")
+                }
+            }
+            let queued = await Self.eventually { await engine.syncPassWaiters[accountId]?.count == 1 }
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = loggingAtHandover }
+            first.continuation.yield()
+            let handedOver = await Self.eventually { log.snapshot == ["start a", "end a", "start b"] }
+            let holderB = await engine.syncTurnHolders[accountId]
+            second.continuation.yield()
+            let finished = await Self.eventually { log.snapshot.count == 4 }
+            if finished { await passA.value; await passB.value }
+            let holderAfter = await engine.syncTurnHolders[accountId]
+
+            let mode = "logging \(logging), then \(loggingAtHandover) from the handover"
+            #expect(started && queued && handedOver && finished, "precondition: two passes held the turn one after the other (\(mode))")
+            let expectedA: String? = logging ? "pass-a:1" : nil
+            let expectedB: String? = loggingAtHandover ? "pass-b:2" : nil
+            #expect(holderA == expectedA, "the running pass's label (\(mode)): \(String(describing: holderA))")
+            #expect(holderB == expectedB, "the label once the next pass has the turn (\(mode)): \(String(describing: holderB))")
+            #expect(holderAfter == nil, "a free turn has no holder (\(mode)): \(String(describing: holderAfter))")
+        }
     }
 
     /// THE CLASS, not one site: a turn holder that awaits a task which takes the

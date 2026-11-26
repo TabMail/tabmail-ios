@@ -68,3 +68,16 @@ finds two callers and looks like redundancy; reading what each iterates finds on
 Related: [112](112-uidvalidityresetpendingat-is-a-redrive-flag-that-stays-armed-on-purpose.md),
 `Folder.uidValidityResetPendingAt`'s own doc comment (which enumerates "two consumers" and does not
 mention that both share a filter).
+
+## Current note (2026-11-22, #1109): the predicate now follows user actions
+
+`SyncEngine.isSyncable(_:)` now also admits a FOLLOWED folder (`Folder.isFollowed`, v112): any folder a
+user action landed in (opened, a move, archive or delete with it as source or destination, or one of its
+messages opened). The re-drive owners no longer share one predicate: the full sync's per-folder loop
+still iterates the syncable set, but the change pass's `SyncEngine.redriveArmedTurnovers` re-drives every
+armed folder with a path, syncable or not, and the on-demand door above stays the third owner. So the gap
+above is closed for the re-drive whatever the mark; what the mark adds to a custom folder is the full
+sync's listing, the change read and the catch-up, which a custom folder nobody ever acted in still lacks.
+The mark is never cleared, and it is NOT kept in `changeState`, which the epoch reaction itself clears: a
+mark there would drop the folder out of the full sync's loop and out of its change read and catch-up
+inside its own reaction. ADR-IOS-111, amendment 2026-11-22.

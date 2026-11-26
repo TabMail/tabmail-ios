@@ -85,6 +85,11 @@ The owner's rulings of 2026-11-09:
      folders the full sync syncs (`SyncEngine.syncableFoldersInOrder`, main roles and favourites, in
      the full sync's order), re-read at every slice. The sentence above ("ONCE per full sync pass
      [...] re-read after the folder upsert") is superseded.
+   - *Amended 2026-11-22 (#1109):* the syncable set also holds every followed folder
+     (`Folder.isFollowed`: opened, acted in, or one of its messages opened), and a user action starts a
+     catch-up run for just the folders it landed in (`CatchUpRun.accessedFolderIds`); on IMAP with no
+     mod-sequences such an access lists the folder when its counters moved since its last completed
+     listing. See ADR-IOS-111, amendment 2026-11-22.
    - The provider reads local rows through `CatchUpLocalRowReader`. It gets ids and the read and
      flagged state, never content (ADR-004), and reads by numeric range, by first id, by an id list,
      or as an ordered scan. Nothing loads a whole folder.
@@ -148,7 +153,9 @@ The owner's rulings of 2026-11-09:
        hands the catch-up a network state from before the walk.
      - **Slices under the lock.** Each slice takes the account's `oneSyncAtATime` turn (ADR-IOS-104),
        runs inside `queue.execute(.headerFetch)`, and releases the turn when it ends. The slice's clock
-       starts when its turn starts, not while it waits. A push or silent-push delta (or a foreground
+       starts when its turn starts, not while it waits. *(Superseded 2026-11-23, #1109, amendment at the
+       end of this ADR: the slice's clock starts when its provider work starts, at its slot of the
+       provider work queue, not at its turn.)* A push or silent-push delta (or a foreground
        pass) that arrives during the catch-up therefore waits at most one slice, and the turn is FIFO,
        so it runs before the run's next slice. A slice never throws.
      - **How many slices.** A foreground cycle (no deadline) runs ONE slice. The background job runs
@@ -1496,6 +1503,56 @@ window floor named UIDs, unmaterialised UID, known epoch, prune cutoff, pruneCut
 pool capacity wait, healthy folder asked in several slices, floor rule, epoch-tagged floor, CatchUpEpochValue,
 legacy prune seed, seedCatchUpPruneCutoffs, scan floor below the cutoff, actually deleted rows)
 
+### Amendment (2026-11-23, #1109): a slice's clock starts at its slot of the provider work queue
+
+**Current.** Every catch-up slice, the backfill worker's and a followed folder's access run's
+(ADR-IOS-111, amendment 2026-11-22, decision 3) alike, makes its context (`CatchUpRun.sliceStartingNow`),
+and so starts its clock, inside `queue.execute(.headerFetch)`, when the account's provider work queue
+gives it a slot: the slice's time (`catchUpSliceSeconds`) and an access run's working time count from
+there. The wait for the slot, like the wait for the turn, is not counted (sync timing promise 2: a time
+limit never counts a wait for a turn, a lock, a connection slot or a queue). The background job's
+deadline is a fixed instant, which passes while a slice waits; it is checked at the slot, and a job whose
+deadline passed while the slice waited ends there (`CatchUpSliceOutcome.runOver`), sending nothing. An
+access run ends with the slice that spends its working time; it takes no other turn to find it spent.
+
+**Pacing from the slot.** A slice opens the account's pacing window (`catchUpSliceWindowEnds`,
+`catchUpSliceIntervalSeconds`) at its turn, as before, and a slice that ran opens it again from when its
+provider work started. Without the second, a slice that waited longer than the window for its slot
+would run its whole slice and leave the next slice free to start at once: two slices' request caps
+(`catchUpSliceMaxRequests`) inside one window, over the catch-up's share of the provider's rate. A slice
+that finds the run over at its slot keeps the window its turn opened.
+
+**Cost, accepted.** When every slot of the account's queue is busy (body downloads, a listing), a slice
+now holds the account's turn for its queue wait plus its whole bounded hold (decision 3: the 2 s slice,
+then at most one request's 3 s timeout, then the apply), where before the wait came out of the slice and
+a slice that waited its whole slice sent nothing: usually about 2 s longer than before, at most about
+5 s. A pass that waits for the turn behind it (the pull's folder listings, the follow-up stage 2,
+`sync(account:)`, a Settings reset) can wait that much longer; a sync trigger (push, IDLE, the poll, the
+pull's change read) never waits, it sets the follow-up flag (ADR-IOS-104). Other accounts and the
+interface do not wait on the turn; body downloads do not take it, but share the queue's slots with the
+slice as before.
+
+**Measured, debug-gated** (`BackgroundSyncLogger.logDebug`): each slice logs `[CatchUpSlice]` with the
+account, its kind (`access`, `backfill-background`, `backfill-foreground`), its outcome, `queueWaitMs`,
+`workMs` and `turnHoldMs`; a pass that waited for the turn logs `[SyncTurnWait]` with where it was started,
+`waitedMs`, and where the pass that held the turn when it got in line was started (`behind=`,
+`SyncTurnWaiter.caller`, `SyncEngine.syncTurnHolders`). The holder label and the wait's clock are recorded
+only with debug logging on (`recordSyncTurnHolder`); with it off, taking and handing over a turn stores
+nothing for them. *(Amended in review 2026-11-23: the label was first stored on every turn.)*
+
+**Gap closed.** The backfill slices had clocked from their turn, before the slot wait, since the catch-up
+moved into the backfill worker (#766): a slice that waited for its slot reached the provider with less
+of its slice, or none. Still open: the wait for a connection inside a provider's catch-up call still
+counts (an IMAP slice's time and each request's timeout include the wait for a pooled connection),
+#1344 (P4).
+
+*Superseded:* "The slice's clock starts when its turn starts, not while it waits" (decision 2, "Slices
+under the lock"). Decision 2's "A push or silent-push delta ... waits at most one slice" was already
+superseded by #1289 (ADR-IOS-104): a trigger that finds the account busy sets the follow-up flag, and the
+follow-up stage 2 it asks for waits in line.
+
+(slice clock, queue admission, provider work queue slot, sync timing promise 2, access run working time,
+spent run ends, turn hold, pacing window from the slot, CatchUpSlice log, SyncTurnWait log, queueWaitMs, turnHoldMs, #766 gap, #1109)
 
 ### Amendment (2026-11-24, #1380): every range read of a listing starts at its bound
 

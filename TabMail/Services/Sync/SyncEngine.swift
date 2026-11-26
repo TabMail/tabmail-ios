@@ -33,6 +33,13 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
+    /// Per account: the catch-up run user actions started (#1109,
+    /// `SyncEngine.startAccessCatchUp`), one at a time, and the folders the
+    /// actions landed in that it has not taken yet. In memory only: the folders
+    /// are followed, so the backfill worker's catch-up checks them anyway.
+    var accessCatchUpTasks: [String: Task<Void, Never>] = [:]
+    var accessCatchUpPending: [String: Set<String>] = [:]
+
     #if DEBUG
     /// Test-only seam (`setCatchUpSliceStartHookForTesting`): called with the
     /// folders each catch-up slice asks, as it starts, and awaited, so a test
@@ -43,6 +50,9 @@ actor SyncEngine {
     /// anything is applied, and awaited, so a test can hold a slice that has
     /// read the server inside its turn. Nil outside tests.
     var catchUpAfterReadHookForTesting: (@Sendable ([String]) async -> Void)?
+    /// Test-only seam (`setAccessCatchUpClockForTesting`): the clock access
+    /// catch-up runs are measured on. Nil outside tests: the real clock.
+    var accessCatchUpClockForTesting: (@Sendable () -> Date)?
     #endif
 
     /// Generation counter per account — prevents stale task defer from clearing
@@ -73,6 +83,12 @@ actor SyncEngine {
     /// their turn, oldest first (`oneSyncAtATime`).
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
+    /// For each account whose turn is held, where the pass holding it was
+    /// started (`caller:line`), so a pass that waited names in the debug log
+    /// what it waited behind (`[SyncTurnWait]`). Read by nothing else. A label
+    /// is stored only with debug logging on; with it off, `recordSyncTurnHolder`
+    /// drops any label left from a time it was on.
+    var syncTurnHolders: [String: String] = [:]
     var syncTurnWaiterSerial: UInt64 = 0
     /// Waiters the test harness released after an overrun (`syncTurnWaitWatch`).
     var overrunSyncTurnWaiters: Set<UInt64> = []
@@ -393,6 +409,11 @@ actor SyncEngine {
         if let indexTask = bulkIndexTasks.removeValue(forKey: accountId) {
             indexTask.cancel()
             await indexTask.value // wait for cancellation to propagate
+        }
+        accessCatchUpPending.removeValue(forKey: accountId)
+        if let accessTask = accessCatchUpTasks.removeValue(forKey: accountId) {
+            accessTask.cancel()
+            await accessTask.value
         }
     }
 

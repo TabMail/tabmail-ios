@@ -424,10 +424,13 @@ extension AccountManager {
     /// provider that is not in `accounts` is skipped. After its folders, each
     /// account in `accounts` runs one change read (`SyncEngine.backgroundDeltaSync`,
     /// #902); an account not in `accounts`, or one whose connect or re-list failed,
-    /// gets no change read. Returns whether a change read found its account busy
-    /// (its follow-up flag set instead): the pull did not read that account, so
-    /// its run is not a success for every account (it never clears the inbox
-    /// banner).
+    /// gets no change read. Every folder synced here is followed (#1109,
+    /// `SyncEngine.followFolders`), and after its account's listings and change
+    /// read a catch-up run reconciles the whole of those folders
+    /// (`SyncEngine.startAccessCatchUp`), which this call does not wait for.
+    /// Returns whether a change read found its account busy (its follow-up flag
+    /// set instead): the pull did not read that account, so its run is not a
+    /// success for every account (it never clears the inbox banner).
     @discardableResult
     func syncFolders(_ folders: [Folder], connecting accounts: [Account]) async throws -> Bool {
         let grouped = Dictionary(grouping: folders) { $0.accountId }
@@ -448,6 +451,13 @@ extension AccountManager {
                 guard connected != nil || account != nil else { continue }
                 let syncEngine = self.syncEngine
                 group.addTask {
+                    // The user opened or refreshed these folders: they are followed
+                    // from now on (#1109). Written first, before the connect and the
+                    // listings, so an open while offline, or a listing that fails,
+                    // still leaves them followed; and before the change read below,
+                    // which then reads (or first baselines) them.
+                    let accessed = accountFolders.filter { !$0.path.isEmpty }.map(\.id)
+                    await syncEngine.followFolders(accessed)
                     var provider = connected
                     if provider == nil, let account {
                         do {
@@ -501,6 +511,18 @@ extension AccountManager {
                     let read = try await withTimeout(seconds: timeout) {
                         try await syncEngine.backgroundDeltaSync(account: account, deadline: deadline)
                     }
+                    // Then the whole of each folder is reconciled (#1109): a catch-up
+                    // run for these folders, started after the change read so a
+                    // folder the reader has just baselined is one the catch-up may
+                    // list. The refresh does not wait for it. When the read found
+                    // the account busy, the run starts all the same: it waits in
+                    // line like the follow-up (its time counts only from each
+                    // slice's queue slot), lists an untracked folder by its access
+                    // rule, and a tracked one's changes come through the
+                    // follow-up's read. It may take the turn before the follow-up:
+                    // a folder the follow-up has yet to baseline is then left to
+                    // the ordinary catch-up.
+                    await syncEngine.startAccessCatchUp(accountId: accountId, folderIds: accessed)
                     if DebugModeManager.isLoggingEnabled() {
                         let outcome = read.map { "changed=\($0.changed) reason=\($0.reason)" } ?? "busy, follow-up wanted"
                         BackgroundSyncLogger.logDebug("[SyncFolders] change read for account \(accountId.prefix(6)): \(outcome)")

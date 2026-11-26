@@ -729,7 +729,7 @@ struct DatabaseMigrationTests {
     /// column that left the CREATE text alone still fails) and `indexShape` (which
     /// reads `PRAGMA index_list`, the only place the implicit primary-key
     /// autoindex is visible at all).
-    private static func schemaDump(_ db: DatabaseQueue) throws -> [String] {
+    static func schemaDump(_ db: DatabaseQueue) throws -> [String] {
         let objects: [String] = try db.read { conn in
             try Row.fetchAll(conn, sql: """
                 SELECT type, name, tbl_name, COALESCE(sql, '∅') AS sql
@@ -757,7 +757,7 @@ struct DatabaseMigrationTests {
     /// GRDB's applied-migrations ledger, read straight out of GRDB's own table
     /// rather than through `DatabaseMigrator` — the point is what is RECORDED,
     /// not what the migrator computes.
-    private static func appliedLedger(_ db: DatabaseQueue) throws -> [String] {
+    static func appliedLedger(_ db: DatabaseQueue) throws -> [String] {
         try db.read {
             try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier")
         }
@@ -1697,5 +1697,134 @@ struct FolderBackfillVersionNeverRepeatsMigrationTests {
         try db.write { [other] in try other.insert($0) }
         let seeded = try Self.version(db, otherId)
         #expect(seeded > existing, "the inserted row kept or reused version \(seeded); the existing row holds \(existing)")
+    }
+}
+
+// MARK: - v112 — folder.isFollowed
+
+/// `v112_addFolderIsFollowed` adds the follow mark (#1109): a folder a user
+/// action landed in joins the syncable set. Every existing folder starts
+/// unfollowed (a column default; nothing is converted), and the column is NOT
+/// NULL, so the model's non-optional field decodes every existing row.
+@Suite("Migration v112 — folder.isFollowed")
+struct FolderIsFollowedMigrationTests {
+    @Test("v112 adds a NOT NULL column defaulting to 0, every existing folder reads unfollowed, and nothing else changes")
+    func existingFoldersAreNotFollowed() throws {
+        var configuration = Configuration()
+        configuration.foreignKeysEnabled = true
+        let db = try DatabaseQueue(configuration: configuration)
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        try migrator.migrate(db, upTo: "v104_addReplyAllAndMarkSentAt")
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Starred", path: "Starred", role: .custom)
+        try db.write { try $0.execute(sql: "UPDATE folder SET isFavorite = 1 WHERE path = 'Starred'") }
+
+        try migrator.migrate(db, upTo: "v112_addFolderIsFollowed")
+
+        let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
+        let column = try #require(columns.first { ($0["name"] as String) == "isFollowed" })
+        #expect((column["notnull"] as Int) == 1)
+        #expect((column["type"] as String).uppercased() == "BOOLEAN")
+        #expect((column["dflt_value"] as String?) == "0")
+        let rows = try db.read { try Row.fetchAll($0, sql: "SELECT isFollowed, isFavorite FROM folder ORDER BY path") }
+        #expect(rows.count == 2)
+        guard rows.count == 2 else { return }
+        let followed: [Bool] = rows.map { $0["isFollowed"] }
+        let favourite: [Bool] = rows.map { $0["isFavorite"] }
+        #expect(followed == [false, false], "every existing folder starts unfollowed")
+        #expect(favourite == [false, true], "a favourite stays a favourite: nothing is converted")
+        let decoded = try db.read { try Folder.fetchAll($0) }
+        let decodedFollowed = decoded.map(\.isFollowed)
+        #expect(decodedFollowed == [false, false], "the model reads every existing row as unfollowed")
+    }
+
+    /// v112 is registered after v104, but every released install already ran the migrations
+    /// registered behind it (v1.11.6: v113 to v116; v1.11.7: v113 to v117). On those devices
+    /// v112 runs AFTER them, an order no fresh install and no stepped upgrade takes. The
+    /// released state is rebuilt from a database at the current version: the columns the
+    /// release did not have are dropped and their migrations' ledger rows deleted. The app's
+    /// own entry point (`AppDatabase.runMigrations`, as at launch) must then run what is
+    /// missing without an error and reach a fresh install's schema. Never `migrate(_:upTo:)`
+    /// here: GRDB stops the process when that target is behind an applied migration.
+    @Test("v112 runs cleanly after the released v113 to v117, and the schema equals a fresh install's",
+          arguments: ReleasedMigrationState.allCases)
+    func v112RunsCleanlyAfterTheReleasedV113ToV117(_ released: ReleasedMigrationState) throws {
+        let fresh = try TestDatabase.make()
+        let freshDump = try DatabaseMigrationTests.schemaDump(fresh)
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        let missing = released.notYetApplied
+        try db.write { conn in
+            for step in missing {
+                try conn.execute(sql: "ALTER TABLE \"\(step.table)\" DROP COLUMN \"\(step.column)\"")
+                try conn.execute(sql: "DELETE FROM grdb_migrations WHERE identifier = ?", arguments: [step.migration])
+            }
+        }
+
+        var registration = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &registration)
+        let migrator = registration
+        let registered = migrator.migrations
+        // Non-vacuity: the database really is at the released schema.
+        let ledgerBefore = try DatabaseMigrationTests.appliedLedger(db)
+        let expectedBefore = registered.filter { id in !missing.contains { $0.migration == id } }.sorted()
+        #expect(ledgerBefore == expectedBefore)
+        let folderColumnsBefore = try db.read { try $0.columns(in: "folder").map(\.name) }
+        #expect(!folderColumnsBefore.contains("isFollowed"))
+        let completeBefore = try db.read { try migrator.hasCompletedMigrations($0) }
+        #expect(!completeBefore, "the splash gate must see v112 as pending work")
+
+        try AppDatabase.runMigrations(on: db)
+
+        let ledgerAfter = try DatabaseMigrationTests.appliedLedger(db)
+        #expect(ledgerAfter == registered.sorted())
+        let completeAfter = try db.read { try migrator.hasCompletedMigrations($0) }
+        #expect(completeAfter)
+        // The CREATE text of a table this test dropped a column from is SQLite's rewrite, a
+        // setup artifact (on a device the column was never there); that table's column and
+        // index shape, which the dump also holds, still pins every column's type, NOT NULL,
+        // default and position. Everything else is compared whole.
+        let rebuilt = Set(missing.map(\.table))
+        let comparable: ([String]) -> [String] = { dump in
+            dump.filter { line in !rebuilt.contains { line.hasPrefix("table|\($0)|\($0)|") } }
+        }
+        let releasedDump = try DatabaseMigrationTests.schemaDump(db)
+        let releasedShape = comparable(releasedDump)
+        let freshShape = comparable(freshDump)
+        #expect(!freshShape.isEmpty)
+        #expect(releasedShape == freshShape)
+        let folders = try db.read { try Folder.fetchAll($0) }
+        let followed = folders.map(\.isFollowed)
+        #expect(followed == [false, false], "both existing folders decode, unfollowed")
+        let accounts = try db.read { try Account.fetchCount($0) }
+        #expect(accounts == 1)
+    }
+}
+
+/// A released app's schema, for `FolderIsFollowedMigrationTests`: the migrations registered
+/// after v112 that the release did NOT have yet, each with the column it adds. v112 itself is
+/// in neither release.
+enum ReleasedMigrationState: String, CaseIterable, Sendable {
+    case v1_11_7
+    case v1_11_6
+
+    struct Step: Sendable {
+        let migration: String
+        let table: String
+        let column: String
+    }
+
+    var notYetApplied: [Step] {
+        let v112 = Step(migration: "v112_addFolderIsFollowed", table: "folder", column: "isFollowed")
+        let v117 = Step(migration: "v117_addOutboxOriginalChangesAtQueue", table: "outboxMessage", column: "originalChangesAtQueue")
+        switch self {
+        case .v1_11_7: return [v112]
+        case .v1_11_6: return [v112, v117]
+        }
     }
 }

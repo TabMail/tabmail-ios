@@ -872,6 +872,21 @@ enum SyncConfig {
     /// its cursor is valid, so a Gmail folder is listed only the first time and
     /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
+    /// On a server with no mod-sequences, a folder a user action lands in is
+    /// listed again at that access when its counters (EXISTS, UIDNEXT) differ
+    /// from those its last completed listing started from, or when that listing
+    /// completed longer ago than this (seconds, #1109). Flag changes move no
+    /// counter, so this age is how stale a read or flag mark below the newest
+    /// listing can be when the user comes back to the folder.
+    static let catchUpAccessCheckAgeSeconds: TimeInterval = 3_600
+    /// How long the catch-up run a user action starts for the folders it landed
+    /// in may work (seconds, #1109): slices run, paced like every other catch-up
+    /// slice of the account, until the folders make no progress or the slices'
+    /// time inside the account's turn adds up to this (`CatchUpRun.workSeconds`:
+    /// the wait for the turn and the pacing wait between slices do not count).
+    /// What a large folder still needs then is the backfill worker's, which
+    /// checks every followed folder.
+    static let accessCatchUpRunSeconds: TimeInterval = 120
     /// About how many messages one IMAP listing range holds (`UID FETCH lo:hi
     /// (UID FLAGS)`, then one membership `UID SEARCH` of the same range). The
     /// first range's width in UIDs is sized from the folder's EXISTS and UIDNEXT

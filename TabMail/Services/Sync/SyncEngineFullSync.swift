@@ -321,9 +321,11 @@ extension SyncEngine {
              try Account.fetchOne(db, key: account.id)?.lastHistoryId != nil)
         }
 
-        // Sync messages for main roles + favorited folders, prioritized:
-        // inbox first, then favorites, then secondary roles, then custom.
-        // Custom non-favorited folders sync on-demand when the user navigates to them.
+        // Sync messages for the syncable folders (main roles, favourites and
+        // followed folders, `SyncEngine.isSyncable`), prioritized: inbox first,
+        // then favorites, then secondary roles, then followed folders. A custom
+        // folder no user action has landed in syncs on demand when the user
+        // navigates to it, which also follows it (#1109).
         let syncableFolders = syncableFoldersInOrder(folders)
 
         BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
@@ -564,15 +566,15 @@ extension SyncEngine {
     }
 
     /// The folders the full sync syncs, the backfill worker's catch-up lists,
-    /// and a per-folder change reader reads (`ChangeFolder.isSynced`): main roles
-    /// and favourites, inbox first, then favourites, then secondary roles. Custom
-    /// non-favourite folders sync on demand when the user navigates to them.
+    /// and a per-folder change reader reads (`ChangeFolder.isSynced`): main roles,
+    /// favourites and followed folders, inbox first, then favourites, then
+    /// secondary roles, then followed folders. Any other folder is listed on
+    /// demand, and the first user action that lands in it makes it followed
+    /// (#1109, `SyncEngine.folderAccessed`).
     nonisolated func syncableFoldersInOrder(_ folders: [Folder]) -> [Folder] {
         let primary = self.primaryRoles
         let secondary = self.secondaryRoles
-        return folders.filter { folder in
-            Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite)
-        }.sorted { a, b in
+        return folders.filter(Self.isSyncable).sorted { a, b in
             func priority(_ f: Folder) -> Int {
                 if primary.contains(f.role) { return 0 }
                 if f.isFavorite { return 1 }
@@ -584,11 +586,13 @@ extension SyncEngine {
     }
 
     /// Whether a folder is in the syncable set (`syncableFoldersInOrder`): a main
-    /// role or a favourite. These are also the only folders the catch-up checks
+    /// role, a favourite, or a folder a user action landed in (`Folder.isFollowed`,
+    /// #1109). These are also the only folders the catch-up checks
     /// (`runCatchUpRun` takes `syncableFolderIds`), so only for them does arming
     /// the catch-up repair anything.
-    nonisolated static func isSyncable(role: FolderRole, isFavorite: Bool) -> Bool {
-        syncedPrimaryRoles.contains(role) || syncedSecondaryRoles.contains(role) || isFavorite
+    nonisolated static func isSyncable(_ folder: Folder) -> Bool {
+        syncedPrimaryRoles.contains(folder.role) || syncedSecondaryRoles.contains(folder.role)
+            || folder.isFavorite || folder.isFollowed
     }
 
     // MARK: - Message Sync
@@ -611,10 +615,10 @@ extension SyncEngine {
     @discardableResult
     func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
-        // non-favourite folder. `fullSync` (after its listing, in the pass's own
-        // task) and `imapDeltaSync` both branch into the reaction for a quarantined
-        // folder, but both iterate
-        // `syncableFolders` (primary ∪ secondary ∪ favourite), so a quarantined
+        // folder that is neither a favourite nor followed. `fullSync` (after its
+        // listing, in the pass's own task) and `imapDeltaSync` both branch into the
+        // reaction for a quarantined folder, but both iterate
+        // `syncableFolders` (primary ∪ secondary ∪ favourite ∪ followed, #1109), so a quarantined
         // custom folder previously had NO re-drive at all: `runSyncMessages`'s
         // in-transaction quarantine term correctly SKIPS the merge pass and
         // `isFolderWalkComplete` refuses the crawl, which together left the folder
