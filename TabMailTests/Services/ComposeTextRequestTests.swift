@@ -174,8 +174,8 @@ struct ComposeTextRequestTests {
     ]
 
     @Test("An answer that writes no email, or an HTTP error, fails the request", arguments: failures)
-    func failedAnswerThrows(_ name: String, _ assistant: String?) async throws {
-        try await AITestSetting.with(aiOff: false) {
+    func failedAnswerThrows(_ name: String, _ assistant: String?) async {
+        await AITestSetting.with(aiOff: false) {
             let backend = Backend(assistant: assistant)
             await #expect(throws: (any Error).self, "\(name)") {
                 _ = try await Self.service(backend).performComposeText(
