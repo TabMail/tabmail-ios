@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 // MARK: - Helpers
@@ -1627,16 +1628,316 @@ struct OptimisticSentProductionProbeTests {
     }
 
     private func seedClaimedSend(
-        pool: DatabasePool, accountId: String, outboxId: String, messageId: String
+        pool: DatabasePool, accountId: String, outboxId: String, messageId: String,
+        attachments: [DraftAttachment] = []
     ) throws -> OutboxMessage {
-        let draft = DraftMessage(
+        var draft = DraftMessage(
             to: ["recipient@example.com"], subject: "Production probe", body: "Body")
+        draft.attachments = attachments
         var message = OutboxMessage(accountId: accountId, draft: draft)
+        if let dirName = message.attachmentsDirName {
+            try OutboxMessage.saveAttachments(attachments, dirName: dirName)
+        }
         message.id = outboxId
         message.status = OutboxStatus.sending.rawValue
         message.sentMessageId = messageId
         try pool.write { try message.insert($0) }
         return message
+    }
+
+    private func removeAttachments(of message: OutboxMessage) {
+        if let dir = message.attachmentsDir { try? FileManager.default.removeItem(at: dir) }
+    }
+
+    private func sentRows(
+        _ pool: DatabasePool, accountId: String
+    ) async throws -> (headers: [MessageHeader], bodyIds: [String]) {
+        try await pool.read { db in
+            let headers = try MessageHeader
+                .filter(Column("folderId") == "\(accountId):Sent")
+                .order(Column("id"))
+                .fetchAll(db)
+            let bodyIds = try headers.compactMap { header in
+                try MessageBody.fetchOne(db, key: ContentKey(rawValue: header.id)).map { _ in header.id }
+            }
+            return (headers, bodyIds)
+        }
+    }
+
+    /// The provider's copy, as its header listing reads it: its own id, and a
+    /// Message-ID of its own instead of the one the send wrote.
+    private static let providerRfc822 = "provider-own-id@mail.example.com"
+
+    /// The provider's order date for its copy, whole seconds so it survives the
+    /// database's date precision.
+    private static func providerOrderDate() -> Date {
+        Date(timeIntervalSince1970: (Date().timeIntervalSince1970 - 90).rounded())
+    }
+
+    private static func listedCopy(
+        accountId: String, id: String, threadId: String?, rfc822: String? = providerRfc822,
+        date: Date? = nil, providerDate: Date
+    ) -> MessageHeaderInfo {
+        var info = makeHeaderInfo(
+            messageId: id, rfc822MessageId: rfc822, threadId: threadId,
+            subject: "Production probe", from: "Sender", fromAddress: "\(accountId)@example.com",
+            to: "recipient@example.com", date: date ?? providerDate)
+        info.providerDate = providerDate
+        return info
+    }
+
+    private func send(_ claimed: OutboxMessage, messageId: String, accountId: String, provider: MockEmailProvider) async {
+        await TestProviderRegistry.withRegisteredProvider(
+            accountId: accountId, provider: provider
+        ) {
+            await AccountManager.shared.sendClaimedOutboxMessageForTesting(
+                claimed, messageId: messageId)
+        }
+    }
+
+    @Test("a read Sent copy is ONE row with the provider's Message-ID, date and order date, read after the stamp, which a later Sent listing leaves as is")
+    func readSentCopyIsTheRowTheSyncKeeps() async throws {
+        let accountId = "sentcopy-named"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<sentcopy-named@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-sentcopy-named", messageId: messageId)
+        let internalDate = Self.providerOrderDate()
+        // The date the provider's listing gives the copy (Gmail: its Received
+        // time), apart from both the order date and the device's clock.
+        let copyDate = internalDate.addingTimeInterval(-30)
+        let listed = Self.listedCopy(
+            accountId: accountId, id: "gm-named", threadId: "thread-named",
+            date: copyDate, providerDate: internalDate)
+        let provider = MockEmailProvider()
+        await provider.setSendResult(SentCopyIdentity(providerMessageId: "gm-named", threadId: "thread-named"))
+        await provider.setFetchMessageHeadersResult([listed])
+        let stampedAtRead = Mutex<[Bool]>([])
+        let pool = fixture.pool
+        let outboxId = claimed.id
+        await provider.setFetchMessageHeadersHook {
+            let stamped = (try? await pool.read { db in
+                try OutboxMessage.fetchOne(db, key: outboxId)?.sentAt != nil
+            }) ?? false
+            stampedAtRead.withLock { $0.append(stamped) }
+        }
+
+        await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+
+        #expect(stampedAtRead.withLock { $0 } == [true],
+                "the copy is read once, after the send is stamped: a kill during the read resends nothing")
+        let rowId = "\(accountId):Sent:gm-named"
+        let afterSend = try await sentRows(fixture.pool, accountId: accountId)
+        #expect(afterSend.headers.map(\.id) == [rowId], "the Sent row takes the id the provider's send named")
+        guard afterSend.headers.count == 1 else { return }
+        #expect(afterSend.headers[0].threadId == "thread-named", "its conversation id, which a reply from this row sends")
+        #expect(afterSend.headers[0].rfc822MessageId == Self.providerRfc822,
+                "the provider's own Message-ID, which recipients' copies carry")
+        #expect(afterSend.headers[0].providerDate == internalDate, "the provider's order date, as the sync stores it")
+        #expect(afterSend.headers[0].date == copyDate, "the copy's own date, not the device's clock")
+        #expect(afterSend.bodyIds == [rowId])
+
+        // The first sync after the send: the Sent listing names the copy.
+        await provider.setFetchMessagesResult([listed])
+        let folder = try await fixture.pool.read { db in try Folder.fetchOne(db, key: "\(accountId):Sent") }
+        guard let folder else {
+            Issue.record("the Sent folder is missing")
+            return
+        }
+        _ = try await SyncEngine.runListing(
+            for: folder, provider: provider, limit: SyncConfig.syncMessageLimit,
+            dbPool: AppDatabase.dbPool).requireResult()
+        // A change pass that reads the copy's arrival.
+        let changes = FolderChanges(
+            folderId: "\(accountId):Sent", status: .tracked, addressEpoch: nil,
+            records: [ChangeRecord(header: listed)], removals: [])
+        _ = try await fixture.pool.write { db in try SyncEngine.applyFolderChanges(changes, db: db) }
+
+        let afterSync = try await sentRows(fixture.pool, accountId: accountId)
+        #expect(afterSync.headers.map(\.id) == [rowId],
+                "the sync's copy is the row the send wrote: one row, and the id a view holds stays valid")
+        guard afterSync.headers.count == 1 else { return }
+        #expect(afterSync.headers[0].rfc822MessageId == Self.providerRfc822)
+        #expect(afterSync.headers[0].providerDate == internalDate)
+        #expect(afterSync.headers[0].date == copyDate)
+        #expect(afterSync.headers[0].threadId == "thread-named")
+        #expect(afterSync.bodyIds == [rowId], "the locally written body stays with the row")
+    }
+
+    enum CopyThread: String, CaseIterable, Sendable {
+        /// The send's answer names no conversation; the read copy does.
+        case readOnly
+        /// The read copy names no conversation; the send's answer does.
+        case sendOnly
+    }
+
+    @Test("the row's conversation id is the read copy's, else the one the send's answer named",
+          arguments: CopyThread.allCases)
+    func readSentCopyThreadId(_ source: CopyThread) async throws {
+        let accountId = "sentcopy-thread-\(source.rawValue)"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<sentcopy-thread-\(source.rawValue)@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-sentcopy-thread-\(source.rawValue)", messageId: messageId)
+        let provider = MockEmailProvider()
+        await provider.setSendResult(SentCopyIdentity(
+            providerMessageId: "gm-thread", threadId: source == .sendOnly ? "thread-copy" : nil))
+        await provider.setFetchMessageHeadersResult([Self.listedCopy(
+            accountId: accountId, id: "gm-thread", threadId: source == .readOnly ? "thread-copy" : nil,
+            providerDate: Self.providerOrderDate())])
+
+        await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+
+        let state = try await sentRows(fixture.pool, accountId: accountId)
+        #expect(state.headers.map(\.id) == ["\(accountId):Sent:gm-thread"])
+        guard state.headers.count == 1 else { return }
+        #expect(state.headers[0].threadId == "thread-copy",
+                "the conversation id a reply from this row sends, which no sync sets on a row it holds")
+    }
+
+    enum UnreadCopy: String, CaseIterable, Sendable {
+        case readFails, notListed, noMessageId
+        /// The listing answers with another message, which has a Message-ID.
+        case otherMessage
+    }
+
+    @Test("a Sent copy that cannot be read gives the placeholder row, and the send still completes",
+          arguments: UnreadCopy.allCases)
+    func unreadSentCopyGivesThePlaceholder(_ unread: UnreadCopy) async throws {
+        let accountId = "sentcopy-unread-\(unread.rawValue)"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<sentcopy-unread-\(unread.rawValue)@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-sentcopy-unread-\(unread.rawValue)", messageId: messageId)
+        let provider = MockEmailProvider()
+        await provider.setSendResult(SentCopyIdentity(providerMessageId: "gm-unread", threadId: "thread-unread"))
+        switch unread {
+        case .readFails:
+            await provider.setFetchMessageHeadersThrows(URLError(.timedOut))
+        case .notListed:
+            await provider.setFetchMessageHeadersResult([])
+        case .noMessageId:
+            await provider.setFetchMessageHeadersResult([Self.listedCopy(
+                accountId: accountId, id: "gm-unread", threadId: "thread-unread", rfc822: nil,
+                providerDate: Self.providerOrderDate())])
+        case .otherMessage:
+            await provider.setFetchMessageHeadersResult([Self.listedCopy(
+                accountId: accountId, id: "gm-other", threadId: "thread-other",
+                providerDate: Self.providerOrderDate())])
+        }
+
+        await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+
+        let rowId = "\(accountId):Sent:sent-\(claimed.id)"
+        let state = try await sentRows(fixture.pool, accountId: accountId)
+        let outbox = try await fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: claimed.id) }
+        #expect(outbox == nil, "the send completes; a failed read never fails or repeats it")
+        #expect(state.headers.map(\.id) == [rowId], "the placeholder the sync replaces, as without a named copy")
+        guard state.headers.count == 1 else { return }
+        #expect(state.headers[0].rfc822MessageId == "sentcopy-unread-\(unread.rawValue)@example.com")
+        #expect(state.headers[0].threadId == nil)
+        #expect(state.headers[0].providerDate == state.headers[0].date)
+        #expect(state.bodyIds == [rowId])
+        #expect(state.headers[0].bodyComplete)
+    }
+
+    @Test("a Sent copy the sync stored first is kept as the sync wrote it: no error and no second row")
+    func syncFirstCopyIsKept() async throws {
+        let accountId = "sentcopy-sync-first"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let rowId = "\(accountId):Sent:gm-first"
+        try await fixture.pool.write { db in
+            var synced = MessageHeader(
+                messageId: "gm-first", subject: "Production probe", from: "Sender",
+                fromAddress: "\(accountId)@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "from the sync", folderId: "\(accountId):Sent",
+                accountId: accountId, folderPath: "Sent", isInInbox: false)
+            synced.rfc822MessageId = Self.providerRfc822
+            synced.headerComplete = true
+            try synced.insert(db)
+        }
+        let messageId = "<sentcopy-sync-first@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-sentcopy-sync-first", messageId: messageId)
+        let provider = MockEmailProvider()
+        await provider.setSendResult(SentCopyIdentity(providerMessageId: "gm-first", threadId: "thread-first"))
+        await provider.setFetchMessageHeadersResult([Self.listedCopy(
+            accountId: accountId, id: "gm-first", threadId: "thread-first", providerDate: Self.providerOrderDate())])
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sentcopy_sync_first_\(UUID().uuidString).log")
+        AppLogStore.fileURLOverride.withLock { $0 = logURL }
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        defer {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logURL)
+        }
+
+        await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+
+        let debugLog = AppLogStore.read(channel: .debug)
+        #expect(debugLog.contains("Inserted optimistic Sent header for \(claimed.id)"),
+                "the log was captured (non-vacuity)")
+        #expect(!debugLog.contains("Could not insert optimistic Sent header"),
+                "the copy already stored is not an error")
+        let state = try await sentRows(fixture.pool, accountId: accountId)
+        let outbox = try await fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: claimed.id) }
+        #expect(state.headers.map(\.id) == [rowId], "one row: the sync's")
+        guard state.headers.count == 1 else { return }
+        #expect(state.headers[0].snippet == "from the sync")
+        #expect(state.headers[0].rfc822MessageId == Self.providerRfc822)
+        #expect(state.headers[0].bodyComplete == false,
+                "the sync's row keeps its body to fetch; the send marks nothing on it")
+        #expect(state.bodyIds.isEmpty, "no local body is written over the sync's row")
+        #expect(outbox == nil, "the send still finalizes")
+    }
+
+    @Test("a send with attachments writes its local body only when the provider's Sent copy was not read",
+          arguments: [true, false])
+    func attachmentsLeaveAReadCopysBodyToFetch(named: Bool) async throws {
+        let accountId = "sentcopy-attachments-\(named)"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<sentcopy-attachments-\(named)@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-sentcopy-attachments-\(named)", messageId: messageId,
+            attachments: [DraftAttachment(filename: "report.txt", mimeType: "text/plain", data: Data("report".utf8))])
+        defer { removeAttachments(of: claimed) }
+        let provider = MockEmailProvider()
+        if named {
+            await provider.setSendResult(SentCopyIdentity(providerMessageId: "gm-attached", threadId: nil))
+            await provider.setFetchMessageHeadersResult([Self.listedCopy(
+                accountId: accountId, id: "gm-attached", threadId: nil, providerDate: Self.providerOrderDate())])
+        }
+
+        await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+
+        let state = try await sentRows(fixture.pool, accountId: accountId)
+        let rowId = "\(accountId):Sent:" + (named ? "gm-attached" : "sent-\(claimed.id)")
+        #expect(state.headers.map(\.id) == [rowId])
+        guard state.headers.count == 1 else { return }
+        #expect(state.headers[0].headerComplete)
+        if named {
+            // The local copy lists no attachments, and a body fetch keeps a stored
+            // body: the provider's copy is fetched under its real id instead.
+            #expect(state.headers[0].hasAttachments, "the sync's update of a row it holds never sets it")
+            #expect(state.bodyIds.isEmpty)
+            #expect(state.headers[0].bodyComplete == false)
+        } else {
+            // A placeholder id cannot be fetched; the sync replaces the row.
+            #expect(state.headers[0].hasAttachments == false, "unchanged for the placeholder")
+            #expect(state.bodyIds == [rowId])
+            #expect(state.headers[0].bodyComplete)
+        }
     }
 
     @Test("post-send optimistic insertion is idempotent when the RFC header already exists")

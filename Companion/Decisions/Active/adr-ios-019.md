@@ -27,6 +27,8 @@
 8. **User actions** — Retry: resets failed→queued + retryCount→0, triggers drain. Discard: atomic fetch+delete in single write transaction, refused if status==sending.
 9. **Reactive UI** — `NavigationStore` observes `outboxMessage` table via GRDB `ValueObservation`. Sidebar shows "Outbox" in unified section + per-account sections, with count badge (red if failures). `OutboxView` hides discard button for sending messages.
 
+**Amendment 2026-11-26 — the optimistic Sent row is written as the provider lists its copy (#1491).** Gmail gives a sent message a Message-ID of its own, so a Sent row matched by the pre-generated Message-ID (item 6) never matched Gmail's copy: the sync stored a second row. `EmailProvider.send` now returns the identity of the copy the provider keeps in Sent when its answer names one (`SentCopyIdentity?`: Gmail's `users.messages.send` answers `id` and `threadId`; `nil` for IMAP/SMTP, Exchange and the demo mailbox). After the `sentAt` stamp, never before it (a kill during the read must not resend), the Outbox reads that copy's header through `EmailProvider.fetchMessageHeaders` (`AccountManager.readSentCopy`) and writes the row under the provider's id, thread id, Message-ID, date and order date, as the sync lists the copy; a later sync finds the row it already holds. A read that fails, or that names no Message-ID, leaves the row as the `sent-<outbox id>` placeholder the sync replaces, as before. Detail: memory 069.
+
 **Core reliability philosophy — a dropped send or double-send is near end-of-product:**
 
 - **Never drop a message.** `queueSend` throws on failure. ComposeView MUST show the error and NOT dismiss. The compose view is the user's last chance to preserve their message.

@@ -66,7 +66,7 @@ struct ConfirmGoneAtThresholdTests {
         func markUnread(ids: [String], folder: String) async throws {}
         func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {}
         func move(ids: [String], from: String, to: String) async throws {}
-        func send(draft: DraftMessage) async throws {}
+        @discardableResult func send(draft: DraftMessage) async throws -> SentCopyIdentity? { nil }
         func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool { true }
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }
@@ -127,7 +127,7 @@ struct ConfirmGoneAtThresholdTests {
         func markUnread(ids: [String], folder: String) async throws {}
         func markFlagged(ids: [String], flagged: Bool, folder: String) async throws {}
         func move(ids: [String], from: String, to: String) async throws {}
-        func send(draft: DraftMessage) async throws {}
+        @discardableResult func send(draft: DraftMessage) async throws -> SentCopyIdentity? { nil }
         func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool { true }
         func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] { [] }
         func fetchTextBodies(ids: [String], folder: String) async throws -> [TextBodyFetchResult] { [] }

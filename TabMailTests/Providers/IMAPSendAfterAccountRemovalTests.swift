@@ -85,7 +85,7 @@ struct IMAPSendAfterAccountRemovalTests {
         let provider = provider()
         let session = HeldConnectSession(held: step)
         provider.setSMTPSessionFactoryForTesting { session }
-        let send = Task { try await provider.send(draft: draft) }
+        let send = Task { _ = try await provider.send(draft: draft) }
         var iterator = session.reachedHeldStep.makeAsyncIterator()
         _ = await iterator.next()
         if removeAccount { await provider.disconnectForAccountRemoval() }

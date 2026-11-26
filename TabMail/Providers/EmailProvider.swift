@@ -511,7 +511,13 @@ protocol EmailProvider: Sendable {
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws
     func move(ids: [String], from: String, to: String) async throws
 
-    func send(draft: DraftMessage) async throws
+    /// Send the message. Returns the identity the server gave the copy it keeps
+    /// in Sent when its answer to the send names one, `nil` when it does not.
+    /// Once the send is stamped, the Outbox reads that copy's header
+    /// (`fetchMessageHeaders`) and writes the optimistic Sent row as the sync
+    /// lists the copy (`AccountManager.readSentCopy`).
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity?
 
     /// Append a copy of the sent message to the server's Sent folder.
     /// For IMAP: explicit APPEND. For Gmail/Exchange: no-op (API auto-saves).
@@ -1221,9 +1227,31 @@ struct ProviderListingUnconfirmed: Error, CustomStringConvertible, CustomDebugSt
     }
 }
 
+/// The copy a provider keeps in Sent, as its answer to the send named it: the
+/// message's id in the provider's own address space, and its native
+/// conversation id when the provider has one. Opaque above the provider
+/// boundary: the Outbox only writes them onto the optimistic Sent row, as the
+/// sync writes the same fields for a listed message.
+struct SentCopyIdentity: Sendable, Equatable {
+    let providerMessageId: String
+    let threadId: String?
+}
+
+/// The Sent copy a send named, as the provider's own header listing reads it:
+/// the Message-ID the provider gave the message it keeps (Gmail replaces the
+/// one the send wrote), its date and order date (`MessageHeaderInfo.date`,
+/// `.providerOrderDate`) and its conversation id (`identity.threadId`: the
+/// listing's, else the send's answer's), the fields the sync stores for the copy.
+struct ListedSentCopy: Sendable, Equatable {
+    let identity: SentCopyIdentity
+    let rfc822MessageId: String
+    let date: Date
+    let providerDate: Date
+}
+
 /// True when `id` matches a TabMail-internal optimistic-placeholder shape.
 /// `sent-<UUID>` (`AccountManager.insertOptimisticSentHeader`, in
-/// `AccountManagerOutbox.swift`) and `draft-<UUID>`
+/// `AccountManagerOutbox.swift`, when the provider's Sent copy was not read) and `draft-<UUID>`
 /// (`AccountManager.queueDraftSave`, in `AccountManagerActions.swift`) are written into
 /// `messageHeader.messageId` so the row exists in the user's Sent/Drafts view
 /// before the server has assigned a real id. They MUST NOT be forwarded to
