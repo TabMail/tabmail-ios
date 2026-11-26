@@ -14,11 +14,12 @@ import UIKit
 /// panel's requests.
 ///
 /// THE SYSTEM PROPERTIES pinned here:
-///  1. The closed field's Send is the reply's compose edit, never a turn for the agent (ADR-IOS-114
-///     decision 10, amended 2026-11-25): an edit of the AI Suggestion is written into the ghost
-///     (stored in place first when it keeps its envelope), then opens the field's own card, and
-///     asks the agent nothing; a card closed unsent hands the words back
-///     (ADR-IOS-117); a compose cut off leaves nothing to resume and keeps the words.
+///  1. The closed field's Send writes the reply that says the user's own words, never a turn for
+///     the agent (ADR-IOS-114 decision 10, amended 2026-11-26): the words go up as the user's
+///     bubble in the AI Suggestion's place while the email is written, then the field's own card
+///     opens; nothing is stored over the AI Suggestion, and the agent is asked nothing; a card
+///     closed unsent hands the words back (ADR-IOS-117); a compose cut off leaves nothing to
+///     resume and keeps the words.
 ///  2. A request the open sheet sends, cut off, is recovered with no field words named, and the
 ///     inbox pill's words typed after a cut-off offer Send.
 ///  3. The ghost's card: its Recompute and its own pill's edits go to the chat's AI service.
@@ -72,13 +73,18 @@ struct ChatReplyRecoveryTests {
 
         /// `recompute`: a reply asked for by a card's Recompute is answered with `recomputed`, held until the gate is released.
         /// `cardEdit`: the compose edit a card's own pill asks for is answered with this JSON.
+        /// `fieldCompose`: the closed field's compose text request is answered by it (nil: it goes
+        /// the way every other request goes).
         /// `holdFirst`: the first request is answered (as `failure`) only once it is signalled, so
         /// the agent keeps working until then.
         init(failure: Failure?, asksForReply: Bool = true, recompute: ReplyGate? = nil,
-             cardEdit: String? = nil, holdFirst: DispatchSemaphore? = nil) {
+             cardEdit: String? = nil, fieldCompose: FieldCompose? = nil, holdFirst: DispatchSemaphore? = nil) {
             http.register(path: "/completions/chat", method: "POST") { [record] request in
                 if let recompute, AITextMessageCallerTests.Backend.prompt(request.body) == "system_prompt_compose" {
                     return recompute.answer()
+                }
+                if let fieldCompose, AITextMessageCallerTests.Backend.prompt(request.body) == "system_prompt_compose_text" {
+                    return fieldCompose.answer(request.body)
                 }
                 if let cardEdit, AITextMessageCallerTests.Backend.prompt(request.body) == "system_prompt_compose_interactive" {
                     record.cardEdits.withLock { $0 += 1 }
@@ -139,6 +145,53 @@ struct ChatReplyRecoveryTests {
     /// The reply a card's Recompute gets.
     nonisolated static let recomputed = ReplyResult(body: "Hi Alex,\n\nTuesday is perfect.\n\nThanks", textMessage: "Tuesday is perfect")
 
+    /// Answers the closed field's compose text request with `written`, held until `release()` when
+    /// `held`; keeps the words each request carried.
+    final class FieldCompose: Sendable {
+        let written: ReplyResult
+        private let gate = DispatchSemaphore(value: 0)
+        private let state = Mutex<(words: [String], released: Bool)>(([], false))
+
+        init(written: ReplyResult, held: Bool) {
+            self.written = written
+            if !held { state.withLock { $0.released = true } }
+        }
+
+        /// The words of every request, in order.
+        var words: [String] { state.withLock { $0.words } }
+
+        func answer(_ body: Data?) -> FakeHTTP.CannedResponse {
+            let object = body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let message = (object?["messages"] as? [[String: Any]])?.first
+            let held = state.withLock { value -> Bool in
+                value.words.append(message?["user_text"] as? String ?? "")
+                return !value.released
+            }
+            let written = written
+            let respond: @Sendable () -> FakeHTTP.CannedResponse = {
+                let assistant = ComposeEditJSON.make(
+                    response: "Done.", subject: "", body: written.body,
+                    textMessage: written.textMessage ?? "", changeCommand: written.changeCommand ?? "")
+                let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
+                return .bytes(Data(("event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n").utf8),
+                              contentType: "text/event-stream")
+            }
+            guard held else { return respond() }
+            return .parked { [self] in
+                _ = self.gate.wait(timeout: .now() + 20)
+                return respond()
+            }
+        }
+
+        func release() {
+            let first = state.withLock { value -> Bool in
+                defer { value.released = true }
+                return !value.released
+            }
+            if first { gate.signal() }
+        }
+    }
+
     /// Holds the reply a card's Recompute asks for until `release()`, and counts the asks.
     final class ReplyGate: Sendable {
         private let gate = DispatchSemaphore(value: 0)
@@ -182,7 +235,6 @@ struct ChatReplyRecoveryTests {
 
     /// Opens the chat on `groupEmail(tag)` in a window, its requests going to `backend`, and runs `body`.
     func withChat(_ backend: Backend, tag: String, suggestion: ReplyResult? = nil,
-                          composeEdit: EmailReplyTool.ComposeEdit? = nil,
                           _ body: @MainActor (Chat) async throws -> Void) async throws {
         let saved = ChatSummaryQueueTests.SavedChatViewState()
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -232,7 +284,7 @@ struct ChatReplyRecoveryTests {
         let registry = ToolRegistry.shared
         await registry.ensureDefaultToolsRegistered()
         let registeredReply = await registry.tool(named: "email_reply")
-        await registry.register(EmailReplyTool(context: ToolContext(db: pool, translator: ChatIdTranslator.shared), composeEdit: composeEdit))
+        await registry.register(EmailReplyTool(context: ToolContext(db: pool, translator: ChatIdTranslator.shared)))
         // The reply's card is left open, so its turn never ends: closing cancels it, and its
         // working mark, which a cancelled turn leaves, is cleared with it.
         func close() async throws {
@@ -338,7 +390,7 @@ struct ChatReplyRecoveryTests {
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 1 && ActiveAgentTracker.shared.anyWorking,
-                        "control: the field's compose edit is out and the send is working")
+                        "control: the field's compose is out and the send is working")
                 @MainActor func carrier() -> NSObject? {
                     HostedAccessibility.elements(under: chat.view).first {
                         $0.isAccessibilityElement && HostedAccessibility.identifier(of: $0) != ChatThreadView.replyPillId
@@ -357,40 +409,14 @@ struct ChatReplyRecoveryTests {
         }
     }
 
-    // MARK: - An edit of the AI Suggestion, held, through the field and the cards
-
-    /// Holds the compose edit the field's request runs until `release()`.
-    final class EditGate: Sendable {
-        private let state = Mutex<(entered: Int, released: Bool, waiter: CheckedContinuation<Void, Never>?)>((0, false, nil))
-
-        var entered: Int { state.withLock { $0.entered } }
-
-        func hold() async {
-            await withCheckedContinuation { continuation in
-                let resume = state.withLock { value -> Bool in
-                    value.entered += 1
-                    if value.released { return true }
-                    value.waiter = continuation
-                    return false
-                }
-                if resume { continuation.resume() }
-            }
-        }
-
-        func release() {
-            let waiter = state.withLock { value -> CheckedContinuation<Void, Never>? in
-                value.released = true
-                defer { value.waiter = nil }
-                return value.waiter
-            }
-            waiter?.resume()
-        }
-    }
+    // MARK: - The field's Send: the user's own message, through its card
 
     static let shownSuggestion = ReplyResult(
         body: "Hi Alex,\n\nTuesday works for me.\n\nThanks", textMessage: "Tuesday works for me")
-    private static let editedSuggestion = ReplyResult(
-        body: "Hi Alex,\n\nTuesday works.\n\nThanks", textMessage: "Tuesday works", changeCommand: "make it shorter")
+    /// The email the field's compose writes from the user's words.
+    nonisolated static let writtenEmail = ReplyResult(
+        body: "Hi Alex,\n\nTuesday works, see you then.\n\nThanks", textMessage: "Tuesday works, see you then.",
+        changeCommand: "Could we move it to Wednesday?")
 
     /// The AI Suggestions on screen, by the text they show.
     static func ghosts(in view: UIView) -> [(text: String, element: NSObject)] {
@@ -421,80 +447,76 @@ struct ChatReplyRecoveryTests {
         try await waitUntil { chat.controller.presentedViewController === card }
     }
 
-    @Test("A field edit of the AI Suggestion, held: the suggestion stays, pulsing; released, the edit is stored in place, lands in the ghost, then its card opens, and the agent is asked nothing; the ghost's card is the exact Reply All")
-    func heldFieldEditThroughTheGhostAndItsCard() async throws {
+    /// The user's own message on screen: its label, while its email is written or once written.
+    static func messages(in view: UIView) -> [String] {
+        HostedAccessibility.elements(under: view).compactMap { element in
+            let id = HostedAccessibility.identifier(of: element)
+            return id == ChatFieldMessageBubble.writingId || id == ChatFieldMessageBubble.bubbleId ? element.accessibilityLabel : nil
+        }
+    }
+
+    @Test("A field Send, held: the user's words show as their bubble in the AI Suggestion's place, nothing stored; released, the field's own card opens with the email written, to everyone, and the agent is asked nothing; closed, the AI Suggestion is back as it was, and the ghost's card is the exact Reply All")
+    func heldFieldMessageThroughItsCard() async throws {
         // The card's own debug log says what it was given (ComposeView.prepopulate).
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let backend = Backend(failure: nil)
-        let gate = EditGate()
-        let edited = Self.editedSuggestion
-        let composeEdit: EmailReplyTool.ComposeEdit = { _, subject, _, _ in
-            await gate.hold()
-            return try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
-                response: "Done.", subject: subject, body: edited.body,
-                textMessage: edited.textMessage ?? "", changeCommand: edited.changeCommand ?? "")))
-        }
-        defer { gate.release() }
+        let compose = FieldCompose(written: Self.writtenEmail, held: true)
+        let backend = Backend(failure: nil, fieldCompose: compose)
+        defer { compose.release() }
+        let words = "tuesday works see you then"
         try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "edit-in-place", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
+            try await withChat(backend, tag: "field-message", suggestion: Self.shownSuggestion) { chat in
                 let router = AgentToolRouter.shared
                 try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == Self.shownSuggestion.textMessage } }
                 #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
                         "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
 
-                // The field asks for an edit; the edit its Send runs is held.
+                // The field sends the user's words; the compose its Send runs is held.
                 // The field can be replaced while the chat settles; wait for it.
-                try await Self.waitUntil { Self.type("Make it shorter", in: chat.view) }
-                #expect(Self.type("Make it shorter", in: chat.view), "control: the field takes words")
+                try await Self.waitUntil { Self.type(words, in: chat.view) }
+                #expect(Self.type(words, in: chat.view), "control: the field takes words")
                 try await Task.sleep(for: .milliseconds(300))
-                // The card the edit opens waits in the queue, so the test reads it before it shows.
+                // The card the compose opens waits in the queue, so the test reads it before it shows.
                 router.composePresentationDidBegin()
                 #expect(HostedAccessibility.activate("chatSend", in: chat.view),
                         "control: the field's Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
-                try await Self.waitUntil { gate.entered == 1 }
-                #expect(gate.entered == 1, "control: the field's Send ran the edit: \(backend.bodies.count) requests")
-                // While it is written the suggestion stays in its place, pulsing, and never shows the
-                // edit before it is stored.
-                @MainActor func writing() -> [String] {
-                    HostedAccessibility.elements(under: chat.view).compactMap { element in
-                        HostedAccessibility.identifier(of: element) == ChatSuggestionWorkingBubble.bubbleId
-                            ? element.accessibilityLabel : nil
-                    }
-                }
-                let pulsing = "\(ChatSuggestionConfig.writingLine): \(Self.shownSuggestion.textMessage ?? "")"
-                try await Self.waitUntil { writing() == [pulsing] }
-                let shownWriting = writing()
-                #expect(shownWriting == [pulsing], "while the edit is held the suggestion shown stays, pulsing: \(shownWriting)")
-                let heldGhosts = Self.ghosts(in: chat.view).map(\.text)
-                let heldShowsEdit = heldGhosts.contains { $0 == edited.textMessage }
-                #expect(!heldShowsEdit, "while the edit is held the ghost never shows it: \(heldGhosts)")
+                try await Self.waitUntil { compose.words.count == 1 }
+                #expect(compose.words == [words], "the request carries the words as typed: \(compose.words)")
+                // While it is written: the user's own bubble, pulsing, in the AI Suggestion's place.
+                let pulsing = "You said: \(words), writing your email"
+                try await Self.waitUntil { Self.messages(in: chat.view) == [pulsing] }
+                #expect(Self.messages(in: chat.view) == [pulsing], "the user's words, pulsing: \(Self.messages(in: chat.view))")
+                #expect(Self.ghosts(in: chat.view).isEmpty, "the user's bubble replaces the AI Suggestion")
                 let held = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
-                #expect(held?.suggestion == Self.shownSuggestion, "nothing is stored while the edit is held")
+                #expect(held?.suggestion == Self.shownSuggestion, "nothing is stored while the email is written")
 
-                // Released: the edit replaces the suggestion in place, lands in the ghost, then its card opens.
-                gate.release()
-                try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == edited.textMessage } }
-                #expect(Self.ghosts(in: chat.view).map(\.text) == [edited.textMessage],
-                        "the ghost shows the edit: \(Self.ghosts(in: chat.view).map(\.text))")
-                let stored = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
-                #expect(stored?.suggestion == edited, "the edit is stored whole, its command included")
+                // Released: the field's own card opens with the email written, to everyone.
+                compose.release()
                 try await Self.waitUntil { router.composeQueueDepth == 1 }
-                let request = try #require(router.firstQueuedRequestForTesting, "an edit in place opens its card too")
-                #expect(request.isFieldsOwnReply && request.suggestion?.textMessage == edited.textMessage,
-                        "the card is the field's own, with the edit: \(String(describing: request.suggestion?.textMessage))")
+                let request = try #require(router.firstQueuedRequestForTesting, "the email written opens its card")
+                #expect(request.isFieldsOwnReply && request.draftId != nil, "the card is the field's own, on its own draft")
+                #expect(request.body == Self.writtenEmail.body, "the email written: \(String(describing: request.body))")
+                #expect(request.suggestion?.textMessage == words, "its text version is the user's words")
+                #expect(Self.addresses(request.to.joined(separator: ",")).union(Self.addresses(request.cc.joined(separator: ",")))
+                            == ["alex@example.com", "david@example.com", "sam@example.com"] && request.isReplyAll,
+                        "to everyone on the email: \(request.to) cc \(request.cc)")
                 #expect(backend.bodies.isEmpty, "the closed field asks the agent nothing: \(backend.bodies.count) requests")
-                // The user closes that card; the edit stays the AI Suggestion.
+                #expect(Self.messages(in: chat.view) == ["You said: \(words)"], "written: still, the same words")
+                let stored = try await AppDatabase.dbPool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+                #expect(stored?.suggestion == Self.shownSuggestion, "nothing is stored over the AI Suggestion")
+
+                // The user closes that card: the AI Suggestion is back as it was.
                 request.onOutcome(.cancelled)
                 router.composePresentationDidEnd()
                 try await Self.waitUntil { !ActiveAgentTracker.shared.anyWorking }
-                try await Self.waitUntil { Self.ghosts(in: chat.view).map(\.text) == [edited.textMessage] }
-                #expect(Self.ghosts(in: chat.view).map(\.text) == [edited.textMessage],
-                        "the ghost keeps the edit after its card closed: \(Self.ghosts(in: chat.view).map(\.text))")
+                try await Self.waitUntil { Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage] }
+                #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
+                        "the AI Suggestion after the card closed: \(Self.ghosts(in: chat.view).map(\.text))")
+                #expect(Self.messages(in: chat.view).isEmpty, "the user's bubble is gone")
 
-                // The ghost's card is the exact Reply All, with the edit.
-                try await Self.openGhostCard(try #require(stored?.suggestion), in: chat)
+                // The ghost's card is the exact Reply All.
+                try await Self.openGhostCard(Self.shownSuggestion, in: chat)
                 var card: [String: String] = [:]
                 // To and Cc both shown: the check below reads both, and the card's rows join the
                 // accessibility tree one by one (#1125).
@@ -509,27 +531,21 @@ struct ChatReplyRecoveryTests {
         }
     }
 
-    @Test("A field edit of the AI Suggestion that changes its envelope opens the field's own card, with no agent; closed unsent, the words are handed back: in the field, on the device, and in the chat opened again after a relaunch")
-    func fieldEditCardClosedUnsentKeepsTheWords() async throws {
+    @Test("A field Send's own card closed unsent hands the words back, with no agent: in the field, on the device, and in the chat opened again after a relaunch")
+    func fieldMessageCardClosedUnsentKeepsTheWords() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
-        let sent = "Make it formal"
-        let backend = Backend(failure: nil)
-        let edited = Self.editedSuggestion
-        // The edit changes the envelope (a new subject), so it opens a card instead of landing in place.
-        let composeEdit: EmailReplyTool.ComposeEdit = { _, _, _, _ in
-            try #require(AIService.parseInlineEditResponse(ComposeEditJSON.make(
-                response: "Done.", subject: "Re: New plan", body: edited.body,
-                textMessage: edited.textMessage ?? "", changeCommand: sent)))
-        }
+        let sent = "tuesday works see you then"
+        let compose = FieldCompose(written: Self.writtenEmail, held: false)
+        let backend = Backend(failure: nil, fieldCompose: compose)
         try await HostedAccessibility.withAutomation {
-            try await withChat(backend, tag: "edit-card-words", suggestion: Self.shownSuggestion, composeEdit: composeEdit) { chat in
+            try await withChat(backend, tag: "field-card-words", suggestion: Self.shownSuggestion) { chat in
                 let router = AgentToolRouter.shared
                 let key = ChatFieldWords.key(for: chat.email)
                 try await Self.waitUntil { Self.ghosts(in: chat.view).contains { $0.text == Self.shownSuggestion.textMessage } }
                 #expect(Self.ghosts(in: chat.view).map(\.text) == [Self.shownSuggestion.textMessage],
                         "control: the chat shows the AI Suggestion: \(Self.ghosts(in: chat.view).map(\.text))")
 
-                // The field asks for the edit; the card its compose opens is held in the queue.
+                // The field sends the words; the card its compose opens is held in the queue.
                 try await Self.waitUntil { Self.type(sent, in: chat.view) }
                 #expect(Self.type(sent, in: chat.view), "control: the field takes words")
                 try await Task.sleep(for: .milliseconds(300))
@@ -540,7 +556,7 @@ struct ChatReplyRecoveryTests {
                 let request = try #require(router.firstQueuedRequestForTesting,
                                            "control: the field's compose opened a card: \(backend.bodies.count) requests")
                 let onOwnDraft = request.draftId != nil
-                #expect(onOwnDraft, "control: the card is the suggestion edit's own")
+                #expect(onOwnDraft, "control: the card is the field's own")
                 let composing = ChatFieldWords.shared.fill(for: key).composing
                 #expect(composing, "the field's own card owns the send")
 
@@ -640,7 +656,8 @@ struct ChatReplyRecoveryTests {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted chat")
         DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
         defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
-        let edited = Self.editedSuggestion
+        let edited = ReplyResult(
+            body: "Hi Alex,\n\nTuesday works.\n\nThanks", textMessage: "Tuesday works", changeCommand: "make it shorter")
         let backend = Backend(failure: .serverError, cardEdit: ComposeEditJSON.make(
             response: "Made it shorter.", subject: "Re: Plans", body: edited.body,
             textMessage: edited.textMessage ?? "", changeCommand: edited.changeCommand ?? ""))
@@ -678,8 +695,8 @@ struct ChatReplyRecoveryTests {
 
     /// A request the open sheet sends goes with no field (`sendAgentChat` takes none, fenced in
     /// `ChatReplyFieldRuntimeTests.agentSendsCarryNoField`), and its words went with it: cut off, it
-    /// can be resumed. The closed field's Send is a compose edit, not an agent turn (ADR-IOS-114
-    /// decision 10, amended 2026-11-25): cut off, it leaves no recovery, and its words stay in the
+    /// can be resumed. The closed field's Send writes the email, not an agent turn (ADR-IOS-114
+    /// decision 10, amended 2026-11-26): cut off, it leaves no recovery, and its words stay in the
     /// field.
     @Test("A cut-off request from the sheet can be resumed and its words went with it; a cut-off compose from the field leaves no recovery and keeps the words",
           arguments: [false, true])
@@ -704,8 +721,8 @@ struct ChatReplyRecoveryTests {
                         "control: Send takes a tap: \(HostedAccessibility.identifiers(in: chat.view))")
                 try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
                 #expect(backend.bodies.count == 1, "control: the request went out once and was cut off")
-                let compose = backend.bodies.first?.contains("system_prompt_compose_interactive") == true
-                #expect(compose == fromField, "the field's words go to the compose edit, the sheet's to the agent")
+                let compose = backend.bodies.first?.contains("system_prompt_compose_text") == true
+                #expect(compose == fromField, "the field's words go to the field's compose, the sheet's to the agent")
                 let session = ChatPillState.shared.session(for: ChatThreadKey.key(for: chat.email))
                 if fromField {
                     try await Task.sleep(for: .milliseconds(500))

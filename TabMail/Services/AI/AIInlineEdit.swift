@@ -128,7 +128,8 @@ struct InlineEditResult: Sendable {
     let bccDelta: RecipientDelta?
     /// The email as a short text message (`text_message`): what the chat's AI Suggestion shows.
     let textMessage: String?
-    /// One suggested change for this draft (`change_command`), shown as the field's "e.g." line.
+    /// A one-line alternative message in the user's voice (`change_command`), shown under the chat
+    /// view's field as its "alt: " line.
     let changeCommand: String?
     let raw: String        // Raw LLM response for storing in chat history
 }
@@ -160,14 +161,6 @@ extension AIService {
             return Self.inlineEditWithAIOff
         }
 
-        // Demo Mode budget. One performInlineEdit = one count.
-        let inDemo = await MainActor.run { DemoModeStore.shared.isActive }
-        if inDemo {
-            let exhausted = await MainActor.run { DemoModeStore.shared.isCallBudgetExhausted }
-            guard !exhausted else { throw DemoError.callBudgetExhausted }
-            await MainActor.run { DemoModeStore.shared.consumeCall() }
-        }
-
         // Format recipients as JSON array, matching TB's buildComposeEditChat
         struct Recipient: Encodable {
             let name: String
@@ -188,16 +181,9 @@ extension AIService {
         // Format current To/Cc/Bcc as one-recipient-per-line blocks for the prompt.
         // These feed the v1.5.16+ edit prompt which instructs the LLM to copy the
         // recipient fields through unchanged by default.
-        func formatRecipientBlock(_ emails: [String], names: [String: String]) -> String {
-            return emails.map { email in
-                let key = email.lowercased()
-                let name = (names[key] ?? names[email] ?? "").trimmingCharacters(in: .whitespaces)
-                return name.isEmpty ? "<\(email)>" : "\(name) <\(email)>"
-            }.joined(separator: "\n")
-        }
-        let originalTo = formatRecipientBlock(context.toRecipients, names: context.toDisplayNames)
-        let originalCc = formatRecipientBlock(context.ccRecipients, names: context.ccDisplayNames)
-        let originalBcc = formatRecipientBlock(context.bccRecipients, names: context.bccDisplayNames)
+        let originalTo = Self.recipientBlock(context.toRecipients, names: context.toDisplayNames)
+        let originalCc = Self.recipientBlock(context.ccRecipients, names: context.ccDisplayNames)
+        let originalBcc = Self.recipientBlock(context.bccRecipients, names: context.bccDisplayNames)
 
         // Build vars matching TB's buildComposeEditChat structure
         var vars: [String: JSONValue] = [
@@ -270,11 +256,43 @@ extension AIService {
             disable_tools: false  // Allow tools for compose (contacts, calendar, etc.)
         )
 
+        return try await runComposeEditRequest(request, label: "performInlineEdit", onSSEEvent: onSSEEvent, invocation: invocation)
+    }
+
+    /// A draft's To, Cc or Bcc as the compose prompts read it (`original_to` and its kin): one
+    /// recipient per line, `Name <email>` or `<email>`, the name looked up by the address as
+    /// written or lowercased.
+    static func recipientBlock(_ emails: [String], names: [String: String]) -> String {
+        emails.map { email in
+            let key = email.lowercased()
+            let name = (names[key] ?? names[email] ?? "").trimmingCharacters(in: .whitespaces)
+            return name.isEmpty ? "<\(email)>" : "\(name) <\(email)>"
+        }.joined(separator: "\n")
+    }
+
+    /// THE run of a compose edit request, for the compose edit (`performInlineEdit`) and the chat
+    /// view field's compose-text request (`performComposeText`) alike: one Demo Mode call, the
+    /// request, and the answer read as the compose edit JSON (`parseInlineEditResponse`). AI turned
+    /// off while it runs ends it as with AI off at the start (`inlineEditWithAIOff`); no answer, or
+    /// one that is not the compose edit JSON, throws `InlineEditFailure`. `label` names the request
+    /// in debug logs.
+    func runComposeEditRequest(
+        _ request: CompletionsRequest, label: String,
+        onSSEEvent: BackendClient.SSEEventHandler? = nil, invocation: ToolInvocation = .noninteractive
+    ) async throws -> InlineEditResult {
+        // Demo Mode budget. One request = one count.
+        let inDemo = await MainActor.run { DemoModeStore.shared.isActive }
+        if inDemo {
+            let exhausted = await MainActor.run { DemoModeStore.shared.isCallBudgetExhausted }
+            guard !exhausted else { throw DemoError.callBudgetExhausted }
+            await MainActor.run { DemoModeStore.shared.consumeCall() }
+        }
+
         // Log raw JSON for debugging
         if DebugModeManager.isLoggingEnabled() {
             if let jsonData = try? JSONEncoder().encode(request),
                let jsonStr = String(data: jsonData, encoding: .utf8) {
-                BackgroundSyncLogger.logDebug("[AIService] performInlineEdit REQUEST JSON (\(jsonData.count) bytes):")
+                BackgroundSyncLogger.logDebug("[AIService] \(label) REQUEST JSON (\(jsonData.count) bytes):")
                 // Truncate to avoid flooding logs — print first and last 500 chars
                 if jsonStr.count > 1200 {
                     BackgroundSyncLogger.logDebug("[AIService]   \(jsonStr.prefix(500))...TRUNCATED...\(jsonStr.suffix(500))")
@@ -284,7 +302,7 @@ extension AIService {
             }
         }
 
-        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: calling sendCompletionsWithToolsDirect...")
+        BackgroundSyncLogger.logDebug("[AIService] \(label): calling sendCompletionsWithToolsDirect...")
         let response: CompletionsResponse
         do {
             response = try await backend.sendCompletionsWithToolsDirect(request, onSSEEvent: onSSEEvent, invocation: invocation)
@@ -294,7 +312,7 @@ extension AIService {
             if inDemo {
                 await MainActor.run { DemoModeStore.shared.refundCall() }
             }
-            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: stopped — AI turned off")
+            BackgroundSyncLogger.logDebug("[AIService] \(label): stopped — AI turned off")
             return Self.inlineEditWithAIOff
         } catch {
             if inDemo, DemoModeStore.shouldRefund(for: error) {
@@ -302,26 +320,26 @@ extension AIService {
             }
             throw error
         }
-        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: sendCompletionsWithToolsDirect returned — assistant=\(response.assistant != nil) error=\(response.error ?? "nil")")
+        BackgroundSyncLogger.logDebug("[AIService] \(label): sendCompletionsWithToolsDirect returned — assistant=\(response.assistant != nil) error=\(response.error ?? "nil")")
 
         guard let text = response.assistant, !text.isEmpty else {
-            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: no assistant text (error=\(response.error ?? "nil"))")
+            BackgroundSyncLogger.logDebug("[AIService] \(label): no assistant text (error=\(response.error ?? "nil"))")
             throw InlineEditFailure(message: response.error ?? "No response from AI.")
         }
 
-        BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: raw response length=\(text.count)")
+        BackgroundSyncLogger.logDebug("[AIService] \(label): raw response length=\(text.count)")
         BackgroundSyncLogger.logDebug("[AIService]   response preview: \(text.prefix(200))")
 
         guard let result = Self.parseInlineEditResponse(text) else {
             // Not the compose edit JSON: the edit failed, and the draft stays as it was.
-            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit: response is not the compose edit JSON (\(text.count) chars)")
+            BackgroundSyncLogger.logDebug("[AIService] \(label): response is not the compose edit JSON (\(text.count) chars)")
             throw InlineEditFailure(message: "The edit could not be read. Please try again.")
         }
         if DebugModeManager.isLoggingEnabled() {
             let toDesc = result.toDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
             let ccDesc = result.ccDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
             let bccDesc = result.bccDelta.map { "+\($0.adds.recipients.count)/-\($0.removes.count)\($0.clearsField ? "*" : "")" } ?? "nil"
-            BackgroundSyncLogger.logDebug("[AIService] performInlineEdit PARSED: response=\(result.response?.prefix(60) ?? "nil") subject=\(result.subject?.prefix(40) ?? "nil") bodyLen=\(result.body?.count ?? 0) to=\(toDesc) cc=\(ccDesc) bcc=\(bccDesc)")
+            BackgroundSyncLogger.logDebug("[AIService] \(label) PARSED: response=\(result.response?.prefix(60) ?? "nil") subject=\(result.subject?.prefix(40) ?? "nil") bodyLen=\(result.body?.count ?? 0) to=\(toDesc) cc=\(ccDesc) bcc=\(bccDesc)")
         }
         return result
     }

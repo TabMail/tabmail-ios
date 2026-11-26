@@ -9,14 +9,15 @@ import GRDB
 /// [mic] [field] [Send]. The field holds only the user's words: the ready AI Suggestion waits as a
 /// ghost bubble in the chat (`ChatSuggestionBubble`), and a tap on it opens the compose card.
 /// What the words mean is decided by where they are sent, never by the AI guessing (decision 10,
-/// amended 2026-11-25): Send in the closed field writes the email to the people of this chat, a
-/// compose edit with the words as its request (`EmailReplyTool.composeFromField`), never a message
-/// to the agent; the words typed in the open TabMail panel go to the agent. Under the empty field
-/// an "e.g." line shows a change the user could ask for (`example`); a tap puts it in the field and
-/// never sends it.
+/// amended 2026-11-25 and 2026-11-26): the closed field's words are always the user's own message,
+/// in the way they would text it. Send there puts them up at once as the user's bubble, and the
+/// email that says them is written to the people of this chat (`ChatFieldCompose`),
+/// never a message to the agent; the words typed in the open TabMail panel go to the agent. Under
+/// the empty field an "alt: " line offers another reply the user could send instead (`alternative`);
+/// a tap puts it in the field and never sends it.
 struct ChatReplyField {
-    /// The change the "e.g." line offers; nil shows no line.
-    let example: String?
+    /// The other reply the "alt: " line offers; nil shows no line.
+    let alternative: String?
     /// The reply goes only to these people; nil for Reply All.
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, the step's move in the read-only field (part 2); nil, none.
@@ -33,9 +34,6 @@ struct ChatReplyField {
     /// equivalent, offered on the element VoiceOver focuses (`showChatAction`); nil offers nothing
     /// (the panel open, the tutorial except at its drag-up step).
     var showChat: (() -> Void)? = nil
-    /// The full email of the AI Suggestion the chat shows now (`cachedReply`); nil when no ghost
-    /// shows. A request sent while it shows is a compose edit of it (`ChatFieldReply.suggestion`).
-    var suggestion: ReplyResult? = nil
     /// A new email's chat (`ChatNewThreadView`): the field has no email to reply to; nil in a
     /// thread's chat.
     var newEmail: ChatNewEmailField? = nil
@@ -48,24 +46,22 @@ struct ChatReplyField {
         newEmail?.attach ?? attach
     }
 
-    var placeholder: String {
-        newEmail != nil ? ChatNewEmailField.placeholder : Self.writePlaceholder
-    }
-
-    /// The closed field's hint: what its Send does, write the email to the people (a no-reply
-    /// sender's too; the chat says replies won't be read).
-    static let writePlaceholder = "Write your reply"
+    /// The closed field's hint, a thread's and a new email's alike: its words are the user's own
+    /// message, which its Send writes as the email to the people (a no-reply sender's too; the chat
+    /// says replies won't be read).
+    static let writePlaceholder = "Write your message"
     /// The open TabMail panel's hint in a chat: its words go to TabMail, about this chat.
     static let panelPlaceholder = "Ask TabMail"
 
-    /// The ready AI Suggestion of the thread's newest email, the one value the ghost bubble, the
-    /// "e.g." line and the field's edit all read (`MessageHeader.suggestion`): shown while its full
+    /// The ready AI Suggestion of the thread's newest email, the one value the ghost bubble and the
+    /// "alt: " line read (`MessageHeader.suggestion`): shown while its full
     /// reply and its text version are stored. Nothing on the user's turn, for a no-reply sender,
     /// or while the reply goes only to people chosen in Reply to (`onlyTo`): the suggestion was
     /// written for everyone.
-    /// Nothing while "Writing your email" runs (`writing`) or a compose card is open (`cardOpen`):
-    /// a suggestion that became ready meanwhile shows once the card closes without sending (a send
-    /// makes it the user's turn). Words in the field never hide it: it waits as the ghost.
+    /// Nothing while the field's Send writes its email (`writing`: the user's own bubble stands in
+    /// its place) or a compose card is open (`cardOpen`): a suggestion that became ready meanwhile
+    /// shows once the card closes without sending (a send makes it the user's turn). Words in the
+    /// field never hide it: it waits as the ghost.
     static func shown(
         newest: MessageHeader, usersTurn: Bool, onlyTo: [ChatThread.Person]?,
         writing: Bool = false, cardOpen: Bool = false
@@ -76,14 +72,14 @@ struct ChatReplyField {
         return suggestion
     }
 
-    /// The "e.g." line's change: while the AI Suggestion shows (`shown`), the change command that
-    /// came with it, so the example fits the reply on screen; otherwise, or when the suggestion
-    /// has none, the chat's configured example (`ChatSuggestionConfig.randomExample`).
-    static func example(shown: ReplyResult?, configured: String?) -> String? {
-        if let command = shown?.changeCommand?.trimmingCharacters(in: .whitespacesAndNewlines), !command.isEmpty {
-            return command
+    /// The "alt: " line's reply: while the AI Suggestion shows (`shown`), the other reply that came
+    /// with it, one line in the user's voice that goes the other way (stored in the suggestion's
+    /// one-line slot, `ReplyResult.changeCommand`); nil when no suggestion shows or it has none.
+    static func alternative(shown: ReplyResult?) -> String? {
+        guard let line = shown?.changeCommand?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
+            return nil
         }
-        return configured
+        return line
     }
 
     /// The working bubble under the newest email: `.writing` while the AI still works on the email
@@ -119,11 +115,10 @@ struct ChatReplyField {
 
 /// The field of a new email's chat (`ChatNewThreadView`): no email to reply to, so Send goes to the
 /// new email's chat, which asks who it is to or writes it; the field's words are the new email's
-/// draft; the paperclip at the field's end adds attachments. Its agent chat is its own, in memory
-/// only (`sessionKey`), never an email's thread chat or the inbox chat.
+/// draft, the user's own message as in a thread's chat; the paperclip at the field's end adds
+/// attachments. Its agent chat is its own, in memory only (`sessionKey`), never an email's thread
+/// chat or the inbox chat.
 struct ChatNewEmailField {
-    static let placeholder = "Message or ask anything"
-
     /// Where the paperclip's menu takes the user.
     enum AttachSource: CaseIterable {
         case photos, camera, files
@@ -151,13 +146,20 @@ struct ChatNewEmailField {
     let sessionKey: String
     /// Each change of the field's words.
     let wordsChanged: (String) -> Void
-    /// Send with words in the field: the chat decides (`ChatNewDraft.send`). It returns the people
-    /// the email is written to, read at the tap, and the field's words are the request of the new
-    /// email's compose edit, as a reply's are (`EmailComposeTool.composeFromField`, never the
-    /// agent); nil when the chat asked who it is to, and the words stay as they are.
-    let send: (String) -> [ChatThread.Person]?
+    /// Send with words in the field: the chat decides (`ChatNewDraft.send`). It returns whom the
+    /// email is written to and under what subject, read at the tap, and the field's words are the
+    /// message the new email says, as a reply's are (`ChatFieldCompose.newEmail`, never the agent);
+    /// nil when the chat asked who it is to, and the words stay as they are.
+    let send: (String) -> Write?
     /// A choice in the paperclip's menu.
     let attach: (AttachSource) -> Void
+
+    /// Whom a new email's Send writes to: the people picked in the chat, and the subject the chat
+    /// shows ("" when it shows none: the email written gives one).
+    struct Write: Equatable {
+        let people: [ChatThread.Person]
+        let subject: String
+    }
 
     /// A new email's chat session key: a fresh one for each new email's chat.
     static func newSessionKey() -> String { "\(sessionKeyPrefix)\(UUID().uuidString)" }
@@ -223,17 +225,18 @@ struct ChatFieldFill: Equatable {
         /// transcript's last write (the change counter).
         case heard(String)
         /// The words become this text: the user's edit of the input, or words the app puts in for
-        /// them (an Edit of an earlier message, or the "e.g." line's change).
+        /// them (an Edit of an earlier message, or the "alt: " line's reply).
         case put(String)
         /// Send from the open sheet: the words go, and nothing is left to complete.
         case sentFromSheet
-        /// Send from the collapsed field: the words stay, pulsing, until the send completes.
+        /// Send from the collapsed field: the words are kept, held for the send (they show as the
+        /// user's bubble, not in the field), until the send completes or hands them back.
         case sentFromField
         /// The open send completed (its compose card's reply went out): it empties the words only
         /// if a send is open and they are still the words sent, or none.
         case completed
-        /// The field's send finished with something written (its compose card closed, or an edit
-        /// stored in place whose card never opened), or the agent answered it (the tutorial's scripted request):
+        /// The field's send finished with something written (its compose card closed), or the
+        /// agent answered it (the tutorial's scripted request):
         /// `completed`, unless a compose card opened for it and closed unsent; then the words are
         /// the user's again, kept and not emptied.
         case answered
@@ -241,13 +244,13 @@ struct ChatFieldFill: Equatable {
         case composeOpened
         /// A confirmation card opened the sheet: the same check, and the send is still open.
         case confirmationCard
-        /// The field's Send wrote nothing (no compose card opened, nothing stored): the send ends
-        /// and its words are the user's again, kept.
+        /// The field's Send wrote nothing (no compose card opened), or Stop ended it: the send ends
+        /// and its words are the user's again, back in the field.
         case notWritten
     }
 
     /// The words to keep for the chat (`ChatFieldWords`): the words, except a send's still in
-    /// flight (they went to the agent).
+    /// flight (they are up as the user's bubble).
     var unsent: String { holdsSentWords ? "" : words }
 
     /// The only way the words change.
@@ -355,34 +358,16 @@ struct ChatReplyTarget: Equatable {
     }
 }
 
-/// A request sent from the chat's reply field, as it was when sent (ADR-IOS-114 decision 11): the
-/// email the field replies to and who the user chose in Reply to. It travels with the request
-/// (`ToolInvocation.fieldReply`, then `ComposeRequest.fieldReply` on a reply to that email), so the
-/// chat that shows the compose card never decides who it goes to from its own state at that moment.
+/// A Send from the chat's reply field, as it was when sent (ADR-IOS-114 decision 11): the email
+/// the field replies to and who the user chose in Reply to. It travels with the Send
+/// (`ToolInvocation.fieldReply`, then `ComposeRequest.fieldReply` on its reply), so the chat that
+/// shows the compose card never decides who it goes to from its own state at that moment.
 struct ChatFieldReply: Sendable, Equatable {
-    /// The email the field showed, as it showed it: its row and that row's identity. Its AI
-    /// Suggestion belongs to this row alone, and only while the row is still this email.
+    /// The email the field showed, as it showed it: its row and that row's identity. The reply is
+    /// written to this email only while the row is still this email.
     let email: MessageHeader
     /// The addresses chosen in Reply to; nil: Reply All.
     let onlyTo: [String]?
-    /// The AI Suggestion showing when the request was sent: its full email, text version and
-    /// change command, as shown; nil when none showed. The agent's reply to that email with a
-    /// request edits it (`EmailReplyTool`), stored only over this same suggestion.
-    var suggestion: ReplyResult? = nil
-
-    /// Whether the user's choice in Reply to applies to a reply to `header`: the email the field
-    /// showed in the same account, any copy of it (another folder's), never another account's copy.
-    func audienceApplies(to header: MessageHeader) -> Bool {
-        header.accountId == email.accountId && ChatThread.copyKey(header) == ChatThread.copyKey(email)
-    }
-
-    /// Whether a reply to `header` is the field's own reply, the card its send asked for: `header`
-    /// is the email the field showed, any copy of it, in any account (`ChatThread.copyKey`). Unlike
-    /// the audience, it holds across accounts: the user asked for this reply in the field, so its
-    /// card owns the send's completion (`ChatFieldFill.Change.composeOpened`).
-    func isOwnReply(to header: MessageHeader) -> Bool {
-        ChatThread.copyKey(header) == ChatThread.copyKey(email)
-    }
 }
 
 /// A send from the chat's reply field, read once as it starts: the email it is about and who the
@@ -390,11 +375,9 @@ struct ChatFieldReply: Sendable, Equatable {
 struct ChatFieldSend {
     let message: MessageHeader
     let onlyTo: [ChatThread.Person]?
-    /// The AI Suggestion showing as the send started (`ChatReplyField.suggestion`).
-    var suggestion: ReplyResult? = nil
 
     var fieldReply: ChatFieldReply {
-        ChatFieldReply(email: message, onlyTo: onlyTo?.map(\.address), suggestion: suggestion)
+        ChatFieldReply(email: message, onlyTo: onlyTo?.map(\.address))
     }
 }
 
@@ -595,15 +578,18 @@ struct ChatReadyReply: Identifiable {
     }
 }
 
-/// The AI Suggestion's ghost the user tapped, held in its place in the chat while its compose card
-/// is up, so the chat behind the card still shows it as the card opens and closes. UI only: the
-/// send itself is the card's, persisted to the outbox before the card closes. The hold ends once
-/// the card has finished closing: at once if nothing was sent, or if the chat does not show this
-/// send as its bubble (`showsBubble`); after a send it shows, once the reply shows (its outbox
-/// bubble, or the sent email itself), and the ghost turns into that bubble.
+/// The AI Suggestion's ghost the user tapped, or the user's own message the field's Send wrote
+/// (`isMessage`), held in its place in the chat while its compose card is up, so the chat behind
+/// the card still shows it as the card opens and closes. UI only: the send itself is the card's,
+/// persisted to the outbox before the card closes. The hold ends once the card has finished
+/// closing: at once if nothing was sent, or if the chat does not show this send as its bubble
+/// (`showsBubble`); after a send it shows, once the reply shows (its outbox bubble, or the sent
+/// email itself), and the held bubble turns into that bubble.
 struct ChatHeldGhost: Equatable {
-    /// The ghost's words, as it showed them.
+    /// The bubble's words, as it showed them.
     let text: String
+    /// The user's own message from the field (`ChatFieldMessageBubble`), not the ghost.
+    var isMessage = false
     /// The chat shows this card's send as its bubble (`ChatThreadView.composeScreen`).
     let showsBubble: Bool
     /// The card sent the reply.
@@ -617,28 +603,25 @@ struct ChatHeldGhost: Equatable {
         cardClosed && (!sent || !showsBubble || replyShows)
     }
 
-    /// Ending turns the ghost into the sent reply's bubble (else it simply goes).
+    /// Ending turns the held bubble into the sent reply's bubble (else it simply goes).
     var morphs: Bool { sent && showsBubble }
 }
 
-/// The AI Suggestion's bubble while the closed field's Send writes the email (ADR-IOS-114 decision
-/// 10, amended 2026-11-25), one path whatever is written: the suggestion the ghost showed at Send
-/// stays in its place, pulsing (with none, the working bubble shows); the email written lands in
-/// it; it stays there to be read (`ChatSuggestionConfig.writtenHold`); then its compose card opens
-/// and the bubble is held while the card is up (`ChatHeldGhost`). UI only, from Send until the
-/// card is taken or the send ends.
-struct ChatFieldWriting: Equatable {
-    /// The ghost's words as Send was tapped; nil when no suggestion showed.
-    let shown: String?
-    /// The text version of the email written, once it has landed.
-    var written: String?
-
-    /// The bubble's words: the email written once it has landed, else the suggestion shown at
-    /// Send; nil: the working bubble.
-    var text: String? { written ?? shown }
+/// The user's own message while the closed field's Send writes its email (ADR-IOS-114 decision 10,
+/// amended 2026-11-26): the words, verbatim, go up at once as the user's bubble in the AI
+/// Suggestion's place (a ghost showing gives way to it), and the bubble pulses while the email is
+/// written; written, it stops, stays to be read (`ChatSuggestionConfig.writtenHold`), then the
+/// compose card opens and the bubble is held behind it (`ChatHeldGhost`). Stop, or nothing
+/// written, takes it away and the words are back in the field. UI only, from Send until the card is
+/// taken or the send ends.
+struct ChatFieldMessage: Equatable {
+    /// The words sent, as they were in the field.
+    let text: String
+    /// The email that says them is written.
+    var written = false
 
     /// The bubble pulses while the email is written.
-    var pulses: Bool { written == nil }
+    var pulses: Bool { !written }
 }
 
 /// A reply in the outbox the chat does not show as an email yet, shown as the user's bubble at the
@@ -650,8 +633,9 @@ struct ChatFieldWriting: Equatable {
 /// with its body when it was sent unchanged, from its first value; otherwise the summary made at
 /// Send, "Summarizing" until then.
 ///
-/// The hand-over from the ghost: a ghost tapped open is held in its place while its card is up
-/// (`ChatHeldGhost`), and after a send it turns into this bubble.
+/// The hand-over from the ghost or the field's message: a ghost tapped open, or the user's own
+/// message the field's Send wrote, is held in its place while its card is up (`ChatHeldGhost`),
+/// and after a send it turns into this bubble.
 ///
 /// The hand-over to the sent email: once the provider takes the email the send stamps `sentAt`, then
 /// writes the optimistic Sent copy under the row's Message-ID. The chat's list of emails is not

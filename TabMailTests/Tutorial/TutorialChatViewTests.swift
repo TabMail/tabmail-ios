@@ -178,7 +178,7 @@ struct TutorialChatViewContentTests {
         typealias C = TutorialCoordinator
         let moves: [C.FieldMove?] = [nil, .tapSuggestion, .dragUp]
         for move in moves {
-            let hint = DynamicIslandChat.tutorialDragHint(ChatReplyField(example: nil, tutorialMove: move))
+            let hint = DynamicIslandChat.tutorialDragHint(ChatReplyField(alternative: nil, tutorialMove: move))
             #expect(hint == (move == .dragUp ? "Drag up to ask TabMail" : nil), "\(String(describing: move))")
         }
     }

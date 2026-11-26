@@ -288,6 +288,16 @@ struct AISettingAppliesToEveryRequestTests {
             instruction: "Make it shorter.", chatHistory: [])
     }
 
+    /// The chat view's closed field's request (ADR-IOS-114 decision 10, amended 2026-11-26).
+    private func composeText(_ service: AIService) async throws -> InlineEditResult {
+        let context = ComposeEditContext(
+            recipients: ["recipient@example.com"], toRecipients: ["recipient@example.com"], ccRecipients: [], bccRecipients: [],
+            toDisplayNames: [:], ccDisplayNames: [:], bccDisplayNames: [:], senderName: "Sender", senderEmail: "sender@company.com",
+            mode: ComposeTextMode.new.rawValue, compositionPrompt: "", kbText: "", relatedDate: "", relatedSubject: "",
+            relatedFrom: "", relatedTo: "", relatedCc: "", bodyText: "")
+        return try await service.performComposeText(.new, userText: "can we meet thursday?", subject: Self.draftSubject, context: context)
+    }
+
     @Test("a resumed chat turn refused after its check ends with no answer, as with AI off at the start")
     func aRefusedResumeHasNoAnswer() async throws {
         #expect(await MainActor.run { !DemoModeStore.shared.isActive })
@@ -349,10 +359,33 @@ struct AISettingAppliesToEveryRequestTests {
         }
     }
 
+    @Test("the closed field's compose text refused after its check writes no email, so the field keeps the words")
+    func aRefusedComposeTextWritesNothing() async throws {
+        #expect(await MainActor.run { !DemoModeStore.shared.isActive })
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "/completions/chat", method: "POST", response: Self.stream(Self.editAnswer))
+        let setting = AISettingSwitch()
+        let service = makeService(http, setting)
+
+        try await withRealSetting(aiOff: false) {
+            setting.turnOff()
+            let refused = try await composeText(service)
+            #expect(refused.response == AIService.inlineEditWithAIOff.response)
+            #expect(refused.subject == nil && refused.body == nil, "no email written")
+            #expect(http.recordedCalls().isEmpty)
+
+            setting.turnOn()
+            let written = try await composeText(service)
+            #expect(written.subject == "Planning" && written.body == "Thursday?")
+            #expect(http.recordedCalls().count == 1)
+        }
+    }
+
     // MARK: - Demo Mode: a refused call uses none of the budget
 
     enum DemoCall: String, CaseIterable, Sendable {
-        case send, resume, edit
+        case send, resume, edit, composeText
     }
 
     /// The Demo Mode calls used, as stored.
@@ -389,6 +422,7 @@ struct AISettingAppliesToEveryRequestTests {
         case .send: return try await service.sendChatMessage(userText: "What is on my calendar tomorrow?", history: []) == nil
         case .resume: return try await service.resumeChatMessage(request: Self.request) == nil
         case .edit: return try await inlineEdit(service).response == AIService.inlineEditWithAIOff.response
+        case .composeText: return try await composeText(service).response == AIService.inlineEditWithAIOff.response
         }
     }
 

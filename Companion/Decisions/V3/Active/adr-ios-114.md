@@ -495,6 +495,73 @@ same AI result, kept as long as the email itself is shown.
    `ChatReplyFieldTests.fieldWritingBubble` and the new email's `ended` check,
    `ChatReplyFieldRuntimeTests.clearWiring`,
    `EmailComposeToolOutcomeTests` (the `sent` outcome).
+   **Superseded 2026-11-26 (the next paragraph):** the compose edit of the closed field's words, the
+   edit of the AI Suggestion showing, the landing of the written text in the ghost and the "e.g."
+   line. The two paragraphs above stay as history.
+   **The closed field's words are the user's own message (amended 2026-11-26).** The compose edit
+   above sent the words wrapped in an instruction ("Reply to email with subject ... with request:"),
+   so the model read them as a request about a reply: it could answer them, or describe them, instead
+   of saying them, and with an AI Suggestion showing it edited that suggestion. Now the words, typed
+   or said, are the user's own message, as a text message is, and the email says exactly them.
+   - **The field.** Its placeholder is "Write your message" (`ChatReplyField.writePlaceholder`; a
+     new email's chat the same). While an AI Suggestion shows, the line under the field reads
+     "alt: " and a one-line alternative reply (`ChatSuggestionConfig.alternativeLine`,
+     `ChatReplyField.alternative(shown:)`, `DynamicIslandChat.alternativeLineId`); a tap puts its
+     text in the field and sends nothing. The alternative is the suggestion's `change_command`,
+     which the reply precache already returns, now defined as at most ten words, no greeting or
+     quotes, the opposite of the suggestion's body; it is kept in the same column
+     (`ReplyResult.changeCommand`, v108), so no migration. With no suggestion showing there is no
+     line. The configured "e.g." lists and their random pick are deleted
+     (`ChatSuggestionConfig.replyExamples`, `newEmailExamples`, `randomExample`, `exampleLine`,
+     `DynamicIslandChat.exampleLineId`), with `ChatViewLayout.fieldPulseOpacity`/`fieldPulseDuration`
+     (the words no longer pulse in the field) and `ChatSuggestionConfig.fieldEditRewritesInPlace`.
+   - **Send.** The words go up at once, verbatim, as the user's own bubble in the AI Suggestion's
+     place (`ChatFieldMessage`, `ChatFieldMessageBubble`, `ChatThreadView.fieldSent`), pulsing
+     while the email is written; the field shows its placeholder and the status line reads "Writing
+     your email" as before. With an AI Suggestion showing, the bubble replaces it on screen; the
+     stored suggestion is not touched. The email is written by the compose-text request
+     (`AIService.performComposeText`): one system message, `system_prompt_compose_text`, no tools
+     (`disable_tools`), with the words as `user_text`, never inside an instruction, and no AI
+     Suggestion, request or edit history. Its `mode` is `text_reply` when the email the field shows
+     is someone else's, `text_followup` when it is the user's own (`PromptVariables.isSentByUser`,
+     the Sent folder included; the email goes to the same people and does not answer it), and
+     `text_new` in a new email's chat (`ComposeTextMode`). The thread modes carry that email
+     (`message` and `quotes_section` from `EmailFilter.splitMessageAndQuotes`, and its date,
+     subject and people); every mode carries the sender's name, the user's composition prompt and
+     knowledge base, the time, the subject and the draft's recipients by role. The answer is the
+     compose edit JSON, read by the code every compose edit uses
+     (`AIService.runComposeEditRequest`, shared with `performInlineEdit`;
+     `parseInlineEditResponse`): recipient changes apply only when the answer gives them
+     (`ChatFieldCompose.envelope`), a thread's subject stays, a new email takes the chat's subject
+     or the one written.
+   - **Written.** The bubble stops pulsing and stays `ChatSuggestionConfig.writtenHold` to be read
+     (`ToolInvocation.fieldWritten`, `ChatThreadView.fieldMessageWritten`); then the card opens with
+     the email, its text version the words themselves (`ReplyResult.textMessage`), so the sent email
+     shows in the chat as exactly what the user said. While the card is up the bubble is held
+     (`ChatHeldGhost.isMessage`) and turns into the sent reply as before. The reply card saves to a
+     draft of its own (`Draft.separateReplyKey`), as the ghost's card does.
+   - **Nothing written.** Stop while the bubble pulses or during the hold, a failed request (no
+     JSON, a missing field, an empty body, an HTTP error), or an email that changed since the Send
+     (the row bound to the email the field showed, `ComposeEditContext.relatedBodyText(of:db:)`):
+     the bubble goes and the words are back in the field (`ChatFieldFill.Change.notWritten`). A card
+     closed unsent keeps the words too, and a sent card completes them.
+   - **One path, no stored edit.** The field's path is its own type (`ChatFieldCompose`, `reply`
+     and `newEmail`); `EmailReplyTool` serves only the agent, and no field state reaches it
+     (`ChatFieldReply` holds the email and the Reply to choice only). Deleted:
+     `EmailReplyTool.composeFromField`, `composeWithRegisteredTool`, `finishSuggestionEdit`,
+     `StoreSuggestionEdit` and the edit in place, `EmailComposeTool.composeFromField` and its
+     registry call, `ToolInvocation.landWritten`, `ChatFieldWriting`,
+     `ChatThreadView.landFieldWritten`, `ChatSuggestionBubble(writing:)`,
+     `ChatFieldReply.audienceApplies`/`isOwnReply` and the field's `suggestion`. Nothing is stored:
+     no suggestion is rewritten and no edit history is kept (ADR-004). A new email's chat goes the
+     same way with no email, from the account bound as the Send started
+     (`ComposeOrigin.fromAccountId`), to the people picked (`ChatNewEmailField.Write`); its message
+     is held until the card's send shows.
+   Tests: `ComposeTextRequestTests` (the request's variables per mode, no tools, the words
+   verbatim), `ChatFieldComposeTests` (each mode, the hold before the card, the text version,
+   nothing stored, a failure or a changed email opens nothing, Reply to and recipient changes),
+   `AISettingAppliesToEveryRequestTests` (compose text with AI off), `ChatReplyFieldTests` (the
+   placeholder, the alternative line, `ChatFieldMessage`), `ChatNewThreadTests`.
    **The AI Reply shows only while the field holds no words of the user's, and never on the user's
    turn (decided 2026-11-07):** `ChatFieldFill.offer`. An empty field, or the AI Reply the app itself
    put there, takes the ready reply whenever it arrives, collapsed or in the open sheet; typed or
@@ -1321,6 +1388,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      and never sends it. Every Send from the field goes to the agent. When the compose prompt
      returns its own suggested change with each draft, the line will show that one while a
      suggestion shows; until then it always shows the config example.
+     *Superseded:* the placeholder and the Send (decision 10, amendments 2026-11-25 and
+     2026-11-26), and the line (2026-11-26: "alt: " and an alternative reply while a suggestion
+     shows, no line otherwise, no configured examples).
    - **Tried and reverted (2026-11-20): holding the card's bubble until the card is on screen.**
      Following an owner ruling that the bubble must never animate in while the compose card slides
      in, ComposeView briefly held the bubble's insertion until a zero-size child controller saw
@@ -1433,6 +1503,13 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      the closed field's words*). "No card opens" above is history. The tool's answer still says
      whether the suggestion was changed in place, then the card's outcome; a card that writes
      nothing after an in-place store still ends as done, since the edit is kept.
+     *Superseded 2026-11-26:* the closed field's words no longer edit the AI Suggestion; they are
+     the user's own message, written into an email by the compose-text request, and nothing is
+     stored (decision 10, *The closed field's words are the user's own message*).
+     `finishSuggestionEdit`, `StoreSuggestionEdit`, `fieldEditRewritesInPlace`,
+     `run(arguments:invocation:rewritesInPlace:)` and `ChatFieldReply.suggestion` are deleted; the
+     bullet above is history. The agent's own `email_reply` request (panel open) still runs the
+     compose edit on a fresh card.
    - **A card edit keeps the ghost.** `ComposeView.writeCachedReplyToDB` stores the edit's text
      version with its body (it cleared `replyTextMessage`); an edit with no text version still clears
      it, so a text never describes another body. Each edit turn records the text version stored with
@@ -1467,6 +1544,11 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      `ChatReplyFieldTests.exampleLine`, and the change-command checks in
      `AITextMessageCallerTests`, `SuggestionRewriteRouteTests.rewritesInPlace` and
      `ComposeSuggestionPersistTests`.
+     *Superseded 2026-11-26:* the stored value and its writers are unchanged, but its meaning and
+     its line are not. `change_command` is the one-line alternative reply (at most ten words, the
+     opposite of the body), shown as "alt: " under the field while the AI Suggestion shows
+     (`ChatReplyField.alternative(shown:)`); with none there is no line, and the configured
+     examples are deleted (decision 10, *The closed field's words are the user's own message*).
    - **The tutorial's practice edit is a whole compose result.** `TutorialChatScript.editedReply`
      returns the edited reply with its text version (`ReplyResult`), passed through the card's edit
      path like a real edit's. Before, "Make it shorter" then Discard left Priya's chat without an AI

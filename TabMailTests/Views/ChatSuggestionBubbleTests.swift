@@ -18,8 +18,9 @@ import UIKit
 ///     the card is open. The card's body is checked in the running app only (`ChatSwipeUITests`).
 ///  3. One copy: the ghost reads the email's row, so a new text version there rewrites it in place,
 ///     and the old text is gone.
-///  4. The field's Send writes into the AI Suggestion's bubble: the suggestion stays, pulsing, while
-///     the email is written; the email lands in it and stays to be read; then its card opens.
+///  4. The field's Send: the words go up at once, verbatim, as the user's own bubble in the AI
+///     Suggestion's place, pulsing while the email is written, still once written; then its card
+///     opens. Closed unsent, the AI Suggestion is back unchanged (nothing stored) and so are the words.
 ///  5. The chat view says "AI Suggestion", never "AI Reply", in any string a user sees or hears.
 @Suite("The chat's AI Suggestion", .serialized, .processGlobalState)
 @MainActor
@@ -148,11 +149,10 @@ struct ChatSuggestionBubbleTests {
             let labels = HostedAccessibility.labels(in: chat.view)
             let texts = Self.fieldTexts(chat.view)
             #expect(!texts.isEmpty && texts.allSatisfy { $0.isEmpty }, "the field holds no AI text: \(texts)")
-            #expect(HostedAccessibility.identifiers(in: chat.view).contains(DynamicIslandChat.exampleLineId),
-                    "the empty field shows its e.g. line")
-            let example = labels.first { $0.hasPrefix("e.g. ") }
-            let picked = try #require(example.map { String($0.dropFirst("e.g. ".count)) }, "the line reads e.g.: \(labels)")
-            #expect(ChatSuggestionConfig.replyExamples.contains(picked), "from the config set: \(picked)")
+            #expect(!labels.contains { $0.hasPrefix("e.g. ") }, "no configured example: \(labels)")
+            // No alternative stored with this suggestion: no line under the field.
+            #expect(!HostedAccessibility.identifiers(in: chat.view).contains(DynamicIslandChat.alternativeLineId),
+                    "no alternative, no line")
         }
     }
 
@@ -240,23 +240,23 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    // MARK: - 4. The field's Send writes into the AI Suggestion's bubble
+    // MARK: - 4. The field's Send: the user's own message replaces the AI Suggestion
 
-    /// The compose edit a closed field's Send runs, answered only once the test lets it go, so the
-    /// bubble can be seen while the email is written. Bounded: never held past ten seconds.
-    final class HeldComposeEdit: @unchecked Sendable {
+    /// The compose text request a closed field's Send runs, answered only once the test lets it go,
+    /// so the bubble can be seen while the email is written. Bounded: never held past ten seconds.
+    final class HeldComposeText: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         let release = DispatchSemaphore(value: 0)
         static let written = ReplyResult(
             body: "Hi Sam,\n\nTuesday is fine, see you then.\n\nMe", textMessage: "Tuesday is fine, see you then.",
-            changeCommand: "suggest Monday")
+            changeCommand: "Could we do Wednesday instead?")
 
         init() {
             http.register(path: "/completions/chat", method: "POST") { [release] _ in
                 _ = release.wait(timeout: .now() + 10)
                 let final: [String: Any] = ["assistant": ComposeEditJSON.make(
-                    response: "Done.", subject: "", body: HeldComposeEdit.written.body,
-                    textMessage: HeldComposeEdit.written.textMessage ?? "", changeCommand: HeldComposeEdit.written.changeCommand ?? "")]
+                    response: "Done.", subject: "", body: HeldComposeText.written.body,
+                    textMessage: HeldComposeText.written.textMessage ?? "", changeCommand: HeldComposeText.written.changeCommand ?? "")]
                 let text = String(decoding: try! JSONSerialization.data(withJSONObject: final), as: UTF8.self)
                 return .bytes(Data("event: final\ndata: \(text)\n\n".utf8), contentType: "text/event-stream")
             }
@@ -264,6 +264,14 @@ struct ChatSuggestionBubbleTests {
 
         var service: AIService {
             AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        }
+
+        /// The system message of every request received, in order.
+        var messages: [[String: Any]] {
+            http.recordedCalls().compactMap { call in
+                let object = call.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+                return (object?["messages"] as? [[String: Any]])?.first
+            }
         }
     }
 
@@ -275,12 +283,20 @@ struct ChatSuggestionBubbleTests {
         }
     }
 
-    /// ADR-IOS-114 decision 10, amended 2026-11-25: one path for whatever the field's Send writes.
-    /// Before, an edit of the suggestion took the ghost away while it was written, then either
-    /// changed it with no card or opened the card at once.
-    @Test("A field Send: the ghost stays in its place, pulsing, while the email is written; the email lands in it and stays to be read; then its card opens with the ghost held behind it")
-    func fieldSendWritesIntoTheGhost() async throws {
-        let backend = HeldComposeEdit()
+    /// The user's own message from the field, being written or written.
+    private static func messageBubble(in view: UIView) -> NSObject? {
+        HostedAccessibility.elements(under: view).first {
+            let id = HostedAccessibility.identifier(of: $0)
+            return id == ChatFieldMessageBubble.writingId || id == ChatFieldMessageBubble.bubbleId
+        }
+    }
+
+    /// ADR-IOS-114 decision 10, amended 2026-11-26: the closed field's words are the user's own
+    /// message. Before, Send was an edit request about the AI Suggestion, which stayed in its place
+    /// while the edit was written and was then replaced in the database by the edit.
+    @Test("A field Send: the words go up at once, verbatim, as the user's bubble in the AI Suggestion's place, pulsing while the email is written; still once written; then its card opens with the bubble held behind it; closed unsent, the AI Suggestion is back unchanged and so are the words")
+    func fieldSendShowsTheUsersMessage() async throws {
+        let backend = HeldComposeText()
         ChatPillState.shared.aiService = backend.service
         defer {
             backend.release.signal()
@@ -289,40 +305,50 @@ struct ChatSuggestionBubbleTests {
             AgentToolRouter.shared.resetComposeQueueForTesting()
         }
         try await withChat { chat in
-            // The field's compose runs the registry's reply tool, which keeps the database it was
-            // made with (an earlier test's once one has run); it reads this chat's here.
-            try await ChatFieldWordsRuntimeTests.withReplyTool(on: chat.pool) {
-                let written = "\(ChatSuggestionConfig.label): \(HeldComposeEdit.written.textMessage ?? "")"
-                #expect(ThreadChatTests.type("Say Tuesday is fine", in: chat.view), "control: the field takes words")
-                try await Task.sleep(for: .milliseconds(300))
-                #expect(HostedAccessibility.activate("chatSend", in: chat.view), "control: Send takes a tap")
+            let words = "tuesday is fine see you then"
+            let writing = "You said: \(words), writing your email"
+            let written = "You said: \(words)"
+            #expect(ThreadChatTests.type(words, in: chat.view), "control: the field takes words")
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(HostedAccessibility.activate("chatSend", in: chat.view), "control: Send takes a tap")
 
-                // While it is written: the suggestion stays in its place, "Writing" under it.
-                let writing = "\(ChatSuggestionConfig.writingLine): \(Self.ready)"
-                try await Self.waitUntil { Self.suggestionBubble(in: chat.view)?.accessibilityLabel == writing }
-                let bubble = Self.suggestionBubble(in: chat.view)
-                #expect(bubble?.accessibilityLabel == writing,
-                        "the suggestion shown stays, pulsing: \(String(describing: bubble?.accessibilityLabel))")
-                #expect(bubble.flatMap { HostedAccessibility.identifier(of: $0) } == ChatSuggestionWorkingBubble.bubbleId)
+            // At once: the words as typed, in the user's own bubble, pulsing, where the AI
+            // Suggestion was; the suggestion is gone and the field shows only its hint.
+            try await Self.waitUntil { Self.messageBubble(in: chat.view)?.accessibilityLabel == writing }
+            let bubble = Self.messageBubble(in: chat.view)
+            #expect(bubble?.accessibilityLabel == writing, "the user's words, pulsing: \(String(describing: bubble?.accessibilityLabel))")
+            #expect(bubble.flatMap { HostedAccessibility.identifier(of: $0) } == ChatFieldMessageBubble.writingId)
+            #expect(Self.ghost(in: chat.view) == nil && Self.suggestionBubble(in: chat.view) == nil,
+                    "the user's bubble replaces the AI Suggestion")
+            #expect(!Self.fieldTexts(chat.view).contains(words), "the words left the field: \(Self.fieldTexts(chat.view))")
 
-                // The email written lands in it, and stays there before its card opens.
-                backend.release.signal()
-                try await Self.waitUntil { Self.suggestionBubble(in: chat.view)?.accessibilityLabel == written }
-                #expect(Self.suggestionBubble(in: chat.view)?.accessibilityLabel == written, "the email written lands in the bubble")
-                #expect(chat.controller.presentedViewController == nil, "its card waits while the email is there to read")
-                try await Self.openCard(chat)
-                #expect(Self.ghost(in: chat.view)?.accessibilityLabel == written, "the email stays in its place behind its card")
+            // Written: the same words, still, there to be read before the card opens.
+            backend.release.signal()
+            try await Self.waitUntil { Self.messageBubble(in: chat.view)?.accessibilityLabel == written }
+            #expect(Self.messageBubble(in: chat.view)?.accessibilityLabel == written, "written: the same words, still")
+            #expect(chat.controller.presentedViewController == nil, "its card waits while the message is there to read")
+            try await Self.openCard(chat)
+            #expect(Self.messageBubble(in: chat.view)?.accessibilityLabel == written, "the message stays in its place behind its card")
 
-                // Closed unsent: the edit was stored as the AI Suggestion, so the ghost still shows it.
-                chat.controller.dismiss(animated: false)
-                try await Self.waitUntil { chat.controller.presentedViewController == nil && !ActiveAgentTracker.shared.anyWorking }
-                try await Self.waitUntil { Self.ghost(in: chat.view)?.accessibilityLabel == written }
-                #expect(Self.ghost(in: chat.view)?.accessibilityLabel == written, "the ghost shows the edit")
-                let stored = try await chat.pool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
-                #expect(stored?.replyTextMessage == HeldComposeEdit.written.textMessage, "the edit is the stored suggestion")
-                let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
-                #expect(queued == 0, "nothing was sent")
-            }
+            // The request: the words verbatim, as the compose text's user text.
+            let sent = backend.messages
+            #expect(sent.count == 1, "one request: \(sent.count)")
+            #expect(sent.first?["content"] as? String == "system_prompt_compose_text")
+            #expect(sent.first?["user_text"] as? String == words, "the words as typed")
+
+            // Closed unsent: the user's bubble goes, the AI Suggestion is back as it was, nothing
+            // was stored or sent, and the words are the user's again.
+            chat.controller.dismiss(animated: false)
+            try await Self.waitUntil { chat.controller.presentedViewController == nil && !ActiveAgentTracker.shared.anyWorking }
+            try await Self.waitUntil { Self.ghost(in: chat.view)?.accessibilityLabel == "AI Suggestion: \(Self.ready)" }
+            #expect(Self.ghost(in: chat.view)?.accessibilityLabel == "AI Suggestion: \(Self.ready)", "the AI Suggestion, unchanged")
+            #expect(Self.messageBubble(in: chat.view) == nil, "the user's bubble is gone")
+            let stored = try await chat.pool.read { try MessageHeader.fetchOne($0, key: chat.email.id) }
+            #expect(stored?.replyTextMessage == Self.ready && stored?.cachedReply == Self.fullReply, "nothing stored over the suggestion")
+            let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
+            #expect(queued == 0, "nothing was sent")
+            try await Self.waitUntil { Self.fieldTexts(chat.view).contains(words) }
+            #expect(Self.fieldTexts(chat.view).contains(words), "the words are back in the field: \(Self.fieldTexts(chat.view))")
         }
     }
 

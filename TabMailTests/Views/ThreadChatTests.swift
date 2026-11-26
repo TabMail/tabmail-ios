@@ -76,9 +76,9 @@ struct ThreadChatTests {
 
     /// The fake backend: answers each chat request "Answer N" (N counts the answers), or, for a
     /// request whose words contain `cardWords`, raises a template card first and answers
-    /// "Template saved." once it is answered; a compose edit (the chat view's closed field) is
+    /// "Template saved." once it is answered; the chat view's closed field's compose text request is
     /// answered with `composed`. `hold` keeps the first round until signalled; `holdAnswers` keeps
-    /// every plain answer and compose edit until signalled (`asked` says it arrived).
+    /// every plain answer and field compose until signalled (`asked` says it arrived).
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
         let asked = DispatchSemaphore(value: 0)
@@ -96,9 +96,9 @@ struct ThreadChatTests {
                 let body = String(decoding: request.body ?? Data(), as: UTF8.self)
                 record.bodies.withLock { $0.append(body) }
                 let final: [String: Any]
-                if body.contains(Backend.composeEditPrompt) {
-                    // The chat view's closed field: its words are the reply's compose edit, held as
-                    // the answers are.
+                if body.contains(Backend.fieldComposePrompt) {
+                    // The chat view's closed field: its words are the user's own message, written
+                    // into the email by the compose text request, held as the answers are.
                     if holdAnswers {
                         asked.signal()
                         _ = proceed.wait(timeout: .now() + 20)
@@ -140,8 +140,8 @@ struct ThreadChatTests {
             AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
         }
 
-        static let composeEditPrompt = "system_prompt_compose_interactive"
-        /// The reply the compose edit writes.
+        static let fieldComposePrompt = "system_prompt_compose_text"
+        /// The reply the field's compose text request writes.
         static let composed = ReplyResult(body: "Hi,\n\nFriday works.\n\nMe", textMessage: "Friday works.", changeCommand: "suggest Monday")
 
         /// The request bodies, in order.
@@ -191,7 +191,7 @@ struct ThreadChatTests {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
                 replyField: inChatView && host.message != nil
-                    ? ChatReplyField(example: nil) : nil)
+                    ? ChatReplyField(alternative: nil) : nil)
             .environment(\.hasTabMailSession, true)
         }
     }

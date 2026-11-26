@@ -251,7 +251,7 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("An empty new email's field takes focus and has its mic, the paperclip and an e.g. line from the new-email set")
+    @Test("An empty new email's field takes focus and has its mic and the paperclip, with no line under it")
     func emptyFieldReady() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await emptyFieldReadyBody() }
@@ -265,13 +265,9 @@ struct ChatNewThreadScreenTests {
             try await Self.waitUntil { Self.editableField(in: screen.view)?.isFirstResponder == true }
             let focused = Self.editableField(in: screen.view)?.isFirstResponder == true
             #expect(focused, "the field takes focus as the chat opens")
-            let lines = Self.labels(of: DynamicIslandChat.exampleLineId, in: screen.view)
-            let offered = ChatSuggestionConfig.newEmailExamples.map(ChatSuggestionConfig.exampleLine)
-            let replies = ChatSuggestionConfig.replyExamples.map(ChatSuggestionConfig.exampleLine)
-            let fromNewEmail = !lines.isEmpty && lines.allSatisfy { offered.contains($0) }
-            let fromReplies = lines.contains { replies.contains($0) }
-            #expect(fromNewEmail, "the e.g. line is a new-email example: \(lines)")
-            #expect(!fromReplies, "never a reply's: \(lines)")
+            // A new email has no AI Suggestion, so nothing offers an alternative under the field.
+            let lines = Self.labels(of: DynamicIslandChat.alternativeLineId, in: screen.view)
+            #expect(lines.isEmpty, "no line under the field: \(lines)")
             let labels = HostedAccessibility.labels(in: screen.view)
             let hasMic = labels.contains("Dictate") || labels.contains("Stop dictation")
             #expect(hasMic, "the field has its mic: \(labels.prefix(24))")
@@ -298,9 +294,7 @@ struct ChatNewThreadScreenTests {
             #expect(abs(mic.midX - micAtStart) < 1, "the mic keeps its place at the row's start: \(mic), row \(row)")
             #expect(abs(send.width - ChatViewLayout.fieldTapSize) < 1, "Send keeps its width: \(send.width)")
             #expect(abs(mic.width - ChatViewLayout.fieldTapSize) < 1, "the mic keeps its width: \(mic.width)")
-            // With the e.g. line under the words, the paperclip stays on Send's line, level with
-            // Send and the mic, not up on the words' first line.
-            #expect(fromNewEmail, "control: the e.g. line shows")
+            // The paperclip stays on Send's line, level with Send and the mic.
             #expect(abs(clip.midY - send.midY) < 1, "the paperclip is level with Send: \(clip) \(send)")
             #expect(abs(clip.midY - mic.midY) < 1, "and with the mic: \(clip) \(mic)")
         }

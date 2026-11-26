@@ -342,27 +342,25 @@ final class AgentToolRouter {
         /// showing that chat takes the request (`takeCompose(for:)`), so the card opens
         /// on the screen that asked, built by that screen.
         let origin: ComposeOrigin
-        /// A `.reply`'s written email as one value: the stored AI Suggestion it opened on (the whole
+        /// The written email as one value: a `.reply`'s stored AI Suggestion it opened on (the whole
         /// stored value, so an edit in the card compares against exactly what is stored), or the
-        /// email the chat's closed reply field had written, with the text version and change
-        /// command its compose edit returned (`EmailReplyTool.composeFromField`). Nil when the card
-        /// opens on `body` alone.
+        /// email the chat view's closed field had written, with the user's words as its text version
+        /// and the alternative its request returned (`ChatFieldCompose`). Nil when the card opens
+        /// on `body` alone.
         let suggestion: ReplyResult?
         /// A `.reply` built from the reply-all recipient set (the AI reply
         /// tool). Carried into ComposeView so the send records reply-all on
         /// the original, like the Reply All button (#915).
         let isReplyAll: Bool
-        /// A reply asked for in the chat's reply field, to the email the field replies to: who the
-        /// user chose in Reply to when the request was sent (ADR-IOS-114 decision 11). Nil for
-        /// every other request, whose compose keeps the recipients above.
+        /// The reply the chat view's closed field wrote (`ChatFieldCompose.reply`): who the user chose
+        /// in Reply to when the Send started (ADR-IOS-114 decision 11). Nil for every other request.
         let fieldReply: ChatFieldReply?
-        /// The card is the reply the chat's reply field asked for (`ChatFieldReply.isOwnReply`): the
-        /// email the field showed, any copy, in any account, whoever it goes to. Decided once by the
-        /// reply tool; the field's words (`AgentToolRouter.enqueueComposeAndAwaitOutcome`) and the
-        /// chat that opens the card (its closing answer opens nothing) both read it.
+        /// The card is the reply the chat view's closed field wrote (`ChatFieldCompose.reply`): the
+        /// field's words (`AgentToolRouter.enqueueComposeAndAwaitOutcome`) and the chat that opens
+        /// the card (its held bubble, its closing answer opening nothing) both read it.
         let isFieldsOwnReply: Bool
-        /// The draft the card saves to; nil, the reply's usual one. An edit of the AI Suggestion
-        /// opens on the suggestion's own draft (`Draft.separateReplyKey`), as the ghost's card does.
+        /// The draft the card saves to; nil, the reply's usual one. The field's reply opens on a draft
+        /// of its own (`Draft.separateReplyKey`), as the ghost's card does.
         let draftId: String?
 
         /// Fires once when the user's compose session reaches a terminal state
@@ -713,9 +711,8 @@ extension AgentToolRouter {
     /// recipients and body in memory until some later take.
     ///
     /// `fieldWordsKey`: the request was sent from the chat's reply field under this chat key
-    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`ComposeRequest.isFieldsOwnReply`,
-    /// `ChatFieldReply.isOwnReply`, decided apart from who it goes to) marks the field composing
-    /// there, and a sent card completes the field's send there, in `ChatFieldWords`, whether or not
+    /// (`ToolInvocation.fieldWordsKey`). The field's own reply card (`ComposeRequest.isFieldsOwnReply`)
+    /// marks the field composing there, and a sent card completes the field's send there, in `ChatFieldWords`, whether or not
     /// a chat view still shows it (ADR-IOS-117).
     func enqueueComposeAndAwaitOutcome(
         fieldWordsKey: String? = nil,

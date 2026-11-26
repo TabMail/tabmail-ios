@@ -7,13 +7,13 @@ import Foundation
 import GRDB
 @testable import TabMail
 
-/// A reply the chat's reply field asked for with only some people chosen in Reply to (ADR-IOS-114
-/// decision 11): its words are written for the people chosen; the email's stored AI Suggestion,
-/// written for its whole Reply All audience, never stands in for them; and none of the card's words
-/// is stored as that suggestion, whether the agent wrote them, the user edited them, or Recompute
-/// wrote new ones. `.processGlobalState`: the tool reads the shared demo state
-/// (`DemoToolGuard.headerAccessible`), which other suites hold across suspensions.
-@Suite("Who the agent's reply is written for", .serialized, .processGlobalState)
+/// A reply the chat's reply field writes with only some people chosen in Reply to (ADR-IOS-114
+/// decisions 10 and 11): its words are written for the people chosen, as the account the email was
+/// received in; the email's stored AI Suggestion, written for its whole Reply All audience, never
+/// stands in for them; and none of the card's words is stored as that suggestion, whether the user
+/// edited them or Recompute wrote new ones. `.processGlobalState`: the field's compose reads the
+/// shared prompt store (`PromptStore.shared`), which other suites change.
+@Suite("Who the field's narrowed reply is written for", .serialized, .processGlobalState)
 @MainActor
 struct EmailReplyWordsTests {
     static let asked = ComposeOrigin(sessionKey: "thread:chat", screen: .chat)
@@ -22,20 +22,17 @@ struct EmailReplyWordsTests {
     /// The email's stored AI Suggestion, written for everyone.
     nonisolated static let stored = ReplyResult(
         body: "Hi all,\n\nCount us in!\n\nAlex", textMessage: "Count us in!", changeCommand: "decline instead")
+    /// The words the user sent from the field.
+    nonisolated static let words = "count me in"
     nonisolated static let written = "Hi Sam,\n\nCount me in!\n\nAlex"
     nonisolated static let writtenText = "Count me in!"
     nonisolated static let writtenCommand = "ask for the agenda"
-    /// A Device Sync reply that happens to hold the very words written for the people chosen, with
-    /// no text message or change command (`AccountManager.processOpenedMessage` stores that shape):
-    /// the value a narrowed card shows (`ComposeView.givenSuggestion`) equals it.
-    nonisolated static let sameWords = ReplyResult(body: written, textMessage: nil)
-    /// Another email's own stored suggestion.
-    nonisolated static let otherStored = ReplyResult(
-        body: "Hi all,\n\nSee you at lunch.\n\nAlex", textMessage: "See you at lunch.", changeCommand: "suggest noon")
+    /// A reply stored with the very value a narrowed field card shows (the email written, the words
+    /// as its text version, its alternative): the value the card shows (`ComposeView.givenSuggestion`)
+    /// equals it, so only the narrowed rule keeps an edit from being stored over it.
+    nonisolated static let sameWords = ReplyResult(body: written, textMessage: words, changeCommand: writtenCommand)
     /// The email's own text, distinct from its snippet.
     static let emailText = "Are you coming to the offsite on Friday?"
-    /// Everyone on the email but the user: the sender, the other To and the Cc.
-    static let everyone: Set<String> = ["sender@example.com", "alex@example.com", "sam@example.com"]
 
     final class Calls: @unchecked Sendable {
         struct Call { let context: ComposeEditContext; let subject: String; let body: String; let request: String }
@@ -50,7 +47,6 @@ struct EmailReplyWordsTests {
         let router: AgentToolRouter
         let header: MessageHeader
         let accounts: [Account]
-        let translator: MockChatIdTranslator
         let ctx: ToolContext
     }
 
@@ -82,31 +78,9 @@ struct EmailReplyWordsTests {
             }
         }
         let header = try await row(db, id)
-        let translator = MockChatIdTranslator()
-        await translator.seed(header.id, as: 1)
         let router = AgentToolRouter()
-        return Fixture(db: db, router: router, header: header, accounts: accounts, translator: translator,
-                       ctx: ToolContext(db: db, translator: translator, router: router))
-    }
-
-    /// A second email in `accountId`'s `folder`, numbered 2, holding its own stored suggestion:
-    /// another email (its own Message-ID), or a copy of the fixture email (the same one) in another
-    /// account or another folder.
-    func insertOther(
-        _ fixture: Fixture, accountId: String, own: String, subject: String, rfc822: String, folder: String = "INBOX"
-    ) async throws -> MessageHeader {
-        let inserted = try TestDatabase.insertMessageHeader(
-            fixture.db, messageId: "w2", subject: subject, to: "\(own), alex@example.com",
-            folderId: "\(accountId):\(folder)", accountId: accountId, folderPath: folder, rfc822MessageId: rfc822)
-        let other = Self.otherStored
-        try await fixture.db.write { db in
-            try db.execute(
-                sql: "UPDATE messageHeader SET cc = ?, cachedReply = ?, replyTextMessage = ?, replyChangeCommand = ? WHERE id = ?",
-                arguments: ["sam@example.com", other.body, other.textMessage, other.changeCommand, inserted.id])
-        }
-        let header = try await row(fixture.db, inserted.id)
-        await fixture.translator.seed(header.id, as: 2)
-        return header
+        return Fixture(db: db, router: router, header: header, accounts: accounts,
+                       ctx: ToolContext(db: db, translator: MockChatIdTranslator(), router: router))
     }
 
     /// How the model answers: writes the reply, fails, or returns no email.
@@ -123,21 +97,6 @@ struct EmailReplyWordsTests {
         }
     }
 
-    func tool(_ fixture: Fixture, calls: Calls, answer: Answer) -> EmailReplyTool {
-        let db = fixture.db
-        return EmailReplyTool(context: fixture.ctx, composeEdit: { context, subject, body, request in
-            calls.add(.init(context: context, subject: subject, body: body, request: request))
-            return try Self.result(answer)
-        }, storeSuggestionEdit: { edit, shown, email in
-            await ComposeView.writeCachedReplyToDB(edit, replacing: shown, replyTo: email, db: db)
-        })
-    }
-
-    func field(_ header: MessageHeader, onlyTo: [String]?) -> ToolInvocation {
-        // The field shows no AI Suggestion while some people are chosen (`ChatReplyField.shown`).
-        ToolInvocation(fieldReply: ChatFieldReply(email: header, onlyTo: onlyTo), composeOrigin: Self.asked)
-    }
-
     func row(_ db: DatabaseQueue, _ id: MessageHeader.ID) async throws -> MessageHeader {
         let fetched = try await db.read { try MessageHeader.fetchOne($0, key: id) }
         return try #require(fetched)
@@ -150,16 +109,19 @@ struct EmailReplyWordsTests {
         return try await db.read { try MessageAICache.fetchOne($0, key: key)?.suggestion }
     }
 
-    /// The card the reply tool opens for `arguments` asked from the field showing `fieldEmail` (the
-    /// fixture email when nil), closed again; the router is cleared for the next card. With no card
-    /// the tool's task is cancelled and drained before the test fails, so no request stays queued.
+    /// The card the field's Send opens for `words` with `onlyTo` chosen in Reply to, closed again;
+    /// the router is cleared for the next card. With no card the compose's task is cancelled and
+    /// drained before the test fails, so no request stays queued.
     func card(
-        _ fixture: Fixture, calls: Calls, answer: Answer, arguments: [String: JSONValue], onlyTo: [String]?,
-        fieldEmail: MessageHeader? = nil
+        _ fixture: Fixture, calls: Calls, answer: Answer, onlyTo: [String]?
     ) async throws -> AgentToolRouter.ComposeRequest {
-        let tool = tool(fixture, calls: calls, answer: answer)
-        let invocation = field(fieldEmail ?? fixture.header, onlyTo: onlyTo)
-        let task = Task { @MainActor in try await tool.run(arguments: arguments, invocation: invocation, rewritesInPlace: true) }
+        let compose = ChatFieldCompose(context: fixture.ctx, composeText: { _, words, subject, context in
+            calls.add(.init(context: context, subject: subject, body: "", request: words))
+            return try Self.result(answer)
+        })
+        let invocation = ToolInvocation(
+            fieldReply: ChatFieldReply(email: fixture.header, onlyTo: onlyTo), composeOrigin: Self.asked)
+        let task = Task { @MainActor in await compose.reply(Self.words, invocation: invocation) }
         var pending: AgentToolRouter.ComposeRequest?
         let deadline = Date().addingTimeInterval(5)
         while pending == nil, Date() < deadline {
@@ -168,175 +130,33 @@ struct EmailReplyWordsTests {
         }
         guard let card = pending else {
             task.cancel()
-            _ = try? await task.value
+            _ = await task.value
             fixture.router.resetComposeQueueForTesting()
-            Issue.record("the tool opens a reply card")
+            Issue.record("the field's Send opens a reply card")
             throw NoCard()
         }
         card.onOutcome(.cancelled)
-        _ = try await task.value
+        _ = await task.value
         fixture.router.resetComposeQueueForTesting()
         return card
-    }
-
-    static let noRequest: [String: JSONValue] = ["unique_id": .int(1)]
-
-    @Test("A reply narrowed in the field with no request is written for the people chosen, never the stored suggestion written for everyone",
-          arguments: [["sender@example.com"], ["sender@example.com", "sam@example.com"]])
-    func narrowedReplyWithNoRequestIsWrittenForThePeopleChosen(_ chosen: [String]) async throws {
-        let fixture = try await fixture()
-        try TestDatabase.insertMessageBody(fixture.db, headerId: fixture.header.id, htmlContent: "<p>\(Self.emailText)</p>")
-        let calls = Calls()
-        let card = try await card(fixture, calls: calls, answer: .writes, arguments: Self.noRequest, onlyTo: chosen)
-
-        #expect(calls.all.count == 1, "the reply is written once")
-        guard calls.all.count == 1 else { return }
-        let call = calls.all[0]
-        #expect(call.request == "" && call.subject == "" && call.body == "",
-                "written as a reply asked for with no request: an empty draft and an empty request")
-        #expect(call.context.mode == "edit_reply")
-        #expect(Set(call.context.toRecipients + call.context.ccRecipients + call.context.bccRecipients) == Set(chosen),
-                "the model writes for the people chosen alone: \(call.context.toRecipients) cc \(call.context.ccRecipients)")
-        #expect(call.context.senderEmail == "test@example.com", "written as the account the reply is sent from")
-        let bodyText = call.context.bodyText
-        #expect(bodyText.contains(Self.emailText) && !bodyText.contains(fixture.header.snippet),
-                "the model reads the email's own text, not its snippet: \(bodyText)")
-
-        #expect(card.body == Self.written, "the card opens with the words written for them")
-        #expect(card.suggestion == nil, "the stored suggestion is not handed to the card")
-        #expect(Set(card.to + card.cc + card.bcc) == Set(chosen) && !card.isReplyAll, "the card goes to the people chosen")
-        let view = card.composeView(account: nil, onOutcome: { _ in })
-        #expect(view.onlyToChosen, "the card knows it replies only to the people chosen")
-        #expect(view.suggestion == nil && view.suggestedBody == Self.written)
-        let after = try await row(fixture.db, fixture.header.id).suggestion
-        #expect(after == Self.stored, "nothing is stored")
-    }
-
-    @Test("A reply narrowed in the field with a request is written for the people chosen, with the agent's request as Thunderbird wraps it")
-    func narrowedReplyWithARequestIsWrittenForThePeopleChosen() async throws {
-        let fixture = try await fixture()
-        let calls = Calls()
-        let card = try await card(fixture, calls: calls, answer: .writes,
-                                  arguments: ["unique_id": .int(1), "request": .string("say yes")],
-                                  onlyTo: ["sender@example.com"])
-        #expect(calls.all.count == 1)
-        guard calls.all.count == 1 else { return }
-        let call = calls.all[0]
-        #expect(call.request == "Reply to email with subject \"Offsite\" with request: say yes",
-                "the agent's request, wrapped: \(call.request)")
-        #expect(call.subject == "" && call.body == "", "an empty draft")
-        #expect(call.context.toRecipients == ["sender@example.com"] && call.context.ccRecipients.isEmpty
-                    && call.context.bccRecipients.isEmpty, "written for the people chosen")
-        #expect(card.body == Self.written && card.suggestion == nil)
-        #expect(card.composeView(account: nil, onOutcome: { _ in }).onlyToChosen)
-    }
-
-    @Test("Controls: with nobody chosen the card offers the stored suggestion; a body the agent gave is used as it is")
-    func otherRepliesAreUnchanged() async throws {
-        let fixture = try await fixture()
-        let calls = Calls()
-        let everyone = try await card(fixture, calls: calls, answer: .writes, arguments: Self.noRequest, onlyTo: nil)
-        #expect(calls.all.isEmpty, "nobody chosen: nothing is written")
-        #expect(everyone.suggestion == Self.stored && everyone.body == nil, "the stored suggestion, whole")
-        #expect(Set(everyone.to + everyone.cc) == Self.everyone && everyone.isReplyAll)
-        #expect(!everyone.composeView(account: nil, onOutcome: { _ in }).onlyToChosen)
-
-        let given = try await card(fixture, calls: calls, answer: .writes,
-                                   arguments: ["unique_id": .int(1), "body": .string("Friday works")],
-                                   onlyTo: ["sender@example.com"])
-        #expect(calls.all.isEmpty, "the agent's own body is not rewritten")
-        #expect(given.body == "Friday works" && given.suggestion == nil)
-    }
-
-    /// The choice made in the field applies to a reply to the email it showed in that account
-    /// alone (`ChatFieldReply.audienceApplies`). A reply with no request and no body to another
-    /// email, or to the shown email's copy in another account, is an ordinary reply: nothing is
-    /// written, and the card offers that email's own stored suggestion to everyone.
-    @Test("Controls: a choice in the field that does not apply (another email, another account's copy) leaves a reply with no request unchanged",
-          arguments: [false, true])
-    func choiceThatDoesNotApplyLeavesTheReplyUnchanged(_ otherAccountsCopy: Bool) async throws {
-        let fixture = try await fixture(second: otherAccountsCopy)
-        let target = try await insertOther(
-            fixture, accountId: "acc1", own: "test@example.com", subject: otherAccountsCopy ? "Offsite" : "Lunch",
-            rfc822: otherAccountsCopy ? "<offsite@example.com>" : "<lunch@example.com>")
-        let sameEmail = ChatThread.copyKey(target) == ChatThread.copyKey(fixture.header)
-        let sameAccount = target.accountId == fixture.header.accountId
-        if otherAccountsCopy {
-            #expect(sameEmail && !sameAccount, "control: the same email, in another account")
-        } else {
-            #expect(!sameEmail && sameAccount, "control: another email, in the same account")
-        }
-        let choice = ChatFieldReply(email: fixture.header, onlyTo: ["sender@example.com"])
-        #expect(!choice.audienceApplies(to: target), "control: the choice does not apply to the target")
-
-        let calls = Calls()
-        let card = try await card(fixture, calls: calls, answer: .writes, arguments: ["unique_id": .int(2)],
-                                  onlyTo: ["sender@example.com"], fieldEmail: fixture.header)
-        #expect(calls.all.isEmpty, "nothing is written")
-        #expect(card.suggestion == Self.otherStored && card.body == nil, "the target's own stored suggestion, whole")
-        #expect(Set(card.to + card.cc) == Self.everyone && card.isReplyAll, "a Reply All to the target's people")
-        #expect(!card.composeView(account: nil, onOutcome: { _ in }).onlyToChosen, "an ordinary card")
-        let after = try await row(fixture.db, target.id).suggestion
-        #expect(after == Self.otherStored, "nothing is stored")
-    }
-
-    /// The choice applies to any copy of the email in the same account: a reply to another
-    /// folder's copy (another row) with no request is written for the people chosen too, never
-    /// with that copy's own stored suggestion.
-    @Test("A reply narrowed in the field to another folder's copy of the email, with no request, is written for the people chosen")
-    func narrowedReplyToAnotherFoldersCopyIsWrittenForThePeopleChosen() async throws {
-        let fixture = try await fixture()
-        try TestDatabase.insertFolder(fixture.db, name: "Archive", path: "Archive", role: .archive)
-        let copy = try await insertOther(fixture, accountId: "acc1", own: "test@example.com", subject: "Offsite",
-                                         rfc822: "<offsite@example.com>", folder: "Archive")
-        let applies = ChatFieldReply(email: fixture.header, onlyTo: ["sender@example.com"]).audienceApplies(to: copy)
-        #expect(copy.id != fixture.header.id && applies, "control: another row, the same email in the same account")
-
-        let calls = Calls()
-        let card = try await card(fixture, calls: calls, answer: .writes, arguments: ["unique_id": .int(2)],
-                                  onlyTo: ["sender@example.com"], fieldEmail: fixture.header)
-        #expect(calls.all.count == 1, "the reply is written once")
-        guard calls.all.count == 1 else { return }
-        let call = calls.all[0]
-        #expect(call.request == "" && call.subject == "" && call.body == "", "a reply asked for with no request")
-        #expect(call.context.toRecipients == ["sender@example.com"] && call.context.ccRecipients.isEmpty
-                    && call.context.bccRecipients.isEmpty, "written for the people chosen")
-        #expect(card.body == Self.written && card.suggestion == nil, "the words written for them, not the copy's stored suggestion")
-        #expect(card.composeView(account: nil, onOutcome: { _ in }).onlyToChosen)
-        let after = try await row(fixture.db, copy.id).suggestion
-        #expect(after == Self.otherStored, "nothing is stored")
     }
 
     @Test("A reply narrowed in the field is written as the account it was received in, not the first or primary one")
     func narrowedReplyIsWrittenAsItsOwnAccount() async throws {
         let fixture = try await fixture(second: true)
         let calls = Calls()
-        _ = try await card(fixture, calls: calls, answer: .writes, arguments: Self.noRequest, onlyTo: ["sender@example.com"])
+        let card = try await card(fixture, calls: calls, answer: .writes, onlyTo: ["sender@example.com"])
         #expect(calls.all.count == 1)
         guard calls.all.count == 1 else { return }
         #expect(calls.all[0].context.senderEmail == "second@example.com")
-    }
-
-    @Test("A reply narrowed in the field whose writing fails opens empty, never with the stored suggestion written for everyone",
-          arguments: [Answer.fails, .noEmail])
-    func narrowedReplyNeverFallsBackToTheStoredSuggestion(_ answer: Answer) async throws {
-        let fixture = try await fixture()
-        for arguments in [Self.noRequest, ["unique_id": .int(1), "request": .string("say yes")]] {
-            let calls = Calls()
-            let card = try await card(fixture, calls: calls, answer: answer, arguments: arguments, onlyTo: ["sender@example.com"])
-            #expect(calls.all.count == 1, "the writing was tried")
-            #expect(card.body == nil && card.suggestion == nil, "no words, and not the stored ones")
-            let view = card.composeView(account: nil, onOutcome: { _ in })
-            #expect(view.onlyToChosen, "the card itself does not read the stored suggestion either")
-        }
-        // Control: with nobody chosen a failed request still opens on the stored suggestion.
-        let control = try await card(fixture, calls: Calls(), answer: answer,
-                                     arguments: ["unique_id": .int(1), "request": .string("say yes")], onlyTo: nil)
-        #expect(control.suggestion == Self.stored)
+        #expect(calls.all[0].request == Self.words, "the words as sent")
+        #expect(card.body == Self.written && card.suggestion?.textMessage == Self.words,
+                "the words written for the people chosen, never the stored suggestion")
+        #expect(card.composeView(account: nil, onOutcome: { _ in }).onlyToChosen)
     }
 
     /// What the email stores before the narrowed card opens: the Reply All suggestion, nothing, or
-    /// a Device Sync reply holding the very words the card shows.
+    /// a reply holding the very value the card shows.
     enum Stored { case forEveryone, none, sameWords }
 
     @Test("An edit in a narrowed card is never stored as the email's suggestion, even after its recipients go back to everyone with the stored words showing",
@@ -350,7 +170,7 @@ struct EmailReplyWordsTests {
         let fixture = try await fixture(stored: seeded)
         let before = try await row(fixture.db, fixture.header.id).suggestion
         let cachedBefore = try await cached(fixture.db, fixture.header)
-        let card = try await card(fixture, calls: Calls(), answer: .writes, arguments: Self.noRequest, onlyTo: ["sender@example.com"])
+        let card = try await card(fixture, calls: Calls(), answer: .writes, onlyTo: ["sender@example.com"])
         let view = card.composeView(account: nil, onOutcome: { _ in })
         // What the card shows and later compares an edit against (`ComposeView.prepopulate`).
         let shown = try #require(ComposeDraftGuards.suggestionToShow(
