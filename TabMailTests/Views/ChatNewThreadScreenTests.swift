@@ -565,8 +565,10 @@ struct ChatNewThreadScreenTests {
     }
 
     @Test("From the Sending bubble to the sent email's thread, every frame shows the email: the new email with its Sending bubble, then the whole thread with its header, its field and the email on the user's side, never a thread still loading or still reading who the user is",
-          arguments: zip([true, true, false, false, false, false, false, false], 0..<8))
+          arguments: [true, false], 0..<3)
     func sentCopyTurnsIntoTheThreadWithNoBlink(copyHasItsBody: Bool, attempt: Int) async throws {
+        // Each copy swaps three times: where the swap falls between two frames varies from one
+        // swap to the next.
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation {
             try await Self.withChatView(true) {
@@ -1577,22 +1579,14 @@ private struct SwapFrame: Equatable, CustomStringConvertible {
     var replyField = false
     /// The field's paperclip (recorded, not required: a thread shows it once its emails are read).
     var paperclip = false
-    /// Diagnostic: the thread's Forward, in the same bar as the header.
-    var forward = false
-    /// Diagnostic: the bar's title view as UIKit holds it ("none" when it has none).
-    var title = "none"
-    /// Diagnostic: the pixels drawn in the middle half of the bar (the header's avatars and names)
-    /// that differ from its corner, as the screen shows them.
-    var ink = -1
 
     var isNewEmail: Bool { hint && sending && newField && header }
     var isThread: Bool { !hint && header && bubble && own && replyField }
 
     var description: String {
         let parts = [("hint", hint), ("sending", sending), ("newField", newField), ("header", header),
-                     ("bubble", bubble), ("own", own), ("replyField", replyField), ("paperclip", paperclip),
-                     ("fwd", forward)]
-        return "[" + parts.filter { $0.1 }.map { $0.0 }.joined(separator: " ") + " t=\(title) ink=\(ink)]"
+                     ("bubble", bubble), ("own", own), ("replyField", replyField), ("paperclip", paperclip)]
+        return "[" + parts.filter { $0.1 }.map { $0.0 }.joined(separator: " ") + "]"
     }
 
     @MainActor
@@ -1608,63 +1602,17 @@ private struct SwapFrame: Equatable, CustomStringConvertible {
         own = texts.contains("Sent")
         replyField = ids.contains(ChatThreadView.replyPillId)
         paperclip = ids.contains(ChatPaperclipButton.id)
-        forward = ids.contains(ChatThreadView.forwardId)
-        if let bar = Self.navigationBar(in: view) {
-            if let titleView = bar.topItem?.titleView {
-                title = "\(Int(titleView.bounds.width))x\(Int(titleView.bounds.height))"
-                    + (titleView.isHidden ? ",hidden" : "") + (titleView.alpha < 1 ? ",a\(Int(titleView.alpha * 10))" : "")
-            }
-            ink = Self.ink(of: bar)
-        }
-    }
-
-    @MainActor
-    private static func navigationBar(in view: UIView) -> UINavigationBar? {
-        if let bar = view as? UINavigationBar { return bar }
-        for subview in view.subviews {
-            if let bar = navigationBar(in: subview) { return bar }
-        }
-        return nil
-    }
-
-    /// The pixels of the bar's middle half, as drawn on screen, that differ from its corner.
-    @MainActor
-    private static func ink(of bar: UINavigationBar) -> Int {
-        let size = bar.bounds.size
-        guard size.width >= 4, size.height >= 4 else { return -2 }
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
-        format.opaque = true
-        let image = UIGraphicsImageRenderer(size: size, format: format).image { context in
-            UIColor.white.setFill()
-            context.fill(CGRect(origin: .zero, size: size))
-            _ = bar.drawHierarchy(in: CGRect(origin: .zero, size: size), afterScreenUpdates: false)
-        }
-        guard let cgImage = image.cgImage, let data = cgImage.dataProvider?.data,
-              let bytes = CFDataGetBytePtr(data) else { return -3 }
-        let perPixel = cgImage.bitsPerPixel / 8
-        let perRow = cgImage.bytesPerRow
-        func pixel(_ x: Int, _ y: Int) -> [Int] {
-            let at = y * perRow + x * perPixel
-            return [Int(bytes[at]), Int(bytes[at + 1]), Int(bytes[at + 2])]
-        }
-        let corner = pixel(1, 1)
-        var count = 0
-        for y in 0..<cgImage.height {
-            for x in (cgImage.width / 4)..<(cgImage.width * 3 / 4) {
-                let drawn = pixel(x, y)
-                if zip(drawn, corner).contains(where: { abs($0 - $1) > 32 }) { count += 1 }
-            }
-        }
-        return count
     }
 }
 
-/// Reads the chat on every display frame between `start` and `stop`, as the screen draws them.
+/// Reads the chat after every Core Animation commit between `start` and `stop`: each frame is the
+/// screen as committed, laid out, so as it is drawn. A display-link tick is not: it can come
+/// between SwiftUI's update and the commit that lays it out, and read a navigation bar whose new
+/// title view has no size yet, while the screen still draws the header before it.
 @MainActor
-private final class SwapFrames: NSObject {
+private final class SwapFrames {
     private let view: UIView
-    private var link: CADisplayLink?
+    private var observer: CFRunLoopObserver?
     private(set) var frames: [SwapFrame] = []
 
     init(view: UIView) {
@@ -1673,18 +1621,24 @@ private final class SwapFrames: NSObject {
 
     func start() {
         record()
-        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-        link.add(to: .main, forMode: .common)
-        self.link = link
+        // After Core Animation's own commit observer on the same activities (its order is 2000000).
+        let observer = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue | CFRunLoopActivity.exit.rawValue,
+            true, CFIndex.max
+        ) { [weak self] _, _ in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.record() }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+        self.observer = observer
     }
 
     func stop() {
-        link?.invalidate()
-        link = nil
-        record()
-    }
-
-    @objc private func tick(_ link: CADisplayLink) {
+        if let observer {
+            CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
+            CFRunLoopObserverInvalidate(observer)
+        }
+        observer = nil
         record()
     }
 
