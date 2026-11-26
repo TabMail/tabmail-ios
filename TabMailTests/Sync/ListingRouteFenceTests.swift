@@ -123,6 +123,30 @@ struct ListingRouteFenceTests {
                 "the app's message open accesses its folder: \(detailAccess)")
     }
 
+    /// The turn line's places (ADR-IOS-104, #1360): only the new-mail
+    /// follow-up (`followUpPass`) and the folder view's listing
+    /// (`AccountManager.syncFolders`) wait ahead of the catch-up slices, and
+    /// only the catch-up slice (`runCatchUpRun`) waits as one. Every other
+    /// single-folder listing keeps arrival order, so a caller that passes
+    /// either place is reviewed against that decision. RED if, say, the
+    /// listing after a send or an open email's listing passed
+    /// `.aheadOfBackgroundChunks`.
+    @Test("Only the follow-up and the folder view's listing wait ahead of the catch-up slices, and only a slice waits as one")
+    func turnPlacesHaveTheirOwnCallers() throws {
+        let sources = try Self.productionSources()
+        let ahead = Self.hits(".aheadOfBackgroundChunks", in: sources)
+        #expect(ahead == [
+            "TabMail/Services/Sync/SyncEngine.swift": 1,
+            "TabMail/Services/Account/AccountManagerFetch.swift": 1,
+            "TabMail/Services/Sync/SyncEngineOneSyncAtATime.swift": 1,
+        ], "followUpPass, syncFolders and the line's own insert only: \(ahead)")
+        let chunk = Self.hits(".backgroundChunk", in: sources)
+        #expect(chunk == [
+            "TabMail/Services/Sync/SyncEngineCatchUp.swift": 1,
+            "TabMail/Services/Sync/SyncEngineOneSyncAtATime.swift": 1,
+        ], "runCatchUpRun's slice and the line's own mark only: \(chunk)")
+    }
+
     @Test("Every on-demand listing goes through syncFolderMessages (folder open, after a send, after a move, epoch-rebuild step 6)")
     func onDemandListingsThroughTheClassifier() throws {
         let sources = try Self.productionSources()

@@ -782,7 +782,11 @@ struct SyncFollowUpTests {
     /// values: every trigger gets a change read that starts after it before the
     /// account goes quiet (checked at seeded checkpoints and at the end), one
     /// account never runs two passes at once, and the flag is empty whenever all
-    /// is quiet. Over the seeds, both trigger kinds find the account busy.
+    /// is quiet. Over the seeds, both trigger kinds find the account busy. Half
+    /// the held work waits as catch-up slices, which the follow-up joins the
+    /// line ahead of (#1360): the invariants hold with the line reordered too,
+    /// and over the seeds some follow-up does join ahead of a waiting slice
+    /// (`syncTurnOvertakesForTesting`).
     /// RED with a trigger that waits for its turn and counts its time limit from
     /// its arrival (#1289): one behind held work reaches its turn with no time
     /// left and reads nothing.
@@ -790,6 +794,7 @@ struct SyncFollowUpTests {
     func fuzzEveryTriggerGetsALaterRead() async throws {
         var asksSeen = 0
         var checkpoints = 0
+        var overtakes = 0
         let busyKinds = BusyKinds()
         for seed in Self.fuzzSeeds {
             try await O.withAppDB { pool in
@@ -832,8 +837,13 @@ struct SyncFollowUpTests {
                             } catch {}
                         })
                     case .held(let milliseconds):
+                        // Half the held work waits as a catch-up slice, so the
+                        // follow-up also joins the line ahead of waiting slices
+                        // (#1360). Taken from the duration, not a new draw, so
+                        // every seed's schedule stays as it was.
+                        let place: SyncTurnPlace = milliseconds.isMultiple(of: 2) ? .backgroundChunk : .arrivalOrder
                         work.append(Task {
-                            await engine.oneSyncAtATime(accountId: Self.accountId) {
+                            await engine.oneSyncAtATime(accountId: Self.accountId, place: place) {
                                 wire.heldStarts()
                                 try? await Task.sleep(for: .milliseconds(milliseconds))
                                 clock.advance(stageTwoLimit + 1)
@@ -861,10 +871,12 @@ struct SyncFollowUpTests {
                         "seed \(seed): a trigger got no change read that started after it (\(seen.triggers) triggers, \(seen.reads) reads)")
                 #expect(seen.overlaps.isEmpty, "seed \(seed): two passes of the account ran at once: \(seen.overlaps)")
                 #expect(!followUps.outcomes.contains("threw"), "seed \(seed): a follow-up stage 2 failed: \(followUps.outcomes)")
+                overtakes += await engine.syncTurnOvertakesForTesting
                 await engine.remove(accountId: Self.accountId)
             }
         }
         #expect(asksSeen > 0, "precondition: no seed made a trigger find the account busy")
+        #expect(overtakes > 0, "precondition: no seed had a follow-up join the line ahead of a waiting catch-up slice")
         let busy = busyKinds.snapshot
         #expect(busy["change read", default: 0] > 0 && busy["stage 2", default: 0] > 0,
                 "precondition: not every trigger kind found the account busy: \(busy)")

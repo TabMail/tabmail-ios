@@ -415,6 +415,13 @@ extension AccountManager {
     }
 
     /// Sync only specific folders (pull-to-refresh of the folders on screen).
+    /// The folder view's own sync: opening a folder (`InboxViewModel.startSync`)
+    /// and pulling to refresh it (`refreshSync`). Each folder's listing waits for
+    /// its account's turn ahead of the catch-up slices already waiting, as the
+    /// new-mail follow-up does (`SyncTurnPlace.aheadOfBackgroundChunks`, #1360):
+    /// the user asked for what is new in it now, so it never waits behind the
+    /// background readers' slices. It asks for that place when it starts, one
+    /// folder after another.
     ///
     /// Each account connects (when it has no provider yet and is in `accounts`) and
     /// syncs its folders in its own task; an account's folders are sequential (shared
@@ -479,7 +486,8 @@ extension AccountManager {
                         // still ends the refresh with that error; a folder the server
                         // refused or no longer has, and an unconfirmed count, are
                         // skipped silently as before so the other folders still sync.
-                        let outcome = try await syncEngine.syncFolderMessages(folder: folder, provider: provider)
+                        let outcome = try await syncEngine.syncFolderMessages(
+                            folder: folder, provider: provider, place: .aheadOfBackgroundChunks)
                         guard case .unproven(_, _, let error) = outcome else { continue }
                         BackgroundSyncLogger.logDebug("[SyncFolders] listing of \(folder.name) proved nothing — listed again next pass")
                         guard let error else { continue }
@@ -515,11 +523,13 @@ extension AccountManager {
                     // run for these folders, started after the change read so a
                     // folder the reader has just baselined is one the catch-up may
                     // list. The refresh does not wait for it. When the read found
-                    // the account busy, the run starts all the same: it waits in
-                    // line like the follow-up (its time counts only from each
-                    // slice's queue slot), lists an untracked folder by its access
+                    // the account busy, the run starts all the same: its slices
+                    // wait in line as catch-up slices (their time counts only from
+                    // each slice's queue slot), behind the follow-up once that is
+                    // in line (#1360); it lists an untracked folder by its access
                     // rule, and a tracked one's changes come through the
-                    // follow-up's read. It may take the turn before the follow-up:
+                    // follow-up's read. It takes the turn before the follow-up
+                    // only when the turn frees before the follow-up has joined:
                     // a folder the follow-up has yet to baseline is then left to
                     // the ordinary catch-up.
                     await syncEngine.startAccessCatchUp(accountId: accountId, folderIds: accessed)
