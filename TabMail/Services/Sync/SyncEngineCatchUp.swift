@@ -264,10 +264,12 @@ extension SyncEngine {
     /// one-sync-at-a-time turn (`oneSyncAtATime`, ADR-IOS-104), so it never runs
     /// beside a delta, a full sync or a lapse, and releases it at the slice's end:
     /// a sync trigger that arrives meanwhile does not wait, it sets the account's
-    /// follow-up flag (#1289), and the stage 2 it asks for waits at most one
-    /// slice: it joins the turn line ahead of every slice waiting, this run's
-    /// and other readers' alike (`SyncTurnPlace`, #1360), as does the folder
-    /// view's listing (opening a folder, pulling to refresh it).
+    /// follow-up flag (#1289), and the stage 2 it asks for joins the turn line
+    /// ahead of every slice waiting, this run's and other readers' alike
+    /// (`SyncTurnPlace`, #1360), as does the folder view's listing (opening a
+    /// folder, pulling to refresh it). Each waits at most for the running work
+    /// and for any work that is not a slice and queued before the first
+    /// waiting slice.
     /// *Superseded (#1289):* "so a push or silent-push delta that arrives
     /// meanwhile waits at most one slice". The slice's clock starts when its
     /// provider work starts, once the account's provider work queue gives it a

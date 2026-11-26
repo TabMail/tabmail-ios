@@ -409,10 +409,11 @@ struct NewMailFirstTests {
     /// view's listing) joins behind the follow-up, still ahead of the first
     /// waiting chunk. RED if the follow-up went to the front (it passes the
     /// listing), if a later chunk could pass it, if it went in after the last
-    /// pass that is not a chunk rather than before the first chunk (the wider
-    /// reorder the owner ruled out on 2026-11-26: "slice 1" and "listing 2"
-    /// would then run before it), or if the second pass at that place went in
-    /// ahead of the first.
+    /// pass that is not a chunk rather than before the first chunk ("slice 1"
+    /// and "listing 2" would then run before it), if the passes that are not
+    /// chunks were moved ahead of every chunk (the wider reorder the owner
+    /// ruled out on 2026-11-26: "listing 2" would then run before "slice 1"),
+    /// or if the second pass at that place went in ahead of the first.
     @Test("The follow-up goes in before the first waiting slice only: earlier passes stay ahead, later slices queue behind",
           arguments: [true, false])
     func followUpTakesItsPlaceBeforeTheFirstWaitingSlice(sliceWaiting: Bool) async {

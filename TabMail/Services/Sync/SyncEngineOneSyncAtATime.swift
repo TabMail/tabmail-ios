@@ -52,9 +52,9 @@ import Synchronization
 //   served it.
 // - New mail goes first (#1360): the follow-up joins the line right before the
 //   first catch-up slice waiting (the older-mail catch-up, an access run), so
-//   once it is in line only the running work is ahead of it, never other
-//   readers' slices that queued before it. The slices keep their order; work
-//   that is not a slice and queued before the first slice stays ahead of it.
+//   once it is in line no waiting slice is ahead of it, only the running work
+//   and work that is not a slice and queued before the first slice. The
+//   slices keep their order.
 //   This is a place in the one line (`SyncTurnPlace`), not a second queue.
 //   Before #1360 it joined the back of the line, behind every slice already
 //   waiting, about 5 s each. The folder view's listing (opening a folder,
