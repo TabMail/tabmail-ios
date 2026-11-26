@@ -537,7 +537,6 @@ struct GmailChangeReadingTests {
             }
             try await w.pool.write { db in
                 _ = try Account.filter(Column("id") == w.accountId).updateAll(db,
-                    Column("lastSyncedAt").set(to: nil as Date?),
                     Column("lastFullSyncAt").set(to: Date().addingTimeInterval(-60)))
             }
             let windowBefore = Self.windowListings(w)
@@ -803,9 +802,6 @@ struct GmailChangeReadingTests {
 
     /// One foreground pass with the full sync NOT forced due.
     static func foregroundPassFullSyncNotForced(_ w: Pins.World) async throws {
-        try await w.pool.write { db in
-            _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastSyncedAt").set(to: nil as Date?))
-        }
         let engine = SyncEngine()
         await engine.register(
             accountId: w.accountId, provider: w.provider,
@@ -817,16 +813,15 @@ struct GmailChangeReadingTests {
     /// account's backfill cycles run to completion on the same engine: the
     /// older-mail catch-up runs in those cycles, not in the pass (ADR-IOS-107,
     /// #766). `fullSyncDue` forces the full sync due, as
-    /// `foregroundPassWithFullSyncDue` does; otherwise only the last sync time is
-    /// cleared, as `foregroundPassFullSyncNotForced` does. The worker the pass
+    /// `foregroundPassWithFullSyncDue` does; otherwise the account is left as it
+    /// is, as `foregroundPassFullSyncNotForced` does. The worker the pass
     /// starts is stopped and awaited first, the cycles then run one at a time,
     /// and the engine is removed at the end, so no worker outlives the call and
     /// skews a later count. A pass that throws starts no worker, so no cycles
     /// run after it, as in the app.
     static func foregroundPassThenBackfill(_ w: Pins.World, fullSyncDue: Bool) async throws {
-        try await w.pool.write { db in
-            _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastSyncedAt").set(to: nil as Date?))
-            if fullSyncDue {
+        if fullSyncDue {
+            try await w.pool.write { db in
                 _ = try Account.filter(Column("id") == w.accountId).updateAll(db, Column("lastFullSyncAt").set(to: nil as Date?))
             }
         }

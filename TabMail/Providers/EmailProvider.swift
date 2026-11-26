@@ -361,7 +361,9 @@ enum ProgressTotal: Sendable, Equatable {
     /// profile read fails; providers without one).
     case none
     /// The provider has a total, but not before this launch's first folder list:
-    /// progress publishes nothing (the bar stays hidden) until it has.
+    /// until it has, progress is the database's own (stored and settled
+    /// messages, the walk's completed state), with no UID scope and no server
+    /// total (#1273).
     case notKnownYet
     /// The account's message total (Gmail: the profile's; Exchange: the sum of
     /// `totalItemCount` over its last complete folder list).
@@ -374,6 +376,12 @@ enum ProgressTotal: Sendable, Equatable {
 protocol EmailProvider: Sendable {
     func connect() async throws
     func disconnect() async throws
+    /// Terminal teardown for account removal: after this returns (and from its
+    /// first actor turn) the provider opens no new server session for any
+    /// caller. A provider holding no credentials of its own (OAuth providers,
+    /// refused by the removal fence on their token accessors) needs nothing
+    /// beyond `disconnect()`.
+    func disconnectForAccountRemoval() async
 
     /// Fetch-ordering dimension for stale-detection windowing. Defaults to `.date`
     /// (HTTP providers); IMAP overrides to `.uid`. See `StaleWindowMode`.
@@ -406,6 +414,12 @@ protocol EmailProvider: Sendable {
     /// (`DemoProvider`) says `true`: there the placeholder is the message, and
     /// no sync will ever replace it.
     static var placeholderIdsAreAddressable: Bool { get }
+
+    /// Whether the folder change bookmark `cursor` (`Folder.changeCursor`)
+    /// claims the folder already holds every live message with `messageId`, so
+    /// a row inserted outside a change read under that id contradicts it
+    /// (#755): the notification merge then ends the folder's tracking.
+    static func changeBookmark(_ cursor: String, claimsHeld messageId: String) -> Bool
 
     /// T1.2b: the UIDVALIDITY the MOST RECENT SELECT of `folderPath` reported, or
     /// `nil` when that SELECT reported none, when this provider has never SELECTed
@@ -497,7 +511,13 @@ protocol EmailProvider: Sendable {
     func markFlagged(ids: [String], flagged: Bool, folder: String) async throws
     func move(ids: [String], from: String, to: String) async throws
 
-    func send(draft: DraftMessage) async throws
+    /// Send the message. Returns the identity the server gave the copy it keeps
+    /// in Sent when its answer to the send names one, `nil` when it does not.
+    /// Once the send is stamped, the Outbox reads that copy's header
+    /// (`fetchMessageHeaders`) and writes the optimistic Sent row as the sync
+    /// lists the copy (`AccountManager.readSentCopy`).
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity?
 
     /// Append a copy of the sent message to the server's Sent folder.
     /// For IMAP: explicit APPEND. For Gmail/Exchange: no-op (API auto-saves).
@@ -627,9 +647,18 @@ enum DraftReadConfig {
 struct DraftCopyUnsupportedAttachment: Error {}
 
 extension EmailProvider {
+    /// Default for providers that hold no credentials of their own: the
+    /// removal fence already refuses their token accessors.
+    func disconnectForAccountRemoval() async {
+        try? await disconnect()
+    }
+
     /// Default `false`: a provider that talks to a server cannot address a
     /// local placeholder id. `DemoProvider` overrides it.
     static var placeholderIdsAreAddressable: Bool { false }
+
+    /// Default `false`: a provider whose bookmark makes no such claim.
+    static func changeBookmark(_ cursor: String, claimsHeld messageId: String) -> Bool { false }
 
     /// Default for test doubles and the demo provider, whose drafts are never
     /// read back (only Gmail and Outlook drafts reload on open, and only drafts in a
@@ -1198,9 +1227,31 @@ struct ProviderListingUnconfirmed: Error, CustomStringConvertible, CustomDebugSt
     }
 }
 
+/// The copy a provider keeps in Sent, as its answer to the send named it: the
+/// message's id in the provider's own address space, and its native
+/// conversation id when the provider has one. Opaque above the provider
+/// boundary: the Outbox only writes them onto the optimistic Sent row, as the
+/// sync writes the same fields for a listed message.
+struct SentCopyIdentity: Sendable, Equatable {
+    let providerMessageId: String
+    let threadId: String?
+}
+
+/// The Sent copy a send named, as the provider's own header listing reads it:
+/// the Message-ID the provider gave the message it keeps (Gmail replaces the
+/// one the send wrote), its date and order date (`MessageHeaderInfo.date`,
+/// `.providerOrderDate`) and its conversation id (`identity.threadId`: the
+/// listing's, else the send's answer's), the fields the sync stores for the copy.
+struct ListedSentCopy: Sendable, Equatable {
+    let identity: SentCopyIdentity
+    let rfc822MessageId: String
+    let date: Date
+    let providerDate: Date
+}
+
 /// True when `id` matches a TabMail-internal optimistic-placeholder shape.
 /// `sent-<UUID>` (`AccountManager.insertOptimisticSentHeader`, in
-/// `AccountManagerOutbox.swift`) and `draft-<UUID>`
+/// `AccountManagerOutbox.swift`, when the provider's Sent copy was not read) and `draft-<UUID>`
 /// (`AccountManager.queueDraftSave`, in `AccountManagerActions.swift`) are written into
 /// `messageHeader.messageId` so the row exists in the user's Sent/Drafts view
 /// before the server has assigned a real id. They MUST NOT be forwarded to
@@ -1221,16 +1272,22 @@ func isSyntheticPlaceholderId(_ id: String) -> Bool {
 /// as IMAP but is served by `DemoProvider`; an account kind with no mail
 /// provider (CalDAV) answers `false`.
 func placeholderIdsAreAddressable(for account: Account) -> Bool {
-    let type: (any EmailProvider.Type)?
-    if account.id == DemoSeed.demoAccountId {
-        type = DemoProvider.self
-    } else {
-        switch account.provider {
-        case .gmail: type = GmailProvider.self
-        case .outlook: type = ExchangeProvider.self
-        case .imap, .icloud: type = IMAPProvider.self
-        case .caldav: type = nil
-        }
+    emailProviderType(accountId: account.id, provider: account.provider)?.placeholderIdsAreAddressable ?? false
+}
+
+/// `EmailProvider.changeBookmark(_:claimsHeld:)` of the provider type that
+/// serves the account, read without a provider instance inside a write.
+func changeBookmark(_ cursor: String, claimsHeld messageId: String, accountId: String, provider: AccountProvider) -> Bool {
+    emailProviderType(accountId: accountId, provider: provider)?.changeBookmark(cursor, claimsHeld: messageId) ?? false
+}
+
+/// The provider type that serves an account; nil for a kind with no mail provider.
+private func emailProviderType(accountId: String, provider: AccountProvider) -> (any EmailProvider.Type)? {
+    if accountId == DemoSeed.demoAccountId { return DemoProvider.self }
+    switch provider {
+    case .gmail: return GmailProvider.self
+    case .outlook: return ExchangeProvider.self
+    case .imap, .icloud: return IMAPProvider.self
+    case .caldav: return nil
     }
-    return type?.placeholderIdsAreAddressable ?? false
 }

@@ -905,9 +905,9 @@ struct ChatFieldWordsTests {
 
     /// The ways the app deletes a thread's emails to download them again.
     enum Resync: String, CaseIterable, Sendable {
-        /// Settings' Delete All Email Index Data (`SettingsView.localIndexWipeTxn`).
+        /// Settings' Delete All Email Index Data (`SyncEngine.localIndexWipeTxn`).
         case indexWipe
-        /// An account's Reset Message Data (`AccountDetailView.resetMessageDataTxn`).
+        /// An account's Reset Message Data (`SyncEngine.resetMessageDataTxn`).
         case accountReset
         /// A folder's UIDVALIDITY change (`AccountManager.uidValidityResetPurgeTxn`).
         case uidValidity
@@ -917,9 +917,9 @@ struct ChatFieldWordsTests {
         func run(_ pool: DatabasePool, account: String) async throws {
             switch self {
             case .indexWipe:
-                try await pool.write { try SettingsView.localIndexWipeTxn($0) }
+                try await pool.write { try SyncEngine.localIndexWipeTxn($0) }
             case .accountReset:
-                try await pool.write { try AccountDetailView.resetMessageDataTxn($0, accountId: account) }
+                try await pool.write { try SyncEngine.resetMessageDataTxn($0, accountId: account) }
             case .uidValidity:
                 let purged = await AccountManager.shared.uidValidityResetPurgeTxn(
                     accountId: account, folderPath: "INBOX",

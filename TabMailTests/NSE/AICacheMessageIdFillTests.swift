@@ -107,10 +107,11 @@ struct AICacheMessageIdFillTests {
     }
 
     /// Storage maintenance's purge, run once the orphan grace has passed since every write here.
-    private func purgePastGrace(_ pool: DatabasePool) {
-        SyncEngine.runPurgeOrphanedAICache(
+    private func purgePastGrace(_ pool: DatabasePool) async {
+        await SyncEngine.runPurgeOrphanedAICache(
             dbPool: PrioritizedDatabase(pool: pool),
-            now: Date().addingTimeInterval(Double(SyncConfig.aiCacheOrphanGraceDays + 1) * 86_400)
+            now: Date().addingTimeInterval(Double(SyncConfig.aiCacheOrphanGraceDays + 1) * 86_400),
+            checkpointWAL: {}
         )
     }
 
@@ -150,7 +151,7 @@ struct AICacheMessageIdFillTests {
         #expect(written?.rfc822MessageId == Self.rfc822,
                 "\(stored), sameResult \(sameResult): the entry still has no Message-ID after the extension's write")
 
-        purgePastGrace(pool)
+        await purgePastGrace(pool)
         #expect(try await entry(pool) != nil,
                 "\(stored), sameResult \(sameResult): the purge removed an entry whose email is on the device")
     }
@@ -194,7 +195,7 @@ struct AICacheMessageIdFillTests {
         #expect(written?.rfc822MessageId == Self.rfc822,
                 "\(stored), \(write): the entry still has no Message-ID after writeThrough")
 
-        purgePastGrace(pool)
+        await purgePastGrace(pool)
         #expect(try await entry(pool) != nil,
                 "\(stored), \(write): the purge removed an entry whose email is on the device")
     }

@@ -151,6 +151,7 @@ is preserved in [the 2026-08-13 routed snapshot](Companion/Process/Current/manda
 |---|---|
 | audit, review, plan, vet, agent, delegation, supervision, stall, exact diff, shipped release, secret | [Current audit/review/supervision rules](Companion/Process/Current/audit-review-and-agent-supervision-rules.md) and [predecessor workflow](Companion/Process/Current/audit-workflow.md) |
 | resilience, main thread, connection loss, idempotency, `Mutex`, isolation | [Resilience](Companion/Rules/Active/resilience.md) |
+| sync, new sync mechanism, backfill, catch-up, folder reads, work queue, priority tier, `headerFetch`, `bodyFetch`, account turn, chunk, slice | [Every sync mechanism rides the existing pipe](Companion/Rules/Active/sync-work-rides-the-existing-pipe.md) |
 | Outbox, SMTP, send, `sentAt`, retry, discard, double-send | [Outbox reliability](Companion/Rules/Active/outbox-reliability.md) |
 | AI, summary, action, reply, Thunderbird parity, LLM queue | [AI processing](Companion/Rules/Active/ai-processing.md) |
 | SwiftUI, `@Observable`, array mutation, `ForEach`, pagination | [SwiftUI mutation safety](Companion/Rules/Active/swiftui-mutation-safety.md) |

@@ -106,4 +106,51 @@ struct SubjectPrefixTests {
     func forwardEmpty() {
         #expect(ThreadUtils.forwardSubject(for: "") == "Fwd:")
     }
+
+    // MARK: - normalizeSubject (the strip both lists feed)
+
+    /// Pins the strip's behaviour from before its one prefix list was split into
+    /// a reply list and a forward list: every prefix it removed, in any case,
+    /// nested, with or without a space; and what it leaves.
+    @Test("normalizeSubject strips exactly Re, Fwd, Fw, Aw, Sv and Vs", arguments: zip(stripInputs, stripOutputs))
+    func normalizeSubjectPin(_ input: String, _ expected: String) {
+        #expect(ThreadUtils.normalizeSubject(input) == expected, "normalizeSubject(\"\(input)\")")
+    }
+
+    // MARK: - hasForwardPrefix
+
+    @Test("A subject whose first prefix is Fwd or Fw is a forward's", arguments: [
+        "Fwd: Slides", "FWD: Slides", "fwd:Slides", "Fw: Slides", "FW: Slides", "fw:", "  Fwd: Slides",
+        "\tFW: Slides", "Fwd: Re: Slides",
+    ])
+    func forwardPrefix(_ subject: String) {
+        #expect(ThreadUtils.hasForwardPrefix(subject))
+    }
+
+    @Test("A reply's subject, the ambiguous Vs, localized forward prefixes and lookalikes are not a forward's", arguments: [
+        "Re: Slides", "Re: Fwd: Slides", "RE: FW: Slides", "Aw: Slides", "Sv: Slides", "VS: Slides", "Vs: Slides",
+        "WG: Slides", "TR: Slides", "RV: Slides", "Fwd Slides", "Fwd", "Forward: Slides", "Slides Fwd: x", "", "   ",
+    ])
+    func notForwardPrefix(_ subject: String) {
+        #expect(!ThreadUtils.hasForwardPrefix(subject))
+    }
 }
+
+/// `normalizeSubject` inputs and what it returns (file scope: a `@Test` trait
+/// cannot name a static member of its own type).
+private let stripCases: [(String, String)] = [
+    ("Re: A", "A"), ("RE: A", "A"), ("re:A", "A"),
+    ("Fwd: A", "A"), ("FWD:A", "A"), ("fwd: A", "A"),
+    ("Fw: A", "A"), ("FW: A", "A"), ("fw:A", "A"),
+    ("Aw: A", "A"), ("AW: A", "A"),
+    ("Sv: A", "A"), ("SV: A", "A"),
+    ("Vs: A", "A"), ("VS: A", "A"),
+    ("Re: Fwd: Aw: Sv: Vs: Fw: A", "A"), ("Fw:Fwd:Re:A", "A"),
+    ("  Fwd:   Re:  A  ", "A"), ("Re:", ""), ("", ""),
+    ("Ref: A", "Ref: A"), ("Fwd A", "Fwd A"), ("Forward: A", "Forward: A"),
+    ("A Re: B", "A Re: B"), ("A Fwd: B", "A Fwd: B"),
+    ("WG: A", "WG: A"), ("TR: A", "TR: A"), ("RV: A", "RV: A"),
+    ("Re: WG: A", "WG: A"),
+]
+private let stripInputs = stripCases.map(\.0)
+private let stripOutputs = stripCases.map(\.1)

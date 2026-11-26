@@ -52,6 +52,13 @@ import Foundation
 /// sends at most `SyncConfig.graphChangeReadRequestsPerSecond` times its read
 /// budget, a `$batch` charged its width before it is sent.
 ///
+/// **Other-folder runs** (scope `.otherFolders`, #1110): each slice reads the
+/// run's folders, every one a delta as above, with no folder list and no re-read
+/// list; a folder the slice can send nothing for is `.notRun`, and a baseline
+/// read that passed no page (the slice's time, or a held page, ended it) is
+/// `.baselining` with `FolderChanges.readCut`, so the run does not read the same
+/// page again in every slice (#1358).
+///
 /// **Folder list** (scope `.all`): the mail-folder delta is a change signal. A
 /// record for a folder already stored updates its name and counts
 /// (`FolderListUpdate.updated`); a new folder, a removed one or no link yet runs
@@ -91,6 +98,10 @@ extension ExchangeProvider {
         var results: [String: FolderChanges] = [:]
         var verbIdsByFolder: [(folder: ChangeFolder, ids: [String])] = []
         for folder in Self.foldersToRead(request) {
+            // A slice of an other-folder run reports a folder it can send nothing
+            // for `.notRun`, so the run reads it in a later slice (#1110); a pass
+            // reports such a folder from its stored phase.
+            if request.scope == .otherFolders, !allowance.canSend(1) { break }
             let read = try await readFolder(folder, request: request, allowance: &allowance)
             results[folder.id] = read.changes
             if !read.verbIds.isEmpty { verbIdsByFolder.append((folder, read.verbIds)) }
@@ -128,15 +139,20 @@ extension ExchangeProvider {
     }
 
     /// The folders this read covers, in order: those already tracking before
-    /// those in their baseline, the Inbox first in each. Scope `.all` reads every
-    /// folder the full sync syncs; `.inboxOnly` reads the Inbox only.
+    /// those in their baseline, the Inbox first in each, else in the request's
+    /// order. Scope `.all` reads every folder the full sync syncs; `.inboxOnly`
+    /// reads the Inbox only; `.otherFolders` reads the run's folders (#1110) in
+    /// the request's order, which the engine sets (those read longest ago first),
+    /// so a folder still in its baseline is never kept behind tracked ones run
+    /// after run.
     nonisolated static func foldersToRead(_ request: ChangeRequest) -> [ChangeFolder] {
         let eligible = request.folders.filter { folder in
             switch request.scope {
-            case .all: return folder.isSynced
+            case .all, .otherFolders: return folder.isSynced
             case .inboxOnly: return folder.role == .inbox
             }
         }
+        if request.scope == .otherFolders { return eligible }
         return eligible.enumerated().sorted { lhs, rhs in
             let l = (Self.isBaselinePhase(lhs.element) ? 1 : 0, lhs.element.role == .inbox ? 0 : 1, lhs.offset)
             let r = (Self.isBaselinePhase(rhs.element) ? 1 : 0, rhs.element.role == .inbox ? 0 : 1, rhs.offset)
@@ -178,6 +194,7 @@ extension ExchangeProvider {
 
         var ending = FolderReadEnding.cut
         var restartedBaseline = false
+        var pagePassed = false
         pages: while true {
             guard allowance.canSend(1) else { ending = .cut; break }
             let link = state.next
@@ -297,6 +314,7 @@ extension ExchangeProvider {
             }
             state.next = next
             state.failingSince = nil
+            pagePassed = true
             if page.deltaLink != nil {
                 if state.phase == .baseline {
                     state.phase = .tracking
@@ -316,8 +334,15 @@ extension ExchangeProvider {
                              collected: &collected, changes: &changes)
         }
 
-        let finished = Self.finish(
+        var finished = Self.finish(
             changes, collected: collected, state: state, stored: stored, ending: ending, now: context.clock())
+        // A run's baseline read that passed no page did not move the folder,
+        // whatever held rows it applies: the run counts it as cut, not as a
+        // baseline under way, so a slow link cannot keep the run on this page
+        // in every slice (#1358).
+        if request.scope == .otherFolders, !pagePassed, case .baselining = finished.status {
+            finished.readCut = true
+        }
         // Only records that travel with the result need their verb.
         let carried = Set(finished.records.map(\.messageId))
         return (finished, verbOrder.filter { carried.contains($0) })

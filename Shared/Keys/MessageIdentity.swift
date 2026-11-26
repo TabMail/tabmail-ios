@@ -112,6 +112,9 @@ public enum MessageIdentity {
     ///   entirely by this guard.
     /// * `AccountManager.purgeBodyAssetsForFolder` — the
     ///   `BodyAssetStore` manifest, matched entirely by this guard.
+    /// * `AccountManager.uidValidityResetPurgeTxn`'s `messageBody` delete — matched
+    ///   by this guard, and the bodies of the folder's own headers whose tail holds
+    ///   a `:` are then deleted by key, their ids read through the folder relation.
     /// * `SearchIndex.removeMessagesForFolder`'s **H-2 orphan sweep** of
     ///   `message_ids` — but NOT that function's primary delete.
     /// * The in-memory queue filters in `ActiveBodyQueue` / `BackfillBodyQueue` and
@@ -175,6 +178,38 @@ public enum MessageIdentity {
     /// `headerIdLikeNoDeeperColonSQLFragment` and for Swift-side `hasPrefix` scans.
     public static func headerIdPrefix(accountId: String, folderPath: String) -> String {
         "\(accountId):\(folderPath):"
+    }
+
+    /// The half-open range `[lower, upper)` of ids that begin with this folder's
+    /// `headerIdPrefix`, for a seek on a TEXT key's index (`id >= lower AND id < upper`)
+    /// instead of `LIKE`, which SQLite's case-insensitive default cannot run on a
+    /// BINARY index. Ids of a folder whose path continues after a `:` are inside the
+    /// range too; add `headerIdLikeNoDeeperColonSQLFragment` (bound to `lower`) to
+    /// leave them out.
+    public static func headerIdRange(accountId: String, folderPath: String) -> (lower: String, upper: String) {
+        let prefix = headerIdPrefix(accountId: accountId, folderPath: folderPath)
+        // The prefix ends with ":", so it is never empty and its bound always exists.
+        guard let upper = prefixUpperBound(prefix) else {
+            preconditionFailure("headerIdPrefix is never empty")
+        }
+        return (prefix, upper)
+    }
+
+    /// The EXCLUSIVE upper bound of the half-open range that selects exactly the
+    /// strings beginning with `prefix`, under SQLite's default BINARY collation:
+    /// `prefix` with its final Unicode scalar incremented by one.
+    ///
+    /// Used so a prefix test can be an indexable range instead of
+    /// `substr(col, 1, n) = ?`, which hides the column inside a function and
+    /// forces a table/index SCAN. The callers' prefixes end in an ASCII character
+    /// (`:` of a header-id prefix, hex or `'/'` of a blob id), so the `+ 1` cannot
+    /// leave Unicode's range; `nil` is returned only for an empty prefix, whose
+    /// callers treat it as "cannot decide" and keep whatever they were considering
+    /// removing.
+    public static func prefixUpperBound(_ prefix: String) -> String? {
+        guard let last = prefix.unicodeScalars.last,
+              let bumped = UnicodeScalar(last.value + 1) else { return nil }
+        return String(String.UnicodeScalarView(prefix.unicodeScalars.dropLast())) + String(bumped)
     }
 
     /// `headerIdPrefix` with SQL-LIKE wildcards escaped for `ESCAPE '\'`. A folder

@@ -81,6 +81,13 @@ within that directive's intent and are explicitly surfaced for owner veto.
   `flushBatch(enableAI: false)`). ⚠️ `flushBatch` is DUAL-ORIGIN — the user-open priority fetch
   also flushes through it (below); the origin travels as its `aiWindowExempt` parameter, so
   "flushBatch is gated" is true of its sync feeders, not of the function.
+  - *Correction 2026-11-24 (iOS #1400).* "Inbox-wide and UNBOUNDED" above describes the refill
+    before #1400. `ActiveBodyQueue.repopulateFromDatabase` and its drain-time refill now read the
+    newest `SyncConfig.bodyFetchRepopulateLimit` waiting inbox rows per refill (`admissionSQL`'s
+    `LIMIT`), and successive refills still reach every waiting row. So on first install every
+    historical Inbox row still flows through `flushBatch`, a window at a time, and the admission
+    window is still the only thing between that flood and the LLM: it stays load-bearing. The cost
+    of reading a window at a time is `IOS-BODY-007`.
 - **Window EXEMPT (arrival/user-intent bucket), carried by `AIJob.windowExempt`:**
   - *Push/NSE merge* (`NSEDataBridge`'s post-merge downstream loop): a pushed message is new mail
     the user was just notified about.
@@ -222,6 +229,38 @@ within that directive's intent and are explicitly surfaced for owner veto.
   keeps an entry while a header of the entry's own account (the key's first part), in any folder,
   has its Message-ID (`SyncEngine.aiCacheEntryHasEmail`; own account since 2026-11-09), and purges
   it only after `SyncConfig.aiCacheOrphanGraceDays` untouched with no such header.
+  - *Correction 2026-11-24 (iOS #1374).* The bullet above held for `runPurgeExpiredAICache`
+    alone. `refreshAICacheTTLAndPurge`, which the AI queue ran each time it drained, first
+    restarted the clock of every entry whose key began with an inbox folder's id. The key names
+    the folder the AI ran in, so the entry of a message archived later kept its inbox prefix and
+    had its clock restarted on every drain: it never expired, the membership check never saw it,
+    and every drain rewrote every such entry. The refresh is removed and the drain runs
+    `runPurgeExpiredAICache`, so membership alone decides. Its inbox check now asks whether any copy
+    of the message, in any account, is in an inbox (it read at most five copies), each batch reads
+    the expired set from its start (the old `OFFSET` skipped unhandled entries after a kept one),
+    and the expired set is read through `messageAICache_expiry` (ADR-IOS-029, 2026-11-24
+    amendment). A batch reads each entry's key and Message-ID only, so an entry whose stored
+    results no longer decode is expired like any other instead of failing every batch. The check
+    finds the message by the entry's Message-ID, so every writer stores it: the notification
+    extension's merge now stores the Message-ID it made the key from, and a write-through gives an
+    entry that has none the one it is keyed by. An entry the merge wrote before this change, for a
+    message still in an inbox, has no Message-ID and expires once; the header keeps the result on
+    screen, and a later rebuild of that header runs the AI again. Pinned by `AICacheExpiryTests`
+    and `NSEAICacheUpdatedAtEncodingTests.expiredEntryOfAnInboxMessageIsKept`.
+  - *Both lines joined 2026-11-25.* The two changes above met when the 2026-11-24 correction
+    reached the branch that already held ADR-IOS-114. The rule is ADR-IOS-114's; the mechanism is the
+    correction's. `runPurgeOrphanedAICache(dbPool:now:checkpointWAL:)` is `async`. It reads the
+    entries past `SyncConfig.aiCacheOrphanGraceDays` through `messageAICache_expiry`
+    (`aiCacheExpiredCountSQL`, `aiCacheExpiredBatchSQL`, from the start each batch, one entry more
+    than it handles), checkpoints the WAL between batches, and keeps an entry while a header of its
+    own account, in any folder, has its Message-ID. That check is `aiCacheHasEmailSQL`
+    (`INDEXED BY messageHeader_rfc822MessageId`, through `SyncEngine.aiCacheEntryHasEmail`); it
+    replaces the correction's any-account inbox check (`aiCacheInInboxSQL`). The AI queue's drain
+    runs no purge: maintenance runs it, then `runPurgeOrphanedChatFieldWords`. Pinned by
+    `AICacheExpiryTests` (`theAIQueueRunsNoCacheUpkeep` replaces `theDrainRunsTheExpiry`), the
+    `AI Cache Orphan Purge` suite, and
+    `NSEAICacheUpdatedAtEncodingTests.entryPastTheGraceOfAnEmailOnTheDeviceIsKept` (was
+    `expiredEntryOfAnInboxMessageIsKept`).
 - **No durable exception state.** Exempt processing is direct and ephemeral — no marker columns,
   no triggers, no redrive. IOS-AI-004's retirement of PR #39's durable machinery stands.
 

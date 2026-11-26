@@ -505,7 +505,8 @@ struct MigrationForeignKeyModeTests {
     /// upgrade, and until now it was only ever checked by grepping `AppDatabase.swift`.
     ///
     /// A grep cannot carry it, for two independent reasons. It counts **dead DDL** —
-    /// 16 `.references("` declarations for 10 live edges, because `v1`'s
+    /// 17 `.references("` declarations for 11 live edges (16 for 10 before `v115`
+    /// added `userLabelLastUsed → userLabel`), because `v1`'s
     /// `messageHeader → folder` was dropped by `v2`, `messageBody → messageHeader` is
     /// spelled twice and dropped by `v70`, and `v82`'s rebuild re-spells the three
     /// label edges `v33` created. And it counts **its own recording**: the `v71`
@@ -571,9 +572,10 @@ struct MigrationForeignKeyModeTests {
                 "outboxMessage -> account",
                 "pendingCalendarOperation -> account",
                 "userLabel -> account",
+                "userLabelLastUsed -> userLabel",
             ],
             """
-            the live schema declares \(edges.count) foreign key(s), not the 10 the v71 \
+            the live schema declares \(edges.count) foreign key(s), not the 11 the v71 \
             retirement comment enumerates: \(edges.map { "\($0.child) -> \($0.parent)" }.sorted()). \
             Re-derive that census with PRAGMA foreign_key_list, update the comment, then \
             update this roster.

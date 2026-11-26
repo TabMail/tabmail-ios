@@ -188,8 +188,10 @@ extension AccountManager {
         try await connectAccount(account)
 
         // Kick off initial sync in background so the UI dismisses immediately.
-        // If RootView.foregroundSyncAll fires meanwhile, its pass waits its turn
-        // (`SyncEngine.oneSyncAtATime`); the two never run at once.
+        // The two never run at once (`SyncEngine.oneSyncAtATime`). This initial
+        // sync waits for its turn; a poll that finds the account busy sets its
+        // follow-up flag instead (the sync design block in
+        // SyncEngineOneSyncAtATime.swift).
         let engine = syncEngine
         Task {
             do {
@@ -252,7 +254,8 @@ extension AccountManager {
             password: password,
             senderEmail: email,
             smtpHost: smtpHost,
-            smtpPort: smtpPort
+            smtpPort: smtpPort,
+            useTLS: imapUseTLSOverride
         )
         try await testProvider.connect()
 
@@ -308,6 +311,7 @@ extension AccountManager {
         let queue = ProviderWorkQueue(provider: testProvider, maxConcurrency: concurrency)
         workQueues[account.id] = queue
         await syncEngine.register(accountId: account.id, provider: testProvider, workQueue: queue)
+        liveProviderConnected(account)
 
         // Kick off initial sync in background so the UI dismisses immediately.
         let engine = syncEngine
@@ -392,6 +396,7 @@ extension AccountManager {
         let queue = ProviderWorkQueue(provider: testProvider, maxConcurrency: concurrency)
         workQueues[account.id] = queue
         await syncEngine.register(accountId: account.id, provider: testProvider, workQueue: queue)
+        liveProviderConnected(account)
 
         // Set up CalDAV if requested. Best-effort: the email account is the
         // primary entity and its IMAP connection was already validated above,
@@ -493,7 +498,7 @@ extension AccountManager {
             )
             calendarProviders[accountId] = provider
 
-            BackgroundSyncLogger.logDebug("[AccountManager] CalDAV set up for account \(accountId): home=\(discovery.calendarHomeURL)")
+            BackgroundSyncLogger.logDebug("[AccountManager] CalDAV set up for account \(accountId): home=\(LoggableURL.address(discovery.calendarHomeURL))")
         } catch {
             // Calendar setup failed after the password was written to the
             // Keychain but before a CalDAVConfig row exists to own it. config.id
@@ -748,20 +753,22 @@ extension AccountManager {
         try db.execute(sql: "DELETE FROM messageAICache WHERE key LIKE ? || ':%'", arguments: [accountId])
         // The account's chats' unsent words go with its AI data (ADR-IOS-117).
         try ChatFieldWords.deleteAccount(accountId, db: db)
+        // Cascade: account → folders → messageHeaders → outboxMessages.
+        // (messageBody is NO LONGER on this chain — see the explicit delete below.)
+        try Account.deleteOne(db, key: accountId)
         // `messageBody` is keyed by CONTENT key, not by `messageHeader.id`, and
         // Stage D (`v70_dropMessageBodyHeaderFK`) removed the FK that used to carry
         // it out on the cascade. Without this the removed account's cached email
-        // HTML would survive in the database for up to `bodyCacheTTLHours` after the
-        // user asked for the account to be gone. LIKE-escaped (account ids are
-        // colon-free UUIDs today, so this is hygiene rather than a fix) — content
-        // keys share the header id's `accountId:folderPath:` prefix, so one prefix
-        // covers every folder of the account.
+        // HTML would stay in the database with no header, and nothing reclaims a
+        // body that has no header (the evict reads headers, #1433). LIKE-escaped
+        // (account ids are colon-free UUIDs today, so this is hygiene rather than a
+        // fix) — content keys share the header id's `accountId:folderPath:` prefix,
+        // so one prefix covers every folder of the account. AFTER the cascade, so the
+        // HTML-cache pair's body-delete trigger (migration v116) finds no header to
+        // rewrite just before it is deleted.
         try db.execute(
             sql: #"DELETE FROM messageBody WHERE id LIKE ? ESCAPE '\'"#,
             arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
-        // Cascade: account → folders → messageHeaders → outboxMessages.
-        // (messageBody is NO LONGER on this chain — see the explicit delete above.)
-        try Account.deleteOne(db, key: accountId)
 
         // Promote next oldest active account to primary if we just removed the primary
         if wasPrimary {
@@ -935,6 +942,7 @@ extension AccountManager {
             }
         }
         authFailedAccounts.remove(account.id)
+        if mailProbe != nil { liveProviderConnected(account) }
     }
 
     /// Re-authenticate an account that signs in with OAuth and reconnect it.

@@ -1077,12 +1077,16 @@ actor ExchangeProvider: EmailProvider {
     /// would (a duplicate, never a drop). Nothing is deleted after an accepted send.
     /// Both routes ask Graph to give the message the draft's Message-ID, which the
     /// optimistic Sent row is keyed by (`buildGraphSendPayload(draft:sending:)`).
-    func send(draft: DraftMessage) async throws {
+    /// Neither answer names the Sent Items copy (`sendMail` and `send` answer
+    /// 202 with no body, and a sent draft gets a new id when it moves), so this
+    /// returns `nil` and the copy is matched by that Message-ID.
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
         guard !draft.attachments.isEmpty else {
             let message = buildGraphSendPayload(draft: draft, sending: true)
             let jsonData = try JSONSerialization.data(withJSONObject: ["message": message])
             let _ = try await request(path: "/sendMail", method: "POST", body: jsonData)
-            return
+            return nil
         }
         let graphId = try await createDraftWithAttachments(draft, sending: true)
         do {
@@ -1092,6 +1096,7 @@ actor ExchangeProvider: EmailProvider {
             try? await deleteDraft(identity: .outlook(graphId: graphId))
             throw error
         }
+        return nil
     }
 
     /// Exchange/Graph API auto-saves sent messages to Sent Items — no explicit append needed.

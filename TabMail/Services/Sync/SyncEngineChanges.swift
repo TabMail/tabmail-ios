@@ -53,18 +53,33 @@ struct FolderChangeState: Codable, Equatable, Sendable {
     /// bounds only a pass's own additions; an id already stored is never cut (#903).
     var recheck: [String] = []
     /// How many moves retired without proof have left this folder possibly
-    /// wrong since its last complete self-heal pass (`MessageHeaderRekey.finishMove`,
+    /// wrong since its last clean older-mail check (`MessageHeaderRekey.finishMove`,
     /// ADR-IOS-111 exit rule), whether or not it held a bookmark then. While it is
-    /// above zero the folder gets ONE self-heal pass at each full sync
-    /// (`healFoldersAfterAnUnprovenMove`) and is not tracked. The window listing
-    /// reaches only the newest messages, so one the move left in the folder below
-    /// it would otherwise stay missing. A count, not a flag: a pass clears it only
-    /// when no retirement was added while the pass ran.
+    /// above zero the folder is not tracked, and the catch-up lists it (each
+    /// mark is a lapse), loading every message the server holds in the held
+    /// range that no row holds, by UID (#1062). The window listing reaches only
+    /// the newest messages, so one the move left in the folder below it would
+    /// otherwise stay missing. Cleared by the catch-up apply when a clean listing
+    /// that started at or after `selfHealLapse` completes.
+    /// *Superseded (#1062):* "While it is above zero the folder gets ONE self-heal
+    /// pass at each full sync (`healFoldersAfterAnUnprovenMove`) [...] a pass
+    /// clears it only when no retirement was added while the pass ran."
     var selfHealOwed: Int = 0
 
-    /// The full sync's listing is due for this folder whatever its counters say:
-    /// a count check (phase 2) that did not finish (a failed SEARCH, or a ghost
-    /// a shield protects) set it; a phase 2 that finishes clears it (#755).
+    /// The folder's catch-up lapse count right after the last owed mark (0 when
+    /// its catch-up state was NULL: its first listing starts after the mark). A
+    /// listing that started at a lower count began before the mark and does not
+    /// clear it.
+    var selfHealLapse: Int?
+
+    /// The full sync's listing is due for this folder whatever its counters say.
+    /// Set by a count check (phase 2) that did not finish (a failed SEARCH, or a
+    /// ghost a shield protects), by a listing that proved nothing, by a folder
+    /// holding more rows than the server counts (#755), and by the catch-up when
+    /// its clean listing clears what a folder was owed after an unproven move
+    /// (#1062), so the next full sync lists it and it can be tracked again.
+    /// Only a phase 2 that finishes clears it, before that pass's
+    /// `commitChangeBaseline`, which leaves a folder still due untracked.
     var listingDue: Bool = false
 
     /// Who set `listingDue` last: a fresh token on every mark. A count check
@@ -97,7 +112,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         self.recheck = recheck
     }
 
-    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed, listingDue, listingDueToken }
+    private enum CodingKeys: String, CodingKey { case v, tracking, recheck, selfHealOwed, selfHealLapse, listingDue, listingDueToken }
 
     /// `selfHealOwed` is absent from a state stored before it existed.
     init(from decoder: Decoder) throws {
@@ -106,6 +121,7 @@ struct FolderChangeState: Codable, Equatable, Sendable {
         tracking = try container.decode(Bool.self, forKey: .tracking)
         recheck = try container.decode([String].self, forKey: .recheck)
         selfHealOwed = try container.decodeIfPresent(Int.self, forKey: .selfHealOwed) ?? 0
+        selfHealLapse = try container.decodeIfPresent(Int.self, forKey: .selfHealLapse)
         listingDue = try container.decodeIfPresent(Bool.self, forKey: .listingDue) ?? false
         listingDueToken = try container.decodeIfPresent(String.self, forKey: .listingDueToken)
     }
@@ -161,13 +177,15 @@ extension SyncEngine {
 
     /// Read and apply the provider's changes. Nil = the provider has no change
     /// reader; the caller keeps that provider's remaining change path.
+    /// - Parameter request: the pass's request (`makeChangeRequest`), built once
+    ///   in its turn before the read; its read end also bounds the pass's
+    ///   turnover re-drive.
     /// - Parameter deadline: the caller's own deadline for the whole pass (its
     ///   timeout), or nil when the caller sets none. It is not account sync state.
     func readAndApplyChanges(
-        account: Account, provider: any EmailProvider, scope: ChangeScope, deadline: Date? = nil, pass: UUID? = nil
+        account: Account, provider: any EmailProvider, request: ChangeRequest, deadline: Date? = nil, pass: UUID? = nil
     ) async throws -> ChangePassOutcome? {
         let accountId = account.id
-        let request = try await makeChangeRequest(accountId: accountId, scope: scope, deadline: deadline)
         let outOfTime = !request.context.hasBudget()
         guard let firstRead = try await provider.fetchChanges(
             since: ChangeCursor(account: account.lastHistoryId), request: request) else { return nil }
@@ -203,7 +221,7 @@ extension SyncEngine {
             // Recorded for this pass by `listFolder` (`unprovenListingPasses`),
             // so an error in a later folder cannot lose it.
             case .unproven: break
-            case .notListed: break
+            case .notListed, .listingNotStarted: break
             }
         }
         outcome.outOfTime = outOfTime
@@ -228,8 +246,11 @@ extension SyncEngine {
         return min(cap, lastStart)
     }
 
-    /// Built ONCE when the pass's turn starts (snapshot rule).
-    private func makeChangeRequest(accountId: String, scope: ChangeScope, deadline: Date?) async throws -> ChangeRequest {
+    /// Built ONCE when the pass's turn starts (snapshot rule). Its read end
+    /// (`context.deadline`) is sampled after the folder snapshot, just before
+    /// the first request, and is the one end of the pass's read budget: the
+    /// pass's turnover re-drive starts reactions only before it (#1287).
+    func makeChangeRequest(accountId: String, scope: ChangeScope, deadline: Date?) async throws -> ChangeRequest {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
@@ -256,15 +277,19 @@ extension SyncEngine {
                 }
             })
         return ChangeRequest(
-            folders: folders.map {
-                ChangeFolder(
-                    id: $0.id, path: $0.path, role: $0.role, cursor: $0.changeCursor,
-                    isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate,
-                    addressEpoch: Self.knownUidValidity($0.lastKnownUidValidity),
-                    olderMailComplete: $0.backfillComplete, olderMailCursor: $0.backfillUidCursor)
-            },
+            folders: folders.map { Self.changeFolder($0, isSynced: synced.contains($0.id)) },
             scope: scope, recheck: recheck, context: context,
             localRows: SyncEngineCatchUpRowReader(pool: dbPool))
+    }
+
+    /// The reader's view of one stored folder, for a pass's request
+    /// (`makeChangeRequest`) and an other-folder run's (`readOtherFolders`, #1110).
+    nonisolated static func changeFolder(_ folder: Folder, isSynced: Bool) -> ChangeFolder {
+        ChangeFolder(
+            id: folder.id, path: folder.path, role: folder.role, cursor: folder.changeCursor,
+            isSynced: isSynced, heldSince: folder.oldestSyncedDate,
+            addressEpoch: knownUidValidity(folder.lastKnownUidValidity),
+            olderMailComplete: folder.backfillComplete, olderMailCursor: folder.backfillUidCursor)
     }
 
     /// The distinct ids one pass reads again: the folders' lists taken in turn,
@@ -301,7 +326,9 @@ extension SyncEngine {
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 
-    private func applyChangeSet(_ changeSet: ChangeSet, account: Account, request: ChangeRequest) async throws -> ChangePassOutcome {
+    /// The one generic apply of a read: a pass's (`readAndApplyChanges`) and an
+    /// other-folder run's slice (`readOtherFolders`, #1110).
+    func applyChangeSet(_ changeSet: ChangeSet, account: Account, request: ChangeRequest) async throws -> ChangePassOutcome {
         let accountId = account.id
         var outcome = ChangePassOutcome()
         outcome.fromReader = true
@@ -362,8 +389,10 @@ extension SyncEngine {
         }
 
         // A renumbered folder's turnover reaction, armed durably in its folder
-        // transaction above, runs now (single-flight; a crash re-drives it from
-        // the armed flag at the next pass start).
+        // transaction above, runs now (single-flight). One stopped before it
+        // stamps the new epoch, or lost to a crash, leaves the flag set: a later
+        // pass's re-drive retries it after that pass's read, while its read
+        // budget lasts.
         for path in armedTurnovers {
             BackgroundSyncLogger.logDebug("[Sync] Change apply: folder \(path) renumbered — turnover reaction")
             await AccountManager.shared.runUidValidityResetReaction(accountId: accountId, folderPath: path)

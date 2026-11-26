@@ -130,7 +130,7 @@ actor ExchangeCalendarProvider: CalendarProvider {
         // The query filter is applied client-side (Graph calendarView doesn't support $search),
         // to each page as it is read, so `maxResults` counts matching events, never the rows
         // a page happened to hold. Reading stops once `maxResults` events are listed.
-        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents endpoint: \(endpoint)")
+        BackgroundSyncLogger.logDebug("[ExchangeCalendar] listEvents endpoint: \(LoggableURL.address(endpoint))")
         let lower = query.flatMap { $0.isEmpty ? nil : $0.lowercased() }
         var events: [GCalEvent] = []
         try await readPages(path: endpoint, logLabel: "listEvents response") { (page: [MSEvent]) in
@@ -4534,8 +4534,9 @@ enum ExchangeCalendarConfig {
     /// (`maxResults` 2,500 per calendar) is 10 pages; the rest is room for the cancelled,
     /// empty and non-matching rows a page also holds. The cap bounds the walk at 10,000 rows
     /// (`listPageSize` times this). A listing can reach it: a search with explicit dates years
-    /// apart on a very busy calendar. It then throws `listingIncomplete`, the assistant's tools
-    /// skip that calendar, and a narrower window lists it.
+    /// apart on a very busy calendar. It then throws `listingIncomplete`, and the assistant's
+    /// tools report that calendar as not read (`CalendarToolHelpers.fetchEventsFromAllCalendars`,
+    /// #1293); a narrower window lists it.
     static let maxListPages = 40
 }
 

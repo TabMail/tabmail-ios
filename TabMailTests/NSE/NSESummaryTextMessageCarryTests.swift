@@ -337,7 +337,7 @@ struct NSESummaryTextMessageCarryTests {
         try await pool.write { db in
             _ = try MessageHeader.filter(Column("messageId") == meta.messageId).deleteAll(db)
         }
-        SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool, priority: .background))
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool, priority: .background), checkpointWAL: {})
 
         let kept = try #require(try await pool.read { try MessageAICache.fetchOne($0, key: key) })
         #expect(kept.summaryTextMessage == "Can you review the budget?")

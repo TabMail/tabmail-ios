@@ -139,7 +139,7 @@ struct CalendarPutBackFilesTests {
         let db = try CalendarQueueTestDatabase(accountId: "put-back-wipe")
         defer { db.finish() }
         let held = try await Self.row(db, accountId: "put-back-wipe")
-        try await db.pool.write { d in try SettingsView.localIndexWipeTxn(d) }
+        try await db.pool.write { d in try SyncEngine.localIndexWipeTxn(d) }
         try await db.pool.write { d in
             try d.execute(sql: "INSERT INTO appReleaseStamp (id, release) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET release = excluded.release",
                           arguments: ["an earlier release"])

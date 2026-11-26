@@ -1277,7 +1277,7 @@ extension BackendClient {
 
                 let toolName = toolCall.function.name
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Executing client-side tool: \(toolName) (call_id=\(toolCall.id.prefix(8)))")
-                BackgroundSyncLogger.logDebug("[AIChatDebug]   args: \(toolCall.function.arguments.prefix(200))")
+                BackgroundSyncLogger.logDebug("[AIChatDebug]   args: \(toolCall.function.arguments.utf8.count) bytes")
 
                 // Fire tool-started event for client-side tools (matching server-side SSE events)
                 onSSEEvent?(.toolStarted(ToolStatusEvent(
@@ -1992,7 +1992,7 @@ enum BackendError: Error, LocalizedError {
 /// This is deliberately a DISTINCT type from the fork/resend pathways (which
 /// restart from a user message). Resume continues an in-flight turn; it does not
 /// re-send anything the user typed.
-struct ChatConnectionLostError: Error, LocalizedError {
+struct ChatConnectionLostError: Error, LocalizedError, CustomStringConvertible, CustomDebugStringConvertible {
     /// The failed round's input request (already carries the accumulated
     /// `conversation_state`). Re-enter the tool loop with this to resume.
     let resumeRequest: CompletionsRequest
@@ -2003,6 +2003,12 @@ struct ChatConnectionLostError: Error, LocalizedError {
     /// LocalizedError so those show a clean message, not the Swift default
     /// "The operation couldn't be completed. (… error 1.)".
     var errorDescription: String? { "Connection lost. Please try again." }
+
+    /// Content-free, like the other errors' log text: log lines interpolate errors
+    /// (`\(error)`), and the default description would print every stored
+    /// property, the whole `resumeRequest` included. Fixed, whatever the request.
+    var description: String { "ChatConnectionLostError: connection lost, the round can be resumed" }
+    var debugDescription: String { description }
 }
 
 /// An AI request the client did not send because AI is turned off (Settings → Opt Out of

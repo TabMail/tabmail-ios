@@ -45,13 +45,14 @@ import GRDB
 //   applies what it carries and settles nothing, and the reader reads a listed
 //   message in full), and so is every message the provider could not read
 //   (`rereadLater`).
-//   Over `SyncConfig.changeRecheckLimit` ids, a folder the catch-up checks
-//   (`SyncEngine.isSyncable`) keeps every id already stored and only as many of
-//   this pass's additions as fit, and its catch-up is armed for the cut ones (a
-//   folder holding its own bookmark drops it instead, so it is listed again: its
-//   catch-up need not load a missing message); a
-//   folder the catch-up never checks keeps every id, since nothing else would
-//   repair a dropped one (each pass still reads at most the per-pass budget);
+//   Over `SyncConfig.changeRecheckLimit` ids, a folder keeps every id already
+//   stored and only as many of this pass's additions as fit, and its catch-up,
+//   which checks every folder (#1110), is armed for the cut ones (a folder
+//   holding its own bookmark drops it instead, so it is listed again: its
+//   catch-up need not load a missing message);
+//   *superseded (#1110):* "a folder the catch-up checks (`SyncEngine.isSyncable`)
+//   ...; a folder the catch-up never checks keeps every id, since nothing else
+//   would repair a dropped one (each pass still reads at most the per-pass budget)";
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
 //   transaction. A refused one is cleared with the folder's coverage, a lapse
 //   mark for its catch-up and the account's full sync made due; a folder whose
@@ -99,6 +100,22 @@ extension SyncEngine {
             }
             result.rejected = true
             return result
+        }
+
+        // The rows the read checked, read again before any removal: every id
+        // the folder holds in the checked range must be one the check examined.
+        // A row that came meanwhile was not checked (also when another one
+        // left, keeping the count), so the bookmark stays; a checked row that
+        // left (moved out, or a proven removal) does not invalidate it.
+        // The same for the range the new bookmark newly covers: a row the
+        // notification merge inserted there after the read looked would be
+        // covered without ever being checked (#755).
+        let heldRowsHold = try [changes.heldRowsProof, changes.arrivalRowsProof].compactMap { $0 }.allSatisfy { proof in
+            let held = try Int.fetchAll(db, sql: """
+                SELECT CAST(messageId AS INTEGER) FROM messageHeader
+                WHERE folderId = ? AND CAST(messageId AS INTEGER) BETWEEN ? AND ?
+                """, arguments: [folder.id, proof.lowerId, proof.upperId])
+            return held.allSatisfy(proof.checkedIds.contains)
         }
 
         // Shields, read INSIDE this transaction.
@@ -158,15 +175,14 @@ extension SyncEngine {
         for id in declined.sorted() where !recheck.contains(id) { recheck.append(id) }
         // Over the limit, only this pass's own additions are cut, never an id
         // already stored (a long list of retired ids drains over passes, #903).
-        // Ids are dropped only where the catch-up will find them: arming it does
-        // nothing for a folder it never checks, so that folder keeps them all.
+        // Ids are dropped only where the catch-up will find them; it checks
+        // every folder, those outside the syncable set too (#1110).
         // A folder holding its own bookmark is listed again instead (as a
         // refused read is): its catch-up need not load a missing message (the
         // IMAP one only checks the rows a folder holds), and the bookmark would
         // move past a cut arrival.
         var cutDropsBookmark = false
-        if recheck.count > SyncConfig.changeRecheckLimit,
-           Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite) {
+        if recheck.count > SyncConfig.changeRecheckLimit {
             let stored = Set(before.recheck)
             let room = max(0, SyncConfig.changeRecheckLimit - recheck.filter(stored.contains).count)
             var added = 0
@@ -192,13 +208,14 @@ extension SyncEngine {
         // checked (issued with one, none stored now): a reader's own later page
         // of the same folder moves the bookmark forward, never to none.
         let bookmarkMoved = changes.readFrom.map { $0.cursor != nil && folder.changeCursor == nil } ?? false
-        var cursor = bookmarkMoved ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
+        var cursor = bookmarkMoved || !heldRowsHold ? folder.changeCursor : (changes.cursor ?? folder.changeCursor)
         switch changes.status {
         case .refused(let reason):
             // This folder only: its bookmark is gone, so it is not covered, its
             // catch-up gets one whole-folder check, and the account's full sync
-            // lists it. Its next read starts a new baseline.
-            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
+            // lists it when it syncs it (an other folder, read by its run, is not
+            // listed by the full sync, #1110). Its next read starts a new baseline.
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, listedByFullSync: Self.isSyncable(folder), db: db)
             cursor = nil
             state.tracking = false
             if case .addressEpochChanged(let served) = reason {
@@ -230,15 +247,22 @@ extension SyncEngine {
             state.tracking = false
         case .baselineReady:
             // Covered only after a window listing in a pass whose read covered it
-            // (`commitChangeBaseline`); make that listing due.
+            // (`commitChangeBaseline`); make that listing due. A folder the full
+            // sync does not list (an other folder, read by its run, #1110) leaves
+            // the account's clocks as they are: no listing would follow, and its
+            // new bookmark's one whole-folder check is the catch-up's.
             state.tracking = false
-            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            if Self.isSyncable(folder) {
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            }
         case .tracked, .failed, .notRun:
             break
         }
         if cutDropsBookmark {
-            // Its catch-up gets one whole-folder check and its listing is due.
-            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
+            // Its catch-up gets one whole-folder check and, for a folder the
+            // full sync lists, its listing is due (an other folder's next read,
+            // by its run, starts a new baseline, #1110).
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, listedByFullSync: Self.isSyncable(folder), db: db)
             cursor = nil
             state.tracking = false
         }
@@ -265,20 +289,38 @@ extension SyncEngine {
     /// kept. A folder with no bookmark is otherwise left as it is.
     /// `onlyIfHeld: false` (a refused read) ends the folder's tracking even when
     /// it holds no bookmark (a refused baseline). `selfHealDue: true` (a move
-    /// retired without proof) also owes the folder one self-heal pass before it
-    /// is tracked again (`FolderChangeState.selfHealOwed`), with or without a
-    /// bookmark: a folder awaiting its first baseline is tracked after its next
-    /// listing, which does not reach below the window either.
+    /// retired without proof) also owes the folder one clean older-mail check
+    /// before it is tracked again (`FolderChangeState.selfHealOwed`), with or
+    /// without a bookmark: the catch-up is always armed, and the lapse count after
+    /// the mark is recorded (`selfHealLapse`) so only a listing that starts after
+    /// it clears the mark (#1062). A folder awaiting its first baseline is tracked
+    /// after its next listing, which does not reach below the window either.
+    /// *Superseded (#1062):* "with `selfHealDue` and no bookmark it writes only
+    /// `selfHealOwed`" (the self-heal pass, deleted, ran without the lapse).
+    /// `listedByFullSync: false` (a folder outside the syncable set, whose
+    /// changes an other-folder run reads, #1110): the account's full sync, which
+    /// does not list the folder, is not made due; the catch-up check is armed as
+    /// always.
     /// Reads the folder's raw columns only (no model is decoded), so the release
     /// boundary can call it inside `AppDatabase.init` (#876).
-    nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
+    nonisolated static func dropChangeBookmark(
+        folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, listedByFullSync: Bool = true, db: Database
+    ) throws {
         guard let row = try Row.fetchOne(
             db, sql: "SELECT accountId, changeCursor, changeState FROM folder WHERE id = ?", arguments: [folderId])
         else { return }
         let accountId = String.fromDatabaseValue(row["accountId"] as DatabaseValue)
         let changeCursor = String.fromDatabaseValue(row["changeCursor"] as DatabaseValue)
         var state = FolderChangeState(raw: String.fromDatabaseValue(row["changeState"] as DatabaseValue))
-        if selfHealDue { state.selfHealOwed += 1 }
+        if selfHealDue {
+            state.selfHealOwed += 1
+            try markCatchUpLapse(folderId: folderId, db: db)
+            state.selfHealLapse = try Int.fetchOne(db, sql: """
+                SELECT CASE WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object'
+                    THEN COALESCE(json_extract(catchUpState, '$.' || ?), 0) ELSE 0 END
+                FROM folder WHERE id = ?
+                """, arguments: [CatchUpLapse.countKey, folderId]) ?? 0
+        }
         guard !onlyIfHeld || changeCursor != nil else {
             if selfHealDue {
                 try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folderId])
@@ -288,8 +330,28 @@ extension SyncEngine {
         state.tracking = false
         try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
                        arguments: [state.encoded, folderId])
-        try markCatchUpLapse(folderId: folderId, db: db)
+        if !selfHealDue { try markCatchUpLapse(folderId: folderId, db: db) }
+        guard listedByFullSync else { return }
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+    }
+
+    /// A row inserted outside a change read (the notification merge) under an
+    /// id the folder's bookmark claims it already holds contradicts the
+    /// bookmark: the message may be one a read proved gone. The bookmark is
+    /// dropped as a refused read drops it, so the next full sync lists the
+    /// folder and settles the row (#755, ADR-IOS-111). Call inside the insert's
+    /// transaction.
+    nonisolated static func endTrackingIfBookmarkClaimsHeld(folderId: String, messageId: String, db: Database) throws {
+        guard let row = try Row.fetchOne(db, sql: """
+            SELECT folder.changeCursor AS cursor, account.id AS accountId, account.provider AS provider
+            FROM folder JOIN account ON account.id = folder.accountId WHERE folder.id = ?
+            """, arguments: [folderId]),
+              let cursor = String.fromDatabaseValue(row["cursor"] as DatabaseValue),
+              let accountId = String.fromDatabaseValue(row["accountId"] as DatabaseValue),
+              let provider = String.fromDatabaseValue(row["provider"] as DatabaseValue).flatMap(AccountProvider.init(rawValue:)),
+              changeBookmark(cursor, claimsHeld: messageId, accountId: accountId, provider: provider)
+        else { return }
+        try dropChangeBookmark(folderId: folderId, db: db)
     }
 
     /// Arm one folder's catch-up: the same lapse mark `lapseDeltaCursor` sets on
@@ -304,6 +366,53 @@ extension SyncEngine {
                 ELSE NULL END
             WHERE id = ? AND catchUpState IS NOT NULL
             """, arguments: [CatchUpLapse.countKey, CatchUpLapse.countKey, folderId])
+    }
+
+    /// Record that a window listing of the folder named UID `lowest` in epoch
+    /// `epoch` (`CatchUpWindowFloor`, #1062): the floor becomes the lower of the
+    /// one it holds for that epoch and `lowest`; one held for another epoch is
+    /// replaced. A NULL state, or one that is not a JSON object, becomes an object
+    /// holding only the floor (which a provider reads as "never listed"). Called
+    /// only for a provider that windows by UID, in the window merge's own
+    /// transaction, with the listing's proven epoch, and by the catch-up apply to
+    /// carry the floor across its state write.
+    /// *Superseded (#1062):* the floor stored as a bare number, with no epoch.
+    nonisolated static func recordCatchUpWindowFloor(folderId: String, lowest: Int, epoch: Int, db: Database) throws {
+        try recordCatchUpEpochValue(
+            key: CatchUpWindowFloor.key, folderId: folderId, uid: lowest, epoch: epoch, keep: "MIN", db: db)
+    }
+
+    /// Record that the storage prune removed the folder's rows up to UID
+    /// `highest` in epoch `epoch` (`CatchUpPruneCutoff`, #1062): the cutoff
+    /// becomes the higher of the one it holds for that epoch and `highest`; one
+    /// held for another epoch is replaced. A NULL state, or one that is not a
+    /// JSON object, becomes an object holding only the cutoff (which a provider
+    /// reads as "never listed"). Called in the transaction that deletes the rows,
+    /// by the catch-up slice's one-time seed, and by the catch-up apply to carry
+    /// the cutoff across its state write.
+    nonisolated static func recordCatchUpPruneCutoff(folderId: String, highest: Int, epoch: Int, db: Database) throws {
+        try recordCatchUpEpochValue(
+            key: CatchUpPruneCutoff.key, folderId: folderId, uid: highest, epoch: epoch, keep: "MAX", db: db)
+    }
+
+    /// Writes `{uid, epoch}` under `key` of the folder's catch-up state
+    /// (`CatchUpEpochValue`): within the same epoch the `keep` (MIN or MAX) of the
+    /// stored and new UID, otherwise the new value. `keep` is one of two fixed
+    /// SQL function names, never caller data.
+    private nonisolated static func recordCatchUpEpochValue(
+        key: String, folderId: String, uid: Int, epoch: Int, keep: StaticString, db: Database
+    ) throws {
+        try db.execute(sql: """
+            UPDATE folder SET catchUpState = CASE
+                WHEN json_valid(catchUpState) AND json_type(catchUpState) = 'object' THEN json_set(
+                    catchUpState, '$.' || :key, json_object(
+                        'uid', CASE WHEN json_extract(catchUpState, '$.' || :key || '.epoch') = :epoch
+                            THEN \(keep)(COALESCE(json_extract(catchUpState, '$.' || :key || '.uid'), :uid), :uid)
+                            ELSE :uid END,
+                        'epoch', :epoch))
+                ELSE json_object(:key, json_object('uid', :uid, 'epoch', :epoch)) END
+            WHERE id = :id
+            """, arguments: ["key": key, "uid": uid, "epoch": epoch, "id": folderId])
     }
 
     /// One record in one folder. Returns false when a shield kept the change back.
@@ -642,7 +751,8 @@ extension SyncEngine {
 
         // Sent-folder reply discovery; a no-op for any other folder.
         result.discoveredParents += try ReplyParentResolver.markParentsReplied(
-            inReplyTos: [info.inReplyTo], folderRole: folder.role, accountId: accountId, db: db)
+            sentCopies: [.init(inReplyTo: info.inReplyTo, subject: info.subject)], folderRole: folder.role,
+            accountId: accountId, db: db)
         // The other direction: this row is a parent whose reply is already stored in Sent.
         result.discoveredParents += try ReplyParentResolver.markInsertedParentsOfStoredReplies(
             insertedRfc822Ids: header.rfc822MessageId.map { [$0] } ?? [], accountId: accountId, db: db)

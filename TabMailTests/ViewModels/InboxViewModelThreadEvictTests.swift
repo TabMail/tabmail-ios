@@ -469,7 +469,7 @@ struct InboxViewModelThreadEvictTests {
         UndoService.shared.dismissAll()
         defer { UndoService.shared.dismissAll() }
 
-        vm.moveThread(group.members.map(\.id), toFolderPath: "Archive")
+        vm.moveThread(group.members.map(\.id), toFolderPath: "Archive", accountId: folder.accountId)
 
         // A whole-thread move must be a SINGLE grouped undo entry carrying every
         // member — not three separate entries. This is the bug #1 invariant.

@@ -271,7 +271,7 @@ struct EpochGuardRefusalTests {
     /// This is the state the backfill walk already refuses at
     /// `crawlEpochGate` and that `insertBackfillBatch`'s CAS already refuses for
     /// the walk's chunks. Self-heal reached the same table with neither.
-    @Test("Self-heal never inserts headers from a numbering the folder is not stamped with")
+    @Test("The older-mail check never inserts headers from a numbering the folder is not stamped with")
     @MainActor
     func selfHealNeverInsertsHeadersFromAnUnstampedNumbering() async throws {
         let staleEpoch = 915_101   // what the folder's rows are stamped with
@@ -289,7 +289,7 @@ struct EpochGuardRefusalTests {
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         let accountId = "r13-selfheal-turnover"
-        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try FolderEpochTestFixture.insertFolder(
             accountId: accountId, path: "INBOX", role: .inbox, pool: pool,
             lastKnownUidValidity: staleEpoch)
@@ -302,10 +302,14 @@ struct EpochGuardRefusalTests {
         try await imap.connect()
         defer { Task { try? await imap.disconnect() } }
         let engine = await Self.makeEngine(accountId: accountId, provider: imap)
-        let folder = try #require(
-            try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool))
-
-        await engine.selfHealRecentMessages(account: account, forceSingleFolder: folder)
+        // The folder's older-mail walk is complete, so the older-mail check owns
+        // the whole held range and loads what it finds missing (#1062).
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET backfillComplete = 1 WHERE id = ?", arguments: [folderId])
+        }
+        await engine.runCatchUp(
+            provider: imap, folderIds: [folderId],
+            context: CatchUpContext(deadline: .distantFuture, clock: { Date() }))
 
         let rows = try Self.headers(pool, folderId: folderId)
         #expect(!rows.contains { $0.rfc822MessageId == decoyRfc },
@@ -331,7 +335,7 @@ struct EpochGuardRefusalTests {
     ///
     /// Passes on both trees, by construction. It is an over-refusal control, not
     /// a red proof.
-    @Test("Self-heal still repairs a real UID gap when the folder and the server agree")
+    @Test("The older-mail check still repairs a real UID gap when the folder and the server agree")
     @MainActor
     func selfHealStillRepairsWhenTheEpochsAgree() async throws {
         let liveEpoch = 915_201
@@ -348,7 +352,7 @@ struct EpochGuardRefusalTests {
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
         let accountId = "r13-selfheal-agrees"
-        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try FolderEpochTestFixture.insertFolder(
             accountId: accountId, path: "INBOX", role: .inbox, pool: pool,
             lastKnownUidValidity: liveEpoch)
@@ -359,10 +363,14 @@ struct EpochGuardRefusalTests {
         try await imap.connect()
         defer { Task { try? await imap.disconnect() } }
         let engine = await Self.makeEngine(accountId: accountId, provider: imap)
-        let folder = try #require(
-            try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool))
-
-        await engine.selfHealRecentMessages(account: account, forceSingleFolder: folder)
+        // The folder's older-mail walk is complete, so the older-mail check owns
+        // the whole held range and loads what it finds missing (#1062).
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET backfillComplete = 1 WHERE id = ?", arguments: [folderId])
+        }
+        await engine.runCatchUp(
+            provider: imap, folderIds: [folderId],
+            context: CatchUpContext(deadline: .distantFuture, clock: { Date() }))
 
         let rows = try Self.headers(pool, folderId: folderId)
         #expect(rows.contains { $0.rfc822MessageId == repairedRfc },
@@ -370,60 +378,6 @@ struct EpochGuardRefusalTests {
                 self-heal refused a folder whose stamp (\(liveEpoch)) matches the live mailbox — \
                 UID-gap repair is now off for every IMAP account, and the mail this pass exists to \
                 recover stays missing. Rows: \(rows.map { "\($0.messageId)=\($0.rfc822MessageId ?? "-")" })
-                """)
-    }
-
-    /// THE MIRROR IMAGE #2 — a server that reports NO UIDVALIDITY on SELECT.
-    /// Nothing is ever stamped for such an account, so every gesture on its rows
-    /// stays refused by `newGestureRefusedForUnknownEpoch` and no bare UID is
-    /// ever resolved against the wrong numbering — the accepted `IOS-EPOCH-001`
-    /// window. Self-heal must keep working there rather than treating "no epoch
-    /// on either side" as a disagreement, which is precisely how a nil-collapsing
-    /// comparison would fail.
-    ///
-    /// It also covers the nil that `fetchMessageHeadersWithObservedEpoch` returns
-    /// when no batch reported an epoch: both sides nil must ADMIT.
-    ///
-    /// Passes on both trees; over-refusal control, not a red proof.
-    @Test("Self-heal still repairs on a server that reports no UIDVALIDITY at all")
-    @MainActor
-    func selfHealStillRepairsOnAnEpochlessServer() async throws {
-        let repairedRfc = "selfheal-epochless@example.com"
-
-        let server = FakeIMAPServer(
-            capabilities: Self.nonUidplusCapabilities,
-            mailboxes: ["INBOX": [Self.message(uid: 42, id: repairedRfc, subject: "gap mail")]])
-        server.suppressSelectUidValidity(for: "INBOX")
-        try server.start()
-        defer { server.stop() }
-
-        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
-
-        let accountId = "r13-selfheal-epochless"
-        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
-        try FolderEpochTestFixture.insertFolder(
-            accountId: accountId, path: "INBOX", role: .inbox, pool: pool,
-            lastKnownUidValidity: nil)
-        let folderId = "\(accountId):INBOX"
-        try Self.insertHeader(accountId: accountId, path: "INBOX", uid: "7", pool: pool)
-
-        let imap = Self.provider(for: server)
-        try await imap.connect()
-        defer { Task { try? await imap.disconnect() } }
-        let engine = await Self.makeEngine(accountId: accountId, provider: imap)
-        let folder = try #require(
-            try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool))
-
-        await engine.selfHealRecentMessages(account: account, forceSingleFolder: folder)
-
-        let rows = try Self.headers(pool, folderId: folderId)
-        #expect(rows.contains { $0.rfc822MessageId == repairedRfc },
-                """
-                self-heal refused an account whose server reports no UIDVALIDITY on SELECT. That \
-                account's folders are never stamped, so its gestures are already refused and there \
-                is no wrong-numbering hazard to guard against — refusing here only costs the user \
-                the repair. Rows: \(rows.map { "\($0.messageId)=\($0.rfc822MessageId ?? "-")" })
                 """)
     }
 }

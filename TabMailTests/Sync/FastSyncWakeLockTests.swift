@@ -17,7 +17,7 @@ import Testing
 struct FastSyncWakeLockTests {
 
     enum Progress: String, CaseIterable, Sendable {
-        /// No entry published (a provider whose total is not known yet).
+        /// No entry published (a provider not registered yet, or before the first update).
         case missing
         /// An entry published before the walk finished (stale: headers not done).
         case stale

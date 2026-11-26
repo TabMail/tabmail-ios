@@ -190,7 +190,7 @@ struct FolderCodableTests {
         #expect(decoded == folder)
     }
 
-    @Test("Fence: a whole-record Folder save encodes every folder column except the listing counters, and never writes them")
+    @Test("Fence: a whole-record Folder save encodes every folder column except the listing counters and the follow mark, and never writes them")
     func wholeRecordSaveNeverWritesTheListingCounters() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -207,6 +207,9 @@ struct FolderCodableTests {
         folder.lastKnownHighestModSeq = 4242
         folder.backfillUidCursor = 100
         folder.backfillPageToken = "token-abc"
+        // The follow mark (#1109): a record read before the mark was written, or
+        // one that claims a mark, never changes the stored one.
+        folder.isFollowed = true
         try db.write { try folder.update($0) }
         try db.write { try folder.save($0) }
 
@@ -218,13 +221,22 @@ struct FolderCodableTests {
         #expect(fetched.backfillPageToken == "token-abc")
         #expect(fetched.totalCount == 7 && fetched.lastKnownUidNext == 8 && fetched.lastKnownHighestModSeq == 9,
                 "only the listing writer writes the counters")
+        #expect(fetched.isFollowed == false, "only SyncEngine.markFollowed writes the follow mark")
+        try db.write { db in _ = try SyncEngine.markFollowed(folderIds: [folder.id], db: db) }
+        folder.isFollowed = false
+        try db.write { try folder.update($0) }
+        try db.write { try folder.save($0) }
+        let markedRead = try db.read { try Folder.fetchOne($0, key: folder.id) }
+        let marked = try #require(markedRead)
+        #expect(marked.isFollowed == true, "a whole-record write from a record read before the mark never clears it")
 
         // Every other column of the table is encoded: a new field cannot be
         // left out of the record encoding (`Folder.encode(to: inout PersistenceContainer)`) unnoticed.
         let encoded = Set(try folder.databaseDictionary.keys)
         let tableColumns = Set(try db.read { try $0.columns(in: Folder.databaseTableName).map(\.name) })
-        #expect(encoded == tableColumns.subtracting(Folder.listingCounterColumns),
-                "missing: \(tableColumns.subtracting(Folder.listingCounterColumns).subtracting(encoded).sorted()), extra: \(encoded.subtracting(tableColumns).sorted())")
+        let unencoded = Folder.listingCounterColumns.union([Folder.followedColumn])
+        #expect(encoded == tableColumns.subtracting(unencoded),
+                "missing: \(tableColumns.subtracting(unencoded).subtracting(encoded).sorted()), extra: \(encoded.subtracting(tableColumns).sorted())")
     }
 
     @Test("Folder with nested path has correct id")

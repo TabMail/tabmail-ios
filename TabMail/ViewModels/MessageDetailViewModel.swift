@@ -144,6 +144,12 @@ final class MessageDetailViewModel {
     private let manager = AccountManager.shared
     private var dbPool: PrioritizedDatabase { _dbPoolOverride ?? AppDatabase.dbPool }
 
+    /// Whether opening the message is a folder access (#1109, `SyncEngine.folderAccessed`).
+    /// Always on in production; the test init leaves it off unless a test asks
+    /// for it, because the access goes through the shared engine and database, not
+    /// a test's own pool.
+    private let accessesFolder: Bool
+
     // Test seams — internal so @testable import can inject them
     @ObservationIgnored var _dbPoolOverride: PrioritizedDatabase?
     @ObservationIgnored var _fetchBodyOverride: ((MessageHeader) async throws -> Void)?
@@ -486,6 +492,7 @@ final class MessageDetailViewModel {
         expectedObservedUidValidity: Int? = nil
     ) {
         self.messageId = messageId
+        self.accessesFolder = true
         self.openIdentity = ExpectedMessageIdentity(
             capturedRfc822MessageId: expectedRfc822MessageId,
             capturedObservedUidValidity: expectedObservedUidValidity)
@@ -523,16 +530,23 @@ final class MessageDetailViewModel {
     /// one contract: a merge-commit buffered while the global gate is frozen
     /// needs the release listener to replay, and the AI-update listener's
     /// `applyRefresh` shares the preserve/freeze machinery under test.
+    ///
+    /// `accessesFolder` is opt-in (default OFF) for the same reason: the folder
+    /// access (#1109) writes the follow mark and starts a catch-up through the
+    /// shared engine and database, so a test that reads a private pool would
+    /// mark and sync folders of whatever database is installed at that moment.
     init(
         messageId: String,
         dbPool: DatabasePool,
         fetchBodyOverride: @escaping (MessageHeader) async throws -> Void,
         observeNotifications: Bool = false,
+        accessesFolder: Bool = false,
         expectedRfc822MessageId: String? = nil,
         expectedObservedUidValidity: Int? = nil
     ) {
         self._dbPoolOverride = PrioritizedDatabase(pool: dbPool)
         self._fetchBodyOverride = fetchBodyOverride
+        self.accessesFolder = accessesFolder
         self.messageId = messageId
         self.openIdentity = ExpectedMessageIdentity(
             capturedRfc822MessageId: expectedRfc822MessageId,
@@ -1721,6 +1735,23 @@ final class MessageDetailViewModel {
         // does NOT bump per-image).
         BodyAssetStore.bumpMessageAccess(contentKey: ContentKey(rawValue: msg.id))
 
+        // Opening a message is a user action in its folder, wherever it was
+        // opened from (a folder, a search result, a chat or AI answer): the folder
+        // is followed and its whole content reconciled (#1109,
+        // `SyncEngine.folderAccessed`). Started when this load ends, whichever way
+        // it ends, on its own task: the open never waits for it, and the folder's
+        // catch-up requests never queue ahead of this message's body request on a
+        // provider's shared request slots.
+        let accessedAccountId = msg.accountId
+        let accessedFolderId = msg.folderId
+        defer {
+            if accessesFolder {
+                Task.detached(priority: .utility) { [manager] in
+                    await manager.syncEngine.folderAccessed(accountId: accessedAccountId, folderIds: [accessedFolderId])
+                }
+            }
+        }
+
         // Mark-as-read on open lives in `markReadOnOpenIfNeeded()` — called
         // from the view's `.task`/`.onAppear` on its own unstructured Task so
         // that cancellation of this body-load path (GRDB 7.x throws
@@ -2694,7 +2725,7 @@ final class MessageDetailViewModel {
 
     /// Load body for a thread message on demand (when user expands a bubble)
     func loadThreadMessageBody(_ threadMsg: MessageHeader) async {
-        let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: threadMsg.id) }) != nil
+        let hasBody = (try? await dbPool.read { db in try HTMLCachePair.isCached(db, headerId: threadMsg.id) }) ?? false
         guard !hasBody else { return }
         do {
             try await fetchBodyWithRetry(for: threadMsg)

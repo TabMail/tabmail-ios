@@ -68,13 +68,13 @@ struct ContentOwnershipSweepTests {
     @discardableResult
     private func seedHeader(
         accountId: String, folderPath: String, messageId: String, rfc822: String? = nil,
-        inReplyTo: String? = nil
+        inReplyTo: String? = nil, date: Date = Date()
     ) async throws -> MessageHeader {
         let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
         var header = MessageHeader(
             messageId: messageId,
             subject: "stage C fixture", from: "a", fromAddress: "a@example.com", to: "b@example.com",
-            date: Date(), snippet: "",
+            date: date, snippet: "",
             folderId: folderId, accountId: accountId, folderPath: folderPath,
             isInInbox: false
         )
@@ -152,6 +152,33 @@ struct ContentOwnershipSweepTests {
         BodyAssetStore.allManifestContentKeys()
     }
 
+    /// #1376: the asset side no longer sweeps the whole manifest. A key is judged
+    /// when it is on `bodyAssetPendingDelete`, where a header delete's trigger, the
+    /// notification extension's merge or the one-time sweep puts it. These fixtures
+    /// write assets for keys no header ever named, so they queue the keys the way
+    /// the one-time sweep would, then run one worker pass. The shared list also
+    /// holds the ids other suites' header deletes queued, so the pass gets a budget
+    /// that cannot run out before this fixture's entries.
+    private func queueAndProcessPendingDeletes(_ keys: [ContentKey]) async throws {
+        try await AppDatabase.dbPool.write { db in
+            for key in keys {
+                try db.execute(
+                    sql: "INSERT INTO bodyAssetPendingDelete (contentKey) VALUES (?)",
+                    arguments: [key.rawValue])
+            }
+        }
+        await BodyAssetMaintenance.processPendingDeletes(
+            passBudgetSeconds: 120, foreground: { true })
+    }
+
+    private func pendingDeleteEntries(for key: ContentKey) async -> Int {
+        (try? await AppDatabase.dbPool.read { db in
+            try Int.fetchOne(
+                db, sql: "SELECT COUNT(*) FROM bodyAssetPendingDelete WHERE contentKey = ?",
+                arguments: [key.rawValue])
+        } ?? 0) ?? 0
+    }
+
     private func cleanup(accountId: String, keys: [ContentKey]) async {
         try? await SearchIndex.shared.removeMessages(contentKeys: keys)
         try? await AppDatabase.dbPool.write { db in
@@ -168,6 +195,11 @@ struct ContentOwnershipSweepTests {
             // not reach it. Scoped by the same accountId as everything else here.
             try db.execute(sql: "DELETE FROM userLabel WHERE accountId = ?", arguments: [accountId])
             try db.execute(sql: "DELETE FROM account WHERE id = ?", arguments: [accountId])
+            // Last: the header delete above queued its ids (v114 trigger, #1376), and
+            // a kept (protected) entry stays on the list by design.
+            try db.execute(
+                sql: #"DELETE FROM bodyAssetPendingDelete WHERE contentKey LIKE ? ESCAPE '\'"#,
+                arguments: [MessageIdentity.escapeForLike(accountId) + ":%"])
         }
     }
 
@@ -235,10 +267,12 @@ struct ContentOwnershipSweepTests {
             data: Data(repeating: 7, count: 64),
             identityStamp: "rfc:quarantine-9002@example.com") != nil)
 
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([key])
 
         #expect(manifestKeys().contains(key),
                 "a quarantined folder's cached attachments must survive the orphan sweep")
+        #expect(await pendingDeleteEntries(for: key) == 1,
+                "a kept key stays queued so a later pass judges it again once the reset settles")
         await cleanup(accountId: accountId, keys: [key])
     }
 
@@ -261,10 +295,11 @@ struct ContentOwnershipSweepTests {
 
         let engine = SyncEngine()
         _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([key])
 
         #expect(await ftsRowid(key) == nil, "unowned FTS row must still be pruned")
         #expect(!manifestKeys().contains(key), "unowned asset rows must still be pruned")
+        #expect(await pendingDeleteEntries(for: key) == 0, "a deleted key leaves the list")
         await cleanup(accountId: accountId, keys: [key])
     }
 
@@ -275,28 +310,29 @@ struct ContentOwnershipSweepTests {
     /// `runEvictStaleBodies`, because it is not an orphan sweep by name — it is a TTL
     /// cache evictor whose orphan branch (`no messageHeader holds this id` → delete)
     /// was unreachable while the `messageBody → messageHeader` FK cascade removed the
-    /// row first. `v70_dropMessageBodyHeaderFK` is exactly what makes it reachable,
-    /// which is why the gate ships with the migration and not after it.
+    /// row first. `v70_dropMessageBodyHeaderFK` made it reachable, and Stage D gated it.
+    /// Since #1433 the evictor reads its candidates from the headers
+    /// (`HTMLCachePair.evictCandidatesPage`), so the branch is gone: a body no header
+    /// holds is never read, quarantined or not, and stays as a harmless leftover
+    /// (#1446).
     ///
     /// Two-sided by construction — an evictor that simply stopped deleting would fail
     /// the second half:
     ///
-    /// - a stale orphan in a QUARANTINED folder must be KEPT (red without the gate);
-    /// - a stale orphan nothing owns must STILL be evicted;
-    /// - a stale orphan whose folder no longer exists must STILL be evicted — the
-    ///   deliberate "unresolvable scope is not protected" rule, without which a
-    ///   removed account's cached HTML would be a FOREVER leak rather than the
-    ///   reclaimed-on-a-later-pass kind the fail-safe direction trades for;
-    /// - a body a live header still holds must be KEPT, so the sweep is demonstrably
-    ///   still doing its normal job around the new branch.
+    /// - stale bodies no header holds, in a QUARANTINED folder, in a live folder and
+    ///   in a folder that does not exist, all stay;
+    /// - in a live folder holding one message more than `bodyCacheRecentPerFolder`,
+    ///   the oldest message's stale body is evicted and the newest ones' stay, so the
+    ///   sweep is demonstrably still doing its normal job around the bodies it skips.
     ///
     /// The bounded wait is deliberate. `206ec48cf` had to repair a sibling sweep whose
     /// loop stopped terminating when the Stage C gate added a third per-row outcome;
-    /// this sweep is cursored (`LIMIT/OFFSET`) and a KEEP counts as a SKIP, so the
-    /// offset still advances — asserted here as an OUTCOME (the sweep returns) rather
-    /// than by reading the loop.
-    @Test("#37 — the stale-body evictor keeps what it cannot prove dead, and still reclaims what is")
-    func evictStaleBodiesGatesItsOrphanLegAndStillReclaims() async throws {
+    /// this sweep is cursored (a `(htmlCachedAt, rowid)` keyset on the headers since
+    /// #1433, on the bodies since #1354, `LIMIT/OFFSET` before it) and the cursor moves
+    /// past a KEEP as past any other row — asserted here as an OUTCOME (the sweep
+    /// returns) rather than by reading the loop.
+    @Test("#37, #1433 — the stale-body evictor leaves bodies no header holds, and still reclaims stale ones")
+    func evictStaleBodiesLeavesHeaderlessBodiesAndStillReclaims() async throws {
         let accountId = "stageD-evict"
         try await seedScope(
             accountId: accountId, folderPath: "INBOX", provider: .imap, quarantined: true)
@@ -306,25 +342,35 @@ struct ContentOwnershipSweepTests {
         // Older than the TTL by a clear margin, computed from `Date()` — never a
         // hardcoded date.
         let staleHours = SyncConfig.bodyCacheTTLHours + 24
+        let recent = SyncConfig.bodyCacheRecentPerFolder
 
-        // KEEP: orphan under a UIDVALIDITY quarantine.
+        // KEEP: no header, under a UIDVALIDITY quarantine.
         let quarantinedOrphan = ContentKey(rawValue: "\(accountId):INBOX:3701")
         try await seedBody(key: quarantinedOrphan, html: "<p>quarantined</p>", ageHours: staleHours)
-        // EVICT: orphan in a live folder that nothing owns.
+        // KEEP: no header, in a live folder.
         let deadOrphan = ContentKey(rawValue: "\(accountId):Archive:3702")
         try await seedBody(key: deadOrphan, html: "<p>dead</p>", ageHours: staleHours)
-        // EVICT: orphan whose folder does not exist at all — scope unresolvable.
+        // KEEP: no header, in a folder that does not exist at all.
         let ghostFolderOrphan = ContentKey(rawValue: "\(accountId):GhostFolder:3704")
         try await seedBody(key: ghostFolderOrphan, html: "<p>ghost</p>", ageHours: staleHours)
-        // KEEP: a body a live header still holds.
-        let liveHeader = try await seedHeader(
-            accountId: accountId, folderPath: "Archive", messageId: "3703")
-        let liveKey = ContentKey(rawValue: liveHeader.id)
-        try await seedBody(key: liveKey, html: "<p>live</p>", ageHours: staleHours)
+        // `recent + 1` live headers in Archive, newest first, one hour apart: the
+        // newest `recent` keep their stale bodies, the oldest loses its body.
+        var liveKeys: [ContentKey] = []
+        for index in 0...recent {
+            let date = Calendar.current.date(byAdding: .hour, value: -index, to: Date()) ?? Date()
+            let header = try await seedHeader(
+                accountId: accountId, folderPath: "Archive", messageId: "\(3_800 + index)", date: date)
+            let key = ContentKey(rawValue: header.id)
+            try await seedBody(key: key, html: "<p>live \(index)</p>", ageHours: staleHours)
+            liveKeys.append(key)
+        }
+        #expect(liveKeys.count == recent + 1)
+        guard liveKeys.count == recent + 1, let oldestKey = liveKeys.last else { return }
 
         let sweep = Task.detached(priority: .utility) {
-            SyncEngine.runEvictStaleBodies(
-                dbPool: AppDatabase.dbPool, undoProtectedBodyIds: [])
+            await SyncEngine.runEvictStaleBodies(
+                dbPool: AppDatabase.dbPool, undoProtectedBodyIds: [],
+                afterEachPage: StaleBodyEvictWriterHoldTests.noCheckpoint)
         }
         do {
             try await withTimeout(seconds: 30) { await sweep.value }
@@ -334,17 +380,24 @@ struct ContentOwnershipSweepTests {
         }
 
         #expect(await bodyHTML(quarantinedOrphan) == "<p>quarantined</p>",
-                "a quarantined folder's cached body must survive the TTL evictor's orphan leg")
-        #expect(await bodyHTML(liveKey) == "<p>live</p>",
-                "a body a live header still holds must not be evicted")
-        #expect(await bodyHTML(deadOrphan) == nil,
-                "an orphan nothing owns must STILL be reclaimed")
-        #expect(await bodyHTML(ghostFolderOrphan) == nil,
-                "an orphan whose folder is gone must still be reclaimed — otherwise it leaks forever")
+                "a quarantined folder's cached body no header holds must stay")
+        #expect(await bodyHTML(deadOrphan) == "<p>dead</p>",
+                "a body no header holds must stay (#1446): the evictor reads only headers")
+        #expect(await bodyHTML(ghostFolderOrphan) == "<p>ghost</p>",
+                "a body whose folder is gone must stay: the evictor reads only headers")
+        var keptLive: [ContentKey] = []
+        for key in liveKeys.dropLast() {
+            let html = await bodyHTML(key)
+            if html != nil { keptLive.append(key) }
+        }
+        #expect(keptLive == Array(liveKeys.dropLast()),
+                "the bodies of the folder's newest \(recent) messages must not be evicted")
+        #expect(await bodyHTML(oldestKey) == nil,
+                "the stale body of the folder's oldest message must STILL be evicted")
 
         await cleanup(
             accountId: accountId,
-            keys: [quarantinedOrphan, deadOrphan, ghostFolderOrphan, liveKey])
+            keys: [quarantinedOrphan, deadOrphan, ghostFolderOrphan] + liveKeys)
     }
 
     /// Part 3 of Stage D: `.body` is no longer implicit. With the FK cascade gone,
@@ -455,7 +508,7 @@ struct ContentOwnershipSweepTests {
         try await seedHeader(
             accountId: accountId, folderPath: "Archive", messageId: providerMessageId)
 
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([oldKey])
 
         let keys = manifestKeys()
         #expect(!keys.contains(oldKey), "the stale key must not remain in the manifest")
@@ -1134,7 +1187,7 @@ struct ContentOwnershipSweepTests {
 
         let engine = SyncEngine()
         _ = try await engine.pruneFTSOrphans(scopePrefix: "\(accountId):")
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([key])
 
         #expect(await ftsRowid(key) != nil, "the indexed body must survive the transition")
         #expect(await ftsBody(key)?.contains("f4 body text") == true)
@@ -1306,7 +1359,8 @@ struct ContentOwnershipSweepTests {
     /// answers in ONE run so no leg can pass by a policy the others contradict.
     /// A manifest holding a live key, a protected-but-dead key, a dead key inside
     /// a resolvable scope and a dead key whose scope resolves to nothing must come
-    /// out of `pruneOrphans()` holding exactly the first two.
+    /// out of a pass of the pending-delete worker (`processPendingDeletes`, which
+    /// replaced `pruneOrphans()` in #1376) holding exactly the first two.
     ///
     /// ⚑ WHY THIS IS AN INVARIANT TEST AND NOT A MECHANISM ONE (`MIS-015`). It says
     /// nothing about how the sweep decides — not which keys the ownership gate is
@@ -1354,7 +1408,7 @@ struct ContentOwnershipSweepTests {
                 && seeded.contains(deadKey) && seeded.contains(unscopedKey),
                 "precondition: all four keys are in the manifest before the sweep")
 
-        await BodyAssetMaintenance.pruneOrphans()
+        try await queueAndProcessPendingDeletes([liveKey, quarantinedKey, deadKey, unscopedKey])
 
         let after = manifestKeys()
         #expect(after.contains(liveKey),
@@ -1365,6 +1419,11 @@ struct ContentOwnershipSweepTests {
                 "a key nothing owns, in a settled folder, must still be reclaimed")
         #expect(!after.contains(unscopedKey),
                 "a key no folder claims must still be reclaimable — otherwise a removed account leaks forever")
+        // The list: the live key, and both deleted keys, leave it; the protected key stays.
+        #expect(await pendingDeleteEntries(for: liveKey) == 0)
+        #expect(await pendingDeleteEntries(for: quarantinedKey) == 1)
+        #expect(await pendingDeleteEntries(for: deadKey) == 0)
+        #expect(await pendingDeleteEntries(for: unscopedKey) == 0)
 
         await cleanup(
             accountId: accountId,

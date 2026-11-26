@@ -32,6 +32,25 @@ actor BackfillEmbeddingQueue {
     /// Diagnostic for persistent 1.4-4.2s repopulate times even when 0 rows match.
     private var explainLogged = false
 
+    /// The embedding repopulate read: the first `limit` headers with a body but no
+    /// embedding, inbox first, newest first. Both queues' repopulate reads run it.
+    ///
+    /// It names `messageHeader_embeddingIncomplete` (partial on exactly these terms,
+    /// ordered as the `ORDER BY`), so it stays an ordered scan that stops at `limit`.
+    /// That index is built by migration `v50`, never deferred, so it always exists
+    /// (SQLite refuses a statement whose `INDEXED BY` index is missing). Without the
+    /// name, once the deferred `messageHeader_backfillProgress` exists and the app's
+    /// `ANALYZE` has run, SQLite skip-scans that index by account and sorts the whole
+    /// backlog: 10,831 pages instead of 511 on 105,000 headers (#1401).
+    static func repopulateSQL(limit: Int) -> String {
+        """
+        SELECT id FROM messageHeader INDEXED BY messageHeader_embeddingIncomplete
+        WHERE bodyComplete = 1 AND embeddingComplete = 0 AND bodyEmptyConfirmed = 0
+        ORDER BY isInInbox DESC, date DESC
+        LIMIT \(limit)
+        """
+    }
+
     // MARK: - Public API
 
     /// Enqueue a single header for embedding generation.
@@ -57,12 +76,7 @@ actor BackfillEmbeddingQueue {
         guard EmbeddingService.shared != nil else { return }
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        let sql: String = """
-            SELECT id FROM messageHeader
-            WHERE bodyComplete = 1 AND embeddingComplete = 0 AND bodyEmptyConfirmed = 0
-            ORDER BY isInInbox DESC, date DESC
-            LIMIT \(SyncConfig.embeddingRepopulateChunk)
-            """
+        let sql = Self.repopulateSQL(limit: SyncConfig.embeddingRepopulateChunk)
 
         // One-shot EXPLAIN QUERY PLAN probe. Isolates whether the 1.4-4.2s
         // repopulate cost is planner picking the wrong index vs something else.
@@ -322,12 +336,7 @@ actor BackfillEmbeddingQueue {
         guard EmbeddingService.shared != nil else { return }
         do {
             let ids: [String] = try await AppDatabase.dbPool.read { db in
-                try String.fetchAll(db, sql: """
-                    SELECT id FROM messageHeader
-                    WHERE bodyComplete = 1 AND embeddingComplete = 0 AND bodyEmptyConfirmed = 0
-                    ORDER BY isInInbox DESC, date DESC
-                    LIMIT 500
-                    """)
+                try String.fetchAll(db, sql: Self.repopulateSQL(limit: 500))
             }
             guard !ids.isEmpty else { return }
             let items = ids.map { Item(headerId: $0) }

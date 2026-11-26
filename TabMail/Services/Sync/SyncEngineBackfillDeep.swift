@@ -79,8 +79,9 @@ extension SyncEngine {
     /// `.init(nil)` means "the premise is that the folder is UNSTAMPED", which is
     /// a real and common crawl state (a folder holding rows of unproven epoch,
     /// which `bootstrapCrawledFolderUidValidity` refuses to stamp) and MUST still
-    /// be guarded. Round 13 removed self-heal from the unguarded list — see
-    /// `SyncEngine.selfHealFolder`.
+    /// be guarded. Self-heal left the unguarded list on 2026-07-31 (its
+    /// successor, the catch-up's load of missing UIDs, inserts premised too:
+    /// `SyncEngine.applyCatchUpResult`, #1062).
     ///
     /// ⚠ **A nil premise is NOT a missing folder row**, and
     /// `crawlWalkWriteAllowed` no longer treats them alike: a row that is gone
@@ -113,12 +114,13 @@ extension SyncEngine {
         folderRole: FolderRole,
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise,
-        observedEpoch: UInt32?
+        observedEpoch: UInt32?,
+        catchUpRead: CatchUpReadLatch? = nil
     ) async -> SyncEngine.BackfillBatchOutcome {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: epochPremise,
-            observedEpoch: observedEpoch, catchUpReadStartedAt: nil
+            observedEpoch: observedEpoch, catchUpRead: catchUpRead
         )
         guard !result.refused else { return .refused }
         return .landed(
@@ -142,12 +144,12 @@ extension SyncEngine {
     /// not land (it rolled back as a whole). A caller must not move its
     /// bookkeeping past them.
     ///
-    /// `catchUpReadStartedAt` is set only by the catch-up's direct load
+    /// `catchUpRead` is set only by the catch-up's direct load
     /// (`SyncEngine.applyCatchUpResult`): when the read that listed `headers`
     /// began, on `CatchUpWallClock`. Each chunk then skips a message the user's
-    /// own action stands on (`catchUpReadPredatesAction`), and inserts nothing
-    /// for a read as old as the completion log's retention
-    /// (`catchUpReadIsOverAge`). A skipped message is not a failure and marks
+    /// own action stands on (`catchUpReadPredatesAction`), and once the read's
+    /// over-age latch (`CatchUpReadLatch`, checked per chunk) is set, inserts nothing
+    /// more and records the drop on the latch (#1062). A skipped message is not a failure and marks
     /// nothing: the folder still lacks it, so the next listing finds it missing
     /// again if the server still lists it there.
     func insertBackfillBatch(
@@ -158,12 +160,12 @@ extension SyncEngine {
         folderRole: FolderRole,
         isInInbox: Bool,
         observedEpoch: UInt32?,
-        catchUpReadStartedAt: Date? = nil
+        catchUpRead: CatchUpReadLatch? = nil
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], failed: Bool) {
         let result = await insertBackfillBatchGuardable(
             headers, folderId: folderId, accountId: accountId, folderPath: folderPath,
             folderRole: folderRole, isInInbox: isInInbox, epochPremise: nil,
-            observedEpoch: observedEpoch, catchUpReadStartedAt: catchUpReadStartedAt
+            observedEpoch: observedEpoch, catchUpRead: catchUpRead
         )
         return (result.inserted, result.ftsRecords, result.failed)
     }
@@ -177,7 +179,7 @@ extension SyncEngine {
         isInInbox: Bool,
         epochPremise: SyncEngine.CrawlEpochPremise?,
         observedEpoch: UInt32?,
-        catchUpReadStartedAt: Date?
+        catchUpRead: CatchUpReadLatch?
     ) async -> (inserted: Int, ftsRecords: [FTSHeaderRecord], refused: Bool, failed: Bool) {
         guard !headers.isEmpty else { return (0, [], false, false) }
 
@@ -220,6 +222,12 @@ extension SyncEngine {
                             }
                             return (inserted: 0, unread: 0, fts: [], parents: [], refused: true)
                         }
+                        // A change read became authoritative for this folder since
+                        // the range was read: nothing of it lands (#755).
+                        if let epochPremise, epochPremise.guardsChange,
+                           try !SyncEngine.fromServerInsertAllowed(db, folderId: folderId, premise: epochPremise.change) {
+                            return (inserted: 0, unread: 0, fts: [], parents: [], refused: true)
+                        }
                         // Load pending destructive IDs to skip messages with optimistic moves.
                         // Scoped to (accountId, folderPath) to prevent IMAP cross-folder UID collisions.
                         let scopedOps = try PendingOperation
@@ -233,10 +241,13 @@ extension SyncEngine {
                         // under its old id (#106's ghost). Both shields are read
                         // HERE, inside the chunk's transaction, never before it
                         // (Memory 127).
-                        let catchUpShield = catchUpReadStartedAt.map { readStartedAt in
-                            (readStartedAt: readStartedAt,
+                        // The over-age latch is checked here too, inside this
+                        // chunk's write (#1062): a slice suspended past the
+                        // retention mid-insert drops every load still to come.
+                        let catchUpShield = catchUpRead.map { latch in
+                            (readStartedAt: latch.readStartedAt,
                              recentlyCompleted: AccountManager.shared.liveRecentlyCompleted(),
-                             overAge: SyncEngine.catchUpReadIsOverAge(readStartedAt: readStartedAt, now: CatchUpWallClock.now()))
+                             overAge: latch.checkOverAge())
                         }
 
                         // Existence check: the same predicate the IMAP UID walk
@@ -247,7 +258,7 @@ extension SyncEngine {
                         var fts: [FTSHeaderRecord] = []
                         // The inserted rows' In-Reply-To and Message-ID, for
                         // reply discovery in both directions after the loop.
-                        var insertedInReplyTos: [String?] = []
+                        var insertedSentCopies: [ReplyParentResolver.SentCopy] = []
                         var insertedRfc822Ids: [String] = []
                         var inserted = 0
                         var unread = 0
@@ -289,7 +300,7 @@ extension SyncEngine {
                             // keeps the two in step.
                             if existingIds.contains(info.messageId) { continue }
                             if let catchUpShield {
-                                if catchUpShield.overAge { continue }
+                                if catchUpShield.overAge { catchUpRead?.noteLoadsSkipped(); continue }
                                 if SyncEngine.catchUpReadPredatesAction(
                                     accountId: accountId, messageId: info.messageId,
                                     rfc822MessageId: info.rfc822MessageId,
@@ -368,7 +379,7 @@ extension SyncEngine {
 
                             inserted += 1
                             if !info.isRead { unread += 1 }
-                            insertedInReplyTos.append(info.inReplyTo)
+                            insertedSentCopies.append(.init(inReplyTo: info.inReplyTo, subject: info.subject))
                             if let rfc822 = header.rfc822MessageId { insertedRfc822Ids.append(rfc822) }
 
                             fts.append(FTSHeaderRecord(
@@ -389,7 +400,7 @@ extension SyncEngine {
                         // inserted (a stored reply marked its parent when it was
                         // inserted) — no-op when folderRole != .sent.
                         var parents = try ReplyParentResolver.markParentsReplied(
-                            inReplyTos: insertedInReplyTos,
+                            sentCopies: insertedSentCopies,
                             folderRole: folderRole,
                             accountId: accountId,
                             db: db

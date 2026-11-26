@@ -554,7 +554,7 @@ struct DestructiveCleanupReliabilityTests {
 
         #expect(throws: (any Error).self) {
             try db.write { conn in
-                try AccountDetailView.resetMessageDataTxn(conn, accountId: "acc1")
+                try SyncEngine.resetMessageDataTxn(conn, accountId: "acc1")
             }
         }
 

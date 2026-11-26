@@ -155,9 +155,9 @@ struct BackfillUIDWalkRaceTests {
     // MARK: - The three user resets
 
     enum UserReset: String, CaseIterable, Sendable, CustomStringConvertible {
-        /// Reset Message Data on the account (`AccountDetailView.resetMessageDataTxn`).
+        /// Reset Message Data on the account (`SyncEngine.resetMessageDataTxn`).
         case accountReset
-        /// Delete All Email Index Data in Settings (`SettingsView.localIndexWipeTxn`).
+        /// Delete All Email Index Data in Settings (`SyncEngine.localIndexWipeTxn`).
         case settingsWipe
         /// Smart Reindex (`SyncEngine.resetCrawlState`), after loaded messages
         /// went missing locally: the gap the user is repairing.
@@ -171,9 +171,9 @@ struct BackfillUIDWalkRaceTests {
             let accountId = walk.account.id
             switch self {
             case .accountReset:
-                try? await walk.pool.write { try AccountDetailView.resetMessageDataTxn($0, accountId: accountId) }
+                try? await walk.pool.write { try SyncEngine.resetMessageDataTxn($0, accountId: accountId) }
             case .settingsWipe:
-                try? await walk.pool.write { try SettingsView.localIndexWipeTxn($0) }
+                try? await walk.pool.write { try SyncEngine.localIndexWipeTxn($0) }
             case .smartReindex:
                 let folderId = walk.folderId
                 let ids = missingLocally.map(String.init)
@@ -502,15 +502,24 @@ struct BackfillUIDWalkRaceTests {
             cursor: Self.resumedCursor, localUIDs: [Self.aboveCursor], pool: pool)
         defer { Self.tearDown(walk) }
 
+        // Every write of the walk position moves the folder's version, even one
+        // that rewrites the same cursor. The cursor itself is no proof: the
+        // walk's parallel workers can confirm a lower range first, so its first
+        // progress write still records the resumed cursor, and the writes after
+        // it fall inside the progress throttle.
+        let versionBefore = try walk.row().backfillVersion
+        let progressVersion = Locked<Int?>(nil)
         let progressCursor = Locked<Int?>(nil)
         F.atCheckpoint(1, .afterWorkersJoinedBeforeFinalBookkeeping(folderId: walk.folderId)) {
-            progressCursor.set(try? walk.row().backfillUidCursor)
+            let row = try? walk.row()
+            progressVersion.set(row?.backfillVersion)
+            progressCursor.set(row?.backfillUidCursor)
             await reset.run(on: walk, missingLocally: [Self.aboveCursor])
         }
         let didWork = await walk.call()
 
-        #expect(progressCursor.get().map { $0 < Self.resumedCursor } == true,
-                "\(reset): precondition: the walk's own progress write landed before the reset (cursor \(String(describing: progressCursor.get())))")
+        #expect(progressVersion.get().map { $0 > versionBefore } == true,
+                "\(reset): precondition: the walk's own progress write landed before the reset (version \(versionBefore) then \(String(describing: progressVersion.get())), cursor \(String(describing: progressCursor.get())))")
         let row = try walk.row()
         #expect(!row.backfillComplete, "\(reset): the stale walker completed the reset folder")
         let claim = try walk.claim()
@@ -691,6 +700,68 @@ struct BackfillUIDWalkRaceTests {
         #expect(!row.backfillComplete && row.backfillUidCursor == nil && loaded.isEmpty,
                 "\(write): precondition: nothing the call did landed (complete \(row.backfillComplete), cursor \(String(describing: row.backfillUidCursor)), loaded \(loaded.sorted()))")
         #expect(!didWork, "\(write): the call landed nothing, yet reported work")
+    }
+
+    // MARK: - (4) A change read proves a fetched message gone before its insert (#755)
+
+    /// The folder's change bookmark, in the two shapes a change read stores.
+    enum BookmarkShape: String, CaseIterable, Sendable, CustomStringConvertible {
+        case qresync, condstore
+        var description: String { rawValue }
+
+        func encoded(highestModSeq: UInt64, uidNext: UInt32) -> String? {
+            let epoch = UInt32(BackfillUIDWalkRaceTests.epoch)
+            switch self {
+            case .qresync:
+                return IMAPChangeCursor(uidValidity: epoch, highestModSeq: highestModSeq, uidNext: uidNext).encoded
+            case .condstore:
+                return IMAPChangeCursor(uidValidity: epoch, highestModSeq: highestModSeq, uidNext: uidNext,
+                                        messageCount: 3).encoded
+            }
+        }
+    }
+
+    /// The crawl fetched a range; before it inserts, a change read proves one
+    /// of its messages gone and stores a new bookmark (the apply's write: the
+    /// row is removed and the bookmark advances). The stale chunk must not
+    /// re-create the message nor move the walk; the retry loads the live rows.
+    @Test("A change read that proves a crawled message gone before the crawl inserts it: the message is not re-created and the walk does not advance; the retry loads the live rows",
+          arguments: BookmarkShape.allCases)
+    func changeReadProvesACrawledMessageGone(_ shape: BookmarkShape) async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        defer { F.clearWalkCheckpoints() }
+
+        let walk = try await Self.makeWalk(
+            accountId: "uid-race-change-\(shape)", serverUIDs: [3, 7, 12], cursor: 10, localUIDs: [12], pool: pool)
+        defer { Self.tearDown(walk) }
+        let folderId = walk.folderId
+        let before = shape.encoded(highestModSeq: 10, uidNext: 13)
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [before, folderId])
+        }
+
+        F.atCheckpoint(1, .beforeInsertingFetchedChunk(folderId: folderId)) {
+            // The server expunges UID 7; the change read proves it and its apply
+            // advances the bookmark.
+            walk.onServer.set([3, 12])
+            walk.server.setMessages([3, 12].map(Self.message(uid:)), in: Self.path)
+            let after = shape.encoded(highestModSeq: 11, uidNext: 13)
+            try? await pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeCursor = ? WHERE id = ?", arguments: [after, folderId])
+            }
+        }
+        _ = await walk.call()
+
+        let afterRace = try walk.local()
+        #expect(!afterRace.contains(7), "\(shape): the message the change read proved gone was re-created")
+        let row = try walk.row()
+        #expect(!row.backfillComplete && row.backfillUidCursor == 10,
+                "\(shape): the refused range moved the walk (complete \(row.backfillComplete), cursor \(String(describing: row.backfillUidCursor)))")
+
+        try await walk.callUntilComplete()
+        let retried = try walk.local()
+        #expect(retried == [3, 12], "\(shape): the retry loads the live rows only: \(retried.sorted())")
     }
 }
 

@@ -1312,6 +1312,99 @@ struct FakeIMAPServerOracleTests {
         }
         _ = try client.command(tag: "s9", "LOGOUT")
     }
+
+    /// Pins how the fake reads a UID SEARCH's date keys when dates are honoured,
+    /// so a change to how it reads them keeps every answer: `SINCE d` matches an
+    /// INTERNALDATE on or after day `d`, `BEFORE d` one strictly earlier; a
+    /// zero-padded or quoted date reads as the unpadded form; a message whose
+    /// INTERNALDATE does not parse matches whatever the bounds; an unknown key
+    /// and a `SINCE` whose date does not parse are ignored; with no date key every
+    /// message matches; the date keys AND with a `UID` set.
+    @Test("UID SEARCH date keys: SINCE on or after its day, BEFORE strictly earlier, padded and quoted dates read alike, an unparseable INTERNALDATE matches, unknown keys and an unparseable SINCE are ignored, UID sets AND in")
+    func uidSearchDateKeysKeepTheirDaySemantics() throws {
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        func formatter(_ format: String) -> DateFormatter {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.timeZone = TimeZone(identifier: "UTC")
+            formatter.dateFormat = format
+            return formatter
+        }
+        let internalDate = formatter("dd-MMM-yyyy HH:mm:ss Z")
+        let unpadded = formatter("d-MMM-yyyy")
+        let padded = formatter("dd-MMM-yyyy")
+        func days(_ count: Int, from day: Date) -> Date { utc.date(byAdding: .day, value: count, to: day)! }
+
+        // The SINCE day, at UTC noon: ten or more days ago, on a day of the
+        // month below 10, so its zero-padded form differs from the unpadded one.
+        // The BEFORE day is five days later.
+        var since = days(-10, from: utc.date(byAdding: .hour, value: 12, to: utc.startOfDay(for: Date()))!)
+        while utc.component(.day, from: since) >= 10 { since = days(-1, from: since) }
+        let before = days(5, from: since)
+        let sinceDay = unpadded.string(from: since), beforeDay = unpadded.string(from: before)
+        #expect(padded.string(from: since) != sinceDay, "setup: the zero-padded SINCE date differs from the unpadded one")
+
+        // UIDs 1 to 6: the day before, on, and after each bound. UID 7's
+        // INTERNALDATE does not parse.
+        let dated: [(uid: Int, day: Date)] = [
+            (1, days(-1, from: since)), (2, since), (3, days(1, from: since)),
+            (4, days(-1, from: before)), (5, before), (6, days(1, from: before)),
+        ]
+        var messages = dated.map { item in
+            FakeIMAPServer.makeMessage(uid: item.uid, rfc822Text: Self.rfc822(messageId: "search-day-\(item.uid)@example.com"))
+                .replacingInternalDate(internalDate.string(from: item.day))
+        }
+        messages.append(FakeIMAPServer.makeMessage(uid: 7, rfc822Text: Self.rfc822(messageId: "search-day-7@example.com"))
+            .replacingInternalDate("not an internal date"))
+        let server = FakeIMAPServer(mailboxes: ["INBOX": messages])
+        server.honorSearchDateCriteria()
+        try server.start()
+        defer { server.stop() }
+
+        let client = try RawIMAPClient(port: server.port)
+        defer { client.close() }
+        try client.readGreeting()
+        _ = try client.command(tag: "s1", "LOGIN \(server.username) \(server.password)")
+        _ = try client.command(tag: "s2", "SELECT INBOX")
+
+        let every = [1, 2, 3, 4, 5, 6, 7]
+        let fromSince = [2, 3, 4, 5, 6, 7]
+        let toBefore = [1, 2, 3, 4, 7]
+        let cases: [(criteria: String, expected: [Int])] = [
+            // On the SINCE day matches; the day before does not; the day after does.
+            ("SINCE \(sinceDay)", fromSince),
+            // On the BEFORE day does not match; the day before does.
+            ("BEFORE \(beforeDay)", toBefore),
+            ("SINCE \(sinceDay) BEFORE \(beforeDay)", [2, 3, 4, 7]),
+            // A zero-padded and a quoted date read as the unpadded form.
+            ("SINCE \(padded.string(from: since))", fromSince),
+            ("SINCE \"\(sinceDay)\"", fromSince),
+            ("BEFORE \"\(padded.string(from: before))\"", toBefore),
+            // An unknown key is ignored, and so is its date.
+            ("SINCE \(sinceDay) SENTBEFORE \(sinceDay) UNSEEN", fromSince),
+            // A SINCE whose date does not parse is ignored.
+            ("SINCE notadate BEFORE \(beforeDay)", toBefore),
+            ("SINCE notadate", every),
+            // No date key: every message matches.
+            ("ALL", every),
+            // The date keys AND with a UID set.
+            ("UID 1:3,5:7 SINCE \(sinceDay) BEFORE \(beforeDay)", [2, 3, 7]),
+            ("UID 4:6 SINCE \(sinceDay) BEFORE \(beforeDay)", [4]),
+        ]
+        for (index, item) in cases.enumerated() {
+            let tag = "k\(index)"
+            let reply = try client.command(tag: tag, "UID SEARCH \(item.criteria)")
+            let lines = reply.split(separator: "\r\n", omittingEmptySubsequences: true).map(String.init)
+            let answers = lines.filter { $0.hasPrefix("* SEARCH") }
+            #expect(answers.count == 1, "one SEARCH answer for \(item.criteria): \(lines)")
+            #expect(lines.contains("\(tag) OK UID SEARCH completed"), "tagged OK for \(item.criteria): \(lines)")
+            guard answers.count == 1 else { continue }
+            let uids = answers[0].split(separator: " ").dropFirst(2).compactMap { Int($0) }
+            #expect(uids.sorted() == item.expected, "UID SEARCH \(item.criteria) answered \(uids), expected \(item.expected)")
+        }
+        _ = try client.command(tag: "s9", "LOGOUT")
+    }
 }
 
 /// A minimal raw-socket IMAP client: enough to log in, select, and issue a

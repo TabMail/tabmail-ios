@@ -119,8 +119,8 @@ struct NSEAICacheUpdatedAtEncodingTests {
         }
     }
 
-    private func purge(_ pool: DatabasePool) {
-        SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool))
+    private func purge(_ pool: DatabasePool) async {
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: PrioritizedDatabase(pool: pool))
     }
 
     private func entryExists(_ pool: DatabasePool) async throws -> Bool {
@@ -154,7 +154,7 @@ struct NSEAICacheUpdatedAtEncodingTests {
         try await pool.write { db in
             try db.execute(sql: "DELETE FROM messageHeader WHERE accountId = ?", arguments: [Self.accountId])
         }
-        purge(pool)
+        await purge(pool)
         return try await entryExists(pool)
     }
 
@@ -212,6 +212,32 @@ extension NSEAICacheUpdatedAtEncodingTests {
         return (dir, pool, previous, try DatabaseQueue(path: path), path)
     }
 
+    /// The purge keeps an entry whose email is still on the device, finding the email's
+    /// copies by the entry's Message-ID. So the merge must store the Message-ID it made
+    /// the key from: an entry without one is purged as if its email were gone.
+    @Test("An extension-written entry past the grace whose email is on the device is kept, with its result",
+          arguments: Branch.allCases)
+    func entryPastTheGraceOfAnEmailOnTheDeviceIsKept(branch: Branch) async throws {
+        let (dir, pool, previous, q, path) = try openScenario()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pools: [pool], queues: [q], directory: dir)
+        }
+        let expired = Date().addingTimeInterval(-Double(SyncConfig.aiCacheOrphanGraceDays + 1) * 86_400)
+        try await mergeAIResult(branch: branch, processedAt: expired.timeIntervalSince1970, pool: pool, q: q, path: path)
+        let key = cacheKey
+        let merged = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
+        #expect(merged?.rfc822MessageId == Self.rfc822, "\(branch): the merge did not store the Message-ID it made the key from")
+        let start = Date()
+
+        await purge(pool)
+
+        let after = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
+        #expect(after?.summaryBlurb == "A short summary", "\(branch): the entry of an email on the device was purged")
+        let clock = after?.updatedAt ?? .distantPast
+        #expect(clock >= start.addingTimeInterval(-1), "\(branch): a kept entry's clock did not restart")
+    }
+
     @Test("A header-phase failure still caches the AI result with its own age and cleans staging",
           arguments: [true, false])
     func fallbackLegCachesWithSourceAge(fresh: Bool) async throws {
@@ -232,12 +258,13 @@ extension NSEAICacheUpdatedAtEncodingTests {
         let cached = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
         #expect(cached?.summaryBlurb == "A short summary")
         #expect(cached?.actionTag == .reply)
+        #expect(cached?.rfc822MessageId == Self.rfc822, "the fallback leg did not store the Message-ID it made the key from")
         #expect(abs((cached?.updatedAt.timeIntervalSince1970 ?? 0) - processedAt) < 0.002)
         #expect(try await pool.read { try MessageHeader.fetchOne($0) } != nil)
         #expect(try await q.read { try Int.fetchOne($0, sql: "SELECT COUNT(*) FROM nse_processed_message") } == 0)
 
         try await pool.write { try $0.execute(sql: "DELETE FROM messageHeader") }
-        purge(pool)
+        await purge(pool)
         #expect(try await entryExists(pool) == fresh)
     }
 

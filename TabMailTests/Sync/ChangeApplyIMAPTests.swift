@@ -243,6 +243,30 @@ struct ChangeApplyIMAPTests {
         }
     }
 
+    // MARK: - Server-reported \Deleted removals
+
+    @Test("A server-reported \\Deleted removal never takes a row the user's pending operation owns: the row stays and is read again, and a removal for a UID with no row writes nothing",
+          arguments: [OperationType.archive, .delete, .move, .markRead])
+    func deletedRemovalKeepsAShieldedRow(_ type: OperationType) async throws {
+        try await Base.withWorld { w in
+            var state = FolderChangeState(raw: nil)
+            state.tracking = true
+            try Self.setEpoch(w, w.inboxId, Self.storedEpoch, cursor: "c", state: state.encoded)
+            try w.insertRow("7", in: w.inboxId, path: "INBOX")
+            try w.insertRow("8", in: w.inboxId, path: "INBOX")
+            try w.insertOp(type, ids: ["7"], path: "INBOX")
+            var changes = FolderChanges(
+                folderId: w.inboxId, status: .tracked, addressEpoch: Self.storedEpoch,
+                records: [], removals: ["7", "8", "9"])
+            changes.cursor = "c2"
+            _ = try Self.apply(w, changes)
+            #expect(try w.row("7", in: w.inboxId) != nil, "the row the user's \(type) owns is kept")
+            #expect(try w.state(w.inboxId).recheck.contains("7"), "and read again once the operation is done")
+            #expect(try w.row("8", in: w.inboxId) == nil, "an unshielded row the server marks deleted is removed")
+            #expect(try w.row("9", in: w.inboxId) == nil, "a removal for a UID with no row inserts nothing")
+        }
+    }
+
     // MARK: - Answered / forwarded
 
     @Test("Answered and forwarded are raised by a record, never lowered")

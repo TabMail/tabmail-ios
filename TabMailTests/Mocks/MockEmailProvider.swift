@@ -221,6 +221,8 @@ actor MockEmailProvider: EmailProvider {
     /// contains the failing id.
     var moveThrowsOnId: (id: String, error: Error)?
     var sendThrows: Error?
+    /// What `send` answers about the Sent copy (a Gmail-shaped provider names one).
+    var sendResult: SentCopyIdentity?
     var appendToSentResult: Bool = true
     var appendToSentThrows: Error?
     var fetchMessageHeadersResult: [MessageHeaderInfo] = []
@@ -257,6 +259,9 @@ actor MockEmailProvider: EmailProvider {
     /// database mid-fetch, which is the only way to exercise a guard that must run AFTER the
     /// network returns but BEFORE the result is rendered or written.
     var fetchMessageHook: (@Sendable () async -> Void)?
+    /// Awaited from INSIDE `fetchMessageHeaders(ids:)`, after the call is logged and before
+    /// it answers: lets a test read the database state at the moment of the read.
+    var fetchMessageHeadersHook: (@Sendable () async -> Void)?
     /// Awaited from INSIDE `fetchMessages(folder:limit:offset:)`, AFTER the call is logged and
     /// BEFORE the listing is returned, and handed the folder path being listed. `fetchMessage`'s
     /// hook cannot stand in for this one: that is the per-MESSAGE body fetch, while a full sync's
@@ -391,11 +396,13 @@ actor MockEmailProvider: EmailProvider {
         if let error = moveThrows { throw error }
     }
 
-    func send(draft: DraftMessage) async throws {
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
         callLog.append("send")
         sentDrafts.append(draft)
         if let hook = sendHook { await hook() }
         if let error = sendThrows { throw error }
+        return sendResult
     }
 
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool {
@@ -427,6 +434,7 @@ actor MockEmailProvider: EmailProvider {
 
     func fetchMessageHeaders(ids: [String]) async throws -> [MessageHeaderInfo] {
         callLog.append("fetchMessageHeaders(ids:\(ids))")
+        if let fetchMessageHeadersHook { await fetchMessageHeadersHook() }
         if let error = fetchMessageHeadersThrows { throw error }
         return fetchMessageHeadersResult
     }
@@ -533,6 +541,14 @@ actor MockEmailProvider: EmailProvider {
         fetchMessageHook = hook
     }
 
+    func setFetchMessageHeadersHook(_ hook: (@Sendable () async -> Void)?) {
+        fetchMessageHeadersHook = hook
+    }
+
+    func setFetchMessageHeadersThrows(_ error: Error?) {
+        fetchMessageHeadersThrows = error
+    }
+
     func setFetchMessagesHook(_ hook: (@Sendable (String) async -> Void)?) {
         fetchMessagesHook = hook
     }
@@ -547,6 +563,10 @@ actor MockEmailProvider: EmailProvider {
 
     func setDisconnectHook(_ hook: (@Sendable () async -> Void)?) {
         disconnectHook = hook
+    }
+
+    func setSendResult(_ result: SentCopyIdentity?) {
+        sendResult = result
     }
 
     /// Reset all recorded state.

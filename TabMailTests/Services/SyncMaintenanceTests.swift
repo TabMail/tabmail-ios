@@ -541,25 +541,25 @@ struct AICachePurgeTests {
     private var pastGrace: Int { SyncConfig.aiCacheOrphanGraceDays + 1 }
 
     @Test("An entry past the grace whose email is gone is purged")
-    func orphanPastGracePurged() throws {
+    func orphanPastGracePurged() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertCache(f, key: "acc1:INBOX:gone@example.com", rfc: "gone@example.com", daysAgo: pastGrace)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:gone@example.com") == nil)
     }
 
     @Test("An old entry whose email is in Sent (not the inbox) is kept and re-stamped")
-    func oldEntryWithSentEmailKept() throws {
+    func oldEntryWithSentEmailKept() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertHeader(f, uid: "1", folderPath: "Sent", rfc: "sent@example.com")
         try insertCache(f, key: "acc1:Sent:sent@example.com", rfc: "sent@example.com", daysAgo: pastGrace + 30)
         let before = Date()
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         let kept = try cache(f, "acc1:Sent:sent@example.com")
         #expect(kept?.summaryBlurb == "Summary for acc1:Sent:sent@example.com")
@@ -568,68 +568,68 @@ struct AICachePurgeTests {
     }
 
     @Test("An old entry whose email moved to Archive is kept under its old key")
-    func entryForMovedEmailKept() throws {
+    func entryForMovedEmailKept() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertHeader(f, uid: "9", folderPath: "Archive", rfc: "moved@example.com")
         try insertCache(f, key: "acc1:INBOX:moved@example.com", rfc: "moved@example.com", daysAgo: pastGrace)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:moved@example.com") != nil)
     }
 
     @Test("An old entry whose email is in the inbox is kept")
-    func oldEntryWithInboxEmailKept() throws {
+    func oldEntryWithInboxEmailKept() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertHeader(f, uid: "2", folderPath: "INBOX", rfc: "inbox@example.com")
         try insertCache(f, key: "acc1:INBOX:inbox@example.com", rfc: "inbox@example.com", daysAgo: pastGrace)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:inbox@example.com") != nil)
     }
 
     @Test("An orphan within the grace survives (a header that left may come back)")
-    func orphanWithinGraceKept() throws {
+    func orphanWithinGraceKept() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertCache(f, key: "acc1:INBOX:resync@example.com", rfc: "resync@example.com",
                         daysAgo: SyncConfig.aiCacheOrphanGraceDays - 1)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:resync@example.com") != nil)
     }
 
     @Test("A bracketed cache Message-ID matches its stored header")
-    func bracketedMessageIdMatches() throws {
+    func bracketedMessageIdMatches() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertHeader(f, uid: "3", folderPath: "INBOX", rfc: "bracket@example.com")
         try insertCache(f, key: "acc1:INBOX:bracket@example.com", rfc: "<bracket@example.com>", daysAgo: pastGrace)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:bracket@example.com") != nil)
     }
 
     @Test("Entries past the grace with no or an empty Message-ID are purged")
-    func noMessageIdPurged() throws {
+    func noMessageIdPurged() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         try insertCache(f, key: "acc1:INBOX:none", rfc: nil, daysAgo: pastGrace)
         try insertCache(f, key: "acc1:INBOX:empty", rfc: "", daysAgo: pastGrace)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:none") == nil)
         #expect(try cache(f, "acc1:INBOX:empty") == nil)
     }
 
     @Test("An old entry without a Message-ID is purged, even while its key's email is on the device")
-    func legacyEntryWithoutMessageIdPurged() throws {
+    func legacyEntryWithoutMessageIdPurged() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         // Written by an older extension build without the Message-ID; the email moved to Archive.
@@ -638,17 +638,17 @@ struct AICachePurgeTests {
         // Control: the same email's entry with its Message-ID is kept.
         try insertCache(f, key: "acc1:Archive:legacy@example.com", rfc: "legacy@example.com", daysAgo: pastGrace)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:legacy@example.com") == nil)
         #expect(try cache(f, "acc1:Archive:legacy@example.com") != nil)
     }
 
     @Test("An entry is kept only by an email of its own account: another account's copy keeps nothing")
-    func entryKeptOnlyByItsOwnAccount() throws {
+    func entryKeptOnlyByItsOwnAccount() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
-        try f.pool.write { db in
+        try await f.pool.write { db in
             var other = Account(emailAddress: "other@example.com", displayName: "Other", provider: .gmail)
             other.id = "acc2"
             try other.insert(db)
@@ -667,14 +667,17 @@ struct AICachePurgeTests {
         try insertCache(f, key: "acc2:INBOX:shared@example.com", rfc: "shared@example.com", daysAgo: pastGrace)
         try insertCache(f, key: "acc2:Work:Projects:shared@example.com", rfc: "shared@example.com", daysAgo: pastGrace)
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
         #expect(try cache(f, "acc1:INBOX:shared@example.com") == nil)
         #expect(try cache(f, "acc2:INBOX:shared@example.com") != nil)
         #expect(try cache(f, "acc2:Work:Projects:shared@example.com") != nil)
     }
 
-    @Test("Storage maintenance runs the purge: an aged orphan goes, an entry whose email is here stays; the same for a chat's unsent words")
+    /// `.processGlobalState`: the pass's steps give up while `DatabaseSuspension.isSuspended`,
+    /// and its statistics refresh holds a process-wide latch and marker.
+    @Test("Storage maintenance runs the purge: an aged orphan goes, an entry whose email is here stays; the same for a chat's unsent words",
+          .processGlobalState)
     func maintenanceRunsThePurge() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
@@ -692,7 +695,7 @@ struct AICachePurgeTests {
             }
         }
 
-        await SyncEngine.runWALMaintenance(dbPool: f.db, includePrune: false, undoProtectedBodyIds: [])
+        await SyncEngine.runWALMaintenance(dbPool: f.db, prune: nil, undoProtectedBodyIds: [], pruneOrder: [:])
 
         #expect(try cache(f, "acc1:INBOX:gone@example.com") == nil)
         #expect(try cache(f, "acc1:Archive:live@example.com") != nil)
@@ -701,7 +704,7 @@ struct AICachePurgeTests {
     }
 
     @Test("More entries than one chunk: every kept entry kept, every orphan purged, the pass ends")
-    func acrossChunks() throws {
+    func acrossChunks() async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         let n = SyncConfig.pruneChunkSize + 7
@@ -711,9 +714,9 @@ struct AICachePurgeTests {
             try insertCache(f, key: "acc1:Sent:orphan\(i)@example.com", rfc: "orphan\(i)@example.com", daysAgo: pastGrace)
         }
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, checkpointWAL: {})
 
-        let keys = try f.pool.read { db in try MessageAICache.fetchAll(db).map(\.key) }
+        let keys = try await f.pool.read { db in try MessageAICache.fetchAll(db).map(\.key) }
         #expect(keys.count == n)
         #expect(keys.allSatisfy { $0.contains(":kept") })
     }
@@ -723,13 +726,13 @@ struct AICachePurgeTests {
     /// are past the grace by the pass's clock.
     @Test("A pass whose clock is off the wall clock keeps each entry once and ends",
           arguments: [-30, 30])
-    func clockOffWallClockEnds(daysOff: Int) throws {
+    func clockOffWallClockEnds(daysOff: Int) async throws {
         let f = try makeFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: f.pool, directory: f.directory) }
         let now = try #require(Calendar.current.date(byAdding: .day, value: daysOff, to: Date()))
         let old = try #require(Calendar.current.date(byAdding: .day, value: -pastGrace, to: now))
         try insertHeader(f, uid: "1", folderPath: "Archive", rfc: "live@example.com")
-        try f.pool.write { db in
+        try await f.pool.write { db in
             for rfc in ["live@example.com", "gone@example.com"] {
                 var cache = MessageAICache(key: "acc1:INBOX:\(rfc)", rfc822MessageId: rfc)
                 cache.summaryTextMessage = "Text for \(rfc)"
@@ -740,7 +743,7 @@ struct AICachePurgeTests {
         // Safety bound: a second re-stamp throws, which ends the pass through its error path,
         // so a pass that keeps selecting the same entry stops instead of hanging the test.
         let restamps = Mutex(0)
-        try f.pool.write { db in
+        try await f.pool.write { db in
             db.add(function: DatabaseFunction("countRestamp", argumentCount: 0, pure: false) { _ in
                 let n = restamps.withLock { value in value += 1; return value }
                 if n > 1 { throw NSError(domain: "AICachePurgeTests", code: 1) }
@@ -752,7 +755,7 @@ struct AICachePurgeTests {
                 """)
         }
 
-        SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, now: now)
+        await SyncEngine.runPurgeOrphanedAICache(dbPool: f.db, now: now, checkpointWAL: {})
 
         #expect(restamps.withLock { $0 } == 1, "the kept entry is re-stamped once and leaves the selection")
         #expect(try cache(f, "acc1:INBOX:live@example.com")?.summaryTextMessage == "Text for live@example.com")
@@ -1396,13 +1399,18 @@ struct PlannerStatisticsRefreshTests {
     /// The row count `ANALYZE` last recorded for `table`, read out of `sqlite_stat1`.
     /// `nil` when statistics have never been computed (the table does not exist yet)
     /// or when they do not cover this table.
+    ///
+    /// Each row's leading integer is the number of entries in that row's index. A
+    /// full index holds every row of the table, a partial index (`WHERE ...`) only
+    /// the rows it matches, so the table's count is the largest leading integer.
+    /// Any single row is not enough: `ANALYZE` writes the newest index first, and a
+    /// partial index built last reads below the table's count.
     private func recordedRowCount(_ pool: DatabasePool, table: String) throws -> Int? {
         try pool.read { db in
             guard try db.tableExists("sqlite_stat1") else { return nil }
-            let stat = try String.fetchOne(
-                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ? LIMIT 1", arguments: [table])
-            guard let leading = stat?.split(separator: " ").first else { return nil }
-            return Int(leading)
+            let stats = try String.fetchAll(
+                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ?", arguments: [table])
+            return stats.compactMap { stat in stat.split(separator: " ").first.flatMap { Int($0) } }.max()
         }
     }
 
@@ -1609,6 +1617,36 @@ struct PlannerStatisticsRefreshTests {
     /// production tree, never listed by hand, so a third caller added in a new file is
     /// caught rather than silently uncovered (`MIS-007` — a hand-written census stops
     /// being complete the day the thing it counts grows).
+    /// Which storage prune each caller runs (#1437): the background processing
+    /// job's maintenance the overnight one (from 90% of the limit), the foreground
+    /// poll's the foreground one (from 95%), and the maintenance pass runs the one it
+    /// is handed first. The tests that call the prune pass their gate, so only the
+    /// source shows which gate production runs. Every production line that names
+    /// a gate, forwards one or calls the prune is discovered by walking the tree.
+    @Test("The background job's maintenance runs the overnight prune, the foreground poll's the foreground prune, and the pass runs the gate it is handed")
+    func eachMaintenanceCallerRunsItsPruneGate() {
+        let uses = SyncEngineMaintenanceTests.productionCodeLines()
+            .filter { line in
+                ["prune: .", "prune: prune", "prune: StorageEstimator", "runPruneIfOverBudget("]
+                    .contains { line.code.contains($0) }
+                    // The gate binding as a whole word: catch-up's `if let pruneCutoff` is not a gate.
+                    || line.code.range(of: #"if let prune\b"#, options: .regularExpression) != nil
+            }
+            .map { "\($0.file): \($0.code)" }
+            .sorted()
+        let expected = [
+            "SyncEngine.swift: await runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder, gate: prune)",
+            "SyncEngine.swift: dbPool: pool, prune: prune,",
+            "SyncEngine.swift: func scheduleMaintenanceInBackground(prune: StorageEstimator.PruneGate?) {",
+            "SyncEngine.swift: if let prune, shouldRun() {",
+            "SyncEngine.swift: prune: StorageEstimator.PruneGate?,",
+            "SyncEngineMaintenance.swift: nonisolated static func runPruneIfOverBudget(",
+            "SyncScheduler.swift: await manager.syncEngine.scheduleMaintenanceInBackground(prune: .foreground)",
+            "SyncScheduler.swift: dbPool: AppDatabase.backgroundPool, prune: .overnight,",
+        ].sorted()
+        #expect(uses == expected, "the prune's gates as production passes them: \(uses)")
+    }
+
     @Test("No production caller runs WAL maintenance above .background")
     func everyWALMaintenanceCallSitePassesABackgroundPool() throws {
         // …/tabmail-ios/TabMailTests/Services/<this file>

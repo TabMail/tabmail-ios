@@ -54,6 +54,8 @@ struct RootView: View {
     /// Set when an earlier significant update notice for this version never
     /// returned: the banner offers it instead of an unasked call (#1010).
     @State private var significantUpdateBannerVersion: String?
+    /// The one-time database upgrade (ADR-IOS-121): its banner and its screen.
+    @State private var databaseUpgrade = DatabaseUpgrade.shared
     @Environment(\.requestAgeRange) private var requestAgeRange
     /// Set while signing out after a failed age check: the person has just
     /// read why, so the generic "Signed Out" alert is not shown on top.
@@ -184,8 +186,14 @@ struct RootView: View {
                                 Task { await openSignificantUpdateNotice() }
                             }
                         }
+                        if databaseUpgrade.needsUpgrade {
+                            DatabaseUpgradeBanner {
+                                Task { await databaseUpgrade.openNotice() }
+                            }
+                        }
                         MailNavigationView(initialSelection: nil)
                     }
+                    .task { await databaseUpgrade.checkAfterLaunch() }
                 }
             } else if !navigationStore.isInitialLoadComplete {
                 // Still loading accounts from GRDB — show splash (not login)
@@ -280,8 +288,14 @@ struct RootView: View {
                         Task { await openSignificantUpdateNotice() }
                     }
                 }
+                if databaseUpgrade.needsUpgrade {
+                    DatabaseUpgradeBanner {
+                        Task { await databaseUpgrade.openNotice() }
+                    }
+                }
                 MailNavigationView()
             }
+            .task { await databaseUpgrade.checkAfterLaunch() }
         }
     }
 
@@ -406,7 +420,8 @@ struct RootView: View {
         // still be queued or may already be sending, so this alert says only that
         // the Undo attempt did not take; it never promises the message was stopped.
         // A refused move Undo (`UndoService.undoFailureMessage`) shows the same
-        // notice: nothing was moved back. See `undoFailureAlertHosts`.
+        // kind of notice: nothing was moved back, or, when other parts of the
+        // Undo did come back, some messages were not. See `undoFailureAlertHosts`.
         .background(undoFailureAlertHosts)
         .onReceive(NotificationCenter.default.publisher(for: .demoModeDidExit)) { _ in
             demoSeedingComplete = false
@@ -435,6 +450,12 @@ struct RootView: View {
         // cancellation's own write, or reports that it did not (the compose then
         // opens as unsaved).
         .modifier(UndoReopenPresenter())
+        // The one-time database upgrade: its notice, then its progress and result
+        // (ADR-IOS-121). A full-screen cover cannot be swiped away: Later and
+        // Done close it, and nothing closes it while the upgrade runs.
+        .fullScreenCover(isPresented: $databaseUpgrade.isPresented) {
+            DatabaseUpgradeView(upgrade: databaseUpgrade)
+        }
         // loadInitialData() is called eagerly in TabMailApp.init() (after DB creation)
         // so isInitialLoadComplete is already true before the first render.
         .task {
@@ -534,7 +555,8 @@ struct RootView: View {
                 // the user sees current state, then sync finds any remaining changes.
                 NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
                 BootProfiler.mark("RootView: posted inboxDataDidChange (UI reload from GRDB)")
-                // Sync is handled by startForegroundPolling() (triggered by scenePhase → .active).
+                // Sync is handled by startForegroundPolling(), which `ForegroundPollStart`
+                // calls once the scene is active with an account (at mount, and on a change).
                 // Do NOT call foregroundSyncAll() here — it races with the poll's sync,
                 // causing every full sync to run twice (doubled API calls, IMAP connections, DB writes).
             }
@@ -799,6 +821,15 @@ struct RootView: View {
             // otherwise have nothing registered until the next foreground pass.
             Task { await TabMailAuthService.restorePushRegistrationAfterSignIn() }
         }
+        // The one place the screen starts foreground polling: the scene active,
+        // an account, not screenshot mode; read at mount and on every change
+        // (#1331 cold launch, #1327 first account). The unit-test host counts as
+        // screenshot mode: it never syncs (`ForegroundPollStart.isUnitTestHost`).
+        .modifier(ForegroundPollStart(
+            hasAccounts: !navigationStore.accounts.isEmpty,
+            screenshotMode: ScreenshotMode.isActive || ForegroundPollStart.isUnitTestHost,
+            start: { syncScheduler.startForegroundPolling() }
+        ))
         .onChange(of: scenePhase) { _, phase in
             let phaseName = phase == .active ? "active" : (phase == .background ? "background" : "inactive")
             BootProfiler.mark("◐ scenePhase → \(phaseName) (accounts=\(navigationStore.accounts.count))")
@@ -807,9 +838,9 @@ struct RootView: View {
                 Task {
                     await PushNotificationService.shared.retryPendingRemovedAccountCleanups()
                 }
-                if !navigationStore.accounts.isEmpty {
-                    syncScheduler.startForegroundPolling()
-                }
+                // Foreground polling starts in `ForegroundPollStart` above, not
+                // here: this handler does not run for the phase RootView mounts
+                // with, which a foreground cold launch already has (#1331).
                 // IOS-OUTBOX-001: the launch `.task` above is reconciliation's
                 // only other trigger, so a send stranded `.sending`/`sentAt ==
                 // nil` stayed stranded for the whole session — the drain selects

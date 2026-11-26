@@ -632,7 +632,8 @@ struct ChatUndoSendTests {
         for id in stored {
             let target = email(id)
             let queued = ThreadUtils.outgoingThreadHeaders(
-                replyTo: target, sendAccountId: Self.account, sendSubject: "Re: Lunch plans", providerKind: .gmail).inReplyTo
+                replyTo: target, isForward: false, sendAccountId: Self.account, sendSubject: "Re: Lunch plans",
+                providerKind: .gmail).inReplyTo
             let shown = ChatUnsentReply.answers(queued, in: chat)
             let recorded = ChatThreadView.composeScreen(answering: target, chatMessageIds: chat) == .chat
             #expect(recorded == shown, "\(String(describing: id)): the chat records itself only for a send it shows as a bubble")

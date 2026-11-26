@@ -85,7 +85,6 @@ struct GmailDeltaApplyInvariantTests {
         func foregroundPassWithFullSyncDue() async throws {
             try await pool.write { db in
                 _ = try Account.filter(Column("id") == accountId).updateAll(db,
-                    Column("lastSyncedAt").set(to: nil as Date?),
                     Column("lastFullSyncAt").set(to: nil as Date?))
             }
             let engine = SyncEngine()
@@ -1127,8 +1126,8 @@ struct GmailDeltaApplyInvariantTests {
             try w.insertRow("p20-older", in: w.inbox, date: Self.daysAgo(2), isRead: true)
             try await w.pool.write { db in
                 _ = try Account.filter(Column("id") == w.accountId).updateAll(db,
-                    Column("lastFullSyncAt").set(to: Date()), Column("lastSyncedAt").set(to: nil as Date?))
-                try AccountDetailView.resetMessageDataTxn(db, accountId: w.accountId)
+                    Column("lastFullSyncAt").set(to: Date()))
+                try SyncEngine.resetMessageDataTxn(db, accountId: w.accountId)
             }
             try await SearchIndex.shared.removeMessagesForAccount(accountId: w.accountId)
             #expect(try w.rows("p20-newest").isEmpty, "precondition: the reset cleared the mail")

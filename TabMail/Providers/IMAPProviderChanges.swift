@@ -53,6 +53,12 @@ import SwiftMail
 // session never opened (its pass-start NOOP included) keeps its failure time too; a
 // session that cannot be opened again mid-pass fails the folders not yet read
 // (`.failed`, bookmark kept, no failure time); a budget run out leaves them `.notRun`.
+// A slice of an other-folder run (`ChangeScope.otherFolders`, #1110) reads the
+// request's folders in its order, the same way, and reports a folder it did not
+// reach `.notRun` whatever stopped it, and a folder whose read it started and the
+// slice's time cut `.notRun` with `FolderChanges.readCut` (#1358). Its first
+// folder is read in the slice's whole time (`ChangeContext.firstFolderDeadline`),
+// after the pass-start NOOP however long that took, as long as the slice has time.
 
 /// IMAP's opaque per-folder change bookmark, stored as JSON in
 /// `Folder.changeCursor`. Three server-assigned integers about the mailbox
@@ -73,27 +79,58 @@ struct IMAPChangeCursor: Codable, Equatable, Sendable {
     /// (`.failingTooLong`). A connection lost mid-pass never sets it for the
     /// folders not yet read.
     var failingSince: Date?
+    /// The selection's EXISTS at this checkpoint (#755); nil = not known. A
+    /// CONDSTORE read needs it (its removals are counted from it) and starts a
+    /// baseline without it; a QRESYNC read does not use it.
+    var messageCount: Int?
+    /// A CONDSTORE removal check that did not finish in one pass (#755).
+    var pendingCheck: IMAPRemovalCheckProgress?
 
-    init(uidValidity: UInt32, highestModSeq: UInt64, uidNext: UInt32, failingSince: Date? = nil) {
+    init(uidValidity: UInt32, highestModSeq: UInt64, uidNext: UInt32, failingSince: Date? = nil,
+         messageCount: Int? = nil) {
         self.uidValidity = uidValidity
         self.highestModSeq = highestModSeq
         self.uidNext = uidNext
         self.failingSince = failingSince
+        self.messageCount = messageCount
     }
 
     /// Nil for no bookmark or an unreadable one (the folder starts a baseline).
+    /// A count no mailbox can hold does not decode.
     static func decode(_ raw: String?) -> IMAPChangeCursor? {
         guard let raw, let data = raw.data(using: .utf8),
               let cursor = try? JSONDecoder().decode(IMAPChangeCursor.self, from: data),
-              cursor.v == currentVersion, cursor.uidValidity > 0, cursor.highestModSeq > 0, cursor.uidNext > 0
+              cursor.v == currentVersion, cursor.uidValidity > 0, cursor.highestModSeq > 0, cursor.uidNext > 0,
+              cursor.messageCount.map({ (0...Int(UInt32.max)).contains($0) }) ?? true
         else { return nil }
         return cursor
+    }
+
+    /// A UID below the bookmark's UIDNEXT: every live message there was held or
+    /// listed for a re-read when the bookmark was written (#755).
+    static func claimsHeld(uid messageId: String, cursor raw: String) -> Bool {
+        guard let uid = UInt32(messageId), let cursor = decode(raw) else { return false }
+        return uid < cursor.uidNext
+    }
+
+    /// The same checkpoint with no failure time.
+    var cleared: IMAPChangeCursor {
+        var copy = self
+        copy.failingSince = nil
+        return copy
     }
 
     var encoded: String? {
         guard let data = try? JSONEncoder().encode(self) else { return nil }
         return String(data: data, encoding: .utf8)
     }
+}
+
+/// One message's whole flag set as a change read reported it (a QRESYNC
+/// SELECT's FETCH responses, or a CHANGEDSINCE FETCH).
+struct IMAPChangedFlags: Sendable {
+    let uid: UInt32
+    let flags: [Flag]
 }
 
 /// A folder's counters as one read observed them; nil = not reported.
@@ -112,7 +149,45 @@ struct IMAPChangeReadIncomplete: Error, CustomStringConvertible {
     var description: String { "IMAP change read: \(folder) SELECT reported no \(missing)" }
 }
 
+/// How a change session reads (RFC 7162), decided once per session from the
+/// capabilities after login. No retry across modes.
+enum IMAPChangeMode: Equatable, Sendable {
+    /// `ENABLE QRESYNC` acknowledged: `SELECT … (QRESYNC …)`.
+    case qresync
+    /// CONDSTORE without QRESYNC: `UID FETCH … (CHANGEDSINCE m)`. With
+    /// `selectParameter` the server has no ENABLE and every SELECT on the session
+    /// carries `(CONDSTORE)`.
+    case condstore(selectParameter: Bool)
+
+    /// What the session asks for: `ENABLE QRESYNC`, `ENABLE CONDSTORE`, or
+    /// nothing (a mode decided now, or none).
+    enum Plan: Equatable { case enableQResync, enableCondStore, decided(IMAPChangeMode?) }
+
+    /// QRESYNC + ENABLE + UIDPLUS asks for QRESYNC; else CONDSTORE + UIDPLUS asks
+    /// for CONDSTORE through ENABLE, or with the SELECT parameter without ENABLE;
+    /// else none. UIDPLUS (RFC 4315 COPYUID) lets a move into a tracked folder
+    /// re-key its row (ADR-IOS-111).
+    static func plan(advertised: [String]) -> Plan {
+        let names = Set(advertised.map { $0.uppercased() })
+        guard names.contains("UIDPLUS") else { return .decided(nil) }
+        if names.contains("QRESYNC"), names.contains("ENABLE") { return .enableQResync }
+        guard names.contains("CONDSTORE") else { return .decided(nil) }
+        return names.contains("ENABLE") ? .enableCondStore : .decided(.condstore(selectParameter: true))
+    }
+}
+
+/// A CONDSTORE read whose count does not add up: the bookmark's count plus its
+/// arrivals is below the served count. The folder fails closed this pass.
+struct IMAPChangeCountMismatch: Error, CustomStringConvertible {
+    let folder: String
+    var description: String { "IMAP change read: \(folder) count below the bookmark's plus its arrivals" }
+}
+
 extension IMAPProvider {
+    static func changeBookmark(_ cursor: String, claimsHeld messageId: String) -> Bool {
+        IMAPChangeCursor.claimsHeld(uid: messageId, cursor: cursor)
+    }
+
 
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
         let context = request.context
@@ -139,7 +214,7 @@ extension IMAPProvider {
             var closedByServer = false
             var timedOut: String?
             do {
-                try await withChangeConnection(openingIn: generationAtStart) { server, qresync in
+                try await withChangeConnection(openingIn: generationAtStart) { server, mode in
                     // Let the session catch up with other connections' changes before
                     // the STATUS reads (some servers answer STATUS from a cached view).
                     try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
@@ -150,13 +225,27 @@ extension IMAPProvider {
                     // never a connection lost mid-pass that leaves no failure time.
                     sessionOpened = true
                     while next < work.count {
-                        guard context.hasBudget() else { budgetSpent = true; return }
+                        // A slice of an other-folder run reads its first folder in
+                        // the slice's whole time (`ChangeContext.firstFolderDeadline`),
+                        // so a slow NOOP above never leaves the slice with no folder
+                        // read (#1110); the folders after it start within the read's
+                        // own deadline.
+                        let firstFolder = results.isEmpty ? request.forFirstFolder() : nil
+                        let folderRequest = firstFolder ?? request
+                        guard folderRequest.context.hasBudget() else { budgetSpent = true; return }
                         let folder = work[next]
-                        changeReadFirst.remove(folder.id)
-                        if changeReadLast == folder.id { changeReadLast = nil }
+                        if request.scope != .otherFolders {
+                            changeReadFirst.remove(folder.id)
+                            if changeReadLast == folder.id { changeReadLast = nil }
+                        }
                         do {
-                            results[folder.id] = try await self.readChangeFolder(
-                                folder, server: server, qresync: qresync, request: request)
+                            var read = try await self.readChangeFolder(
+                                folder, server: server, mode: mode, request: folderRequest)
+                            // A run's folder is always sent its STATUS (or SELECT)
+                            // first: one that comes back not run was cut by the
+                            // slice's time, not left unreached (#1358).
+                            if request.scope == .otherFolders, case .notRun = read.status { read.readCut = true }
+                            results[folder.id] = read
                             if folder.role == .inbox { changeInboxTimeouts = 0 }
                         } catch {
                             // The folder's read failed, whatever the cause: it keeps its
@@ -185,7 +274,8 @@ extension IMAPProvider {
                     BackgroundSyncLogger.logDebug("[IMAPChanges] session ended on \(error)")
                 }
                 if closedByServer, generation == generationAtStart { continue }
-                if let timedOut {
+                // A run's order is the engine's (`changeReadOrder`).
+                if let timedOut, request.scope != .otherFolders {
                     // The next pass reads the folders left unread first and the one
                     // that timed out last (the inbox stays first until its read has
                     // timed out on several passes in a row).
@@ -201,8 +291,11 @@ extension IMAPProvider {
                     // again, a read that timed out, a dropped one that did not end in
                     // time), or after a teardown that ended the pass at any point, the
                     // folders not yet read fail with no failure time and are read on
-                    // the next pass.
-                    results[folder.id] = sessionOpened || generation != generationAtStart
+                    // the next pass. A slice of an other-folder run reports them
+                    // `.notRun` instead: the run reads them in a later slice (#1110).
+                    let unreached = sessionOpened || generation != generationAtStart
+                    if unreached, request.scope == .otherFolders { continue }
+                    results[folder.id] = unreached
                         ? FolderChanges(folderId: folder.id, status: .failed(error))
                         : Self.failedFolder(folder, error: error, now: context.clock())
                 }
@@ -220,18 +313,24 @@ extension IMAPProvider {
     /// read that timed out, the folders it left unread come first and the folder
     /// that timed out comes last, except that the inbox stays first until its read
     /// has timed out on several passes in a row
-    /// (`readFirst(_:first:last:inboxTimeouts:)`).
+    /// (`readFirst(_:first:last:inboxTimeouts:)`). A slice of an other-folder run
+    /// (`.otherFolders`, #1110) reads its folders in the request's order, which
+    /// the engine sets, and leaves the passes' hints as they are.
     func changeReadOrder(_ request: ChangeRequest) -> [ChangeFolder] {
-        // Hints for folders the account no longer has are dropped.
-        changeReadFirst.formIntersection(request.folders.map(\.id))
-        if let last = changeReadLast, !request.folders.contains(where: { $0.id == last }) { changeReadLast = nil }
         let candidates = request.folders.filter { folder in
             guard !folder.path.isEmpty else { return false }
             switch request.scope {
             case .inboxOnly: return folder.role == .inbox
             case .all: return folder.isSynced || !(request.recheck[folder.id] ?? []).isEmpty
+            case .otherFolders: return folder.isSynced
             }
         }
+        // A run's request names only its own folders: the hints, and the
+        // rotation, are the passes' alone.
+        if request.scope == .otherFolders { return candidates }
+        // Hints for folders the account no longer has are dropped.
+        changeReadFirst.formIntersection(request.folders.map(\.id))
+        if let last = changeReadLast, !request.folders.contains(where: { $0.id == last }) { changeReadLast = nil }
         let inbox = candidates.filter { $0.role == .inbox }
         let rest = candidates.filter { $0.role != .inbox }
         guard !rest.isEmpty else { return inbox }
@@ -280,8 +379,13 @@ extension IMAPProvider {
     /// `\Deleted` elsewhere moves that row, and once un-deleted it would fall
     /// outside the range for good while the bookmark moves past it.
     nonisolated static func heldRangeStart(_ folder: ChangeFolder) -> Int? {
-        if folder.olderMailComplete { return 1 }
-        return folder.olderMailCursor.map { $0 + 1 }
+        heldRangeStart(olderMailComplete: folder.olderMailComplete, olderMailCursor: folder.olderMailCursor)
+    }
+
+    /// The same rule from the walk's two values (the catch-up's lower bound, #1062).
+    nonisolated static func heldRangeStart(olderMailComplete: Bool, olderMailCursor: Int?) -> Int? {
+        if olderMailComplete { return 1 }
+        return olderMailCursor.map { $0 + 1 }
     }
 
     /// The arrivals in a UID SEARCH answer, in UID order: every UID from `from`
@@ -321,7 +425,7 @@ extension IMAPProvider {
     // MARK: - One folder
 
     private func readChangeFolder(
-        _ folder: ChangeFolder, server: IMAPServer, qresync: Bool, request: ChangeRequest
+        _ folder: ChangeFolder, server: IMAPServer, mode: IMAPChangeMode?, request: ChangeRequest
     ) async throws -> FolderChanges {
         let context = request.context
         // Both scopes answer the folder's re-read list: the scope narrows which
@@ -337,12 +441,18 @@ extension IMAPProvider {
 
         let observation = try await observe(folder, server: server)
 
-        guard qresync else {
+        guard let mode else {
             return try await untracked(folder, observation: observation, ids: recheckIds, server: server, request: request)
         }
 
-        guard let cursor = IMAPChangeCursor.decode(folder.cursor) else {
+        // A CONDSTORE read counts removals from the bookmark's MESSAGES: a
+        // bookmark without it starts a baseline (#755).
+        guard let cursor = IMAPChangeCursor.decode(folder.cursor), mode == .qresync || cursor.messageCount != nil else {
             return try await baseline(folder, observation: observation, ids: recheckIds, server: server, request: request)
+        }
+        if mode != .qresync {
+            return try await readCondstoreFolder(
+                folder, cursor: cursor, observation: observation, recheckIds: recheckIds, server: server, request: request)
         }
 
         if let served = observation.uidValidity, served != Int(cursor.uidValidity) {
@@ -356,8 +466,7 @@ extension IMAPProvider {
            UInt64(modseq) == cursor.highestModSeq, recheckIds.isEmpty {
             return FolderChanges(
                 folderId: folder.id, status: .tracked,
-                cursor: cursor.failingSince == nil ? nil : IMAPChangeCursor(
-                    uidValidity: cursor.uidValidity, highestModSeq: cursor.highestModSeq, uidNext: cursor.uidNext).encoded)
+                cursor: cursor.failingSince == nil ? nil : cursor.cleared.encoded)
         }
         guard context.hasBudget() else { return FolderChanges(folderId: folder.id, status: .notRun) }
 
@@ -385,7 +494,9 @@ extension IMAPProvider {
 
         var changes = FolderChanges(
             folderId: folder.id, status: .tracked, addressEpoch: Int(served),
-            cursor: IMAPChangeCursor(uidValidity: served, highestModSeq: modseq, uidNext: uidNext).encoded)
+            cursor: IMAPChangeCursor(
+                uidValidity: served, highestModSeq: modseq, uidNext: uidNext,
+                messageCount: selection.reportedMessageCount).encoded)
 
         // Removals: VANISHED, never expanded; only UIDs the folder holds.
         var vanished = resync.vanishedEarlier
@@ -393,60 +504,16 @@ extension IMAPProvider {
         changes.removals += try await heldIds(in: vanished, folderId: folder.id, request: request)
 
         // Changed flags and arrivals.
-        let changed = resync.changedFlags
-        // Held rows are looked up below the bookmark's UIDNEXT and, for a
-        // `\Deleted` message, at or above it too: a moved-in row is re-keyed to
-        // its destination UID there before the folder's next read.
-        let heldCandidates = changed.filter { $0.key.value < cursor.uidNext || $0.value.contains(.deleted) }.map(\.key.value)
-        let held = try await heldIdSet(heldCandidates, folderId: folder.id, request: request)
-        let heldFrom = Self.heldRangeStart(folder)
-        var toFetch: [UInt32] = []
-        for (uid, flags) in changed.sorted(by: { $0.key.value < $1.key.value }) {
-            let value = uid.value
-            if flags.contains(.deleted) {
-                // A message the server holds as `\Deleted` is never shown: the
-                // folder's row for it goes, wherever its UID sits. One it does not
-                // hold is neither fetched nor inserted.
-                if held.contains(value) { changes.removals.append(String(value)) }
-            } else if value >= cursor.uidNext {
-                toFetch.append(value)
-            } else if held.contains(value) {
-                changes.records.append(Self.flagRecord(uid: value, flags: flags))
-            } else if let heldFrom, Int(value) >= heldFrom {
-                // Changed, not held, within the held range: un-deleted, or removed
-                // locally by an earlier read. Only its full record can bring it back.
-                toFetch.append(value)
+        let changed = resync.changedFlags.map { IMAPChangedFlags(uid: $0.key.value, flags: $0.value) }
+        switch try await readChangedAndArrivals(
+            changed, folder: folder, cursorUidNext: cursor.uidNext, servedUidNext: uidNext,
+            server: server, request: request, into: &changes) {
+        case .stopped(let result):
+            return result
+        case .read(_, let toFetch):
+            guard try await fetchArrivals(toFetch, server: server, context: context, into: &changes) else {
+                return FolderChanges(folderId: folder.id, status: .notRun)
             }
-        }
-        // Arrivals by UID as well: RFC 7162 §3.2.5.1 requires the QRESYNC SELECT
-        // to report flag changes and expunges, not new messages, so every UID
-        // from the bookmark's UIDNEXT to the served one is asked for explicitly.
-        if uidNext > cursor.uidNext {
-            guard context.hasBudget() else { return FolderChanges(folderId: folder.id, status: .notRun) }
-            let range = MessageIdentifierSet<UID>(UID(cursor.uidNext)...UID(uidNext - 1))
-            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
-                try await server.extendedSearch(identifierSet: range, criteria: [.all])
-            }
-            let listed = Set(toFetch)
-            let deletedArrivals = Set(changed.filter { $0.key.value >= cursor.uidNext && $0.value.contains(.deleted) }.map(\.key.value))
-            toFetch += Self.arrivals(
-                in: try found.listed(within: range), from: cursor.uidNext, excluding: listed.union(deletedArrivals),
-                room: SyncConfig.imapChangeArrivalsLimit - toFetch.count
-            )
-        }
-        guard toFetch.count <= SyncConfig.imapChangeArrivalsLimit else {
-            return FolderChanges(folderId: folder.id, status: .refused(.tooFarBehind))
-        }
-        if !toFetch.isEmpty {
-            guard context.hasBudget() else { return FolderChanges(folderId: folder.id, status: .notRun) }
-            context.onProgress(toFetch.count)
-            // A UID the FETCH does not return is read again later (or removed
-            // once UID SEARCH proves it gone): the bookmark moves past it, so the
-            // re-read list is the only place it survives.
-            let fetched = try await rereadIds(toFetch, server: server, context: context)
-            changes.records += fetched.records
-            changes.removals += fetched.removals
-            changes.rereadLater += fetched.unreadable
         }
 
         // The re-read list, on this same selection.
@@ -463,7 +530,106 @@ extension IMAPProvider {
         return changes
     }
 
-    /// No bookmark yet: a plain SELECT on the QRESYNC session.
+    /// How `readChangedAndArrivals` ended.
+    enum SelectionReadOutcome {
+        /// Read; the arrivals were fetched into the folder's changes. `arrivals`:
+        /// the UIDs in [bookmark UIDNEXT, served UIDNEXT) the SEARCH found or the
+        /// changed-flags read reported, as ranges, never expanded.
+        case read(arrivals: MessageIdentifierSet<UID>, toFetch: [UInt32])
+        /// The folder's read stops with this result.
+        case stopped(FolderChanges)
+    }
+
+    /// Changed flags and arrivals on the current selection, one classification
+    /// for every change mode: a `\Deleted` message is a removal wherever its
+    /// UID sits, held at lookup or not (IOS-IMAP-001 D3); a changed message at or above the
+    /// bookmark's UIDNEXT is an arrival, fetched in full; a held one gets a
+    /// partial record (its whole flag and keyword set); a changed message the
+    /// folder does not hold, inside the range the older-mail walk has downloaded
+    /// (`heldRangeStart`), is fetched in full. Arrivals are also asked for by
+    /// UID from the bookmark's UIDNEXT to the served one. More than
+    /// `SyncConfig.imapChangeArrivalsLimit` to fetch refuses with `.tooFarBehind`.
+    func readChangedAndArrivals(
+        _ changed: [IMAPChangedFlags], folder: ChangeFolder, cursorUidNext: UInt32, servedUidNext: UInt32,
+        server: IMAPServer, request: ChangeRequest, into changes: inout FolderChanges
+    ) async throws -> SelectionReadOutcome {
+        let context = request.context
+        let sorted = changed.sorted { $0.uid < $1.uid }
+        // Held rows are looked up below the bookmark's UIDNEXT; a `\Deleted`
+        // message needs no lookup, its removal is emitted whether held or not.
+        let heldCandidates = sorted.filter { $0.uid < cursorUidNext && !$0.flags.contains(.deleted) }.map(\.uid)
+        let held = try await heldIdSet(heldCandidates, folderId: folder.id, request: request)
+        let heldFrom = Self.heldRangeStart(folder)
+        var toFetch: [UInt32] = []
+        for message in sorted {
+            let value = message.uid
+            if message.flags.contains(.deleted) {
+                // A message the server holds as `\Deleted` is never shown: its
+                // removal is emitted wherever its UID sits and whether or not the
+                // folder held it at this lookup, and it is never fetched. A row the
+                // notification merge inserts after the lookup is then removed by
+                // the apply (its shields decide), so an arrival proof that counts
+                // the UID as accounted for never strands it (#755).
+                changes.removals.append(String(value))
+            } else if value >= cursorUidNext {
+                toFetch.append(value)
+            } else if held.contains(value) {
+                changes.records.append(Self.flagRecord(uid: value, flags: message.flags))
+            } else if let heldFrom, Int(value) >= heldFrom {
+                // Changed, not held, within the held range: un-deleted, or removed
+                // locally by an earlier read. Only its full record can bring it back.
+                toFetch.append(value)
+            }
+        }
+        // Arrivals by UID as well: RFC 7162 §3.2.5.1 requires the QRESYNC SELECT
+        // to report flag changes and expunges, not new messages, so every UID
+        // from the bookmark's UIDNEXT to the served one is asked for explicitly.
+        var arrivals = MessageIdentifierSet<UID>()
+        if servedUidNext > cursorUidNext {
+            guard context.hasBudget() else { return .stopped(FolderChanges(folderId: folder.id, status: .notRun)) }
+            let range = MessageIdentifierSet<UID>(UID(cursorUidNext)...UID(servedUidNext - 1))
+            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+                try await server.extendedSearch(identifierSet: range, criteria: [.all])
+            }
+            arrivals = try found.listed(within: range)
+            // A UID the changed-flags read reported in this range is present on
+            // this selection even when the SEARCH left it out: it is an arrival
+            // (S-15), so the CONDSTORE count never reads it as a removal.
+            for message in sorted where message.uid >= cursorUidNext && message.uid < servedUidNext {
+                arrivals.insert(UID(message.uid))
+            }
+            let listed = Set(toFetch)
+            let deletedArrivals = Set(sorted.filter { $0.uid >= cursorUidNext && $0.flags.contains(.deleted) }.map(\.uid))
+            toFetch += Self.arrivals(
+                in: arrivals, from: cursorUidNext, excluding: listed.union(deletedArrivals),
+                room: SyncConfig.imapChangeArrivalsLimit - toFetch.count
+            )
+        }
+        guard toFetch.count <= SyncConfig.imapChangeArrivalsLimit else {
+            return .stopped(FolderChanges(folderId: folder.id, status: .refused(.tooFarBehind)))
+        }
+        return .read(arrivals: arrivals, toFetch: toFetch)
+    }
+
+    /// The full records of `toFetch` (`readChangedAndArrivals`) added to
+    /// `changes`; false when the budget ran out first (the folder is not run).
+    func fetchArrivals(_ toFetch: [UInt32], server: IMAPServer, context: ChangeContext, into changes: inout FolderChanges) async throws -> Bool {
+        if !toFetch.isEmpty {
+            guard context.hasBudget() else { return false }
+            context.onProgress(toFetch.count)
+            // A UID the FETCH does not return is read again later (or removed
+            // once UID SEARCH proves it gone): the bookmark moves past it, so the
+            // re-read list is the only place it survives.
+            let fetched = try await rereadIds(toFetch, server: server, context: context)
+            changes.records += fetched.records
+            changes.removals += fetched.removals
+            changes.rereadLater += fetched.unreadable
+        }
+        return true
+    }
+
+    /// No bookmark yet: a plain SELECT on the change session (with `(CONDSTORE)`
+    /// where the session needs it).
     private func baseline(
         _ folder: ChangeFolder, observation: FolderObservation, ids: [UInt32],
         server: IMAPServer, request: ChangeRequest
@@ -486,9 +652,20 @@ extension IMAPProvider {
         }
         let uidNext = selection.uidNext.value
         guard uidNext != 0 else { throw IMAPChangeReadIncomplete(folder: folder.path, missing: "UIDNEXT") }
+        let count = selection.reportedMessageCount
+        // A CONDSTORE bookmark needs the count (no EXISTS: untracked this pass).
+        if count == nil, changeMode != .qresync {
+            return try await untracked(folder, observation: observation, ids: ids, server: server, request: request)
+        }
+        // A bookmark never stores count 0 while the same selection holds live
+        // UIDs (#755): EXISTS 0 is believed only once `UID SEARCH ALL` reads
+        // empty; found UIDs, an unlisted answer or a refusal store no bookmark.
+        if count == 0, await !searchReadsEmpty(server: server) {
+            return try await untracked(folder, observation: observation, ids: ids, server: server, request: request)
+        }
         var changes = FolderChanges(
             folderId: folder.id, status: .baselineReady, addressEpoch: Int(served),
-            cursor: IMAPChangeCursor(uidValidity: served, highestModSeq: modseq, uidNext: uidNext).encoded)
+            cursor: IMAPChangeCursor(uidValidity: served, highestModSeq: modseq, uidNext: uidNext, messageCount: count).encoded)
         changes.armCatchUpWithBookmark = true
         if !ids.isEmpty, request.context.hasBudget() {
             let answer = try await rereadIds(ids, server: server, context: request.context)
@@ -499,8 +676,20 @@ extension IMAPProvider {
         return changes
     }
 
+    /// The selected mailbox's `UID SEARCH ALL` reads empty: the only evidence
+    /// that lets a bookmark store EXISTS 0 (#755). Found UIDs, an unlisted
+    /// answer or a refusal are not.
+    func searchReadsEmpty(server: IMAPServer) async -> Bool {
+        let all = MessageIdentifierSet<UID>(UID(1)...UID(UInt32.max))
+        let found: ExtendedSearchResult<UID>? = try? await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+            try await server.extendedSearch(identifierSet: all, criteria: [.all])
+        }
+        guard let listed = try? found?.listed(within: all) else { return false }
+        return listed.isEmpty
+    }
+
     /// A folder no bookmark can cover, with its re-read list answered.
-    private func untracked(
+    func untracked(
         _ folder: ChangeFolder, observation: FolderObservation, ids: [UInt32],
         server: IMAPServer, request: ChangeRequest
     ) async throws -> FolderChanges {
@@ -547,10 +736,11 @@ extension IMAPProvider {
     }
 
     /// A plain SELECT on the change connection, remembering the selection.
-    private func selectPlain(_ path: String, server: IMAPServer) async throws -> Mailbox.Selection {
+    func selectPlain(_ path: String, server: IMAPServer) async throws -> Mailbox.Selection {
         changeSelectedPath = nil
+        let condStore = changeMode == .condstore(selectParameter: true)
         let selection = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
-            try await server.selectMailbox(path)
+            condStore ? try await IMAPChangeCommands().selectCondStore(path, on: server) : try await server.selectMailbox(path)
         }
         changeSelectedPath = path
         return selection
@@ -575,15 +765,16 @@ extension IMAPProvider {
 
     // MARK: - Reads on the current selection
 
-    /// Full records for these UIDs (one header FETCH). A `\Deleted` message is
-    /// left out (never inserted); a record that cannot be mapped is read later.
+    /// Full records for these UIDs (one header FETCH, at most `requestTimeout`).
+    /// A `\Deleted` message is left out (never inserted); a record that cannot
+    /// be mapped is read later.
     private func fullRecords(
-        _ uids: [UInt32], server: IMAPServer
+        _ uids: [UInt32], server: IMAPServer, requestTimeout: TimeInterval
     ) async throws -> (records: [ChangeRecord], returned: Set<UInt32>, deleted: Set<UInt32>, unreadable: [String]) {
         var set = UIDSet()
         for uid in uids { set.insert(UID(uid)) }
         let requested = set
-        let infos = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+        let infos = try await withTimeout(seconds: requestTimeout) {
             try await server.fetchMessageInfosBulk(using: requested)
         }
         var records: [ChangeRecord] = []
@@ -611,10 +802,12 @@ extension IMAPProvider {
     /// The re-read list's answer: full records; a `\Deleted` message is a
     /// removal; a UID the FETCH did not return is removed only when `UID SEARCH`
     /// on the same selection confirms it is gone, otherwise it is read again.
-    private func rereadIds(
-        _ ids: [UInt32], server: IMAPServer, context: ChangeContext
+    /// Each request waits at most `requestTimeout`.
+    func rereadIds(
+        _ ids: [UInt32], server: IMAPServer, context: ChangeContext,
+        requestTimeout: TimeInterval = SyncConfig.changeReadRequestTimeoutSeconds
     ) async throws -> (records: [ChangeRecord], removals: [String], unreadable: [String]) {
-        let fetched = try await fullRecords(ids, server: server)
+        let fetched = try await fullRecords(ids, server: server, requestTimeout: requestTimeout)
         var removals = fetched.deleted.sorted().map(String.init)
         var unreadable = fetched.unreadable
         let missing = ids.filter { !fetched.returned.contains($0) }
@@ -625,7 +818,7 @@ extension IMAPProvider {
             var set = UIDSet()
             for uid in missing { set.insert(UID(uid)) }
             let missingSet = set
-            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: requestTimeout) {
                 try await server.extendedSearch(identifierSet: missingSet, criteria: [.all])
             }
             let confirmed = Self.confirmMissing(missing, present: try found.listed(within: missingSet))
@@ -679,7 +872,7 @@ extension IMAPProvider {
         return ids
     }
 
-    private func heldIdSet(_ uids: [UInt32], folderId: String, request: ChangeRequest) async throws -> Set<UInt32> {
+    func heldIdSet(_ uids: [UInt32], folderId: String, request: ChangeRequest) async throws -> Set<UInt32> {
         guard let localRows = request.localRows, !uids.isEmpty else { return [] }
         let rows = try await localRows.rows(folderId: folderId, ids: uids.map(String.init))
         return Set(rows.compactMap { UInt32($0.messageId) })
@@ -698,7 +891,7 @@ extension IMAPProvider {
     /// in for it.
     func withChangeConnection<T>(
         openingIn passGeneration: Int,
-        _ body: (IMAPServer, Bool) async throws -> T
+        _ body: (IMAPServer, IMAPChangeMode?) async throws -> T
     ) async throws -> T {
         #if DEBUG
         if let hook = beforeChangeLaneTestHook {
@@ -715,9 +908,9 @@ extension IMAPProvider {
             if !changeLaneWaiters.isEmpty { changeLaneWaiters.removeFirst().resume() }
         }
 
-        let (server, qresync) = try await changeSession(passGeneration)
+        let (server, mode) = try await changeSession(passGeneration)
         do {
-            let result = try await body(server, qresync)
+            let result = try await body(server, mode)
             changeServerLastUsed = Date()
             return result
         } catch {
@@ -728,17 +921,17 @@ extension IMAPProvider {
 
     /// The live change session, or a new one, for a pass that started in
     /// `passGeneration`.
-    private func changeSession(_ passGeneration: Int) async throws -> (IMAPServer, Bool) {
+    private func changeSession(_ passGeneration: Int) async throws -> (IMAPServer, IMAPChangeMode?) {
         guard generation == passGeneration else { throw ProviderError.notConnected }
         if let server = changeServer {
             guard Self.shouldCheckConnectionLiveness(lastUsed: changeServerLastUsed, now: Date()) else {
-                return (server, changeServerQResync)
+                return (server, changeMode)
             }
             do {
                 try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                     _ = try await server.noop()
                 }
-                if changeServer === server { return (server, changeServerQResync) }
+                if changeServer === server { return (server, changeMode) }
             } catch {
                 dropChangeServer(server)
             }
@@ -757,18 +950,26 @@ extension IMAPProvider {
         // goes out between a teardown and the moment the closing lands.
         defer { if changeOpening?.generation == passGeneration { changeOpening = nil } }
         let fresh = try await createChangeServer(openingIn: passGeneration)
-        var qresync = false
+        var mode: IMAPChangeMode?
         do {
             guard generation == passGeneration else { throw ProviderError.notConnected }
             let advertised = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
                 try await fresh.fetchCapabilities()
             }
-            if Self.qresyncUsable(advertised: advertised.filter { $0.value == nil }.map(\.name)) {
+            let plan = IMAPChangeMode.plan(advertised: advertised.filter { $0.value == nil }.map(\.name))
+            if case .decided(let decided) = plan {
+                mode = decided
+            } else {
+                // Only an acknowledged ENABLE gives a mode (S-9), and none is sent
+                // after a teardown (S-10).
                 guard generation == passGeneration else { throw ProviderError.notConnected }
+                let qresync = plan == .enableQResync
                 let enabled = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
-                    try await fresh.enable([.qresync])
+                    try await fresh.enable([qresync ? .qresync : .condStore])
                 }
-                qresync = enabled.contains(.qresync)
+                if enabled.contains(qresync ? .qresync : .condStore) {
+                    mode = qresync ? .qresync : .condstore(selectParameter: false)
+                }
             }
         } catch {
             detachedTeardownLogout(fresh)
@@ -780,13 +981,13 @@ extension IMAPProvider {
             throw ProviderError.notConnected
         }
         changeServer = fresh
-        changeServerQResync = qresync
+        changeMode = mode
         changeSelectedPath = nil
         changeServerLastUsed = Date()
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[IMAPChanges] change connection opened (QRESYNC \(qresync ? "enabled" : "not available"))")
+            BackgroundSyncLogger.logDebug("[IMAPChanges] change connection opened (mode \(mode.map { "\($0)" } ?? "none"))")
         }
-        return (fresh, qresync)
+        return (fresh, mode)
     }
 
     #if DEBUG
@@ -795,22 +996,10 @@ extension IMAPProvider {
     func setChangeServerLastUsedForTesting(_ date: Date?) { changeServerLastUsed = date }
     #endif
 
-    /// QRESYNC can be used only when the server advertises QRESYNC, ENABLE and
-    /// UIDPLUS. RFC 7162 §3.2.3 switches QRESYNC on only through ENABLE (RFC
-    /// 5161). UIDPLUS (RFC 4315 COPYUID) is what lets a move into a tracked
-    /// folder re-key its row to the destination UID; without it every move
-    /// would land without proof and end the folder's tracking (ADR-IOS-111). A
-    /// server missing any of the three is read as untracked, like a
-    /// CONDSTORE-only server: no ENABLE is sent, no pass fails on it.
-    nonisolated static func qresyncUsable(advertised: [String]) -> Bool {
-        let names = Set(advertised.map { $0.uppercased() })
-        return names.contains("QRESYNC") && names.contains("ENABLE") && names.contains("UIDPLUS")
-    }
-
     private func dropChangeServer(_ server: IMAPServer) {
         if changeServer === server {
             changeServer = nil
-            changeServerQResync = false
+            changeMode = nil
             changeSelectedPath = nil
         }
         changeLogout = detachedTeardownLogoutEnded(server)

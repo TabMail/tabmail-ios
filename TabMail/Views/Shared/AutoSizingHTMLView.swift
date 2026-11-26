@@ -594,14 +594,18 @@ private struct HTMLWebView: UIViewRepresentable {
         // `.id(…)`: the key can only change by recreating the whole web view.
         if let ownerKey = bodyContentKey {
             config.setURLSchemeHandler(
-                BodyAssetSchemeHandler(ownerKey: ownerKey) { line in
-                    // The gate lives here because `DebugModeManager` is an app-target
-                    // type and `BodyAssetSchemeHandler` also compiles into the NSE.
-                    // Read at call time, not captured, so toggling debug logging
-                    // takes effect without recreating the web view.
-                    guard DebugModeManager.isLoggingEnabled() else { return }
-                    BackgroundSyncLogger.logDebug(line)
-                },
+                BodyAssetSchemeHandler(
+                    ownerKey: ownerKey,
+                    onMissingFile: { key in BodyAssetMaintenance.dropMessageWithMissingFile(key) },
+                    log: { line in
+                        // The gate lives here because `DebugModeManager` is an app-target
+                        // type and `BodyAssetSchemeHandler` also compiles into the NSE.
+                        // Read at call time, not captured, so toggling debug logging
+                        // takes effect without recreating the web view.
+                        guard DebugModeManager.isLoggingEnabled() else { return }
+                        BackgroundSyncLogger.logDebug(line)
+                    }
+                ),
                 forURLScheme: BodyAssetConfig.urlScheme
             )
         }
@@ -1644,7 +1648,8 @@ private struct HTMLWebView: UIViewRepresentable {
         /// `sanitize` closes on the JS side.
         private static func loggableURL(_ url: URL?) -> String {
             guard let url else { return "(nil)" }
-            let raw = url.absoluteString
+            // A link in a message: its origin only (`LoggableURL.origin`).
+            let raw = LoggableURL.origin(url)
             let capped = raw.count > 120 ? String(raw.prefix(117)) + "..." : raw
             return DebugModeManager.escapedForLogLine(capped)
         }

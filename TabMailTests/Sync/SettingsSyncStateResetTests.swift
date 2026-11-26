@@ -8,8 +8,8 @@ import Testing
 @testable import TabMail
 
 /// The two Settings resets, "Reset message data" on one account
-/// (`AccountDetailView.resetMessageDataTxn`) and "Delete All Email Index Data"
-/// (`SettingsView.localIndexWipeTxn`), delete the local mail and must leave every
+/// (`SyncEngine.resetMessageDataTxn`) and "Delete All Email Index Data"
+/// (`SyncEngine.localIndexWipeTxn`), delete the local mail and must leave every
 /// folder they cover with no sync progress at all, so the next sync starts the
 /// folder like a new account's. A kept cursor describes rows that no longer exist
 /// (#501: the global wipe kept `lastKnownUidNext`; #848: neither reset cleared
@@ -24,9 +24,9 @@ struct SettingsSyncStateResetTests {
 
     /// The two user gestures that reset sync state.
     enum Wipe: String, CaseIterable, Sendable {
-        /// Reset Message Data on one account (`AccountDetailView.resetMessageDataTxn`).
+        /// Reset Message Data on one account (`SyncEngine.resetMessageDataTxn`).
         case accountReset
-        /// Delete All Email Index Data in Settings (`SettingsView.localIndexWipeTxn`).
+        /// Delete All Email Index Data in Settings (`SyncEngine.localIndexWipeTxn`).
         case settingsWipe
     }
 
@@ -44,6 +44,7 @@ struct SettingsSyncStateResetTests {
         "unreadCount": "display count, refreshed by sync",
         "totalCount": "display count, refreshed by sync",
         "isFavorite": "the user's choice",
+        "isFollowed": "the folders the user's own actions landed in (#1109), as the user's choice; a reset deletes mail, not that",
         "backfillVersion": "row version the trigger owns; never set by hand",
         "lastKnownUidValidity": "the epoch the local UIDs belong to (ADR-IOS-061); a reset does not change the server's numbering",
         "uidValidityResetPendingAt": "the UIDVALIDITY reaction's quarantine flag; only the reaction clears it",
@@ -51,7 +52,7 @@ struct SettingsSyncStateResetTests {
 
     /// Excluded columns a reset must leave exactly as they were. The identity and
     /// display columns are not seeded; `backfillVersion` moves with every reset.
-    static let keptOnPurpose = ["lastKnownUidValidity", "uidValidityResetPendingAt"]
+    static let keptOnPurpose = ["lastKnownUidValidity", "uidValidityResetPendingAt", "isFollowed"]
 
     /// Columns the two resets are known to own. Only a non-vacuity check on the
     /// derived set: the property below never compares against this list.
@@ -136,8 +137,8 @@ struct SettingsSyncStateResetTests {
     static func run(_ wipe: Wipe, _ db: DatabaseQueue) throws {
         try db.write { conn in
             switch wipe {
-            case .accountReset: try AccountDetailView.resetMessageDataTxn(conn, accountId: resetAccountId)
-            case .settingsWipe: try SettingsView.localIndexWipeTxn(conn)
+            case .accountReset: try SyncEngine.resetMessageDataTxn(conn, accountId: resetAccountId)
+            case .settingsWipe: try SyncEngine.localIndexWipeTxn(conn)
             }
         }
     }

@@ -113,24 +113,8 @@ enum AppDataWiper {
         // 1. Nuke all database tables. This is the authoritative boundary and
         // deliberately precedes every credential/provider/local-index side effect.
         // If it throws, `wipeAll` throws and nothing else is deleted.
-        // Order still matters for the foreign keys that
-        // remain (folder/account cascades). `messageBody` no longer has one — Stage D
-        // dropped it — so its explicit DELETE here is now REQUIRED rather than merely
-        // ordered: nothing else would remove those rows.
         do {
-            try await dbPool.write { db in
-                try db.execute(sql: "DELETE FROM messageBody")
-                try db.execute(sql: "DELETE FROM messageHeader")
-                try db.execute(sql: "DELETE FROM pendingOperation")
-                try db.execute(sql: "DELETE FROM messageAICache")
-                try db.execute(sql: "DELETE FROM chatTurn")
-                try db.execute(sql: "DELETE FROM chatHistory")
-                try db.execute(sql: "DELETE FROM chatIdMapping")
-                try db.execute(sql: "DELETE FROM outboxMessage")
-                try db.execute(sql: "DELETE FROM pendingCalendarOperation")
-                try db.execute(sql: "DELETE FROM folder")
-                try db.execute(sql: "DELETE FROM account")
-            }
+            try await dbPool.write { db in try Self.wipeRowsTxn(db) }
         } catch {
             for plan in plans {
                 AccountFieldPersistenceStore.production.reactivateAccount(plan.account.id)
@@ -179,9 +163,10 @@ enum AppDataWiper {
         // 2. Disconnect Device Sync WebSocket.
         DeviceSyncService.shared.disconnect()
 
-        // Reclaim disk space — VACUUM can't run inside a transaction
+        // Reclaim disk space — VACUUM can't run inside a transaction. It also leaves
+        // the database on auto_vacuum = INCREMENTAL (ADR-IOS-121).
         try? await dbPool.writeWithoutTransaction { db in
-            try db.execute(sql: "VACUUM")
+            try DatabaseVacuum.vacuum(db)
         }
 
         // 5b. Delete outbox attachment files from disk
@@ -279,5 +264,27 @@ enum AppDataWiper {
         }
 
         BackgroundSyncLogger.logDebug("[AppDataWiper] Local data wiped — true factory reset")
+    }
+
+    /// The wipe's row deletes, in one transaction (`wipeAll` step 1).
+    ///
+    /// Order still matters for the foreign keys that remain (folder/account
+    /// cascades). `messageBody` no longer has one — Stage D dropped it — so its
+    /// explicit DELETE here is REQUIRED rather than merely ordered: nothing else
+    /// would remove those rows. It runs after the headers' delete, so the
+    /// HTML-cache pair's body-delete trigger (migration v116) finds no header to
+    /// rewrite just before it is deleted.
+    nonisolated static func wipeRowsTxn(_ db: Database) throws {
+        try db.execute(sql: "DELETE FROM messageHeader")
+        try db.execute(sql: "DELETE FROM messageBody")
+        try db.execute(sql: "DELETE FROM pendingOperation")
+        try db.execute(sql: "DELETE FROM messageAICache")
+        try db.execute(sql: "DELETE FROM chatTurn")
+        try db.execute(sql: "DELETE FROM chatHistory")
+        try db.execute(sql: "DELETE FROM chatIdMapping")
+        try db.execute(sql: "DELETE FROM outboxMessage")
+        try db.execute(sql: "DELETE FROM pendingCalendarOperation")
+        try db.execute(sql: "DELETE FROM folder")
+        try db.execute(sql: "DELETE FROM account")
     }
 }

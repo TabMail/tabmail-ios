@@ -64,7 +64,8 @@ private func simulateRunSyncMessages(
     messages: [MessageHeaderInfo],
     limit: Int,
     undoProtectedIds: Set<String> = [],
-    windowMode: StaleWindowMode = .date
+    windowMode: StaleWindowMode = .date,
+    uidNext: Int? = nil
 ) throws -> (newHeaders: [MessageHeader], staleIds: [String]) {
     let folderPath = folder.path
     let folderId = folder.id
@@ -108,14 +109,16 @@ private func simulateRunSyncMessages(
         // `limit` — the harness feeds `selectStaleHeaders` directly, so there is no
         // provider narrowing between the two and `messages.count` IS the server's
         // record count here. Real providers must NOT derive coverage this way; see
-        // `FetchCoverage`.
+        // `FetchCoverage`. `uidNext`, when given, is the UIDNEXT the listing's own
+        // SELECT reported, carried as its counters as a real listing does.
         let allLocal = try MessageHeader.filter(Column("folderId") == folderId).fetchAll(dbConn)
         let stale = SyncEngine.selectStaleHeaders(
             candidates: allLocal, fetched: messages,
             coverage: FetchCoverage(
                 serverRecordCount: messages.count,
                 spansEntireFolder: messages.count < limit,
-                unmaterialisedIds: []),
+                unmaterialisedIds: [],
+                counters: uidNext.map { ListingCounters(messageCount: messages.count, uidNext: $0, highestModSeq: nil) }),
             windowMode: windowMode)
 
         let protectedIds = pendingAllIds.union(undoProtectedIds)
@@ -955,14 +958,15 @@ struct StaleDetectionWindowTests {
         #expect(result.staleIds.contains("acc1:Archive:101"))
     }
 
-    @Test("IMAP .uid window still deletes a row INSIDE the fetched UID slice that the server dropped")
+    @Test("IMAP .uid window deletes a row above the highest fetched UID but below the listing's UIDNEXT that the server dropped")
     func uidWindowStillDeletesGenuinelyStale() throws {
         let db = try TestDatabase.make()
         let archive = try seedArchive(db)
         // UID 203 > floor(200): inside the window. Server's newest-3 is still
-        // {202,201,200} (203 was deleted server-side) → 203 must be stale-deleted.
+        // {202,201,200} (203 was deleted server-side, so the listing's SELECT
+        // reports UIDNEXT 204) → 203 is below UIDNEXT and must be stale-deleted.
         try TestDatabase.insertMessageHeader(db, messageId: "203", date: daysAgo(3), folderId: "acc1:Archive", accountId: "acc1", folderPath: "Archive", isInInbox: false, rfc822MessageId: "<a203@example.com>")
-        let result = try simulateRunSyncMessages(db: db, folder: archive, messages: newestThreeFetch(), limit: 3, windowMode: .uid)
+        let result = try simulateRunSyncMessages(db: db, folder: archive, messages: newestThreeFetch(), limit: 3, windowMode: .uid, uidNext: 204)
 
         #expect(result.staleIds.contains("acc1:Archive:203"), "row 203 (UID ≥ floor, gone from server) must still be deleted")
         #expect(!result.staleIds.contains("acc1:Archive:100"), "mid-range row 100 must still survive")

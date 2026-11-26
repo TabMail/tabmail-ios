@@ -270,9 +270,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// files, none of them a type you can cite. Neither self-heal nor deep
     /// backfill is epoch-guarded, so both now write this mirror. Do not restate
     /// any "sole caller" claim here without re-running that search.
+    /// (Current note, #1062: the self-heal and `SyncEngineSelfHeal.swift` are
+    /// deleted; missing mail is loaded by UID by the catch-up, which does not
+    /// call this overload. The text above and below is history.)
     ///
     /// ⚠ **UPDATE (round 13, blocker 2): self-heal IS epoch-guarded now**
-    /// (`SyncEngine.selfHealFolder`) — and it is guarded WITHOUT reading this
+    /// (then `SyncEngine.selfHealFolder`, deleted in #1062: the catch-up's load of
+    /// missing UIDs, `IMAPProvider.catchUp`, took its place, with the same rule) — and it is guarded WITHOUT reading this
     /// mirror, by the epoch `fetchMessageHeadersWithObservedEpoch` returns from
     /// the SELECTs that served its headers. It still WRITES the mirror, because
     /// its fetch still routes through this helper. (The unguarded date-window
@@ -543,6 +547,14 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     //    (cancelling whatever it finds first). `stopIdle()`/`markDirty()`:
     //    cancel + nil. `onIdleStreamEnded(owner:)`: nil ONLY inside the
     //    identity-matched branch. `evictIdleConnection()`: cancel + nil.
+    //  - `idleEnabled` is the wish for IDLE (`startIdle()` sets it,
+    //    `stopIdle()` clears it). Every path that ends a listener or a launch
+    //    while the wish stands starts or schedules its successor:
+    //    `markDirty()` at once, in its own turn (`tearDownIdleConnection`,
+    //    #1288); `onIdleStreamEnded` after 5 s or 10 s;
+    //    `retryLaunchIdleConnection` after 10 s; `evictIdleConnection()` after
+    //    30 s. A cancelled listener and a refused launch never relaunch on
+    //    their own: their canceller does.
     //
     // CROSS-FIELD INVARIANTS (all three lanes)
     //  1. A resumed-but-not-yet-continued waiter holds ownership: the in-use
@@ -792,6 +804,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// connections.
     var generation: Int = 0
 
+    /// Set once, by `disconnectForAccountRemoval()`, and never cleared: the
+    /// account is gone, so no later caller may open a server session with its
+    /// credentials. Read by `openingTornDown`, the one opening check.
+    private var retiredForAccountRemoval = false
+
     // MARK: - Action Connection
     // Dedicated connection for user-initiated actions (move, flag, mark read, draft, etc.).
     // SELECTs the needed folder per-operation (~150ms, fine for low-volume user actions).
@@ -854,8 +871,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `dropChangeServer`, `evictChangeConnectionIfIdle`, `disconnect()` and
     /// `markDirty()`.
     var changeServer: IMAPServer?
-    /// `ENABLE QRESYNC` was acknowledged on `changeServer`'s session.
-    var changeServerQResync = false
+    /// How `changeServer`'s session reads changes, decided once when it opened
+    /// (`IMAPChangeMode.decide`); nil = it cannot, every folder is untracked.
+    var changeMode: IMAPChangeMode?
+    #if DEBUG
+    /// Test seam: `SyncConfig.imapChangeRemovalCheckWindow` for this provider.
+    var removalCheckWindowForTesting: Int?
+    #endif
     var changeServerLastUsed: Date?
     /// The LOGOUT of the change session dropped last (`dropChangeServer`): true
     /// once the session has ended. A pass opens a new session after a dropped one
@@ -966,6 +988,25 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     private nonisolated let serverCreatedTestHook =
         Mutex<(@Sendable (IMAPServer, String) -> Void)?>(nil)
 
+    #if DEBUG
+    /// Test seam: when set, `send(draft:)` uses the returned SMTP session
+    /// instead of a SwiftMail `SMTPServer` (`IMAPProviderSMTPSession.swift`).
+    private nonisolated let smtpSessionTestFactory =
+        Mutex<(@Sendable () -> any SMTPSubmissionSession)?>(nil)
+
+    nonisolated func setSMTPSessionFactoryForTesting(_ factory: (@Sendable () -> any SMTPSubmissionSession)?) {
+        smtpSessionTestFactory.withLock { $0 = factory }
+    }
+    #endif
+
+    /// The SMTP session one send uses.
+    private nonisolated func makeSMTPSession() -> any SMTPSubmissionSession {
+        #if DEBUG
+        if let factory = smtpSessionTestFactory.withLock({ $0 }) { return factory() }
+        #endif
+        return SMTPServer(host: smtpHost, port: smtpPort)
+    }
+
     /// Test seam: install `serverCreatedTestHook`.
     nonisolated func setServerCreatedTestHookForTesting(_ hook: (@Sendable (IMAPServer, String) -> Void)?) {
         serverCreatedTestHook.withLock { $0 = hook }
@@ -1036,6 +1077,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `passGeneration`: the generation of the change pass the session is opened
     /// for; the LOGIN is sent only while it holds.
     private func createServer(diagSite: String, passGeneration: Int? = nil) async throws -> IMAPServer {
+        // A provider retired by account removal opens nothing, for any caller.
+        if openingTornDown(passGeneration) { throw ProviderError.notConnected }
         let server = IMAPServer(
             host: host,
             port: port,
@@ -2682,6 +2725,15 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         startKeepAlive()
     }
 
+    /// Account removal: retire the provider in this actor turn, before any
+    /// suspension, then tear down as `disconnect()` does. A caller still
+    /// holding this provider (a listing that waited for the sync turn, a send)
+    /// gets `ProviderError.notConnected` from every later opening.
+    func disconnectForAccountRemoval() async {
+        retiredForAccountRemoval = true
+        try? await disconnect()
+    }
+
     func disconnect() async throws {
         stopKeepAlive()
         stopIdle()
@@ -2740,7 +2792,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let capturedActionServer = actionServer
         let capturedChangeServer = changeServer
         changeServer = nil
-        changeServerQResync = false
+        changeMode = nil
         changeSelectedPath = nil
         let capturedFolderWaiters = folderWaiters
         let capturedFolderCapacityWaiters = folderCapacityWaiters
@@ -2907,7 +2959,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if let server = changeServer {
             detachedTeardownLogout(server)
             changeServer = nil
-            changeServerQResync = false
+            changeMode = nil
             changeSelectedPath = nil
         }
 
@@ -2937,7 +2989,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         for (_, cont) in folderCapacityWaiters { cont.resume(throwing: ProviderError.notConnected) }
         folderCapacityWaiters.removeAll()
 
-        // Stop IDLE listener (don't clear idleEnabled — it will resume after reconnect)
+        // End IDLE and, while it is still wanted (`idleEnabled` is kept), start
+        // it again on a fresh connection (`tearDownIdleConnection`, #1288).
         if tearDownIdleConnection() {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP] markDirty: disconnecting IDLE connection") }
         }
@@ -3236,10 +3289,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// generation), at every teardown call site that could plausibly log out a
     /// connection some OTHER task still holds: `disconnect()` and `markDirty()`
     /// — the two EXTERNAL teardowns (cross-field invariant #1's void set).
-    /// It also fires for the IDLE connection's teardown in `stopIdle()` and
-    /// `evictIdleConnection()`, which share `markDirty()`'s IDLE path
-    /// (`tearDownIdleConnection`); the IDLE connection is never checked out,
-    /// so those calls can never look like a held connection being logged out.
+    /// It also fires for the IDLE connection's teardown in `stopIdle()`, which
+    /// shares `markDirty()`'s IDLE path (`tearDownIdleConnection`); the IDLE
+    /// connection is never checked out, so that call can never look like a
+    /// held connection being logged out. `evictIdleConnection()` logs its IDLE
+    /// connection out on its own path, without this hook.
     ///
     /// NOT wired into `releaseActionConnection(healthy:false)` /
     /// `releaseFolderConnection(healthy:false)`: those are the exclusive
@@ -3461,8 +3515,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         tearDownIdleConnection()
     }
 
-    /// The ONE way an IDLE session is ended from outside its listener
-    /// (`markDirty()`, `stopIdle()`, `evictIdleConnection()`): cancel the
+    /// The way `markDirty()` and `stopIdle()` end an IDLE session from outside
+    /// its listener (`evictIdleConnection()` has its own teardown and must not
+    /// use this one: the relaunch below would undo the 30 s back-off and take
+    /// back the slot the eviction freed): cancel the
     /// listener, clear the slot, then a detached DONE followed by LOGOUT on the
     /// tracked connection. SwiftMail's `executeCommandBody` calls
     /// `waitForIdleCompletionIfNeeded()` before EVERY command including LOGOUT,
@@ -3473,14 +3529,27 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// owns the connection's only logout, so nothing can put a LOGOUT on the
     /// wire ahead of the DONE. Synchronous — callers keep their one-actor-turn
     /// teardown. Returns whether an IDLE connection was torn down.
+    ///
+    /// A teardown that leaves IDLE wanted (`idleEnabled`, i.e. `markDirty()`)
+    /// starts its successor here, on a fresh connection, in the same turn
+    /// (#1288). Nothing else would: the listener it cancelled returns without
+    /// relaunching, a launch it cancelled is refused at its claim, and IDLE is a
+    /// standing connection, so there is no "next use" to recreate it. The
+    /// resume's `markDirty()` lands while `startIdle()`'s launch is connecting
+    /// on most returns to the app; without this, IDLE stayed off for the rest of
+    /// the session. `stopIdle()` clears `idleEnabled` first, so it starts nothing.
     @discardableResult
     private func tearDownIdleConnection() -> Bool {
         idleListenerTask?.cancel()
         idleListenerTask = nil
-        guard let server = idleServer else { return false }
-        idleServer = nil
-        detachedTeardownLogout(server, sendDoneFirst: true)
-        return true
+        var toreDown = false
+        if let server = idleServer {
+            idleServer = nil
+            detachedTeardownLogout(server, sendDoneFirst: true)
+            toreDown = true
+        }
+        if idleEnabled { launchIdleConnection() }
+        return toreDown
     }
 
     /// Minimum server connection limit to enable IDLE.
@@ -3492,7 +3561,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     ///
     /// T3.7 PORT (D-20 / R7-F3) — this function is deliberately callable
     /// concurrently: its own callers (`startIdle`, `onIdleStreamEnded`'s retry
-    /// timer, `evictIdleConnection`'s post-eviction relaunch) are not mutually
+    /// timer, `retryLaunchIdleConnection`'s timer, `evictIdleConnection`'s
+    /// post-eviction relaunch, `tearDownIdleConnection`'s relaunch for
+    /// `markDirty()`) are not mutually
     /// exclusive, so two overlapping calls landing while `idleServer` is still
     /// nil (neither `createServer()` RTT has resolved) both reach the claim
     /// below. Pre-fix, the created connection was planted via an unconditional
@@ -3571,6 +3642,23 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // itself (`stopIdle`/`markDirty` read `idleServer` directly);
                 // if not, nothing was ever planted — no retry, the cancellation
                 // was intentional.
+            } catch let error as IMAPError where error.isSignInRefusal {
+                // The server refused the password (#1349): the sign-in of
+                // `createServer`, or the sign-in SwiftMail repeats inside the
+                // INBOX SELECT or the IDLE command when it reopened a dropped
+                // connection (both throw inside this `do`). A refusal for
+                // now is not this: `createServer` rethrows it as
+                // `ProviderTemporaryRefusal`, and the repeated sign-in throws it as
+                // a `loginFailed` that `isSignInRefusal` rules out, so both keep
+                // the retry below. A retry of a refused password would send it
+                // every 10 s while the app is open, so IDLE stops here: `stopIdle`
+                // clears the wish, so nothing relaunches it. A password update
+                // makes a new provider live and hands it to the scheduler, which
+                // starts its IDLE; a return to the app skips the account while its
+                // sign-in stays refused (`SyncScheduler.startImapIdle`). A network
+                // error and a dropped stream keep the retry below too.
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Sign-in refused — IDLE stops until the password is updated") }
+                await self.stopIdle()
             } catch {
                 if let claimed {
                     if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAP:IDLE] Error: \(error) — reconnecting in 10s") }
@@ -3707,15 +3795,18 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         guard let server = changeServer, !changeLaneBusy else { return false }
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[IMAPChanges] Evicting the idle change connection to free a server slot") }
         changeServer = nil
-        changeServerQResync = false
+        changeMode = nil
         changeSelectedPath = nil
         logouts.append(detachedTeardownLogout(server))
         return true
     }
 
-    /// Whether the change pass of `passGeneration` has been torn down since.
+    /// Whether an opening must stop: the provider was retired by account
+    /// removal (terminal, every caller), or the change pass of
+    /// `passGeneration` has been torn down since.
     private func openingTornDown(_ passGeneration: Int?) -> Bool {
-        passGeneration.map { $0 != generation } ?? false
+        if retiredForAccountRemoval { return true }
+        return passGeneration.map { $0 != generation } ?? false
     }
 
     /// Teardown: close at once, without a LOGOUT, the change session being
@@ -6287,15 +6378,24 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    func send(draft: DraftMessage) async throws {
+    /// SMTP's answer names no copy: the Sent copy is the APPEND that follows,
+    /// matched to the optimistic row by its Message-ID.
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
+        // The SMTP session logs in with the same credentials: a retired
+        // provider sends nothing.
+        if openingTornDown(nil) { throw ProviderError.notConnected }
         try await withTimeout(seconds: SyncConfig.smtpSendTimeoutSeconds) {
+            // The timeout runs this in an unstructured task: removal can land
+            // between the entry check and its start, so no connection opens then.
+            if await self.openingTornDown(nil) { throw ProviderError.notConnected }
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Sending via \(self.smtpHost):\(self.smtpPort) from=\(self.senderEmail) to=\(draft.to) attachments=\(draft.attachments.count)") }
             // Built before connecting: a recipient SwiftMail cannot read fails the
             // send without opening a connection.
             let email = try Self.buildEmail(from: draft, senderEmail: self.senderEmail)
-            let smtpServer = SMTPServer(host: self.smtpHost, port: self.smtpPort)
+            let smtpServer = self.makeSMTPSession()
             do {
-                try await smtpServer.connect()
+                try await smtpServer.openConnection()
             } catch {
                 // IOS-TLS-002, send path. Without this the row stays `.queued`
                 // FOREVER: `isTransientSendError` reads `.tlsFailed`/connection
@@ -6304,22 +6404,33 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // given the Retry/Discard agency Outbox Rules 7/9 promise.
                 throw Self.mapTransportSecurityFailure(error, host: self.smtpHost)
             }
-            try await smtpServer.login(username: self.username, password: self.password)
+            // Connect, greeting and TLS were awaited: an account removed
+            // meanwhile neither authenticates nor submits.
+            if await self.openingTornDown(nil) {
+                try? await smtpServer.close()
+                throw ProviderError.notConnected
+            }
+            try await smtpServer.authenticate(username: self.username, password: self.password)
+            if await self.openingTornDown(nil) {
+                try? await smtpServer.close()
+                throw ProviderError.notConnected
+            }
 
             do {
-                try await smtpServer.sendEmail(email)
+                try await smtpServer.submit(email)
             } catch {
                 if !(error is CancellationError) && !SyncEngine.isConnectionError(error) {
                     BackgroundSyncLogger.logError("SMTP send failed: \(error)", source: "outbox:\(self.senderEmail)")
                 }
                 // Best-effort disconnect before rethrowing
-                try? await smtpServer.disconnect()
+                try? await smtpServer.close()
                 throw error
             }
             // Email is sent — disconnect is cleanup, must not throw
-            try? await smtpServer.disconnect()
+            try? await smtpServer.close()
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Send complete") }
         }
+        return nil
     }
 
     /// Append a sent message to the IMAP Sent folder. Dedup-safe: searches by Message-ID
@@ -7451,19 +7562,26 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// it cannot say which message it describes — so this THROWS rather than
     /// returning a listing with a hole in it, which the caller would read as a
     /// removal (the `liveSourceUIDs` rule). A UID absent from the result is only a
-    /// CANDIDATE removal: the caller still confirms it with
-    /// `searchExistingUIDs(folder:uids:)`, because a short FETCH is a real server
+    /// CANDIDATE removal: the caller still proves it with the range's membership
+    /// search, `searchMembership(folder:uids:range:)`, because a short FETCH is a real server
     /// shape (`[IMAP-FETCH-GAP]`, MIS-IOS-002).
+    /// In the catch-up, `searchExistingUIDs(folder:uids:)` only asks again for
+    /// the UIDs a header load left unanswered.
+    ///
+    /// Each UID also carries whether the server flags it `\Deleted` (such a
+    /// message is not shown, ADR-IOS-111 item 3), and the answer carries the
+    /// UIDNEXT of the same SELECT (nil when not reported): the catch-up's upper
+    /// bound for a folder with no change bookmark (#1062).
     func listFlagsInUIDRange(
         folder: String, from: Int, to: Int
-    ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool)], uidValidity: UInt32) {
-        guard from >= 1, to >= from else { return ([:], 0) }
+    ) async throws -> (flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)], uidValidity: UInt32, uidNext: UInt32?) {
+        guard from >= 1, to >= from else { return ([:], 0, nil) }
         try Task.checkCancellation()
         return try await withFolderConnection(folder: folder) { server in
             let selection = try await selectMailboxTracked(server, folder: folder)
             let infos = try await server.fetchMessageInfos(
                 uidRange: UID(UInt32(from))...UID(UInt32(to)), options: .uidFlagsOnly)
-            var flags: [UInt32: (isRead: Bool, isFlagged: Bool)] = [:]
+            var flags: [UInt32: (isRead: Bool, isFlagged: Bool, isDeleted: Bool)] = [:]
             for info in infos {
                 guard let uid = info.uid else {
                     if DebugModeManager.isLoggingEnabled() {
@@ -7471,10 +7589,58 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                     }
                     throw IMAPCatchUpRangeInconclusive.unparsedUid(folder: folder)
                 }
-                flags[uid.value] = (info.flags.contains(.seen), info.flags.contains(.flagged))
+                flags[uid.value] = (info.flags.contains(.seen), info.flags.contains(.flagged), info.flags.contains(.deleted))
             }
-            return (flags, selection.uidValidity.value)
+            let uidNext = selection.uidNext.value
+            return (flags, selection.uidValidity.value, uidNext != 0 ? uidNext : nil)
         }
+    }
+
+    /// The membership proof of one listing range (#1062): `UID SEARCH UID <set>`
+    /// for `uids` (local rows the FETCH did not list) and the whole of `range`
+    /// (where missing UIDs load), asked as ranges, never expanded, so the answer
+    /// scales with the messages the range holds. An answer naming a UID outside
+    /// the request proves nothing (`listed(within:)` throws). The epoch is the
+    /// one of THIS SELECT.
+    func searchMembership(folder: String, uids: [UInt32], range: ClosedRange<Int>?) async throws -> UIDExistenceResult {
+        try Task.checkCancellation()
+        return try await withFolderConnection(folder: folder) { server in
+            let selection = try await selectMailboxTracked(server, folder: folder)
+            var searchSet = MessageIdentifierSet<UID>()
+            for uid in uids { searchSet.insert(UID(uid)) }
+            if let range { searchSet.insert(range: range) }
+            let extResult: ExtendedSearchResult<UID> = try await server.extendedSearch(
+                identifierSet: searchSet, criteria: [.all])
+            let listed = try extResult.listed(within: searchSet)
+            return UIDExistenceResult(
+                found: Set(listed.toArray().map(\.value)), uidValidity: selection.uidValidity.value)
+        }
+    }
+
+    /// One catch-up header batch on one SELECT: the records the client could
+    /// read, the UIDs whose record it could not (per record, so one bad record
+    /// never fails the batch), and the epoch of that SELECT (nil: not reported).
+    func fetchCatchUpHeaders(
+        folder: String, uids: [UInt32], expectedEpoch: UInt32
+    ) async throws -> (decoded: [MessageHeaderInfo], undecoded: [UInt32], observedEpoch: UInt32?) {
+        try Task.checkCancellation()
+        var uidSet = UIDSet()
+        for uid in uids { uidSet.insert(UID(uid)) }
+        let fetched: (infos: [SwiftMail.MessageInfo], observed: UInt32) =
+            try await withFolderConnection(folder: folder) { server in
+                let selection = try await selectMailboxTracked(server, folder: folder)
+                // Under another numbering these UIDs name other messages: the
+                // FETCH is never sent, only the observed epoch returns (#1062).
+                guard selection.uidValidity.value == expectedEpoch else { return ([], selection.uidValidity.value) }
+                return (try await server.fetchMessageInfosBulk(using: uidSet), selection.uidValidity.value)
+            }
+        var decoded: [MessageHeaderInfo] = []
+        var undecoded: [UInt32] = []
+        for info in fetched.infos {
+            guard let uid = info.uid?.value else { continue }
+            if let header = mapMessageInfo(info) { decoded.append(header) } else { undecoded.append(uid) }
+        }
+        return (decoded, undecoded, fetched.observed != 0 ? fetched.observed : nil)
     }
 
     /// The listing request above could not say which messages a range holds.

@@ -317,8 +317,8 @@ final class ChatFieldWords {
     /// re-stamps its kept entries: no statement binds more than one key, so no number of rows meets
     /// SQLite's bound-variable limit and fails the transaction it runs in. The orphan pass runs it first; every
     /// transaction that deletes emails for a resync runs it before the headers go (Delete All Email
-    /// Index Data, `SettingsView.localIndexWipeTxn`; an account's Reset Message Data,
-    /// `AccountDetailView.resetMessageDataTxn`; a folder's UIDVALIDITY change,
+    /// Index Data, `SyncEngine.localIndexWipeTxn`; an account's Reset Message Data,
+    /// `SyncEngine.resetMessageDataTxn`; a folder's UIDVALIDITY change,
     /// `AccountManager.uidValidityResetPurgeTxn`), so the resync's re-walk counts as emails briefly
     /// gone from that moment, however long ago the last orphan pass ran.
     @discardableResult

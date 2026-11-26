@@ -43,7 +43,13 @@ struct CalendarSearchTool: AgentTool, Sendable {
         )
 
         if result.events.isEmpty {
-            return "No calendar events found matching '\(trimmedQuery)' in the requested date range."
+            if result.unread.isEmpty {
+                return "No calendar events found matching '\(trimmedQuery)' in the requested date range."
+            }
+            return CalendarToolHelpers.withUnreadNote(
+                "No calendar events found matching '\(trimmedQuery)' in the requested date range in the calendars that could be read.",
+                unread: result.unread
+            )
         }
 
         // Google's `singleEvents=true` expansion returns each occurrence as its
@@ -58,9 +64,13 @@ struct CalendarSearchTool: AgentTool, Sendable {
 
         let tz = CalendarToolHelpers.resolveTimeZone(arguments)
         Task { await CalendarToolHelpers.cacheEventDetailsForPills(result.events, calendarNames: result.calendarNames) }
-        return paginateAndFormat(
-            events: result.events, calendarNames: result.calendarNames,
-            pageIndex: pageIndex, timeZone: tz, seriesById: seriesById
+        // Every page carries the note: each page is its own tool result.
+        return CalendarToolHelpers.withUnreadNote(
+            paginateAndFormat(
+                events: result.events, calendarNames: result.calendarNames,
+                pageIndex: pageIndex, timeZone: tz, seriesById: seriesById
+            ),
+            unread: result.unread
         )
     }
 

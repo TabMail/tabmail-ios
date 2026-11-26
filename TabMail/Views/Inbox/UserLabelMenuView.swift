@@ -45,8 +45,14 @@ import GRDB
 @MainActor
 final class UserLabelMenuModel {
     let messageSnapshot: MessageSnapshot
-    /// Sorted once on load — remains stable during the session (no re-sorting on
-    /// toggle, and the reconcile below deliberately does not disturb it).
+    /// The labels the user applied most recently in this app, listed above
+    /// `sortedLabels` (`UserLabelStore.menu`, #1386). Read once on load and stable
+    /// during the session, like `sortedLabels`: applying a label from this sheet stamps
+    /// its time, and the next opening lists it here.
+    var recentLabels: [UserLabel] = []
+    /// Every label of the account, A to Z. Sorted once on load — remains stable during
+    /// the session (no re-sorting on toggle, and the reconcile below deliberately does
+    /// not disturb it).
     var sortedLabels: [UserLabel] = []
     /// Applied label IDs — mutated optimistically on toggle, drives checkmark display.
     var appliedIds: Set<String> = []
@@ -66,6 +72,18 @@ final class UserLabelMenuModel {
         self.messageSnapshot = messageSnapshot
     }
 
+    // MARK: - Rows
+
+    /// The rows the sheet shows for `searchText` (#1386). With no search, `recent` is
+    /// `recentLabels` (its own section, above a separator) and `list` is every label
+    /// A to Z, the recent ones included; with no recent label, `recent` is empty and
+    /// the sheet is the A-to-Z list alone. While the user searches, `recent` is empty
+    /// and `list` is the A-to-Z labels whose name contains the search.
+    func rows(searchText: String) -> (recent: [UserLabel], list: [UserLabel]) {
+        guard !searchText.isEmpty else { return (recentLabels, sortedLabels) }
+        return ([], sortedLabels.filter { $0.name.localizedCaseInsensitiveContains(searchText) })
+    }
+
     // MARK: - Data Loading
 
     func loadLabels() {
@@ -73,35 +91,24 @@ final class UserLabelMenuModel {
             let accountId = messageSnapshot.accountId
             let messageId = messageSnapshot.id
             // ONE read, not two. The gate and the rows it gates must observe one
-            // consistent database state, and the two separate `dbPool.read` calls
-            // this replaced could not even guarantee that for the inbox-folder
-            // frequency input.
+            // consistent database state.
             let state = try AppDatabase.dbPool.read { db -> (
                 supportsRemoteUserLabels: Bool,
-                entries: [(label: UserLabel, isApplied: Bool)]
+                menu: UserLabelStore.Menu?
             ) in
                 // Provider gate — an account whose adapter cannot mutate labels
                 // remotely gets an EMPTY, disabled menu rather than a list of taps
                 // that could only ever queue an op nothing will execute.
                 guard let account = try Account.fetchOne(db, key: accountId),
                       account.provider.emailProviderType != nil
-                else { return (false, []) }
-                let inboxFolderIds = try String.fetchAll(db,
-                    Folder.select(Column("id"))
-                        .filter(Column("accountId") == accountId && Column("role") == FolderRole.inbox.rawValue)
-                )
-                let entries = try UserLabelStore.labelsSortedForMenu(
-                    accountId: accountId,
-                    messageId: messageId,
-                    inboxFolderIds: inboxFolderIds,
-                    in: db
-                )
-                return (true, entries)
+                else { return (false, nil) }
+                return (true, try UserLabelStore.menu(accountId: accountId, messageId: messageId, in: db))
             }
             supportsRemoteUserLabels = state.supportsRemoteUserLabels
-            // Sort order set once — stable during session
-            sortedLabels = state.entries.map(\.label)
-            appliedIds = Set(state.entries.filter(\.isApplied).map(\.label.id))
+            // Order set once — stable during session
+            recentLabels = state.menu?.recent ?? []
+            sortedLabels = state.menu?.all ?? []
+            appliedIds = state.menu?.appliedIds ?? []
         } catch {
             BackgroundSyncLogger.logDebug("[UserLabelMenu] Failed to load labels: \(error)")
         }
@@ -113,12 +120,12 @@ final class UserLabelMenuModel {
     ///
     /// `UserLabelStore.labelsForMessage` applies the same two filters `loadLabels`'
     /// applied set is subject to — `isSystem == false` and `shouldExcludeLabel` —
-    /// differing only in that it does not re-apply `labelsSortedForMenu`'s
+    /// differing only in that it does not re-apply `UserLabelStore.menu`'s
     /// `accountId` predicate. An id that survives that difference names a label
-    /// `sortedLabels` does not contain, and the `ForEach` renders only
-    /// `sortedLabels`, so it draws nothing. `sortedLabels` is deliberately
-    /// untouched: row ORDER is a presentation choice fixed at load, and re-sorting
-    /// under the user's finger is a different bug.
+    /// `sortedLabels` does not contain, and the `ForEach`es render only
+    /// `recentLabels` and `sortedLabels`, so it draws nothing. Both lists are
+    /// deliberately untouched: row ORDER is a presentation choice fixed at load, and
+    /// re-sorting under the user's finger is a different bug.
     ///
     /// A failed READ leaves `appliedIds` alone rather than guessing. That is the
     /// only honest answer — this function's whole contract is "show what the
@@ -199,6 +206,8 @@ final class UserLabelMenuModel {
     /// Returns whether the write was ADMITTED. `false` means nothing was queued and
     /// nothing changed locally, so the caller must reconcile its optimistic UI.
     func applyLabel(_ label: UserLabel) async -> Bool {
+        // The gesture's time, for the label's last-used time (#1386).
+        let usedAt = Date()
         do {
             let admitted = try await AppDatabase.dbPool.write { db -> Bool in
                 guard let header = try MessageHeader.fetchOne(db, key: messageSnapshot.id) else { return false }
@@ -231,6 +240,10 @@ final class UserLabelMenuModel {
                     folderPath: header.folderPath, db: db) else { return false }
                 try MessageUserLabel(messageId: header.id, userLabelId: label.id)
                     .insert(db, onConflict: .ignore)
+                // The menu lists recently applied labels first (#1386, ADR-IOS-118).
+                // Stamped in this transaction, after every refusal above, so a label
+                // has a time only when an apply of it was admitted.
+                try UserLabelStore.recordUse(of: label.id, at: usedAt, in: db)
                 // 🚨 `providerLabelId`, NEVER `id` — THIS VALUE GOES ON THE WIRE.
                 // The drain hands `PendingOperation.userLabelId` straight to the
                 // provider as a raw argument: Gmail `addLabelIds:`, IMAP
@@ -367,11 +380,19 @@ final class UserLabelMenuModel {
             // so the freshly created label's checkmark would not draw.
             //
             // A label Gmail already had may already be in the menu: replace that
-            // entry rather than listing the same label twice.
+            // entry rather than listing the same label twice. A new one goes where it
+            // falls A to Z, so the list stays in order (#1386); `recentLabels` is the
+            // list read at load and does not change during the session.
             if let index = sortedLabels.firstIndex(where: { $0.id == newLabel.id }) {
                 sortedLabels[index] = newLabel
             } else {
-                sortedLabels.insert(newLabel, at: 0)
+                let position = sortedLabels.firstIndex {
+                    newLabel.name.localizedCaseInsensitiveCompare($0.name) == .orderedAscending
+                } ?? sortedLabels.endIndex
+                sortedLabels.insert(newLabel, at: position)
+            }
+            if let index = recentLabels.firstIndex(where: { $0.id == newLabel.id }) {
+                recentLabels[index] = newLabel
             }
             if admitted { appliedIds.insert(newLabel.id) }
             return true
@@ -402,20 +423,19 @@ struct UserLabelMenuView: View {
                     createRow
                 }
 
-                // Label list (sort order is stable — set once on appear)
-                ForEach(filteredLabels) { label in
-                    Button {
-                        model.toggleLabel(label)
-                    } label: {
-                        HStack {
-                            Image(systemName: model.appliedIds.contains(label.id) ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle(.secondary)
-                            Text(label.name)
-                                .foregroundStyle(.primary)
-                            Spacer()
-                        }
+                // Label list (sort order is stable — set once on appear). The model
+                // decides the rows (`UserLabelMenuModel.rows`, #1386): recent labels in
+                // their own section above every label A to Z, or the A-to-Z list alone.
+                let rows = model.rows(searchText: searchText)
+                if !rows.recent.isEmpty {
+                    Section {
+                        ForEach(rows.recent) { label in labelRow(label) }
                     }
-                    .buttonStyle(.plain)
+                    Section {
+                        ForEach(rows.list) { label in labelRow(label) }
+                    }
+                } else {
+                    ForEach(rows.list) { label in labelRow(label) }
                 }
             }
             .searchable(text: $searchText, prompt: "Search or create label...")
@@ -433,6 +453,23 @@ struct UserLabelMenuView: View {
         }
         .onAppear { model.loadLabels() }
         .dismissKeyboardOnTap()
+    }
+
+    // MARK: - Label Row
+
+    private func labelRow(_ label: UserLabel) -> some View {
+        Button {
+            model.toggleLabel(label)
+        } label: {
+            HStack {
+                Image(systemName: model.appliedIds.contains(label.id) ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(.secondary)
+                Text(label.name)
+                    .foregroundStyle(.primary)
+                Spacer()
+            }
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Create Row
@@ -468,11 +505,6 @@ struct UserLabelMenuView: View {
     }
 
     // MARK: - Filtering
-
-    private var filteredLabels: [UserLabel] {
-        guard !searchText.isEmpty else { return model.sortedLabels }
-        return model.sortedLabels.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-    }
 
     private var matchesExisting: Bool {
         model.sortedLabels.contains { $0.name.caseInsensitiveCompare(searchText) == .orderedSame }

@@ -1,6 +1,10 @@
 
 ## ADR-IOS-042: Stale-Detection Overlap Window Is Measured in the Fetch's Ordering Dimension (UID for IMAP, date for Gmail/Exchange)
 
+> **Current note (2026-11-20, #1062).** The storage prune follows the same rule: it deletes each
+> folder oldest-first in its account's `staleWindowMode` (lowest UID first on IMAP), so an IMAP
+> folder under a storage limit keeps a clean UID floor. See ADR-IOS-006's current note.
+
 **Context:** Full-sync (`SyncEngine.runSyncMessages`) fetches only the newest `SyncConfig.syncMessageLimit` (=50) messages per folder, then stale-DELETEs local rows in the "overlap window" the server didn't return. The window was bounded by **message date** (`date >= min(fetched dates)`) for every provider. That is only safe when the windowed fetch's ordering correlates with date. It does NOT for IMAP: `fetchMessages(limit:)` returns the highest **UIDs**, and a folder's UID order is **archive-time**, not message date. Archiving an OLD-dated email assigns it a fresh HIGH UID, so it enters the newest-50 and drags `min(fetched dates)` backwards — sweeping every mid-range month that wasn't in the newest-50 into "stale" and deleting it. Re-fires every full-sync (so it survives Smart Reindex re-fetches). Diagnosed from a real user mailbox: IMAP `Archive` lost all of May 2026 (`2026-04=135, 2026-05=0, 2026-06=48`, `bfComplete=Y`) while Sent/Trash (UID≈date) and Gmail All Mail (date-ordered fetch) were intact — exactly the reported "missing months", IMAP-only.
 
 **Decision:**

@@ -85,6 +85,11 @@ final class AccountOperationExecutor {
     /// Accessed only on AccountManager isolation, including work-queue callbacks.
     class DrainContext: @unchecked Sendable {
         var foldersToSync: Set<String> = []
+        /// The folders, by account, a retired archive, delete or move landed in:
+        /// its source and its destination (#1109). The post-drain phase marks
+        /// them followed and starts their reconciling catch-up
+        /// (`SyncEngine.folderAccessed`).
+        var foldersAccessed: [String: Set<String>] = [:]
 
         /// One member a completed `.move` landed in a folder the account treats
         /// as its INBOX, recorded by DURABLE IDENTITY rather than by address.
@@ -124,6 +129,14 @@ final class AccountOperationExecutor {
 
     func beginDrain(using manager: isolated AccountManager) { drainContext = DrainContext() }
     func prepareDrain(using manager: isolated AccountManager) { manager.pruneRecentlyCompleted() }
+
+    #if DEBUG
+    /// Test seam: record folders to sync in the current drain, as a retired
+    /// operation does (`AccountManager.finishDrainForTesting`).
+    func recordFoldersToSyncForTesting(_ folderKeys: [String], using manager: isolated AccountManager) {
+        drainContext.foldersToSync.formUnion(folderKeys)
+    }
+    #endif
 
     /// A provider outcome whose LOCAL write could not commit. Full/partial
     /// cases retain settlement proof; providerFailure retains one eligible failure
@@ -263,6 +276,9 @@ final class AccountOperationExecutor {
         await manager.retireConfirmedGoneMemberHeaders(retired, memberIds: confirmedGoneMembers)
         await manager.materializeDeferredMoveSuccessors(after: retired, result: result)
         if [.archive, .delete, .move].contains(retired.type), let dest = retired.destinationPath {
+            context.foldersAccessed[retired.accountId, default: []].formUnion([
+                MessageIdentity.folderId(accountId: retired.accountId, folderPath: retired.folderPath),
+                MessageIdentity.folderId(accountId: retired.accountId, folderPath: dest)])
             context.foldersToSync.insert("\(retired.accountId)|\(dest)")
             if reconcileMoveSource { context.foldersToSync.insert("\(retired.accountId)|\(retired.folderPath)") }
             if retired.type == .move, dest != retired.folderPath {
@@ -292,9 +308,9 @@ final class AccountOperationExecutor {
                     continue
                 }
                 do {
-                    _ = try await queue.execute(priority: .userAction) {
-                        try await manager.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
-                    }
+                    // No work-queue slot around it: the listing takes the
+                    // account's sync turn (see the post-send Sent sync).
+                    _ = try await manager.syncEngine.syncFolderMessages(folder: folder, provider: queue.provider)
                     queueLog("[MoveTrace] post-drain sync — completed for \(folder.name)")
                 } catch {
                     queueLog("[MoveTrace] post-drain sync — failed for \(folder.name): \(error)")
@@ -305,6 +321,12 @@ final class AccountOperationExecutor {
                 // no earlier one is.
                 await manager.enqueueAIForMembersThatEnteredInbox(key: key, folderPath: folderPath, context: context)
             }
+        }
+        // The folders the drained actions landed in are followed, and a catch-up
+        // run reconciles the whole of each (#1109), after the listings above so
+        // the moved messages show first. The drain does not wait for the run.
+        for (accountId, folderIds) in context.foldersAccessed.sorted(by: { $0.key < $1.key }) {
+            await manager.syncEngine.folderAccessed(accountId: accountId, folderIds: folderIds.sorted())
         }
     }
 

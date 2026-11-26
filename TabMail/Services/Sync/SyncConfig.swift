@@ -173,6 +173,8 @@ enum SyncConfig {
     /// writer — so above this count we fall through to the windowed slice instead
     /// (which can't conclude anything outside its floor). Generous on purpose; only
     /// pathologically large folders (Gmail All Mail / big Archives) trip it.
+    /// The windowed IMAP slice loads at most this many rows too, newest UID first, so a
+    /// window reaching UIDNEXT - 1 after a mass deletion elsewhere stays bounded (#1184).
     ///
     /// 🚨 **This is a MEMORY bound, and it was never the safety bound.** The branch it
     /// gates used to trip on `messages.count < syncMessageLimit` — a count taken AFTER
@@ -283,6 +285,18 @@ enum SyncConfig {
     static let backgroundBackfillDeadlineSeconds: TimeInterval = 5 * 60
     /// Pruning batch size — how many messages to process per iteration when over budget.
     static let pruneChunkSize = 50
+    /// The storage prune under an Email Index Limit (`SyncEngine.runPruneIfOverBudget`)
+    /// compares the space it counts (`StorageEstimator.SpaceMeter`: the space
+    /// Settings reports, less the WAL files and empty pages of the email and search databases)
+    /// with these percentages of the limit. In the background processing job it
+    /// starts once that space reaches `storagePruneOvernightStartPercent`; in the
+    /// foreground maintenance task, once it reaches
+    /// `storagePruneForegroundStartPercent`. Either way it deletes until the space is
+    /// at or below `storagePruneTargetPercent`, which leaves room for new mail; the
+    /// older-mail walk stops there too (`StorageEstimator.WalkCheck`).
+    static let storagePruneOvernightStartPercent = 90
+    static let storagePruneForegroundStartPercent = 95
+    static let storagePruneTargetPercent = 80
     /// FTS bulk-index batch size — headers indexed per folder page.
     static let ftsIndexBatchSize = 200
     /// Yield interval during FTS body backfill — sleep briefly every N updates.
@@ -447,6 +461,10 @@ enum SyncConfig {
     /// in a large inbox trigger a suggestion to archive.
     /// Matches TB's inboxManagement.archiveAgeDays.
     static let archiveAgeDays = 14
+    /// Rows per read of the Settings "Archive old messages" sweep
+    /// (`SettingsView.oldInboxPage`): each read is one bounded statement over
+    /// one inbox folder's old messages, instead of one statement over all of them.
+    static let archiveOldReadPageSize = 500
 
     // MARK: - Polling & Background Intervals (seconds)
 
@@ -552,7 +570,18 @@ enum SyncConfig {
 
     /// Timeout for IMAP/provider connect() during reconnect. TCP handshake + login.
     static let connectTimeoutSeconds: TimeInterval = 15
-    /// Timeout for per-account sync during poll(). Prevents one stalled server from blocking others.
+    /// Time limit for one account's stage 2 in poll() (`SyncEngine.syncOrFollowUp`),
+    /// also used for pull to refresh's quick sync. Added when the poll synced the
+    /// accounts one after another (2026-02); they have synced in parallel since
+    /// 2026-03. Its job now: one stalled server must not hold the poll open, which
+    /// would skip the next polls and keep back the queued work the poll runs after
+    /// stage 2. It never counts a wait for another pass's turn: those callers
+    /// never wait for one (only their own connection check comes first), and the
+    /// follow-up stage 2 (`SyncEngine.followUpPass`), which waits, takes its change
+    /// read's deadline from this when it gets the turn and has no outer timeout.
+    /// v1.11.4 counted the wait for the turn, so a stage 2 queued behind stage 1
+    /// read nothing (#1289; design settled 2026-11-23). See the sync design block
+    /// in SyncEngineOneSyncAtATime.swift.
     static let perAccountSyncTimeoutSeconds: TimeInterval = 60
     /// Min seconds between WAL checkpoints. The checkpoint is invoked from many
     /// background/normal jobs (full/delta sync, backfill batches, maintenance) via
@@ -560,6 +589,43 @@ enum SyncConfig {
     /// (the embedding queue) from over-checkpointing while still bounding the WAL. SQLite
     /// autocheckpoint is disabled (see `AppDatabase.makePool`).
     static let walCheckpointMinIntervalSeconds: TimeInterval = 1.5
+    /// Pages one step of the overnight space return gives back
+    /// (`SyncEngine.runOvernightSpaceReturn`, `DatabaseVacuum.giveBackEmptyPages`,
+    /// ADR-IOS-121): 8 MB at the 4 KB page size. Each step is one write that holds
+    /// the database's writer. Measured on a Mac, 190 MB empty in a 960 MB database:
+    /// 1,024 pages 51 ms a step (median), 2,048 pages 35 ms (one step of 520 ms),
+    /// 4,096 pages 71 ms, 8,192 pages 168 ms. At least 1: SQLite's
+    /// `incremental_vacuum` with 0 or less gives every empty page back in one write.
+    static let incrementalVacuumStepPages = 2048
+    /// Free space the device needs for a database's one-time upgrade to INCREMENTAL,
+    /// as a multiple of the database's size (`SyncEngine.bytesToFreeForUpgrade`): the
+    /// `VACUUM` builds a full copy in a temporary file, then writes every page of it
+    /// through the WAL (measured: a 1.1 GB database left a 965 MB WAL).
+    static let incrementalVacuumSwitchFreeSpaceMultiple: Double = 2
+    /// How long the upgrade waits, at a time, for a planner statistics refresh that
+    /// was already running when it started, a maintenance pass's `ANALYZE`
+    /// (`SyncEngine.runDatabaseUpgrade`): it holds the latch the email database's
+    /// switch takes.
+    static let databaseUpgradeStatisticsWaitMilliseconds = 250
+    /// Battery level under which the upgrade notice asks the user to plug the phone
+    /// in first, when it is not charging (`DatabaseUpgrade`): below it a long rewrite
+    /// risks running the battery out.
+    static let databaseUpgradeMinimumBatteryLevel: Float = 0.2
+    /// How long after the inbox has painted the upgrade's state read (its banner) and
+    /// its notice, shown by itself once, wait (`DatabaseUpgrade.checkAfterLaunch`):
+    /// not during startup.
+    static let databaseUpgradeNoticeQuietDelaySeconds: Double = 3
+    /// Entries of `bodyAssetPendingDelete` per batch of the pending-delete worker
+    /// (`BodyAssetMaintenance.processPendingDeletes`): one manifest read, one
+    /// main-database read and one main-database write per batch (#1376).
+    static let bodyAssetPendingDeleteBatchSize = 200
+    /// Wall-clock budget of one pending-delete pass; the rest of the list waits for
+    /// the next foreground maintenance pass.
+    static let bodyAssetPendingDeletePassBudgetSeconds: TimeInterval = 5
+    /// Manifest keys per page of the one-time orphan sweep
+    /// (`BodyAssetMaintenance.runOrphanSweepOnce`): one manifest read and one
+    /// main-database write per page.
+    static let bodyAssetOrphanSweepPageSize = 500
     /// Timeout for WiFi check (NWPathMonitor). Returns false if exceeded.
     static let wifiCheckTimeoutSeconds: TimeInterval = 5
     /// Timeout for per-account background delta sync (ensureConnected + delta).
@@ -829,10 +895,88 @@ enum SyncConfig {
     /// its cursor is valid, so a Gmail folder is listed only the first time and
     /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
-    /// Width of one IMAP listing range, in UIDs (`UID FETCH lo:hi (UID FLAGS)`).
-    /// About 50 bytes per message on the wire, so a dense range stays far inside
-    /// the request timeout even on a slow link.
-    static let catchUpListingRangeSpan = 1000
+    /// The same full listing for a folder outside the syncable set (#1110: no
+    /// main role, not a favourite, no user action landed in it), whose changes
+    /// an other-folder run reads (seconds: a week). It matters only where no
+    /// change bookmark covers the folder (an IMAP server without change
+    /// tracking): there it is what removes a message deleted deep in the folder,
+    /// and applies a read mark changed on old mail, without opening the folder.
+    static let catchUpOtherFolderFullCheckIntervalSeconds: TimeInterval = 604_800
+    /// On a server with no mod-sequences, a folder a user action lands in is
+    /// listed again at that access when its counters (EXISTS, UIDNEXT) differ
+    /// from those its last completed listing started from, or when that listing
+    /// completed longer ago than this (seconds, #1109). Flag changes move no
+    /// counter, so this age is how stale a read or flag mark below the newest
+    /// listing can be when the user comes back to the folder.
+    static let catchUpAccessCheckAgeSeconds: TimeInterval = 3_600
+    /// How long the catch-up run a user action starts for the folders it landed
+    /// in may work (seconds, #1109): slices run, paced like every other catch-up
+    /// slice of the account, until the folders make no progress or the slices'
+    /// time inside the account's turn adds up to this (`CatchUpRun.workSeconds`:
+    /// the wait for the turn and the pacing wait between slices do not count).
+    /// What a large folder still needs then is the backfill worker's, which
+    /// checks every followed folder.
+    static let accessCatchUpRunSeconds: TimeInterval = 120
+    /// How long one other-folder run may work (seconds, #1110): the run a
+    /// clock-due foreground pass starts to read the changes of the folders
+    /// outside the syncable set. Its slices run, paced like every other catch-up
+    /// slice of the account, until every such folder has been read once, a slice
+    /// reads nothing new, or the slices' time inside the account's turn adds up
+    /// to this (`CatchUpRun.workSeconds`: waits do not count). A folder not
+    /// reached is read first by the next run.
+    static let otherFolderRunSeconds: TimeInterval = 120
+    /// The share of an other-folder slice's time its change read may use
+    /// (#1110); the rest is left for the listings of the changed folders no
+    /// bookmark covers (servers without change tracking), which start only
+    /// before the slice's end. Without it a read of many folders on a slow link
+    /// spends the whole slice on one STATUS per folder, no listing ever starts,
+    /// and the same folders are read again at every run. A reader whose read is
+    /// all its work (a bookmark, an Outlook delta) gets the same time per run in
+    /// more, shorter slices: a run's working time counts slice time only. The
+    /// share bounds when a folder after the first may start: the read's first
+    /// folder is read in the slice's whole time, so a slow session check before
+    /// it never leaves a slice with no folder read
+    /// (`SyncEngine.otherFolderReadContext`).
+    static let otherFolderReadShare: Double = 0.5
+    /// About how many messages one IMAP listing range holds (`UID FETCH lo:hi
+    /// (UID FLAGS)`, then one membership `UID SEARCH` of the same range). The
+    /// first range's width in UIDs is sized from the folder's EXISTS and UIDNEXT
+    /// (`IMAPProvider.listingRangeSpan`), each later one from the previous
+    /// range's own count (`IMAPProvider.nextListingRangeSpan`), so a listing
+    /// costs about EXISTS / this many ranges however sparse or bunched the UID
+    /// space is (#1062). A listing range that times out caps the next ranges at
+    /// its width divided by `catchUpWidthCapShrinkFactor`. About 50 bytes per
+    /// message on the wire, so a range stays far inside the request timeout even
+    /// on a slow link.
+    /// *Superseded (#1062):* `catchUpListingRangeSpan = 1000`, a fixed width in
+    /// UIDs, which made a listing's cost grow with UIDNEXT, not with the folder.
+    /// *Superseded (#1062):* "is halved by the walk's rule (`UIDWalkCursor.halves`)
+    /// and the next call asks the half": the cap alone sets the next width.
+    static let catchUpListingRangeMessages = 1000
+    /// Narrowest IMAP listing range, in UIDs, whatever the folder's density.
+    static let catchUpListingMinRangeSpan = 1000
+    /// Widest IMAP listing range, in UIDs: a range that held few messages makes
+    /// the next one wider, never wider than this, so a dense stretch after a
+    /// sparse one is reached by a bounded range (a range that still times out
+    /// lowers the width cap).
+    static let catchUpListingMaxRangeSpan = 10_000_000
+    /// A catch-up listing range that times out caps the next ranges at its
+    /// width divided by this (#1062).
+    static let catchUpWidthCapShrinkFactor = 2
+    /// Each catch-up listing range that answers multiplies the cap by this;
+    /// at `catchUpListingMaxRangeSpan` the cap is dropped (#1062).
+    static let catchUpWidthCapGrowthFactor = 2
+    /// Most missing UIDs one catch-up load request fetches by header (#1062): one
+    /// `UID FETCH` of ENVELOPE, INTERNALDATE, FLAGS, BODYSTRUCTURE and the header,
+    /// charged one request of the slice's budget, so it stays well inside
+    /// `catchUpRequestTimeoutSeconds` on a slow link.
+    /// *Superseded (#1062):* 100, which a slow link could not answer in time.
+    static let catchUpLoadBatchSize = 20
+    /// Most UIDs a catch-up listing carries from one call to the next in a range
+    /// it listed but could not finish (`IMAPCatchUpState.CarriedRange`, #1062).
+    /// A range holding more is cut at the UID that reaches this count, and the
+    /// rest is listed again later, so the carry stays small and still moves.
+    static let catchUpCarriedUidCap = 1000
     /// Most local rows one Gmail listing range covers. A range is taken from the
     /// folder's local rows in provider-date order, so this bounds the membership
     /// listing of a dense folder to about one page.
@@ -981,6 +1125,11 @@ enum SyncConfig {
     /// listing plus one catch-up check is the cheaper path. Same order of work as
     /// Gmail's `GmailAPI.historyMaxChanges`.
     static let imapChangeArrivalsLimit = 100
+    /// IMAP change reader on a CONDSTORE server without QRESYNC (#755): how many
+    /// of a folder's newest held UIDs below the bookmark's UIDNEXT one removal
+    /// check searches when the count says a message went. Older removals are the
+    /// catch-up's (armed with the check).
+    static let imapChangeRemovalCheckWindow = 2_000
     /// IMAP change reader: passes in a row whose inbox read timed out before the
     /// next pass reads the other folders first and the inbox last. One timeout
     /// keeps the inbox first, so a passing blip never delays new mail; a
@@ -993,4 +1142,9 @@ enum SyncConfig {
     /// caller's deadline. A folder whose SELECT keeps timing out is started again
     /// after `changeReadFailureLapseSeconds`.
     static let imapChangeSelectTimeoutSeconds: TimeInterval = 15
+    /// Test harness only (#755): a sync-turn wait longer than this is reported
+    /// to `SyncEngine.syncTurnWaitWatch` as a stuck wait (a turn holder awaiting
+    /// a task that needs the same turn). Far above any wait on the fake servers,
+    /// where a pass holds the turn for well under a second. Unused in production.
+    static let syncTurnWaitTestBoundSeconds: TimeInterval = 60
 }

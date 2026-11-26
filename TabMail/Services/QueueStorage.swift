@@ -291,9 +291,11 @@ struct QueueStorage<Item: Hashable> {
     /// `repopulateFromDatabase()` is the OWNING ACTOR's method — its coverage is the
     /// owner's, not this type's, and the owners do not agree. Do not read the line
     /// above as a guarantee for the queue you happen to be in:
-    ///   • `ActiveBodyQueue.repopulateFromDatabase` is Inbox-wide and UNBOUNDED, and
-    ///     `BackfillAIQueue`'s reloads durable `pendingAIRefinement` rows, so for those
-    ///     owners the reset above really is fully rebuildable from GRDB.
+    ///   • `ActiveBodyQueue.repopulateFromDatabase` is Inbox-wide (since #1400 it reads
+    ///     one window of `SyncConfig.bodyFetchRepopulateLimit` rows at a time, and
+    ///     successive refills reach every row, with the accepted exception
+    ///     `IOS-BODY-007`), and `BackfillAIQueue`'s reloads durable `pendingAIRefinement`
+    ///     rows, so for those owners the reset above really is fully rebuildable from GRDB.
     ///   • `ActiveAIQueue.repopulateFromDatabase` runs `repopulationCandidates`, which
     ///     is WINDOW-BOUNDED in SQL to the newest `SyncConfig.maxRecentEmails` Inbox
     ///     rows. ADR-IOS-078's pathway regating also gave that queue WINDOW-EXEMPT

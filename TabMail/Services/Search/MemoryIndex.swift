@@ -161,6 +161,12 @@ actor MemoryIndex {
         }
     }
 
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     private func createSchema() throws {
         guard let dbPool else { return }
         try dbPool.write { db in

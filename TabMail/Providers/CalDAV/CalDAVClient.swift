@@ -129,7 +129,7 @@ actor CalDAVClient {
 
         let code = httpResponse.statusCode
         if code == 401 {
-            BackgroundSyncLogger.logDebug("[CalDAV] 401 Unauthorized for \(request.url?.absoluteString ?? "")")
+            BackgroundSyncLogger.logDebug("[CalDAV] 401 Unauthorized for \(LoggableURL.address(request.url))")
             throw CalDAVError.authFailed
         }
         if code == 404 {
@@ -143,7 +143,7 @@ actor CalDAVClient {
         if !(200...299).contains(code) && code != 207 {
             if DebugModeManager.isLoggingEnabled() {
                 if let body = String(data: data, encoding: .utf8) {
-                    BackgroundSyncLogger.logDebug("[CalDAV] HTTP \(code) \(request.httpMethod ?? "") \(request.url?.absoluteString ?? ""): \(body.prefix(500))")
+                    BackgroundSyncLogger.logDebug("[CalDAV] HTTP \(code) \(request.httpMethod ?? "") \(LoggableURL.address(request.url)): \(body.prefix(500))")
                 }
             }
             throw CalDAVError.httpError(code, data)

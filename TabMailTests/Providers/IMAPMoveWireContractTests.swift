@@ -1366,7 +1366,7 @@ struct IMAPMoveWireContractTests {
 
     // MARK: - T3.12 — a cancelled task never completes a second mutation
 
-    @Test("A move cancelled during its checkout stops at a step boundary and never soft-deletes the source")
+    @Test("A move cancelled while its UID COPY is on the wire fails with CancellationError and never soft-deletes the source")
     func cancelledMoveNeverCompletesTheSecondMutation() async throws {
         let target = "cancel-target@example.com"
         let server = FakeIMAPServer(capabilities: Self.ownedCapabilities, mailboxes: [
@@ -1382,22 +1382,40 @@ struct IMAPMoveWireContractTests {
         try await provider.connect()
         defer { Task { try? await provider.disconnect() } }
 
-        // The action-connection seam fires once, inside the move's OWN task,
-        // after the checkout's SELECT and before the body — cancelling from
-        // there cancels exactly that task, with no wall-clock race.
-        await provider.setActionConnectionTestHookForTesting {
-            withUnsafeCurrentTask { current in
-                guard let current else { return }
-                current.cancel()
-            }
-        }
-
+        // The fake logs the UID COPY and holds it before answering, so the
+        // cancel lands while the first mutation is on the wire, with no
+        // wall-clock race. SwiftMail refuses any command a cancelled task
+        // has not sent yet, so a cancel before the COPY tests nothing here.
+        server.holdNextCommand(containing: "UID COPY")
         let task = Task {
             try await provider.move(
                 ids: ["71"], from: "Work", to: "Archive", admittedUidValidity: Self.epoch)
         }
+        let clock = ContinuousClock()
+        let waitUntil = clock.now.advanced(by: .seconds(10))
+        while clock.now < waitUntil, !server.isHoldingCommand(containing: "UID COPY") {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let held = server.isHoldingCommand(containing: "UID COPY")
+        #expect(held, "precondition: the move's UID COPY is held on the wire")
+        // The held COPY is this move's: UID 71, sent while Work was selected, to Archive.
+        let copies = server.recordedCommandsWithMailbox().filter { $0.command.uppercased().contains("UID COPY") }
+        #expect(copies.count == 1)
+        if let copy = copies.first {
+            #expect(copy.mailbox == "Work", "the COPY was sent from the source folder: \(copy)")
+            // The UID set names 71 alone (as `71` or the range `71:71`), and the whole mailbox argument
+            // is Archive, bare or in its quoted wire form (RFC 9051 sequence-set, astring).
+            let prefix = "UID COPY "
+            let rest = copy.command.hasPrefix(prefix) ? String(copy.command.dropFirst(prefix.count)) : ""
+            let parts = rest.split(separator: " ", maxSplits: 1).map(String.init)
+            let uidSet = parts.first ?? ""
+            let destination = parts.count == 2 ? parts[1] : ""
+            #expect(uidSet == "71" || uidSet == "71:71", "it copies UID 71 alone: \(copy.command)")
+            #expect(destination == "Archive" || destination == "\"Archive\"", "it copies to Archive: \(copy.command)")
+        }
+        task.cancel()
+        server.releaseHeldCommand(containing: "UID COPY")
         let outcome = await task.result
-        await provider.setActionConnectionTestHookForTesting(nil)
 
         switch outcome {
         case .success:
@@ -1405,15 +1423,24 @@ struct IMAPMoveWireContractTests {
         case .failure(let error):
             #expect(error is CancellationError)
         }
-        // The FIRST mutation completed; the checkpoint stopped everything after
-        // it. That is the property — not "nothing happened", which a cancel
-        // landing before any I/O would also satisfy.
+        // The FIRST mutation was sent; nothing after it was. That is the
+        // property, not "nothing happened", which a cancel landing before any
+        // I/O would also satisfy. Whether the server applied the held COPY is
+        // not asserted: that races the client abandoning the connection.
         #expect(Self.commands(server, containing: "UID COPY").count == 1)
         #expect(Self.deletedStores(server).isEmpty)
         #expect(Self.anyExpunges(server).isEmpty)
         #expect(server.flags(in: "Work", uid: 71).isEmpty)
         #expect(server.messageIDs(in: "Work") == ["<\(target)>"])
         #expect(server.wrongMessageViolations().isEmpty)
+        // The cancel released the action connection, so the next action on this provider gets
+        // it (a connection left checked out would queue that action until teardown).
+        let actionHeld = await provider.actionInUseForTesting()
+        #expect(!actionHeld, "the cancelled move released the action connection")
+        if !actionHeld {
+            let next = try await provider.fetchMessage(id: "71", folder: "Work")
+            #expect(next.header.messageId == "71", "the next action on the provider completes")
+        }
     }
 
     // MARK: - T3.14 — the DESTINATION epoch must be recorded and asserted

@@ -51,10 +51,24 @@ Nothing is lost and no newer user value is overwritten. That is the point of the
 change to the message on the server is reported by the change feed, and the next listing applies
 the server's current state.
 
+## Amendment 2026-11-20 (#1062)
+
+The text above is kept as history; where it differs, this section is current.
+
+- IMAP loads missing mail too (by UID), so the rule covers Gmail, Outlook and IMAP.
+- Over-age is no longer one decision taken once. It is a one-way latch (`CatchUpReadLatch`) checked
+  before the insert, inside each insert chunk's write and inside the apply transaction. Chunks inserted
+  before it sets stay inserted; every later load is dropped; once set it never clears.
+- A dropped load makes the listing unclean: a slice that does not complete records it under the
+  provider-neutral key `CatchUpSkippedLoads.key`, and the completing slice reports the listing unclean.
+- An owed IMAP folder whose listing ended unclean stays owed. It counts as untracked in the plan, so it
+  is listed again at the daily full check, and also when its change counter (HIGHESTMODSEQ) moves
+  past the stamp the unclean listing recorded.
+
 ## Subsystem and search terms
 
 Older-mail check; catch-up; flag heal; read state; over-age read; slow read; app suspended;
 `readStartedAt`; `CatchUpWallClock`; `actionCompletedAt`; `recordActionCompleted`;
 `catchUpCompletionLogRetentionSeconds`; completion log; 1 hour; `applyCatchUpResult`;
 `applyCatchUpTransaction`; Outlook; Gmail; IMAP; ADR-IOS-107; ADR-IOS-111; ADR-IOS-051; #750;
-IOS-CATCHUP-001
+IOS-CATCHUP-001; `CatchUpReadLatch`; `CatchUpSkippedLoads`; unclean listing; owed folder

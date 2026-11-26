@@ -550,85 +550,6 @@ struct SettingsView: View {
         return String(format: "%.2f GB", mb / 1024.0)
     }
 
-    /// The exact GRDB statements "Delete All Email Index Data" runs, in order.
-    ///
-    /// Named and separated so the boundary of this gesture is a thing that can be
-    /// EXECUTED by a test against the real schema, rather than a list buried in a
-    /// closure that no test can reach.
-    ///
-    /// ⚠ **`outboxMessage` IS NOT HERE, and that is the point.** It was, until
-    /// 2026-08-05. An Outbox row is a send the user composed that has **never
-    /// reached a server**, so it cannot "re-sync automatically from your servers"
-    /// — deleting it destroyed the message outright while the confirmation alert
-    /// promised the opposite. `Companion/Rules/Active/never-drop-user-intention.md`
-    /// states the limit of the lifecycle carve-out outright: it "does not extend
-    /// past queue state: Outbox sends, user-authored drafts, bodies, attachments
-    /// and FTS content are never dropped under it." An `outboxMessage` row is also
-    /// self-contained — it carries its own payload and its own attachment subtree
-    /// and references none of the tables below — so keeping it costs no
-    /// consistency.
-    ///
-    /// ⚠ **`pendingCalendarOperation` IS NOT HERE EITHER, for the same reason.**
-    /// It was, until 2026-08-05. A queued `.create` carries the user's authored
-    /// event — title, time, location, attendees — in its `argumentsJSON` for an
-    /// event that exists on **no server**, and a queued `.edit` carries the new
-    /// values the user chose. Deleting those destroys authored content that
-    /// exists nowhere else, exactly as `outboxMessage` did.
-    ///
-    /// It also has none of `pendingOperation`'s consistency justification. Its
-    /// only foreign key is `accountId → account`, and accounts survive this
-    /// transaction (`v8_createPendingCalendarOperation`); its `eventId` and
-    /// `calendarId` name SERVER-side resources; and the list below contains no
-    /// calendar table at all. So a calendar op addresses nothing this wipe
-    /// destroys, and purging it bought exactly zero consistency — the same
-    /// asymmetry that made the `outboxMessage` line indefensible.
-    ///
-    /// `pendingOperation` DOES stay — but **not `.saveDraft`**, and that
-    /// exception is the same principle a third time (added 2026-08-05).
-    ///
-    /// The consistency argument for purging `pendingOperation` is that those rows
-    /// address `messageHeader` rows this same transaction destroys, so leaving
-    /// them would queue mutations against addresses that no longer exist locally.
-    /// **That argument does not reach `.saveDraft`.** A save producer addresses a
-    /// `draft` row by `draftId` plus its `instanceEpoch`
-    /// (`AccountManager.executeOperation`'s `.saveDraft` arm →
-    /// `DraftStore.pushDraftToServer(draftId:expectedInstanceEpoch:…)`); it never
-    /// reads the placeholder header, and `draft` is not in this list.
-    ///
-    /// And it is the ONLY route back. For an authored draft that has never
-    /// reached a server, this transaction deletes the placeholder `messageHeader`
-    /// that surfaces it in the Drafts folder and the `messageBody` beside it,
-    /// while nothing re-downloads it, because it is on no server to re-download
-    /// from. The `draft` row survives but no view lists it and no drain pushes
-    /// it: purging the producer strands authored content in a table nothing
-    /// reads. Keeping the producer means the very next drain pushes the draft to
-    /// the server, after which ordinary sync restores the header — i.e. keeping
-    /// it is precisely what makes the alert's "re-downloaded from your servers"
-    /// true of drafts.
-    ///
-    /// The filter interpolates `OperationType.saveDraft.rawValue` rather than a
-    /// literal so renaming the case cannot silently un-protect the drafts.
-    nonisolated static let localIndexWipeStatements: [String] = [
-        "DELETE FROM messageHeader",
-        "DELETE FROM messageBody",
-        "DELETE FROM messageAICache",
-        // ⚠ Agent Chat turns are user-authored and exist on NO server, so these
-        // two lines are a PERMANENT deletion, not a cache drop. They are kept
-        // deliberately — this gesture also wipes `memory.db`
-        // (`MemoryIndex.shared.deleteAllThrowing()` in `nukeDatabase`), and `chatHistory`
-        // IS that memory store, so excising chat here would leave the two halves
-        // of one feature inconsistent; chat turns also carry raw `[Email](N)`
-        // references into the `messageHeader` rows this transaction destroys.
-        // What was wrong was that the confirmation alert never said so. The alert
-        // now names Agent Chat as permanently deleted (`IOS-SETTINGS-001`), which
-        // is the consent defect actually at issue. Do not remove these lines
-        // without also revisiting `MemoryIndex.deleteAllThrowing()`.
-        "DELETE FROM chatTurn",
-        "DELETE FROM chatHistory",
-        "DELETE FROM pendingOperation WHERE type != '\(OperationType.saveDraft.rawValue)'",
-        "DELETE FROM pendingRender",
-    ]
-
     private func nukeDatabase() async {
         isNuking = true
 
@@ -641,10 +562,9 @@ struct SettingsView: View {
 
         // 2. Authoritative GRDB transaction (preserve accounts + folders).
         // Nothing in a sibling database is touched unless this commits.
+        // It runs in every account's sync turn (ADR-IOS-104, #1062).
         do {
-            try await AppDatabase.dbPool.write { db in
-                try Self.localIndexWipeTxn(db)
-            }
+            try await AccountManager.shared.syncEngine.wipeLocalIndex()
         } catch {
             BackgroundSyncLogger.logDebug("[NukeDB] Authoritative database wipe failed: \(error)")
             settingsErrorMessage = "TabMail couldn’t delete the local email data. Nothing was removed. Please try again."
@@ -661,11 +581,12 @@ struct SettingsView: View {
             BackgroundSyncLogger.logDebug("[NukeDB] Memory index reset failed after GRDB commit: \(error)")
             derivedIndexFailures.append("conversation memory")
         }
-        // 3. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space
+        // 3. Compact GRDB — checkpoint WAL then VACUUM to reclaim disk space. The
+        // VACUUM also leaves the database on auto_vacuum = INCREMENTAL (ADR-IOS-121).
         do {
             try await AppDatabase.dbPool.writeWithoutTransaction { db in
                 try db.execute(sql: "PRAGMA wal_checkpoint(TRUNCATE)")
-                try db.execute(sql: "VACUUM")
+                try DatabaseVacuum.vacuum(db)
             }
         } catch {
             // Compaction is optional after the authoritative rows are gone.
@@ -686,31 +607,21 @@ struct SettingsView: View {
             showSettingsError = true
         }
 
-        // 5b. Sweep BodyAssetStore — every bodyAsset row now references a
-        // deleted messageHeader, so the cross-DB sweep deletes them. The
-        // associated files (no row → orphan after the row delete) are then
-        // removed by the same sweep's filesystem walk. Inline / attachment
-        // assets are part of the "cached data" the user just opted to wipe.
-        await BodyAssetMaintenance.pruneOrphans()
-        BackgroundSyncLogger.logDebug("[NukeDB] Pruned BodyAssetStore orphans")
+        // 5b. Wipe BodyAssetStore — every bodyAsset row now references a deleted
+        // messageHeader. Inline / attachment assets are part of the "cached data"
+        // the user just opted to wipe, so both kinds go now (rows and files),
+        // instead of key by key through the pending-delete list (#1376). The
+        // entries the header delete queued there are now moot; the worker drops
+        // them without a manifest write (no rows remain under their keys).
+        await BodyAssetMaintenance.wipeAllAfterLocalIndexWipe()
+        BackgroundSyncLogger.logDebug("[NukeDB] Wiped BodyAssetStore")
+
+        // The VACUUM above and the search database's new file are INCREMENTAL, so
+        // the one-time upgrade's banner goes when both now are (ADR-IOS-121).
+        await DatabaseUpgrade.shared.refresh()
 
         // 5. `defer` restarts sync — fresh backfill from top — on every exit.
         BackgroundSyncLogger.logDebug("[NukeDB] Sync restarted — backfill will re-walk all folders")
-    }
-
-    /// Execute the user-visible local-index deletion as one transaction: the
-    /// deletes above, then every account's sync state through the one list both
-    /// Settings resets share, so each folder's backfill re-walks from the top and
-    /// the change bookmarks go with the rows (ADR-IOS-111). First, while the headers are still
-    /// here, every chat's unsent field words whose thread has an email are re-stamped
-    /// (`ChatFieldWords.restampLive`, ADR-IOS-117), so the orphan pass gives them the full grace
-    /// for the resync to bring their thread back.
-    nonisolated static func localIndexWipeTxn(_ db: Database) throws {
-        try ChatFieldWords.restampLive(db: db, now: Date())
-        for sql in localIndexWipeStatements {
-            try db.execute(sql: sql)
-        }
-        try SyncEngine.resetSyncStateTxn(db, accountId: nil)
     }
 
     private var storageUsageText: String {
@@ -784,8 +695,71 @@ struct SettingsView: View {
             inboxFolderIds: inboxFolderIds, archiveCutoff: archiveCutoff, marksRead: marksRead, afterRead: afterRead)
     }
 
+    /// The sweep's read: every message dated before `cutoff` in `folderIds`,
+    /// one folder after another, each oldest first. Each statement reads one
+    /// page of one folder (`oldInboxPage`), so no statement reads more than
+    /// `pageSize` rows and none sorts across folders. All pages are read in the
+    /// caller's one read transaction, so they come from one snapshot.
+    nonisolated static func oldInboxMessages(
+        _ db: Database, folderIds: Set<String>, cutoff: Date, pageSize: Int
+    ) throws -> [MessageHeader] {
+        var messages: [MessageHeader] = []
+        for folderId in folderIds.sorted() {
+            var after: OldInboxCursor?
+            while true {
+                let page = try oldInboxPage(db, folderId: folderId, cutoff: cutoff, after: after, limit: pageSize)
+                messages += page.headers
+                guard page.headers.count == pageSize, let next = page.next else { break }
+                after = next
+            }
+        }
+        return messages
+    }
+
+    /// Where the next page of `oldInboxPage` starts: the `date` value stored in
+    /// the previous page's last row, exactly as read, and that row's rowid.
+    struct OldInboxCursor {
+        let date: DatabaseValue
+        let rowid: Int64
+    }
+
+    /// One page of the sweep's read: `folderId`'s messages dated before
+    /// `cutoff`, oldest first, starting after `after`, at most `limit` of them.
+    ///
+    /// It walks `messageHeader_folderId_date` within the one folder, so it reads
+    /// only the rows it returns and needs no sort: the index holds them in
+    /// `(date, rowid)` order. `INDEXED BY` pins that index because the planner
+    /// can choose the plain `date` index instead, and then walks every folder's
+    /// mail older than the cutoff to find the inbox's. The cursor carries the
+    /// stored `date` value as read, so a page boundary inside a run of equal
+    /// dates neither skips nor repeats a row. `nonisolated`: it runs inside the
+    /// database's read, off the main actor.
+    nonisolated static func oldInboxPage(
+        _ db: Database, folderId: String, cutoff: Date, after: OldInboxCursor?, limit: Int
+    ) throws -> (headers: [MessageHeader], next: OldInboxCursor?) {
+        var sql = """
+            SELECT *, rowid AS sweepRowid FROM messageHeader INDEXED BY messageHeader_folderId_date
+            WHERE folderId = ? AND date < ?
+            """
+        var arguments: StatementArguments = [folderId, cutoff]
+        if let after {
+            sql += " AND (date, rowid) > (?, ?)"
+            arguments += [after.date, after.rowid]
+        }
+        sql += " ORDER BY date, rowid LIMIT ?"
+        arguments += [limit]
+        let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
+        guard let last = rows.last else { return ([], nil) }
+        let headers = try rows.map { try MessageHeader(row: $0) }
+        return (headers, OldInboxCursor(date: last["date"], rowid: last["sweepRowid"]))
+    }
+
     /// The "Archive old messages" sweep. Returns how many rows it asked to move,
     /// or nil when the read failed or found no old row (nothing was attempted).
+    ///
+    /// It reads each inbox folder's old messages in pages (`oldInboxMessages`),
+    /// then moves them as one operation per account, as before: one Undo
+    /// restores an account's whole sweep.
     ///
     /// The sweep is a gesture on the rows it reads (ADR-IOS-115): the folder
     /// reset stamp is taken BEFORE the read and bound around the mark-read and
@@ -807,11 +781,8 @@ struct SettingsView: View {
         let stamp = FolderResetGeneration.current()
         await beforeRead()
         guard let oldMessages = try? await AppDatabase.dbPool.read({ db in
-            try MessageHeader
-                .filter(inboxFolderIds.contains(Column("folderId")))
-                .filter(Column("date") < archiveCutoff)
-                .order(Column("date").asc)
-                .fetchAll(db)
+            try Self.oldInboxMessages(db, folderIds: inboxFolderIds, cutoff: archiveCutoff,
+                                      pageSize: SyncConfig.archiveOldReadPageSize)
         }), !oldMessages.isEmpty else { return nil }
         await afterRead()
 

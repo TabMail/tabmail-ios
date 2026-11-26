@@ -30,7 +30,7 @@ struct WebReadTool: AgentTool, Sendable {
             return #"{"error": "Only http:// and https:// URLs are supported"}"#
         }
 
-        BackgroundSyncLogger.logDebug("[WebReadTool] Starting fetch for \(urlString)")
+        BackgroundSyncLogger.logDebug("[WebReadTool] Starting fetch for \(LoggableURL.origin(urlString))")
 
         // Fetch the content
         let (data, response): (Data, URLResponse)
@@ -39,7 +39,9 @@ struct WebReadTool: AgentTool, Sendable {
             request.setValue(Config.userAgent, forHTTPHeaderField: "User-Agent")
             (data, response) = try await sharedEphemeralSession.data(for: request)
         } catch {
-            BackgroundSyncLogger.logDebug("[WebReadTool] Fetch failed: \(error)")
+            // Domain and code only: a URLError's description names the URL it failed on.
+            let failure = error as NSError
+            BackgroundSyncLogger.logDebug("[WebReadTool] Fetch failed: \(failure.domain) code=\(failure.code)")
             return ToolJSON.string(from: ["error": "Failed to fetch URL: \(error.localizedDescription)"])
         }
 

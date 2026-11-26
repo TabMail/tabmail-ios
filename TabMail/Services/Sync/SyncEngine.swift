@@ -33,6 +33,38 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
+    /// Per account: the catch-up run user actions started (#1109,
+    /// `SyncEngine.startAccessCatchUp`), one at a time, and the folders the
+    /// actions landed in that it has not taken yet. In memory only: the folders
+    /// are followed, so the backfill worker's catch-up checks them anyway.
+    var accessCatchUpTasks: [String: Task<Void, Never>] = [:]
+    var accessCatchUpPending: [String: Set<String>] = [:]
+
+    /// Per account: the other-folder run a clock-due foreground pass started
+    /// (#1110, `SyncEngine.startOtherFolderRun`), at most one at a time, and when
+    /// each other folder's read last finished or failed, so the next run reads
+    /// the folders read longest ago first. In memory only: a relaunch reads
+    /// every other folder in stored order at its first run.
+    var otherFolderRunTasks: [String: Task<Void, Never>] = [:]
+    var otherFolderAttemptedAt: [String: [String: Date]] = [:]
+
+    #if DEBUG
+    /// Test-only seam (`setCatchUpSliceStartHookForTesting`): called with the
+    /// folders each catch-up slice asks, as it starts, and awaited, so a test
+    /// can tell which slice sent each request. Nil outside tests.
+    var catchUpSliceStartHookForTesting: (@Sendable ([String]) async -> Void)?
+    /// Test-only seam (`setCatchUpAfterReadHookForTesting`): called with the
+    /// folders a catch-up slice read, once the provider has returned and before
+    /// anything is applied, and awaited, so a test can hold a slice that has
+    /// read the server inside its turn. Nil outside tests.
+    var catchUpAfterReadHookForTesting: (@Sendable ([String]) async -> Void)?
+    /// Test-only seam (`setAccessCatchUpClockForTesting`): the clock access
+    /// catch-up runs are measured on. Nil outside tests: the real clock.
+    var accessCatchUpClockForTesting: (@Sendable () -> Date)?
+    /// Test-only seam (`setOtherFolderRunClockForTesting`): the clock other-folder
+    /// runs are measured on. Nil outside tests: the real clock.
+    var otherFolderRunClockForTesting: (@Sendable () -> Date)?
+    #endif
 
     /// Generation counter per account — prevents stale task defer from clearing
     /// a replacement task's dictionary entry after resetCrawlState.
@@ -59,9 +91,31 @@ actor SyncEngine {
     var deletionReconcileInFlight: Set<String> = []
 
     /// The accounts with a sync pass running, and for each the passes waiting
-    /// their turn, oldest first (`oneSyncAtATime`).
+    /// their turn, in turn order (`oneSyncAtATime`): oldest first, except a
+    /// follow-up or the folder view's listing (`.aheadOfBackgroundChunks`),
+    /// which stands ahead of the catch-up slices waiting (#1360).
     var syncPassRunning: Set<String> = []
-    var syncPassWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+    var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
+    #if DEBUG
+    /// Test harness only: how many waiters went in ahead of a waiting catch-up
+    /// slice (`waitForSyncTurn`), so a fuzz can check that its seeds reordered
+    /// the line at all (#1360).
+    var syncTurnOvertakesForTesting = 0
+    #endif
+    /// For each account whose turn is held, where the pass holding it was
+    /// started (`caller:line`), so a pass that waited names in the debug log
+    /// what it waited behind (`[SyncTurnWait]`). Read by nothing else. A label
+    /// is stored only with debug logging on; with it off, `recordSyncTurnHolder`
+    /// drops any label left from a time it was on.
+    var syncTurnHolders: [String: String] = [:]
+    var syncTurnWaiterSerial: UInt64 = 0
+    /// Waiters the test harness released after an overrun (`syncTurnWaitWatch`).
+    var overrunSyncTurnWaiters: Set<UInt64> = []
+    /// The accounts a sync trigger found busy: each gets one follow-up stage 2
+    /// when its running work ends (`oneSyncAtATimeOrFollowUp`; the sync design
+    /// block at the top of SyncEngineOneSyncAtATime.swift). In memory only: a
+    /// launch runs every account's stage 1 and stage 2 anyway.
+    var syncFollowUpWanted: Set<String> = []
 
     /// Header walks (`runBackfillWalk`) executing now, foreground or job. A walk
     /// admitted before a download gate closed keeps running on its own snapshot,
@@ -82,8 +136,18 @@ actor SyncEngine {
     /// read that runs past its budget needs no real waiting.
     nonisolated let changeReadClock: @Sendable () -> Date
 
-    init(changeReadClock: @escaping @Sendable () -> Date = { Date() }) {
+    /// Asks for an account's follow-up stage 2 when its turn is released with its
+    /// follow-up flag set (`handOverSyncPass`). The app's engine asks
+    /// `SyncScheduler.runSyncFollowUp`, which runs it only in the foreground; an
+    /// engine built without one, as most tests build it, asks nothing.
+    nonisolated let syncFollowUp: @Sendable (_ accountId: String) -> Void
+
+    init(
+        changeReadClock: @escaping @Sendable () -> Date = { Date() },
+        syncFollowUp: @escaping @Sendable (_ accountId: String) -> Void = { _ in }
+    ) {
         self.changeReadClock = changeReadClock
+        self.syncFollowUp = syncFollowUp
     }
 
     /// GRDB DatabasePool for foreground SYNC — full / delta / pull-down / on-demand /
@@ -352,6 +416,9 @@ actor SyncEngine {
     func remove(accountId: String) async {
         providers.removeValue(forKey: accountId)
         workQueues.removeValue(forKey: accountId)
+        // No follow-up is owed to a removed account. With its work queue gone no
+        // trigger can set the flag again (each returns before the turn).
+        syncFollowUpWanted.remove(accountId)
 
         // Cancel and await background tasks to ensure no stale references remain active
         if let backfillTask = headerBackfillTasks.removeValue(forKey: accountId) {
@@ -362,6 +429,16 @@ actor SyncEngine {
             indexTask.cancel()
             await indexTask.value // wait for cancellation to propagate
         }
+        accessCatchUpPending.removeValue(forKey: accountId)
+        if let accessTask = accessCatchUpTasks.removeValue(forKey: accountId) {
+            accessTask.cancel()
+            await accessTask.value
+        }
+        if let otherFolderTask = otherFolderRunTasks.removeValue(forKey: accountId) {
+            otherFolderTask.cancel()
+            await otherFolderTask.value
+        }
+        otherFolderAttemptedAt.removeValue(forKey: accountId)
     }
 
     // MARK: - Background Maintenance
@@ -383,19 +460,20 @@ actor SyncEngine {
     /// - BodyAssetStore steps read a NON-WAL App-Group `DatabaseQueue` whose read lock
     ///   cannot be aborted at process suspension (`0xdead10cc`) → foreground-only.
     /// See ADR-IOS-046.
-    func scheduleMaintenanceInBackground(includePrune: Bool = false) {
+    func scheduleMaintenanceInBackground(prune: StorageEstimator.PruneGate?) {
         maintenanceTask?.cancel()
         let pool = AppDatabase.backgroundPool
+        let pruneOrder = pruneOrderByAccount()
         maintenanceTask = Task.detached(priority: .utility) {
             // Capture undo-protected IDs via MainActor hop (UndoService is @MainActor)
             let undoProtectedBodyIds = await MainActor.run {
                 Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
             }
             await SyncEngine.runWALMaintenance(
-                dbPool: pool, includePrune: includePrune,
-                undoProtectedBodyIds: undoProtectedBodyIds
+                dbPool: pool, prune: prune,
+                undoProtectedBodyIds: undoProtectedBodyIds, pruneOrder: pruneOrder
             )
-            await SyncEngine.checkpointWALThrottled(truncate: includePrune)
+            await SyncEngine.checkpointWALThrottled(truncate: prune != nil)
             await SyncEngine.runBodyAssetMaintenance()
         }
     }
@@ -419,32 +497,43 @@ actor SyncEngine {
     /// want maintenance to happen whenever EITHER fires. Abandons on suspend at each
     /// step (ADR-IOS-046).
     ///
-    /// `async` because its last TWO steps are: the deferred index build and the
-    /// deferred `ANALYZE` both have to reach the priority write queue, and a
-    /// non-async caller binds `PriorityGate`'s pass-through synchronous `write`
+    /// `async` because its last step is: the deferred index build and the deferred
+    /// `ANALYZE`, one write since 2026-11-24, have to reach the priority write queue,
+    /// and a non-async caller binds `PriorityGate`'s pass-through synchronous `write`
     /// overload instead — which has no tier at all and holds SQLite's single writer
     /// ahead of every queued `.priority` write. (This sentence read *"ONLY because
-    /// its last step is"* while `ANALYZE` was the only deferred step;
-    /// `runBuildDeferredIndexesIfMissing` joined it on 2026-08-06.) Every other step
-    /// here is unchanged and still synchronous. Both callers already run inside
-    /// detached tasks, so this adds no new concurrency.
+    /// its last step is"* while `ANALYZE` was the only deferred step; the index build
+    /// joined it as a separate step on 2026-08-06, and moved into the `ANALYZE`'s
+    /// write on 2026-11-24.) The AI cache
+    /// expiry is async as well, only so it can await a WAL checkpoint between its
+    /// batches; its reads and writes stay synchronous. The stale-body evict awaits
+    /// the throttled WAL checkpoint between its pages (#1354); its page writes stay
+    /// the pass-through write. The storage prune awaits its in-use measure and each
+    /// header batch's release (#1437); its reads and writes stay the pass-through
+    /// ones. Every other step here is unchanged and still synchronous. Both callers
+    /// already run inside detached tasks, so this adds no new concurrency.
+    ///
+    /// `prune` is which storage prune runs first, if any: `.foreground` from the
+    /// foreground poll, `.overnight` from the background processing job
+    /// (`StorageEstimator.PruneGate`, #1437).
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
-        includePrune: Bool,
-        undoProtectedBodyIds: Set<String>
+        prune: StorageEstimator.PruneGate?,
+        undoProtectedBodyIds: Set<String>,
+        pruneOrder: [String: StaleWindowMode]
     ) async {
         func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
         let t0 = CFAbsoluteTimeGetCurrent()
-        if includePrune && shouldRun() {
-            runPruneIfOverBudget(dbPool: dbPool)
+        if let prune, shouldRun() {
+            await runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder, gate: prune)
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+            await runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runPurgeOrphanedAICache(dbPool: dbPool)
+            await runPurgeOrphanedAICache(dbPool: dbPool)
             runPurgeOrphanedChatFieldWords(dbPool: dbPool)
         }
         let t3 = CFAbsoluteTimeGetCurrent()
@@ -470,31 +559,24 @@ actor SyncEngine {
             runReclaimRetiredCalendarOps(dbPool: dbPool)
         }
         let t4 = CFAbsoluteTimeGetCurrent()
-        // 🚨 BEFORE THE `ANALYZE`, NOT AFTER — the order is the convergence argument.
-        // `CREATE INDEX` is DDL and bumps SQLite's `schema_version`, which is the very
-        // marker `runRefreshPlannerStatisticsIfStale` latches on. Building first means
-        // the analysis below reads the POST-index version and settles it, so ONE pass
-        // converges. After it, the analysis would record version N, the index bump it
-        // to N+1, and the next pass would re-run a whole-database `ANALYZE` for
-        // nothing. See `runBuildDeferredIndexesIfMissing`.
-        if shouldRun() {
-            await runBuildDeferredIndexesIfMissing(dbPool: dbPool)
-        }
-        let t5 = CFAbsoluteTimeGetCurrent()
         // LAST on purpose. It is the only step here that can cost seconds unconditionally,
         // it runs at most once per schema change, and nothing above depends on it — so
         // putting it last means a suspension mid-`ANALYZE` costs the cheap reclaim steps
         // nothing. It is on THIS side of the maintenance split because `ANALYZE` is a
         // main-DB WAL write (see `runRefreshPlannerStatisticsIfStale`, and ADR-IOS-046
         // for why the `runBodyAssetMaintenance` side would be a `0xdead10cc` bug).
+        // It also builds every missing deferred index, in the same write and before the
+        // `ANALYZE`, so an index and its statistics commit together and one pass
+        // converges (the two used to be separate steps; see "Building a deferred index"
+        // in SyncEngineMaintenance.swift).
         if shouldRun() {
             await runRefreshPlannerStatisticsIfStale(dbPool: dbPool)
         }
-        let t6 = CFAbsoluteTimeGetCurrent()
-        if includePrune {
-            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+        let t5 = CFAbsoluteTimeGetCurrent()
+        if prune != nil {
+            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuildAndAnalyze=\(Int((t5-t4)*1000))ms")
         } else {
-            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuildAndAnalyze=\(Int((t5-t4)*1000))ms")
         }
     }
 
@@ -510,7 +592,13 @@ actor SyncEngine {
     /// merge / a user action can't inherit a checkpoint stall (the ~1-2s "tic"). Hanging it
     /// off the constantly-running backfill — not just the sparse per-poll maintenance, which
     /// ran 0x in a 44-min capture — is what bounds the WAL reliably.
-    nonisolated static func checkpointWALThrottled(truncate: Bool = false) async {
+    ///
+    /// `pool` is `backgroundPool` for every caller in the app. The deferred index step
+    /// passes the pool it wrote to (`runRefreshPlannerStatisticsIfStale`), so a pass run
+    /// on another database (a test, the size proof) checkpoints that database.
+    nonisolated static func checkpointWALThrottled(
+        truncate: Bool = false, pool: PrioritizedDatabase = AppDatabase.backgroundPool
+    ) async {
         let now = CFAbsoluteTimeGetCurrent()
         let go = walCheckpointState.withLock { last -> Bool in
             guard now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
@@ -520,7 +608,7 @@ actor SyncEngine {
         guard go, !DatabaseSuspension.isSuspended else { return }
         let sql = truncate ? "PRAGMA wal_checkpoint(TRUNCATE)" : "PRAGMA wal_checkpoint(PASSIVE)"
         let t0 = CFAbsoluteTimeGetCurrent()
-        let frames = try? await AppDatabase.backgroundPool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
+        let frames = try? await pool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
             guard let row = try Row.fetchOne(db, sql: sql) else { return (-1, -1) }
             let log: Int = row[1] ?? -1
             let ckpt: Int = row[2] ?? -1
@@ -533,10 +621,12 @@ actor SyncEngine {
         }
     }
 
-    /// NON-WAL BodyAssetStore maintenance: evict attachments over the user's cap, then
-    /// sweep cross-DB/filesystem orphans (NSE-written assets whose push got dropped,
-    /// eviction crashes, etc.). Both are no-ops on cold/empty state and idempotent;
-    /// order matters (evict first so the sweep skips freshly-evicted files).
+    /// NON-WAL BodyAssetStore maintenance: evict attachments over the user's cap,
+    /// recover abandoned writes (their leases and staging files), run the one-time
+    /// orphan sweep if it has not completed, then delete the assets of the keys
+    /// queued on `bodyAssetPendingDelete` (#1376; nothing walks the whole store any
+    /// more). All are no-ops on cold/empty state and idempotent; the sweep runs
+    /// before the worker so the keys it queues are handled in the same pass.
     ///
     /// FOREGROUND-ONLY. The manifest is a non-WAL `DatabaseQueue` in the App-Group
     /// container (shared with the NSE); its read holds a SQLite lock that RunningBoard
@@ -559,10 +649,17 @@ actor SyncEngine {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            await BodyAssetMaintenance.pruneOrphans()
+            BodyAssetStore.recoverAbandonedPreparations()
+        }
+        if shouldRun() {
+            await BodyAssetMaintenance.runOrphanSweepOnce()
         }
         let t2 = CFAbsoluteTimeGetCurrent()
-        BackgroundSyncLogger.logDebug("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms assetSweep=\(Int((t2-t1)*1000))ms")
+        if shouldRun() {
+            await BodyAssetMaintenance.processPendingDeletes()
+        }
+        let t3 = CFAbsoluteTimeGetCurrent()
+        BackgroundSyncLogger.logDebug("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms recoverAndSweepOnce=\(Int((t2-t1)*1000))ms pendingDeletes=\(Int((t3-t2)*1000))ms")
     }
 
     /// Two-tier sync: tries delta sync first (fast), falls back to full sync (robust).
@@ -574,12 +671,15 @@ actor SyncEngine {
     /// Only fetches new headers and enqueues to body/AI/embedding queues.
     /// Does NOT start backfill, bulk index, embedding rebuild, or full sync fallback.
     /// Designed to complete well within iOS's ~30s background budget.
-    /// Returns (changed, reason) where reason describes what happened for diagnostics.
+    /// Returns (changed, reason) where reason describes what happened for diagnostics,
+    /// or nil when another pass of the account was running: the account's
+    /// follow-up flag is set and nothing was read (`oneSyncAtATimeOrFollowUp`).
     /// - Parameter deadline: the caller's own deadline for this call (its timeout),
-    ///   or nil when it sets none. The pass reads only what it can apply before it,
-    ///   whatever its wait for its turn (ADR-IOS-104 decision 2, amended).
+    ///   or nil when it sets none. The pass reads only what it can apply before it
+    ///   (ADR-IOS-104 decision 2, amended). It never waits for its turn, so the
+    ///   caller's time limit counts from when the pass takes the turn.
     @discardableResult
-    func backgroundDeltaSync(account: Account, inboxOnly: Bool = false, deadline: Date? = nil) async throws -> (changed: Bool, reason: String) {
+    func backgroundDeltaSync(account: Account, inboxOnly: Bool = false, deadline: Date? = nil) async throws -> (changed: Bool, reason: String)? {
         guard let queue = workQueues[account.id] else {
             BackgroundSyncLogger.logDebug("[Sync:bg] No provider for \(account.emailAddress) — skipping")
             BackgroundSyncLogger.log("bgDelta: \(account.emailAddress) noProvider")
@@ -587,10 +687,11 @@ actor SyncEngine {
         }
         let provider = queue.provider
 
-        // A foreground pass of the same account running now finishes first
-        // (`oneSyncAtATime`); then this delta runs, on the account's row as it is
-        // when its turn starts.
-        return try await oneSyncAtATime(accountId: account.id) {
+        // Stage 1 is a sync trigger: when another pass of the account runs, it
+        // sets the account's follow-up flag and returns nil instead of waiting
+        // (the sync design block in SyncEngineOneSyncAtATime.swift; #1289).
+        // Otherwise it runs on the account's row as it is when its turn starts.
+        return try await oneSyncAtATimeOrFollowUp(accountId: account.id) {
             try await self.backgroundDeltaPass(
                 accountId: account.id, queue: queue, provider: provider, inboxOnly: inboxOnly, deadline: deadline)
         }
@@ -695,27 +796,92 @@ actor SyncEngine {
 
         // The work queue has several slots and does not serialize passes: a pass
         // of the same account running now finishes first (`oneSyncAtATime`).
+        // Settings, a new account and the epoch rebuild wait here; the poll uses
+        // `syncOrFollowUp`, which never waits, and the follow-up `followUpPass`.
         return try await oneSyncAtATime(accountId: account.id) {
             try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider, deadline: deadline)
+        }
+    }
+
+    /// Stage 2 as a sync trigger, for the poll: it runs
+    /// only when the account's turn is free, and returns nil, with the account's
+    /// follow-up flag set, when another pass holds it (`oneSyncAtATimeOrFollowUp`;
+    /// the sync design block in SyncEngineOneSyncAtATime.swift). It never waits
+    /// for its turn, so its caller's time limit counts from when it runs (#1289).
+    func syncOrFollowUp(account: Account, deadline: Date?) async throws -> Bool? {
+        guard let queue = workQueues[account.id] else {
+            BackgroundSyncLogger.logDebug("[Sync] No provider registered for \(account.emailAddress) — skipping")
+            return false
+        }
+        let provider = queue.provider
+        return try await oneSyncAtATimeOrFollowUp(accountId: account.id) {
+            try await self.foregroundPass(accountId: account.id, queue: queue, provider: provider, deadline: deadline)
+        }
+    }
+
+    /// The follow-up stage 2 a set flag asks for (`SyncScheduler.runSyncFollowUp`
+    /// -> `AccountManager.followUpRun`; the sync design block in
+    /// SyncEngineOneSyncAtATime.swift). Unlike a trigger it waits in line for the
+    /// account's turn, so it starts as soon as the work holding the turn ends,
+    /// even when that work takes the turn again at once (a catch-up's next
+    /// slice). It joins the line ahead of every catch-up slice waiting
+    /// (`SyncTurnPlace.aheadOfBackgroundChunks`, #1360), so other readers'
+    /// slices queued before it never read first. It runs stage 2 only if the flag is still set when it gets the
+    /// turn, and returns nil, doing nothing, when a stage 2 that ran in between
+    /// served it: two asks for one flag run one stage 2. `mayStart` is the
+    /// scheduler's follow-up gate (`SyncScheduler.followUpMayStart`: foreground
+    /// only), checked again at the turn, before the flag is cleared: a
+    /// follow-up admitted in the foreground can get the turn after the app has
+    /// left. Not allowed then, it returns nil with the flag still set; the
+    /// release asks again, and the scheduler starts nothing until a stage 2 may
+    /// start (the next opening). Its deadline is taken at its turn, 60 s on
+    /// (`SyncConfig.perAccountSyncTimeoutSeconds`), and bounds its change read
+    /// and a due full sync's deadline-bounded steps, as for the poll's stage 2;
+    /// what those could not finish is owed to the next listing. No outer
+    /// timeout, as Settings' stage 2: a waiter it cancelled would still take the
+    /// turn and clear the flag without reading.
+    func followUpPass(
+        accountId: String, mayStart: @escaping @MainActor @Sendable () -> Bool
+    ) async throws -> Bool? {
+        guard let queue = workQueues[accountId] else { return nil }
+        let provider = queue.provider
+        return try await oneSyncAtATime(accountId: accountId, place: .aheadOfBackgroundChunks) {
+            guard self.syncFollowUpWanted.contains(accountId) else {
+                BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): served by an earlier stage 2")
+                return nil
+            }
+            guard await mayStart() else {
+                BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): no stage 2 now, the flag waits")
+                return nil
+            }
+            let deadline = self.changeReadClock().addingTimeInterval(SyncConfig.perAccountSyncTimeoutSeconds)
+            return try await self.foregroundPass(accountId: accountId, queue: queue, provider: provider, deadline: deadline)
         }
     }
 
     private func foregroundPass(
         accountId: String, queue: ProviderWorkQueue, provider: any EmailProvider, deadline: Date?
     ) async throws -> Bool {
+        // Stage 2 has taken the turn: it is the one stage 2 a trigger that found
+        // the account busy asked for (the follow-up flag in the sync design block).
+        syncFollowUpWanted.remove(accountId)
         guard let account = try await accountAtTurnStart(accountId) else {
             BackgroundSyncLogger.logDebug("[Sync] Account \(accountId.prefix(8)) was removed before its turn — skipping")
             return false
         }
 
-        // Skip if this account was synced very recently — prevents redundant syncs
-        // from overlapping callers (RootView.task, SyncScheduler, InboxViewModel).
-        // Read from the row as it is now, so a pass that waited behind one that
-        // has just synced skips too.
-        if let lastSync = account.lastSyncedAt, Date().timeIntervalSince(lastSync) < 15 {
-            BackgroundSyncLogger.logDebug("[Sync] Skipping \(account.emailAddress) — synced \(Int(Date().timeIntervalSince(lastSync)))s ago")
-            return false
-        }
+        // No recent-sync skip, of any length (design settled 2026-11-23, #1278): the
+        // two persisted clocks gate the pass. It always reads changes, and runs
+        // the full sync when `lastFullSyncAt` says it is due or the read needs a
+        // listing (step 2). Passes of an account take turns (`oneSyncAtATime`),
+        // so one that follows another only repeats a change read that finds
+        // nothing, and never a full sync the other recorded. On a return to the
+        // app this pass follows stage 1's quick sync of every folder: that second
+        // read is an accepted cost of one cheap request per account. A skip on
+        // `lastSyncedAt`, which every change read stamps, swallowed due full syncs
+        // (#1275); a guard would risk that again to save almost nothing. Do not
+        // add one. The whole design, and why: the sync design block at the top of
+        // SyncEngineOneSyncAtATime.swift.
 
         defer {
             Task { @MainActor in AccountManagerState.shared.setSyncPhase(nil, forAccount: accountId) }
@@ -801,7 +967,10 @@ actor SyncEngine {
         //    the read, so it does not hold back the rest of the account.
         let timeSinceFullSync = account.lastFullSyncAt.map { Date().timeIntervalSince($0) } ?? .infinity
         let listingNeeded = changePass?.needsListing ?? false
-        let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
+        // Due by the 15-minute clock, not only by a listing the read needs: such
+        // a pass also starts the other-folder run when it ends (#1110).
+        let clockDue = timeSinceFullSync >= fullSyncInterval
+        let fullSyncDue = clockDue || listingNeeded
         if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
             let plan = FullSyncPlan(deadline: deadline)
@@ -830,11 +999,10 @@ actor SyncEngine {
             // due: the next foreground pass lists the folders still untracked
             // (tracked ones get no window listing) instead of waiting for the
             // next scheduled full sync.
-            // A folder an unproven move dropped the bookmark of gets its one
-            // self-heal pass before the baseline below may track it again.
-            await queue.execute(priority: .headerFetch) {
-                await self.healFoldersAfterAnUnprovenMove(account: account)
-            }
+            // A folder an unproven move dropped the bookmark of stays untracked
+            // (`commitChangeBaseline`) until the catch-up's clean listing clears
+            // what it is owed (#1062).
+            // *Superseded (#1062):* its one self-heal pass ran here.
 
             if let changePass, changePass.fromReader {
                 // The reader's bookmark was read BEFORE these listings; store a
@@ -863,9 +1031,6 @@ actor SyncEngine {
             await queue.execute(priority: .bodyFetch) {
                 await self.sweepStaleActionTags(account: account, provider: provider)
             }
-            await queue.execute(priority: .bodyFetch) {
-                _ = await self.selfHealRecentMessages(account: account)
-            }
         }
 
         // If delta sync failed and full sync didn't run (not due yet), no server contact
@@ -877,7 +1042,10 @@ actor SyncEngine {
             throw error
         }
 
-        // 3. Background work — runs after every sync (delta or full)
+        // 3. Background work — runs after every sync (delta or full). A pass whose
+        //    full sync was due by the clock also starts the change reads of the
+        //    folders outside the syncable set (#1110), in the catch-up's slices.
+        if clockDue { startOtherFolderRun(account: account) }
         BackgroundSyncLogger.logDebug("[Sync] \(account.emailAddress) calling startBackfill")
         startBackfill(account: account)
         bulkIndexIfNeeded(account: account)
@@ -968,6 +1136,8 @@ actor SyncEngine {
                     .fetchOne(db)?.providerDate ?? Date()
             }
 
+            // The change premise, before the page read (#755).
+            let changePremise = try await dbPool.read { db in try Self.changeInsertPremise(db, folderId: folder.id) }
             let pageLimit = SyncConfig.infiniteScrollFetchLimit
             let fetched: (headers: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage)
             do {
@@ -1024,7 +1194,12 @@ actor SyncEngine {
             }
 
             // Deduplicate and insert
-            let writeResult: (inserted: [MessageHeader], discoveredParents: [String]) = try await dbPool.write { db in
+            let writeResult: (inserted: [MessageHeader], discoveredParents: [String], refused: Bool) = try await dbPool.write { db in
+                // A change read became authoritative for this folder since the
+                // page was read: nothing of it lands, and the page is asked again.
+                guard try Self.fromServerInsertAllowed(db, folderId: folder.id, premise: changePremise) else {
+                    return ([], [], true)
+                }
                 var inserted: [MessageHeader] = []
                 for info in headers {
                     // IOS-IMAP-001 / D3 — a message the server reports with `\Deleted`
@@ -1104,7 +1279,7 @@ actor SyncEngine {
 
                 // Sent-folder reply discovery — no-op when folder.role != .sent.
                 var discovered = try ReplyParentResolver.markParentsReplied(
-                    inReplyTos: headers.map(\.inReplyTo),
+                    sentCopies: headers.map { .init(inReplyTo: $0.inReplyTo, subject: $0.subject) },
                     folderRole: folder.role,
                     accountId: folder.accountId,
                     db: db
@@ -1114,7 +1289,11 @@ actor SyncEngine {
                     insertedRfc822Ids: inserted.compactMap(\.rfc822MessageId),
                     accountId: folder.accountId, db: db)
 
-                return (inserted, discovered)
+                return (inserted, discovered, false)
+            }
+            if writeResult.refused {
+                mayHaveMore = true
+                continue
             }
             let newHeaders = writeResult.inserted
             ReplyParentResolver.postParentNotifications(writeResult.discoveredParents)

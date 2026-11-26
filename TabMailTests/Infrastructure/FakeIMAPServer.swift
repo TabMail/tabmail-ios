@@ -128,6 +128,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         var persistent: Bool = false
         /// The tagged status the injected failure answers with: "NO" or "BAD".
         var status: String = "NO"
+        /// Instead of a tagged answer, these bytes alone: a malformed answer
+        /// the client's response parser fails on.
+        var malformedAnswer: String? = nil
     }
 
     /// One deterministic mailbox reset applied only after the matching
@@ -173,6 +176,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         var commandLog: [String] = []
         /// The same commands, by connection (its fd), in order.
         var commandLogByConnection: [Int32: [String]] = [:]
+        /// Parallel to `commandLog`: the mailbox the command's connection had
+        /// selected when the command arrived (nil: none).
+        var commandMailboxLog: [String?] = []
         var injectedFailureCountdowns: [String: [InjectedFailure]] = [:]
         var consumedInjectedFailureCount = 0
         /// `setStatusStaleUntilNoop`: each connection's STATUS answers as of its
@@ -221,6 +227,10 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// server does; CREATE is then the only way to make one. Off for every
         /// pre-existing test, where any name SELECTs and APPEND makes it.
         var requireExistingMailboxes = false
+        /// When set, ENVELOPE carries the message's own In-Reply-To (RFC 3501
+        /// §7.4.2), read from its stored header, as a real server reports it. Off
+        /// for every pre-existing test, whose envelopes carry NIL there.
+        var envelopeCarriesInReplyTo = false
         /// Per-mailbox UIDVALIDITY reported by SELECT/EXAMINE (RFC 3501
         /// §2.3.1.1). Missing entry defaults to 1 — every pre-existing test
         /// relies on that fixed value, so this is purely additive. ADR-IOS-060
@@ -265,6 +275,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// Every ENABLE a connection sent after a SELECT (refused, RFC 5161 §3.1).
         var enableInSelectedStateCount = 0
         var condStoreSelectCount = 0
+        /// Every `UID FETCH … (CHANGEDSINCE n)` answered.
+        var changedSinceFetchCount = 0
 
         /// STATUS attributes a mailbox's answer leaves out (a server may omit one).
         var statusOmittedAttributesByMailbox: [String: Set<String>] = [:]
@@ -440,6 +452,18 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// messages, the FETCH over a range covering all N returns fewer than N.
         /// Empty for every pre-existing test.
         var fetchRecordSuppressedByMailbox: [String: Set<Int>] = [:]
+        /// `injectUnsolicitedFetch(in:uid:flags:)`: one extra untagged FETCH
+        /// (UID and FLAGS) sent with the next FETCH in the mailbox, whatever it asked.
+        var unsolicitedFetchByMailbox: [String: [Int: [String]]] = [:]
+        /// `holdListingFetches(in:overRecords:)`: per mailbox, the record count
+        /// above which a flags-only FETCH is held.
+        var listingHoldByMailbox: [String: Int] = [:]
+        /// Per mailbox, how many times its held listing FETCHes were let go
+        /// (`releaseListingFetches(in:)`): a held FETCH answers once the count
+        /// passes the one it was held at.
+        var listingReleasesByMailbox: [String: Int] = [:]
+        /// Flags-only FETCHes answered in each mailbox, with how many records each matched.
+        var listingFetchSizesByMailbox: [String: [Int]] = [:]
         /// Per-mailbox ESEARCH data for the next UID SEARCHes, in order
         /// (`answerNextUIDSearch(in:all:)`, `answerNextUIDSearch(in:esearchData:)`):
         /// each is sent as `* ESEARCH (TAG …) UID <data>` and consumed. Empty for
@@ -491,6 +515,9 @@ final class FakeIMAPServer: @unchecked Sendable {
         /// with no LOGOUT in between — the abandoned-session class
         /// `liveSessionCount()` cannot see (its doc comment above).
         var everLoggedInFds: Set<Int32> = []
+        /// The fd of the session whose LOGIN was accepted last;
+        /// `dropLastLoggedInSession()` ends it.
+        var lastLoggedInFd: Int32?
         /// R12-F1: every fd whose LOGOUT command was actually processed
         /// (set in the `LOGOUT` command handler, consulted+removed in
         /// `closeClientFd`) — the "ended cleanly" half of the
@@ -570,6 +597,14 @@ final class FakeIMAPServer: @unchecked Sendable {
         var heldGateReleased: Set<String> = []
         /// Set by `stop()`: a held command is let go so its handler can end.
         var heldGatesAbandoned = false
+        /// How many requests a hold has stopped so far (`holdNextCommand`,
+        /// `holdListingFetches`), and how many of those have since answered:
+        /// `holdsStarted()`, `heldRequestsInProgress()`.
+        var holdsStarted = 0
+        var holdsFinished = 0
+        /// How many malformed answers (`answerNextCommandWithOverLimitLiteral`,
+        /// `answerNextCommandUndecodable`) the server began to send.
+        var malformedAnswersSent = 0
         /// Like `stalls`, but the hold ends the session as soon as the client
         /// closes the connection. See `stallNextCommandWatchingClient`.
         var watchedStalls: [String: [Double]] = [:]
@@ -836,6 +871,13 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.commandLog }
     }
 
+    /// `recordedCommands()`, each with the mailbox its connection had selected
+    /// when it arrived (nil: none); a SELECT or EXAMINE carries the mailbox
+    /// selected before it. Lets a test tell which folder a request went to.
+    func recordedCommandsWithMailbox() -> [(command: String, mailbox: String?)] {
+        withState { state in zip(state.commandLog, state.commandMailboxLog).map { (command: $0, mailbox: $1) } }
+    }
+
     /// Two-tier fuzzer (Testing Rule 11), tier-1 invariant (d) — number of
     /// connections currently past a successful LOGIN with no LOGOUT/close
     /// observed since. A fuzz round's final teardown must drive this to 0:
@@ -927,8 +969,19 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.heldGates[fragment.uppercased()] == true }
     }
 
+    /// Releases the hold `fragment` names: a claimed one (a command waits at
+    /// it) is let go; one armed but never claimed is disarmed. A release thus
+    /// belongs to the hold it found, never to one armed later under the same
+    /// fragment.
     func releaseHeldCommand(containing fragment: String) {
-        withState { $0.heldGateReleased.formUnion([fragment.uppercased()]) }
+        let key = fragment.uppercased()
+        withState { state in
+            switch state.heldGates[key] {
+            case true?: state.heldGateReleased.insert(key)
+            case false?: state.heldGates[key] = nil
+            case nil: break
+            }
+        }
     }
 
     /// Test seam: hold the next FETCH in `mailbox` AFTER it has read the
@@ -969,17 +1022,84 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Wait at the armed gate `key`, if any, until released or the server stops.
     private func passHeldGate(_ key: String) {
         let upperKey = key.uppercased()
-        let armed: Bool = withState { state in
-            guard state.heldGates[upperKey] == false else { return false }
-            state.heldGates[upperKey] = true
-            return true
-        }
-        guard armed else { return }
-        while !withState({ $0.heldGateReleased.contains(upperKey) || $0.heldGatesAbandoned }) { usleep(2_000) }
+        guard let claimed = claimHeldGate(where: { $0 == upperKey }) else { return }
+        waitAtHeldGate(claimed)
+    }
+
+    /// Claims the first armed, unclaimed gate whose key `matches`, counting it
+    /// in `holdsStarted`: the one claim path of every hold (a named gate and a
+    /// command-fragment hold alike), so `holdsStarted()` and
+    /// `heldRequestsInProgress()` count every held request.
+    private func claimHeldGate(where matches: (String) -> Bool) -> String? {
         withState { state in
-            state.heldGates[upperKey] = nil
-            state.heldGateReleased.remove(upperKey)
+            guard let key = state.heldGates.keys.sorted().first(where: {
+                matches($0) && state.heldGates[$0] == false
+            }) else { return nil }
+            state.heldGates[key] = true
+            state.holdsStarted += 1
+            return key
         }
+    }
+
+    /// Waits at the claimed gate `key` until released or the server stops, then
+    /// frees it and counts it in `holdsFinished`: the one release path of every
+    /// hold.
+    private func waitAtHeldGate(_ key: String) {
+        while !withState({ $0.heldGateReleased.contains(key) || $0.heldGatesAbandoned }) { usleep(2_000) }
+        withState { state in
+            state.heldGates[key] = nil
+            state.heldGateReleased.remove(key)
+            state.holdsFinished += 1
+        }
+    }
+
+    /// How many requests a hold (`holdNextCommand`, `holdListingFetches`) has
+    /// stopped since the server started. Only grows.
+    func holdsStarted() -> Int {
+        withState { $0.holdsStarted }
+    }
+
+    /// How many requests a hold stopped that have not gone on to answer yet: a
+    /// released request counts until its handler has passed the hold.
+    func heldRequestsInProgress() -> Int {
+        withState { $0.holdsStarted - $0.holdsFinished }
+    }
+
+    /// Test seam: answer the next command containing `fragment` with one
+    /// untagged FETCH whose ENVELOPE date is a literal of `literalBytes` bytes,
+    /// and no tagged answer. A literal in a field the client does not stream
+    /// is bounded by its parser's literal size limit, checked at the literal's
+    /// `{n}` header before any of its bytes are read: one larger than that
+    /// limit fails the request at once (`IMAPDecoderError` around
+    /// `ExceededLiteralSizeLimitError`, and the client closes the connection),
+    /// a genuine too-large answer, unlike a tagged NO that only names one.
+    /// *Superseded (#1062):* one untagged line longer than the client's
+    /// response buffer: the buffer's limit is checked only after each decode
+    /// attempt, which re-parses the buffered line, so on a loaded machine the
+    /// request timed out before the limit was reached.
+    func answerNextCommandWithOverLimitLiteral(containing fragment: String, literalBytes: Int) {
+        let line = "* 1 FETCH (UID 1 ENVELOPE ({\(literalBytes)}\r\n" + String(repeating: "x", count: literalBytes)
+            + " NIL NIL NIL NIL NIL NIL NIL NIL NIL))\r\n"
+        injectMalformedAnswer(line, containing: fragment)
+    }
+
+    /// Test seam: answer the next command containing `fragment` with one
+    /// untagged FETCH whose UID is not a number, and no tagged answer: the
+    /// client's response parser cannot decode it (`IMAPDecoderError`).
+    func answerNextCommandUndecodable(containing fragment: String) {
+        injectMalformedAnswer("* 1 FETCH (UID notanumber)\r\n", containing: fragment)
+    }
+
+    private func injectMalformedAnswer(_ bytes: String, containing fragment: String) {
+        withState { state in
+            state.injectedFailureCountdowns[fragment.uppercased(), default: []]
+                .append(InjectedFailure(skip: 0, message: "", malformedAnswer: bytes))
+        }
+    }
+
+    /// How many malformed answers the server began to send.
+    func malformedAnswersSent() -> Int {
+        withState { $0.malformedAnswersSent }
     }
 
     /// Test seam: like `stallNextCommand`, but while the answer is held the
@@ -1121,6 +1241,39 @@ final class FakeIMAPServer: @unchecked Sendable {
         }
     }
 
+    /// Drops the session whose LOGIN was accepted last, from the server's side and
+    /// with no command in flight, as a network or server drops an open connection:
+    /// the socket is shut down, so the client finds it closed before its next
+    /// command. The close is marked test-initiated (see `testInitiatedCloseFds`),
+    /// so it is not counted as an abandoned session. Returns false when that
+    /// session has already ended.
+    @discardableResult
+    func dropLastLoggedInSession() -> Bool {
+        let fd = withState { state -> Int32? in
+            guard let fd = state.lastLoggedInFd, state.loggedInFds.contains(fd) else { return nil }
+            state.lastLoggedInFd = nil
+            _ = state.loggedInFds.remove(fd)
+            _ = state.testInitiatedCloseFds.insert(fd)
+            return fd
+        }
+        guard let fd else { return false }
+        shutdown(fd, SHUT_RDWR)
+        return true
+    }
+
+    /// Sends one untagged response (`* 2 EXISTS`, `* VANISHED 1`) to every
+    /// session in IDLE, as a server reports a change to the selected mailbox
+    /// during IDLE (RFC 2177). The mailbox itself is changed separately
+    /// (`setMessages`). Returns how many sessions it reached.
+    @discardableResult
+    func notifyIdleSessions(_ untagged: String) -> Int {
+        let fds = withState { $0.idlingFds }
+        for fd in fds {
+            sendLine(fd: fd, "\(untagged)\r\n")
+        }
+        return fds.count
+    }
+
     func killConnectionOnNextCommand(containing fragment: String) {
         withState { state in
             state.injectedFailureCountdowns[fragment.uppercased(), default: []]
@@ -1235,6 +1388,12 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.requireExistingMailboxes = true }
     }
 
+    /// ENVELOPE carries each message's In-Reply-To from its stored header, as a
+    /// real server's does, so a synced copy names the message it replies to.
+    func reportInReplyToInEnvelopes() {
+        withState { $0.envelopeCarriesInReplyTo = true }
+    }
+
     /// Whether `mailbox` exists: it has an entry (possibly empty) and was not
     /// `markMailboxDeleted`. The same presence rule LIST uses.
     func mailboxExists(_ mailbox: String) -> Bool {
@@ -1319,49 +1478,66 @@ final class FakeIMAPServer: @unchecked Sendable {
         withState { $0.honorsSearchUIDSetCriterion = false }
     }
 
+    /// The `SINCE` / `BEFORE` keys of one UID SEARCH, read once per SEARCH.
     /// RFC 3501 §6.4.4 at DAY granularity, which is all the wire form carries
     /// (`date-day "-" date-month "-" date-year`, written unpadded by NIO IMAP as
     /// e.g. `4-Aug-2026`): `SINCE d` matches an INTERNALDATE **on or after** `d`,
     /// `BEFORE d` one **strictly earlier** than `d`. Keys this fake does not model
     /// are ignored, exactly as the un-filtered path ignores all of them.
-    private static func matchesSearchDateCriteria(_ message: Message, args: String) -> Bool {
-        let tokens = args.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ")" }).map(String.init)
-        guard let messageDay = searchDay(fromInternalDate: message.internalDate) else { return true }
-        var matches = true
-        for (index, token) in tokens.enumerated() {
-            let key = token.uppercased()
-            guard key == "SINCE" || key == "BEFORE", index + 1 < tokens.count,
-                  let bound = searchDay(fromCriterion: tokens[index + 1]) else { continue }
-            if key == "SINCE" {
-                matches = matches && messageDay >= bound
-            } else {
-                matches = matches && messageDay < bound
+    /// Built per SEARCH, never shared: its parser and calendar serve this
+    /// search's messages only, so the cost of a search no longer grows with one
+    /// formatter per message.
+    private struct SearchDateCriteria {
+        /// Each key's UTC day-start, in the order the search names them.
+        let bounds: [(since: Bool, day: Date)]
+        /// The UTC day-start of an `INTERNALDATE` value (`dd-MMM-yyyy HH:mm:ss Z`).
+        let internalDateParser: DateFormatter
+        let utc: Calendar
+
+        /// Nil when the search has no `SINCE` / `BEFORE` key with a date that
+        /// parses: every message then matches, so the date check is skipped.
+        init?(args: String) {
+            let tokens = args.split(whereSeparator: { $0 == " " || $0 == "(" || $0 == ")" }).map(String.init)
+            // A key's date argument: `d-MMM-yyyy` accepts both the unpadded form
+            // NIO IMAP writes and the zero-padded form other clients write;
+            // surrounding quotes are optional per the grammar.
+            let criterionParser = DateFormatter()
+            criterionParser.locale = Locale(identifier: "en_US_POSIX")
+            criterionParser.timeZone = TimeZone(identifier: "UTC")
+            criterionParser.dateFormat = "d-MMM-yyyy"
+            var bounds: [(since: Bool, day: Date)] = []
+            for (index, token) in tokens.enumerated() {
+                let key = token.uppercased()
+                guard key == "SINCE" || key == "BEFORE", index + 1 < tokens.count,
+                      let bound = criterionParser.date(from: tokens[index + 1].trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
+                else { continue }
+                bounds.append((since: key == "SINCE", day: bound))
             }
+            guard !bounds.isEmpty else { return nil }
+            self.bounds = bounds
+            let internalDateParser = DateFormatter()
+            internalDateParser.locale = Locale(identifier: "en_US_POSIX")
+            internalDateParser.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
+            self.internalDateParser = internalDateParser
+            var utc = Calendar(identifier: .gregorian)
+            utc.timeZone = TimeZone(identifier: "UTC")!
+            self.utc = utc
         }
-        return matches
-    }
 
-    /// The UTC day-start of an `INTERNALDATE` value (`dd-MMM-yyyy HH:mm:ss Z`).
-    private static func searchDay(fromInternalDate value: String) -> Date? {
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.dateFormat = "dd-MMM-yyyy HH:mm:ss Z"
-        guard let parsed = parser.date(from: value) else { return nil }
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(identifier: "UTC")!
-        return utc.startOfDay(for: parsed)
-    }
-
-    /// The UTC day-start of a search key's date argument. `d-MMM-yyyy` accepts
-    /// both the unpadded form NIO IMAP writes and the zero-padded form other
-    /// clients write; surrounding quotes are optional per the grammar.
-    private static func searchDay(fromCriterion value: String) -> Date? {
-        let bare = value.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-        let parser = DateFormatter()
-        parser.locale = Locale(identifier: "en_US_POSIX")
-        parser.timeZone = TimeZone(identifier: "UTC")
-        parser.dateFormat = "d-MMM-yyyy"
-        return parser.date(from: bare)
+        /// A message whose INTERNALDATE does not parse matches.
+        func matches(_ message: Message) -> Bool {
+            guard let parsed = internalDateParser.date(from: message.internalDate) else { return true }
+            let messageDay = utc.startOfDay(for: parsed)
+            var allMatch = true
+            for bound in bounds {
+                if bound.since {
+                    allMatch = allMatch && messageDay >= bound.day
+                } else {
+                    allMatch = allMatch && messageDay < bound.day
+                }
+            }
+            return allMatch
+        }
     }
 
     /// Test seam (G1): the copies still land exactly where this fake put them,
@@ -1549,6 +1725,43 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// failure it leaves the client with no id for the missing message at all.
     func suppressFetchRecord(in mailbox: String, uids: Set<Int>) {
         withState { $0.fetchRecordSuppressedByMailbox[mailbox] = uids }
+    }
+
+    /// Test seam: with the next FETCH in this mailbox, whatever UIDs it asks for,
+    /// also send `* n FETCH (UID uid FLAGS (flags))` for `uid` (a message the
+    /// mailbox holds): the unsolicited flag update another client's change causes,
+    /// which RFC 9051 §7 lets a server send at any time. Consumed by one FETCH.
+    func injectUnsolicitedFetch(in mailbox: String, uid: Int, flags: [String]) {
+        withState { $0.unsolicitedFetchByMailbox[mailbox, default: [:]][uid] = flags }
+    }
+
+    /// Test seam: a link too slow for large listings. Every flags-only FETCH (no
+    /// ENVELOPE) in this mailbox that matches more than `overRecords` messages
+    /// is held after it has read the mailbox, before it answers, until
+    /// `releaseListingFetches(in:)`: the client's request timeout gives it up,
+    /// whatever the timeout's length, and nothing is timed. Stays armed until
+    /// `stopHoldingListingFetches(in:)`.
+    func holdListingFetches(in mailbox: String, overRecords: Int) {
+        withState { $0.listingHoldByMailbox[mailbox] = overRecords }
+    }
+
+    /// Let every listing FETCH held now in this mailbox answer; later ones are
+    /// held again while the hold stays armed.
+    func releaseListingFetches(in mailbox: String) {
+        withState { $0.listingReleasesByMailbox[mailbox, default: 0] += 1 }
+    }
+
+    /// Disarm the hold of this mailbox's listing FETCHes and let the held ones answer.
+    func stopHoldingListingFetches(in mailbox: String) {
+        withState { state in
+            state.listingHoldByMailbox[mailbox] = nil
+            state.listingReleasesByMailbox[mailbox, default: 0] += 1
+        }
+    }
+
+    /// How many records each flags-only FETCH answered in this mailbox matched, in order.
+    func listingFetchSizes(in mailbox: String) -> [Int] {
+        withState { $0.listingFetchSizesByMailbox[mailbox] ?? [] }
     }
 
     /// Test seam: answer the next UID SEARCH in this mailbox, whatever it asks,
@@ -2123,8 +2336,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                     // here). Lets a test assert the "teardown sends DONE
                     // for an active IDLE session" invariant (the
                     // markDirty-IDLE fix's pin).
+                    let mailboxAtDone = selectedMailbox
                     let doneDelay = withState { state -> Double? in
                         state.commandLog.append("DONE")
+                        state.commandMailboxLog.append(mailboxAtDone)
                         _ = state.idlingFds.remove(fd)
                         return state.idleDoneReplyDelays.isEmpty ? nil : state.idleDoneReplyDelays.removeFirst()
                     }
@@ -2146,8 +2361,10 @@ final class FakeIMAPServer: @unchecked Sendable {
                 let command = parts[1].uppercased()
                 let args = parts.count > 2 ? parts[2] : ""
                 let recordedCommand = ([command] + (args.isEmpty ? [] : [args])).joined(separator: " ")
+                let mailboxAtCommand = selectedMailbox
                 let matchedFailure: InjectedFailure? = withState { state -> InjectedFailure? in
                     state.commandLog.append(recordedCommand)
+                    state.commandMailboxLog.append(mailboxAtCommand)
                     state.commandLogByConnection[fd, default: []].append(recordedCommand)
                     let upper = recordedCommand.uppercased()
                     guard let key = state.injectedFailureCountdowns.keys.sorted().first(where: {
@@ -2191,6 +2408,13 @@ final class FakeIMAPServer: @unchecked Sendable {
                         }
                         break clientLoop
                     }
+                    if let malformed = matchedFailure.malformedAnswer {
+                        // No tagged answer: the client fails on these bytes, and
+                        // may close the connection before the rest is written.
+                        withState { $0.malformedAnswersSent += 1 }
+                        sendLine(fd: fd, malformed)
+                        continue
+                    }
                     sendLine(fd: fd, "\(tag) \(matchedFailure.status) \(matchedFailure.message)\r\n")
                     continue
                 }
@@ -2219,20 +2443,9 @@ final class FakeIMAPServer: @unchecked Sendable {
                     return state.stalls[key]?.removeFirst()
                 }
                 if let stallSeconds { usleep(UInt32(stallSeconds * 1_000_000)) }
-                let heldGate: String? = withState { state in
-                    let upper = recordedCommand.uppercased()
-                    guard let key = state.heldGates.keys.sorted().first(where: {
-                        upper.contains($0) && state.heldGates[$0] == false
-                    }) else { return nil }
-                    state.heldGates[key] = true
-                    return key
-                }
-                if let heldGate {
-                    while !withState({ $0.heldGateReleased.contains(heldGate) || $0.heldGatesAbandoned }) { usleep(2_000) }
-                    withState { state in
-                        state.heldGates[heldGate] = nil
-                        state.heldGateReleased.remove(heldGate)
-                    }
+                let upperCommand = recordedCommand.uppercased()
+                if let heldGate = claimHeldGate(where: { upperCommand.contains($0) }) {
+                    waitAtHeldGate(heldGate)
                 }
                 let watchedSeconds: Double? = withState { state in
                     let upper = recordedCommand.uppercased()
@@ -2327,6 +2540,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 // field's doc comment for why (it gets cleared early by
                 // LOGOUT/kill, so it can't answer "did this fd EVER log in").
                 _ = state.everLoggedInFds.insert(fd)
+                state.lastLoggedInFd = fd
                 return nil
             }
             if let limitRefusal { return "\(tag) NO \(limitRefusal)\r\n" }
@@ -2690,6 +2904,7 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// Every command each connection sent, in order, by connection (its fd).
     var commandLogByConnection: [Int32: [String]] { withState { $0.commandLogByConnection } }
     var condStoreSelectCount: Int { withState { $0.condStoreSelectCount } }
+    var changedSinceFetchCount: Int { withState { $0.changedSinceFetchCount } }
 
     /// The oracle reads: ENABLE QRESYNC per connection, QRESYNC SELECTs per
     /// connection, and QRESYNC SELECTs refused for want of ENABLE.
@@ -2998,12 +3213,15 @@ final class FakeIMAPServer: @unchecked Sendable {
                     .map { Set(Self.resolveUIDSet(tokens[$0 + 1], againstMailboxUIDs: snapshotUIDs)) }
                 : []
             let omitted: Set<Int> = messageIDQuery == nil ? withState { $0.searchOmittedUIDsByMailbox[mailbox] ?? [] } : []
+            // The date keys are read once per SEARCH and checked last among the
+            // keys, on the messages the UID keys leave; none, no date check.
+            let dateCriteria = honorsDates ? SearchDateCriteria(args: subargs) : nil
             let uids = all
                 .filter { message in
                     messageIDQuery.map { message.messageID.trimmingCharacters(in: bracketSet).contains($0) } ?? true
                 }
-                .filter { !honorsDates || Self.matchesSearchDateCriteria($0, args: subargs) }
                 .filter { message in uidSets.allSatisfy { $0.contains(message.uid) } }
+                .filter { message in dateCriteria?.matches(message) ?? true }
                 .filter { !omitted.contains($0.uid) }
                 .map { String($0.uid) }
             return Self.uidSearchReply(tag: tag, uids: uids, esearch: esearch, request: subargs)
@@ -3450,7 +3668,19 @@ final class FakeIMAPServer: @unchecked Sendable {
     private func handleFetch(tag: String, args rawArgs: String, uidMode: Bool, mailbox: String, condStoreEnabled: inout Bool) -> String {
         let seqStr: String
         let itemsStr: String
-        let args = rawArgs
+        // A trailing `(CHANGEDSINCE n)` modifier (RFC 7162 §3.1.4.1): only
+        // messages whose modseq is above n, and it switches CONDSTORE on.
+        var args = rawArgs
+        var changedSince: Int?
+        if let range = rawArgs.range(of: #"\s*\(CHANGEDSINCE (\d+)\)\s*$"#, options: [.regularExpression, .caseInsensitive]) {
+            let digits = rawArgs[range].filter(\.isNumber)
+            guard capabilities.contains("CONDSTORE"), let value = Int(digits) else {
+                return "\(tag) BAD CHANGEDSINCE not supported\r\n"
+            }
+            changedSince = value
+            args = String(rawArgs[..<range.lowerBound])
+            condStoreEnabled = true
+        }
         let reportsModSeq = condStoreEnabled && modelsModSeqs
 
         if let parenOpen = args.firstIndex(of: "("),
@@ -3466,7 +3696,8 @@ final class FakeIMAPServer: @unchecked Sendable {
 
         let modSeqs: [Int: Int] = reportsModSeq
             ? withState { state -> [Int: Int] in
-                Self.observeQResync(mailbox, state: &state).modSeqByUID
+                if changedSince != nil { state.changedSinceFetchCount += 1 }
+                return Self.observeQResync(mailbox, state: &state).modSeqByUID
             }
             : [:]
         let snapshot = withState { state in
@@ -3476,18 +3707,41 @@ final class FakeIMAPServer: @unchecked Sendable {
                 uidSuppressed: state.fetchUidSuppressedByMailbox[mailbox] ?? [],
                 internalDateSuppressed: state.fetchInternalDateSuppressedByMailbox[mailbox] ?? [],
                 recordSuppressed: state.fetchRecordSuppressedByMailbox[mailbox] ?? [],
-                conflicting: state.conflictingFetchRecordByMailbox[mailbox]
+                conflicting: state.conflictingFetchRecordByMailbox[mailbox],
+                unsolicited: state.unsolicitedFetchByMailbox.removeValue(forKey: mailbox) ?? [:],
+                envelopeInReplyTo: state.envelopeCarriesInReplyTo
             )
         }
         passHeldGate(Self.snapshotGateKey(mailbox))
         let matched = parseSequenceSet(seqStr, uidMode: uidMode, messages: snapshot.messages)
+        if itemsStr.contains("FLAGS"), !itemsStr.contains("ENVELOPE") {
+            // The release count this FETCH waits past, when it is held.
+            let heldUntil = withState { state -> Int? in
+                state.listingFetchSizesByMailbox[mailbox, default: []].append(matched.count)
+                guard let over = state.listingHoldByMailbox[mailbox], matched.count > over else { return nil }
+                state.holdsStarted += 1
+                return (state.listingReleasesByMailbox[mailbox] ?? 0) + 1
+            }
+            // This connection's own thread: holding it delays no other connection.
+            if let heldUntil {
+                while !withState({ ($0.listingReleasesByMailbox[mailbox] ?? 0) >= heldUntil || $0.heldGatesAbandoned }) {
+                    usleep(2_000)
+                }
+                withState { $0.holdsFinished += 1 }
+            }
+        }
         var response = ""
+        for (uid, flags) in snapshot.unsolicited.sorted(by: { $0.key < $1.key }) {
+            guard let index = snapshot.messages.firstIndex(where: { $0.uid == uid }) else { continue }
+            response += "* \(index + 1) FETCH (UID \(uid) FLAGS (\(flags.joined(separator: " "))))\r\n"
+        }
 
         for msg in matched {
             // `suppressFetchRecord(in:uids:)` — the SHORT FETCH. The message stays
             // in the mailbox (so SELECT still counts it in EXISTS) but no record
             // for it reaches the client.
             if snapshot.recordSuppressed.contains(msg.uid) { continue }
+            if let changedSince, (modSeqs[msg.uid] ?? 0) <= changedSince { continue }
             let seqnum = (snapshot.messages.firstIndex(where: { $0.uid == msg.uid }) ?? 0) + 1
             var fetchItems: [String] = []
 
@@ -3509,7 +3763,7 @@ final class FakeIMAPServer: @unchecked Sendable {
                 fetchItems.append("MODSEQ (\(modSeq))")
             }
             if itemsStr.contains("ENVELOPE") {
-                fetchItems.append("ENVELOPE \(buildEnvelope(msg))")
+                fetchItems.append("ENVELOPE \(buildEnvelope(msg, inReplyTo: snapshot.envelopeInReplyTo))")
             }
             // `suppressFetchInternalDate(in:uids:)` — the record still arrives, and
             // every other item is unchanged; only the server's delivery timestamp
@@ -3602,14 +3856,32 @@ final class FakeIMAPServer: @unchecked Sendable {
 
     // MARK: - Response Builders
 
-    private func buildEnvelope(_ msg: Message) -> String {
+    private func buildEnvelope(_ msg: Message, inReplyTo: Bool) -> String {
         if let envelope = msg.customEnvelope { return envelope }
         let date = quote(msg.date)
         let subject = quote(msg.subject)
         let fromAddr = buildAddrList(msg.from)
         let toAddr = buildAddrList(msg.to)
         let msgID = quote(msg.messageID)
-        return "(\(date) \(subject) \(fromAddr) \(fromAddr) \(fromAddr) \(toAddr) NIL NIL NIL \(msgID))"
+        let inReplyToField = inReplyTo
+            ? (Self.unfoldedHeaderValue("In-Reply-To", in: msg.headerData).map(quote) ?? "NIL")
+            : "NIL"
+        return "(\(date) \(subject) \(fromAddr) \(fromAddr) \(fromAddr) \(toAddr) NIL NIL \(inReplyToField) \(msgID))"
+    }
+
+    /// The unfolded value (RFC 5322 §2.2.3) of the first `name` field in a CRLF
+    /// header block, or nil when it is absent or empty.
+    static func unfoldedHeaderValue(_ name: String, in headerData: Data) -> String? {
+        let unfolded = String(decoding: headerData, as: UTF8.self)
+            .replacingOccurrences(of: "\r\n ", with: " ")
+            .replacingOccurrences(of: "\r\n\t", with: " ")
+        for line in unfolded.components(separatedBy: "\r\n") {
+            guard let colon = line.firstIndex(of: ":"),
+                  line[..<colon].caseInsensitiveCompare(name) == .orderedSame else { continue }
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            return value.isEmpty ? nil : value
+        }
+        return nil
     }
 
     private func buildAddrList(_ header: String) -> String {

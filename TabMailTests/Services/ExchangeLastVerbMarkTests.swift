@@ -187,7 +187,10 @@ struct ExchangeLastVerbMarkTests {
             accountId: fixture.accountId,
             draft: DraftMessage(
                 to: ["sender@example.com"], subject: isForward ? "Fwd: Original" : "Re: Original",
-                body: "text", inReplyTo: "<original@example.com>"),
+                body: "text",
+                // A forward names its original only as its last References id (#1483).
+                inReplyTo: isForward ? nil : "<original@example.com>",
+                references: isForward ? ["original@example.com"] : []),
             originalMessageHeaderId: originalId,
             isForward: isForward)
         value.isReplyAll = isReplyAll

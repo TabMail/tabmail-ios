@@ -115,52 +115,6 @@ struct SyncEngineMaintenanceTests {
         #expect(expiredCount == 0)
     }
 
-    @Test("AI cache rescue: entry with inbox message gets updatedAt refreshed")
-    func aiCacheRescueInboxMessage() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-
-        let rfc822 = "<msg1@example.com>"
-        _ = try TestDatabase.insertMessageHeader(
-            db, messageId: "1", isInInbox: true, rfc822MessageId: rfc822
-        )
-
-        let expiredDate = Calendar.current.date(byAdding: .day, value: -(SyncConfig.aiCacheOrphanGraceDays + 1), to: Date())!
-        try db.write { dbConn in
-            var cache = MessageAICache(key: "acc1:INBOX:\(rfc822)", rfc822MessageId: rfc822)
-            cache.summaryBlurb = "Summary"
-            cache.updatedAt = expiredDate
-            try cache.insert(dbConn)
-        }
-
-        // Simulate the rescue logic from runPurgeOrphanedAICache
-        let now = Date()
-        try db.write { dbConn in
-            let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheOrphanGraceDays, to: Date())!
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = now
-                        try entry.update(dbConn)
-                    }
-                }
-            }
-        }
-
-        // Verify the entry was rescued (updatedAt refreshed)
-        let cache = try db.read { dbConn in
-            try MessageAICache.fetchOne(dbConn, key: "acc1:INBOX:\(rfc822)")
-        }
-        #expect(cache != nil)
-        #expect(cache!.updatedAt >= now.addingTimeInterval(-1))
-    }
-
     // MARK: - Prune Ordering
 
     @Test("Messages ordered by date ASC for pruning (oldest first)")
@@ -237,10 +191,11 @@ struct SyncEngineMaintenanceTests {
     /// The maintenance sweeps reclaim bodies EXPLICITLY as of Stage D
     /// (`v70_dropMessageBodyHeaderFK`): `pruneOldMessages` routes its header ids
     /// through `MessageContentStore.releaseUnowned(…, stores: [.searchIndex,
-    /// .body])`, and `runEvictStaleBodies` is the TTL/orphan backstop. Neither
-    /// depends on a cascade any more, and the cascade had to go — it deletes
-    /// content below the application layer, where the ownership gate cannot
-    /// veto it once N headers can share one content key.
+    /// .body])`. Since #1433 `runEvictStaleBodies` reads only bodies whose header
+    /// exists, so a body this leaves behind stays (#1446). Nothing depends on a
+    /// cascade any more, and the cascade had to go — it deletes content below the
+    /// application layer, where the ownership gate cannot veto it once N headers
+    /// can share one content key.
     @Test("Deleting MessageHeader no longer cascades to MessageBody")
     func headerDeletionLeavesBodyToTheSweeps() throws {
         let db = try TestDatabase.make()
@@ -257,6 +212,304 @@ struct SyncEngineMaintenanceTests {
             try MessageBody.fetchOne(dbConn, key: header.id)
         }
         #expect(body != nil, "the schema must not delete cached content as a side effect")
+    }
+
+    // MARK: - Stale-body evict page (#1354, #1433)
+
+    /// The evict step's page must seek its own index and come out in that index's
+    /// order, for the first page and for every page after the cursor: a `SCAN`
+    /// reads every header, and a `TEMP B-TREE` sorts the whole candidate set once
+    /// per page. The index is built through the production DDL
+    /// (`createDeferredIndexes`), never re-typed here.
+    @Test("The stale-body page seeks its index in index order, first page and after the cursor")
+    func staleBodyPageSeeksItsIndex() throws {
+        let db = try TestDatabase.make()
+        try db.write { try SyncEngine.createDeferredIndexes($0) }
+        let cutoff = Date()
+        let cursorCachedAt = cutoff.addingTimeInterval(-86_400)
+        for afterCursor in [false, true] {
+            let sql = "EXPLAIN QUERY PLAN " + HTMLCachePair.evictCandidatesPageSQL(afterCursor: afterCursor)
+            let arguments: StatementArguments
+            if afterCursor {
+                arguments = [cutoff, cursorCachedAt, 1, SyncConfig.pruneChunkSize]
+            } else {
+                arguments = [cutoff, SyncConfig.pruneChunkSize]
+            }
+            let plan: String = try db.read { dbConn in
+                try Row.fetchAll(dbConn, sql: sql, arguments: arguments)
+                    .map { $0["detail"] as String }
+                    .joined(separator: " | ")
+            }
+            #expect(plan.contains("USING INDEX \(HTMLCachePair.indexName) (isInInbox=?"),
+                    "afterCursor \(afterCursor): the page does not seek its index: \(plan)")
+            #expect(!plan.contains("SCAN"), "afterCursor \(afterCursor): the page reads the whole table: \(plan)")
+            #expect(!plan.contains("TEMP B-TREE"), "afterCursor \(afterCursor): the page sorts: \(plan)")
+        }
+    }
+
+    /// The maintenance pass runs the evict step only once its deferred index
+    /// exists: without it every page would scan and sort the table inside its
+    /// write. The first pass after an upgrade skips the step and builds the index
+    /// (inside `runRefreshPlannerStatisticsIfStale`'s write, later in the same
+    /// pass); the next pass evicts by the unchanged rules.
+    /// `.processGlobalState`: the build gives up while
+    /// `DatabaseSuspension.isSuspended`, which `DatabaseSuspensionTests` holds, and
+    /// the refresh carries a process-wide single-flight latch.
+    @Test("The evict step waits for its index, then evicts", .processGlobalState)
+    func evictStepWaitsForItsIndex() async throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
+        let markerKey = "analyzeMarker-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removeObject(forKey: markerKey) }
+
+        let ranWithoutIndex = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let beforeIndex = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
+        #expect(!ranWithoutIndex, "the step ran with no index to seek")
+        #expect(beforeIndex == Set(archived), "a body was evicted before the index existed")
+
+        let build = await SyncEngine.runRefreshPlannerStatisticsIfStale(dbPool: dbPool, markerKey: markerKey)
+        #expect(build == .refreshed)
+        let ranWithIndex = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let afterIndex = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
+        #expect(ranWithIndex, "the step did not run once its index existed")
+        #expect(afterIndex == Set(archived.prefix(recent)),
+                "the archive body past the newest \(recent) is evicted, and only it")
+    }
+
+    /// A refresh that builds a deferred index wrote many pages in one transaction (the
+    /// HTML-cache pair's fill rewrites a header per cached body), and autocheckpoint is
+    /// off: it checkpoints the WAL once, after the write. A refresh that builds nothing
+    /// writes only the statistics and adds none; neither does one that finds the
+    /// statistics fresh.
+    /// `.processGlobalState`: the refresh carries a process-wide single-flight latch and
+    /// gives up while `DatabaseSuspension.isSuspended`.
+    @Test("A refresh that builds a deferred index checkpoints the WAL after it; one that builds nothing does not",
+          .processGlobalState)
+    func refreshCheckpointsTheWALAfterABuild() async throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        _ = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: SyncConfig.bodyCacheRecentPerFolder + 1)
+        let markerKey = "analyzeMarker-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removeObject(forKey: markerKey) }
+        let checkpoints = CheckpointCount()
+        let count: @Sendable (PrioritizedDatabase) async -> Void = { _ in await checkpoints.record() }
+
+        let build = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterBuild = await checkpoints.calls
+        // Every index present and the marker stale: the ANALYZE alone.
+        UserDefaults.standard.removeObject(forKey: markerKey)
+        let analyzeOnly = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterAnalyzeOnly = await checkpoints.calls
+        let fresh = await SyncEngine.runRefreshPlannerStatisticsIfStale(
+            dbPool: dbPool, markerKey: markerKey, checkpointWAL: count)
+        let afterFresh = await checkpoints.calls
+
+        #expect(build == .refreshed)
+        #expect(afterBuild == 1, "one checkpoint after the write that built the deferred indexes")
+        #expect(analyzeOnly == .refreshed)
+        #expect(afterAnalyzeOnly == 1, "a refresh that built nothing checkpointed")
+        #expect(fresh == .alreadyFresh)
+        #expect(afterFresh == 1, "a refresh that found the statistics fresh checkpointed")
+    }
+
+    /// The gate waits for the evict step's own index and no other: with that index
+    /// built and every other deferred index still missing, the step runs.
+    /// `.processGlobalState`: the gate runs production's checkpoint between pages,
+    /// which writes the app's database.
+    @Test("The evict step runs once its own index exists, whatever the other deferred indexes", .processGlobalState)
+    func evictStepNeedsOnlyItsOwnIndex() async throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(buildsDeferredIndexes: false)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
+        let ownIndex = SyncEngine.deferredIndexes.filter { $0.name == HTMLCachePair.indexName }
+        let otherNames = SyncEngine.deferredIndexes.map(\.name).filter { $0 != HTMLCachePair.indexName }
+        #expect(ownIndex.count == 1, "the evict step's index is a deferred index")
+        #expect(!otherNames.isEmpty, "setup: another deferred index exists to leave missing")
+        // The production DDL of the step's index alone, with its fill.
+        try await fixture.pool.write { db in try SyncEngine.createDeferredIndexes(db, ownIndex) }
+        let present = try await fixture.pool.read { db in
+            try Set(String.fetchAll(db, sql: "SELECT name FROM sqlite_master WHERE type = 'index'"))
+        }
+        let othersPresent = otherNames.filter { present.contains($0) }
+        #expect(present.contains(HTMLCachePair.indexName), "setup: the step's index exists")
+        #expect(othersPresent.isEmpty, "setup: every other deferred index is missing: \(othersPresent)")
+
+        let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let after = try StaleBodyEvictWriterHoldTests.bodyIds(fixture)
+        #expect(ran, "the step waited for an index other than its own")
+        #expect(after == Set(archived.prefix(recent)),
+                "the archive body past the newest \(recent) is evicted, and only it")
+    }
+
+    /// A schema that cannot be read is unknown, not present: the gate does not run
+    /// the step, which without its index would scan the table inside its writes.
+    /// No reader can open, so reading the catalog fails, while the writer works:
+    /// a step the gate let through would evict.
+    /// `.processGlobalState`: a gate that let the step through would run
+    /// production's checkpoint between pages, which writes the app's database.
+    @Test("The evict step does not run when its index cannot be checked", .processGlobalState)
+    func evictStepWaitsWhenItsIndexCannotBeChecked() async throws {
+        let fixture = try StaleBodyEvictWriterHoldTests.makeFixture(readersFail: true)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: fixture.pool, directory: fixture.directory) }
+        let dbPool = PrioritizedDatabase(pool: fixture.pool, priority: .background)
+        let recent = SyncConfig.bodyCacheRecentPerFolder
+        let archived = try StaleBodyEvictWriterHoldTests.seedArchiveBodies(fixture, count: recent + 1)
+        // Read on the writer: no reader opens.
+        func bodyIds() throws -> Set<String> {
+            try fixture.pool.write { db in try Set(String.fetchAll(db, sql: "SELECT id FROM messageBody")) }
+        }
+        let catalogRead = Result {
+            try fixture.pool.read { db in try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM sqlite_master") ?? 0 }
+        }
+        var catalogReadFailed = false
+        if case .failure = catalogRead { catalogReadFailed = true }
+        #expect(catalogReadFailed, "setup: the catalog cannot be read")
+
+        let ran = await SyncEngine.runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: [])
+        let afterGate = try bodyIds()
+        #expect(!ran, "the step ran though its index could not be checked")
+        #expect(afterGate == Set(archived), "a body was evicted though the index could not be checked")
+
+        // Positive control: the writer works, so the step itself evicts here.
+        await SyncEngine.runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: [], afterEachPage: StaleBodyEvictWriterHoldTests.noCheckpoint)
+        let afterStep = try bodyIds()
+        #expect(afterStep == Set(archived.prefix(recent)),
+                "setup: the step evicts on this database, so the gate is what held it back")
+    }
+
+    /// Production reaches the evict step only through its index gate: a call of
+    /// `runEvictStaleBodies` anywhere but inside `runEvictStaleBodiesIfIndexed`
+    /// would run its page with no index on a device that has not built it yet.
+    /// Call sites are discovered by walking the production tree, never listed.
+    @Test("Production runs the evict step only through its index gate")
+    func evictStepIsReachedOnlyThroughItsGate() throws {
+        var gatedCalls: [String] = []
+        var directCalls: [String] = []
+        for line in Self.productionCodeLines() where !line.code.contains("func runEvictStaleBodies") {
+            if line.code.contains("runEvictStaleBodiesIfIndexed(") {
+                gatedCalls.append(line.file)
+            } else if line.code.contains("runEvictStaleBodies(") {
+                directCalls.append(line.file)
+            }
+        }
+        #expect(gatedCalls == ["SyncEngine.swift"],
+                "the maintenance pass must call the gated step, once: \(gatedCalls)")
+        #expect(directCalls == ["SyncEngineMaintenance.swift"],
+                "the only direct call is the gate's own: \(directCalls)")
+    }
+
+    /// Production's checkpoint between the evict's pages (#1354) is the throttled
+    /// `PASSIVE` one, `checkpointWALThrottled()` with no `truncate`, the step's
+    /// default, and no production caller passes another. One that
+    /// did nothing would let a long run grow the WAL by all of its pages again; a
+    /// `TRUNCATE`, or a checkpoint past the throttle, can wait on readers while it
+    /// holds the writer. The tests that call the step pass their own, and the
+    /// default writes the app's database, so only the source shows which one
+    /// production runs. Every production line that names `afterEachPage` is
+    /// discovered by walking the production tree.
+    @Test("Production's evict step checkpoints between pages with the throttled PASSIVE checkpoint, its default, and no caller passes another")
+    func evictStepCheckpointsWithTheThrottledCheckpoint() {
+        let uses = Self.productionCodeLines()
+            .filter { $0.code.contains("afterEachPage") }
+            .map { "\($0.file): \($0.code)" }
+        let expected = [
+            "SyncEngineMaintenance.swift: afterEachPage: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }",
+            "SyncEngineMaintenance.swift: await afterEachPage()",
+        ]
+        #expect(uses == expected,
+                "the step's parameter with its default and its one call, and no caller passing another: \(uses)")
+    }
+
+    /// Production's checkpoint after a deferred index build is the throttled TRUNCATE on
+    /// the pool the step wrote to, `checkpointWALThrottled(truncate: true, pool:)`, the
+    /// refresh's default, and no production caller passes another. One that did nothing
+    /// would leave the build's whole WAL for later; one on `backgroundPool` would
+    /// checkpoint another database than the one a pass on its own pool wrote; a PASSIVE
+    /// one would make the pass's closing TRUNCATE skip inside the throttle's interval
+    /// and leave the WAL file at its largest ("THE WAL AFTER A BUILD"). The AI-cache
+    /// purge's `checkpointWAL` (a PASSIVE between batches, never after its last) is
+    /// listed too, as every production line naming the parameter is. The tests that run
+    /// the refresh pass their own, so only the source shows which one production runs.
+    @Test("Production's deferred index step checkpoints after a build with the throttled TRUNCATE on its own pool, its default, and no caller passes another")
+    func deferredBuildCheckpointsWithTheThrottledTruncate() {
+        let uses = Self.productionCodeLines()
+            .filter { $0.code.contains("checkpointWAL:") || $0.code.contains("checkpointWAL(") }
+            .map { "\($0.file): \($0.code)" }
+        let expected = [
+            "SyncEngineMaintenance.swift: checkpointWAL: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }",
+            "SyncEngineMaintenance.swift: await checkpointWAL()",
+            "SyncEngineMaintenance.swift: checkpointWAL: @Sendable (PrioritizedDatabase) async -> Void = { await SyncEngine.checkpointWALThrottled(truncate: true, pool: $0) }",
+            "SyncEngineMaintenance.swift: if !missing.isEmpty { await checkpointWAL(dbPool) }",
+        ]
+        #expect(uses == expected,
+                "each step's parameter with its default and its one call, and no caller passing another: \(uses)")
+    }
+
+    /// The storage prune's checkpoint after each batch (#1437): its default is the
+    /// throttled `PASSIVE` checkpoint, as the evict step's is, and both its passes
+    /// call it. The tests that run the prune pass their own, so only the source
+    /// shows which one production runs.
+    @Test("Production's storage prune checkpoints after each batch with the throttled PASSIVE checkpoint, its default, and no caller passes another")
+    func storagePruneCheckpointsWithTheThrottledCheckpoint() {
+        let uses = Self.productionCodeLines()
+            .filter { $0.code.contains("afterEachBatch") }
+            .map { "\($0.file): \($0.code)" }
+            .sorted()
+        let expected = [
+            "SyncEngineMaintenance.swift: afterEachBatch: () async -> Void",
+            "SyncEngineMaintenance.swift: afterEachBatch: @Sendable () async -> Void = { await SyncEngine.checkpointWALThrottled() }",
+            "SyncEngineMaintenance.swift: afterEachBatch: afterEachBatch)",
+            "SyncEngineMaintenance.swift: await afterEachBatch()",
+            "SyncEngineMaintenance.swift: await afterEachBatch()",
+        ].sorted()
+        #expect(uses == expected,
+                "the prune's parameter with its default, the body pass's, its two calls, and no caller passing another: \(uses)")
+    }
+
+    /// The storage prune and the older-mail walk walk the storage folder only
+    /// through `StorageEstimator.SpaceSource.app`, once per run, never in a write
+    /// (#1437); until #1437 both called the walk before every folder, page or row.
+    @Test("Neither the storage prune nor the older-mail walk walks the storage folder itself")
+    func thePruneAndTheWalkMeasureOnlyThroughTheSpaceSource() {
+        let files: Set = ["SyncEngineMaintenance.swift", "SyncEngineBackfillWalk.swift"]
+        let lines = Self.productionCodeLines().filter { files.contains($0.file) }
+        let read = Set(lines.map { $0.file })
+        #expect(read == files, "setup: the files read: \(read)")
+        let walks = lines
+            .filter { $0.code.contains("totalSizeMB(") || $0.code.contains("allocatedSizeMB(") || $0.code.contains("isOverBudget(") }
+            .map { "\($0.file): \($0.code)" }
+        #expect(walks.isEmpty, "a walk of the storage folder outside SpaceSource.app: \(walks)")
+    }
+
+    /// Every line of production code under `TabMail/`, trimmed, with its file's
+    /// name. Comment lines are left out.
+    static func productionCodeLines() -> [(file: String, code: String)] {
+        // …/tabmail-ios/TabMailTests/Services/<this file>
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let productionRoot = projectRoot.appendingPathComponent("TabMail")
+        var lines: [(file: String, code: String)] = []
+        let walker = FileManager.default.enumerator(at: productionRoot, includingPropertiesForKeys: nil)
+        while let entry = walker?.nextObject() as? URL {
+            guard entry.pathExtension == "swift",
+                  let source = try? String(contentsOf: entry, encoding: .utf8) else { continue }
+            for line in source.components(separatedBy: "\n") {
+                let code = line.trimmingCharacters(in: .whitespaces)
+                guard !code.hasPrefix("//") else { continue }
+                lines.append((entry.lastPathComponent, code))
+            }
+        }
+        return lines
     }
 
     // MARK: - Chunk-based processing
@@ -294,4 +547,10 @@ struct SyncEngineMaintenanceTests {
         #expect(firstChunk[0].messageId == "1")
         #expect(secondChunk[0].messageId == "4")
     }
+}
+
+/// Counts the WAL checkpoints a refresh asks for (`refreshCheckpointsTheWALAfterABuild`).
+private actor CheckpointCount {
+    private(set) var calls = 0
+    func record() { calls += 1 }
 }

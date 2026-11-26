@@ -1806,10 +1806,18 @@ final class InboxViewModel {
             // Each account connects (if it has no provider yet) and syncs in its own
             // task, so an account that cannot connect or sync never stops the others
             // (#689). The run's outcome is the one error that reaches this catch.
-            try await manager.syncFolders(folders, connecting: uniqueAccounts)
+            // Sync trigger: the pull's change read gives an account another pass
+            // holds a follow-up flag, never a wait; the folders on screen still
+            // wait for their turn, ahead of the catch-up slices already waiting
+            // (#1360). Siblings: IDLE, silent push, the open-app push,
+            // the poll, a return (the sync design block in
+            // SyncEngineOneSyncAtATime.swift; ADR-IOS-104).
+            // An account whose change read found it busy was not read by this pull,
+            // so the run is partial (its follow-up reports for it).
+            let busy = try await manager.syncFolders(folders, connecting: uniqueAccounts)
 
             AccountManagerState.shared.lastSyncFailed = false
-            AccountManagerState.shared.finishSyncRun(coverage: coverage, countedFailure: false, completed: true)
+            AccountManagerState.shared.finishSyncRun(coverage: busy ? .partial : coverage, countedFailure: false, completed: true)
         } catch is CancellationError {
             // Task cancelled (e.g., user navigated away) — not user-facing
         } catch let error where SyncEngine.isTransientError(error) {
@@ -2055,28 +2063,113 @@ final class InboxViewModel {
                 (requestedId: requestedId, message: overlayAdjustedForAction($0))
             }
         }
-        let actionable = resolved.filter {
-            lookupFolderRole($0.message.folderId) != .drafts
-        }
-        let messages = actionable.map(\.message)
-        // Nothing resolved — every id reported skipped so the caller un-hides.
-        guard !messages.isEmpty else { return messageIds }
-        let groups: [ThreadMoveGroup] = UndoableAction.byAccount(messages).compactMap { members in
-            guard let first = members.first else { return nil }
-            // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
-            // move. Role check first — see archiveIsNoOp. Reached only if the
-            // caller's own `actionableArchiveIds` filter raced a concurrent move;
-            // nothing is recorded, so the account's ids are reported skipped (un-hide).
-            guard lookupFolderRole(first.folderId) != .archive else { return nil }
-            guard let archivePath = lookupFolderPath(accountId: first.accountId, role: .archive) else {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Queue] ERROR: no archive folder for account \(first.accountId)") }
+        // Archive-from-Archive is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — see archiveIsNoOp. Reached only if the
+        // caller's own `actionableArchiveIds` filter raced a concurrent move.
+        let moves = roleFolderMoves(resolved, role: .archive, leaving: [.drafts, .archive])
+        recordThreadRoleMoves(moves, marksRead: marksRead)
+        // Members that never resolved or were left out were never acted
+        // upon — report them skipped so the caller un-hides exactly those rows.
+        let recorded = Set(moves.map(\.requestedId))
+        return messageIds.filter { !recorded.contains($0) }
+    }
+
+    /// Each member's move into ITS OWN account's `role` folder. A thread can
+    /// span accounts (the unified inbox groups one conversation that reached
+    /// several of the user's accounts), and a role folder resolved from one
+    /// member's account names nothing in another's: that member's row would
+    /// point at a folder its account does not have, and its provider would be
+    /// asked to move it there. A member in one of the `excludedRoles`, already
+    /// at its destination, or whose account has no `role` folder is left out,
+    /// so the caller reports it skipped. Order-preserving.
+    private func roleFolderMoves(
+        _ resolved: [(requestedId: String, message: MessageHeader)],
+        role: FolderRole,
+        leaving excludedRoles: Set<FolderRole>
+    ) -> [(requestedId: String, message: MessageHeader, destinationPath: String)] {
+        var pathByAccount: [String: String?] = [:]
+        return resolved.compactMap { item in
+            let message = item.message
+            if let sourceRole = lookupFolderRole(message.folderId), excludedRoles.contains(sourceRole) {
                 return nil
             }
-            guard first.folderPath != archivePath else { return nil }
-            return ThreadMoveGroup(messages: members, path: archivePath)
+            let destinationPath: String?
+            if let known = pathByAccount[message.accountId] {
+                destinationPath = known
+            } else {
+                destinationPath = lookupFolderPath(accountId: message.accountId, role: role)
+                pathByAccount[message.accountId] = destinationPath
+            }
+            guard let destinationPath else {
+                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Queue] ERROR: no \(role.rawValue) folder for account \(message.accountId)") }
+                return nil
+            }
+            guard message.folderPath != destinationPath else { return nil }
+            return (requestedId: item.requestedId, message: message, destinationPath: destinationPath)
         }
-        recordThreadMove(groups, roleMove: true, marksRead: marksRead)
-        return skippedIds(messageIds, actionable: actionable, recorded: groups)
+    }
+
+    /// Records a whole-thread archive or delete whose members may go to
+    /// different folders (`roleFolderMoves`): each member shows in its own
+    /// destination at once, ONE undo entry returns every member to its own
+    /// account and folder, and each account's destination gets its own read
+    /// and move. `marksRead` is the mark-as-read setting the caller snapshotted when
+    /// its action started; the overlay and every destination's queued read use it.
+    private func recordThreadRoleMoves(
+        _ moves: [(requestedId: String, message: MessageHeader, destinationPath: String)],
+        marksRead: Bool
+    ) {
+        guard !moves.isEmpty else { return }
+        let compositeIds = moves.map(\.message.id)
+        // Capture undo snapshots BEFORE the retain/registerMutation loop
+        // below — see overlayAdjustedForUndo's doc comment.
+        let undoMoves = moves.map {
+            (message: overlayAdjustedForUndo($0.message), destinationPath: $0.destinationPath)
+        }
+        // A role folder is never the inbox, so each member's own `isInInbox`
+        // determines "leaving the inbox" (F6) — a thread can mix members
+        // already outside the inbox with ones still in it.
+        // `isRead` rides the same coalesced entry — see `archive(_:)`.
+        for move in moves {
+            manager.retainOverlayEntry(id: move.message.id)
+            manager.registerMutation(id: move.message.id, mutation: .init(
+                isRead: marksRead ? true : nil,
+                folderId: MessageIdentity.folderId(
+                    accountId: move.message.accountId, folderPath: move.destinationPath),
+                folderPath: move.destinationPath,
+                isInInbox: false,
+                actionTag: move.message.isInInbox ? .some(nil) : nil))
+        }
+        if let undo = UndoableAction(moves: undoMoves, timestamp: Date()) {
+            UndoService.shared.push(undo)
+        }
+        // One read and one move per account and destination, never one call
+        // for several accounts: `markRead` and `move` each write every account
+        // they are given in ONE transaction, so a write one account refuses
+        // would roll back another account's work. Two accounts can name their
+        // role folders alike ("Archive").
+        var groups: [(accountId: String, destinationPath: String, messages: [MessageHeader])] = []
+        for move in moves {
+            if let index = groups.firstIndex(where: {
+                $0.accountId == move.message.accountId && $0.destinationPath == move.destinationPath
+            }) {
+                groups[index].messages.append(move.message)
+            } else {
+                groups.append((
+                    accountId: move.message.accountId,
+                    destinationPath: move.destinationPath,
+                    messages: [move.message]))
+            }
+        }
+        manager.enqueueWriteFromSynchronousContext { [manager, groups] in
+            for group in groups {
+                // Read intent BEFORE the move — see `archive(_:)`. Only the
+                // members that are actually unread at execution time get it.
+                await manager.markReadBeforeRoleMove(ids: group.messages.map(\.id), enabled: marksRead)
+                await manager.move(group.messages, to: group.destinationPath)
+            }
+            for id in compositeIds { manager.releaseOverlayEntry(id: id) }
+        }
     }
 
     /// Returns false when nothing was recorded (lookup miss, no trash folder for
@@ -2214,23 +2307,16 @@ final class InboxViewModel {
             }
             return messageIds.filter { !settled.contains($0) }
         }
-        let groups: [ThreadMoveGroup] = UndoableAction.byAccount(messages).compactMap { members in
-            guard let first = members.first else { return nil }
-            AccountManager.logDeleteTrace(accountId: first.accountId, messages: members, callSite: "InboxViewModel.deleteThread")
-            // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
-            // move. Role check first — see deleteIsNoOp. Reached only if the
-            // caller's own `actionableDeleteIds` filter raced a concurrent move;
-            // nothing is recorded, so the account's ids are reported skipped (un-hide).
-            guard lookupFolderRole(first.folderId) != .trash else { return nil }
-            guard let trashPath = lookupFolderPath(accountId: first.accountId, role: .trash) else {
-                if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[Queue] ERROR: no trash folder for account \(first.accountId)") }
-                return nil
-            }
-            guard first.folderPath != trashPath else { return nil }
-            return ThreadMoveGroup(messages: members, path: trashPath)
-        }
-        recordThreadMove(groups, roleMove: true, marksRead: marksRead)
-        return skippedIds(messageIds, actionable: resolved, recorded: groups)
+        AccountManager.logDeleteTrace(accountId: first.accountId, messages: messages, callSite: "InboxViewModel.deleteThread")
+        // Delete-from-Trash is a no-op: no undo entry, no overlay, no queued
+        // move. Role check first — see deleteIsNoOp. Reached only if the
+        // caller's own `actionableDeleteIds` filter raced a concurrent move.
+        let moves = roleFolderMoves(resolved, role: .trash, leaving: [.trash])
+        recordThreadRoleMoves(moves, marksRead: marksRead)
+        // Members that never resolved or were left out were never acted
+        // upon — report them skipped so the caller un-hides exactly those rows.
+        let recorded = Set(moves.map(\.requestedId))
+        return messageIds.filter { !recorded.contains($0) }
     }
 
     /// Delete a draft message from the Drafts folder using the draft-specific deletion path.
@@ -2811,9 +2897,18 @@ final class InboxViewModel {
         return true
     }
 
-    /// Move every member of a thread to `toFolderPath` as one grouped action.
-    /// Pushes a single UndoableAction carrying all members so the whole thread
-    /// restores in one undo — mirrors archiveThread/deleteThread.
+    /// Move every member of a thread to `toFolderPath` of `accountId` as one
+    /// grouped action. Pushes a single UndoableAction carrying all members so
+    /// the whole thread restores in one undo — mirrors archiveThread/deleteThread.
+    ///
+    /// The folder belongs to ONE account and a message cannot move between
+    /// accounts, so only `accountId`'s members move. A thread can span
+    /// accounts (see `roleFolderMoves`); a member of another account is
+    /// reported skipped rather than moved to a same-named path its own
+    /// account may not have. A member already in the chosen folder is
+    /// reported skipped too: `AccountManager.move` drops it as a no-op, so it
+    /// must not show as moved or have a part in the Undo, whose reverse move
+    /// would name the folder it never left.
     ///
     /// Returns the ids of `messageIds` that were NOT acted upon (nothing
     /// resolved for them, or the whole call aborted) — the caller (InboxView)
@@ -2821,14 +2916,16 @@ final class InboxViewModel {
     /// un-hide exactly the ids returned here or those rows vanish forever with
     /// no undo entry. See `archiveThread`'s doc comment for the full contract.
     @discardableResult
-    func moveThread(_ messageIds: [String], toFolderPath: String) -> [String] {
+    func moveThread(_ messageIds: [String], toFolderPath: String, accountId: String) -> [String] {
         let resolved = messageIds.compactMap { requestedId in
             lookupMessage(requestedId).map {
                 (requestedId: requestedId, message: $0)
             }
         }
         let actionable = resolved.filter {
-            lookupFolderRole($0.message.folderId) != .drafts
+            $0.message.accountId == accountId
+                && $0.message.folderPath != toFolderPath
+                && lookupFolderRole($0.message.folderId) != .drafts
         }
         let messages = actionable.map(\.message)
         // Nothing resolved — every id reported skipped so the caller un-hides.
@@ -2839,89 +2936,35 @@ final class InboxViewModel {
             return messageIds
         }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[MoveTrace] ViewModel.moveThread — count=\(messages.count) from=\(first.folderPath) to=\(toFolderPath)")
+            BackgroundSyncLogger.logDebug("[MoveTrace] ViewModel.moveThread — count=\(messages.count) of \(resolved.count) in account \(accountId) from=\(first.folderPath) to=\(toFolderPath)")
         }
-        // Each account's emails go to its own folder at `toFolderPath`; an account without
-        // one keeps its emails where they are (reported skipped, so they un-hide).
-        let groups: [ThreadMoveGroup] = UndoableAction.byAccount(messages).compactMap { members in
-            guard let first = members.first,
-                  lookupFolderRole("\(first.accountId):\(toFolderPath)") != nil else { return nil }
-            return ThreadMoveGroup(messages: members, path: toFolderPath)
-        }
-        recordThreadMove(groups, roleMove: false, marksRead: false)
-        return skippedIds(messageIds, actionable: actionable, recorded: groups)
-    }
-
-    /// One account's share of a thread action: its members and the folder path in that account
-    /// they go to.
-    private struct ThreadMoveGroup {
-        let messages: [MessageHeader]
-        let path: String
-    }
-
-    /// The ids of `messageIds` that were NOT acted upon: those that never resolved, and those
-    /// whose account recorded nothing. The caller un-hides exactly these.
-    private func skippedIds(
-        _ messageIds: [String], actionable: [(requestedId: String, message: MessageHeader)],
-        recorded groups: [ThreadMoveGroup]
-    ) -> [String] {
-        let movedIds = Set(groups.flatMap { $0.messages.map(\.id) })
-        let recorded = Set(actionable.filter { movedIds.contains($0.message.id) }.map(\.requestedId))
-        return messageIds.filter { !recorded.contains($0) }
-    }
-
-    /// The recording step shared by archiveThread/deleteThread/moveThread: ONE undo entry for
-    /// every member, so the whole thread restores in one undo, with each member going back from
-    /// its own account's destination; the overlay; then one queued closure that moves each
-    /// account's members to its folder. `roleMove` selects archive/delete (mark-as-read, the
-    /// destination is never the inbox) over a move to a chosen folder. `marksRead` is the
-    /// mark-as-read setting the caller snapshotted when its action started; the overlay and
-    /// every group's queued read use that one value.
-    private func recordThreadMove(_ groups: [ThreadMoveGroup], roleMove: Bool, marksRead: Bool) {
+        let destFolderId = MessageIdentity.folderId(accountId: accountId, folderPath: toFolderPath)
+        let compositeIds = messages.map(\.id)
         // Capture undo snapshots BEFORE the retain/registerMutation loop
         // below — see overlayAdjustedForUndo's doc comment.
-        guard let undo = UndoableAction.move(groups.map { group in
-            .init(messages: group.messages.map { overlayAdjustedForUndo($0) }, toPath: group.path)
-        }) else { return }
-        for group in groups {
-            guard let accountId = group.messages.first?.accountId else { continue }
-            let destFolderId = "\(accountId):\(group.path)"
-            if roleMove {
-                // Archive's and Delete's destination is never the inbox, so each
-                // member's own `isInInbox` determines "leaving the inbox" (F6) — a
-                // thread can mix members already outside the inbox with ones still
-                // in it. `isRead` rides the same coalesced entry — see `archive(_:)`.
-                for msg in group.messages {
-                    manager.retainOverlayEntry(id: msg.id)
-                    manager.registerMutation(id: msg.id, mutation: .init(
-                        isRead: marksRead ? true : nil,
-                        folderId: destFolderId,
-                        folderPath: group.path,
-                        isInInbox: false,
-                        actionTag: msg.isInInbox ? .some(nil) : nil))
-                }
-            } else {
-                // Generic move: destination CAN be the inbox — check the dest
-                // folder's role once per account, then combine with each member's
-                // own isInInbox (F6).
-                let destRole = lookupFolderRole(destFolderId)
-                for msg in group.messages {
-                    manager.retainOverlayEntry(id: msg.id)
-                    manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: (msg.isInInbox && destRole != .inbox) ? .some(nil) : nil))
-                }
-            }
+        let undoMessages = messages.map { overlayAdjustedForUndo($0) }
+        // Generic move: destination CAN be the inbox — check the dest
+        // folder's role once (same dest for every member), then combine with
+        // each member's own isInInbox (F6).
+        let destRole = lookupFolderRole(destFolderId)
+        for msg in messages {
+            manager.retainOverlayEntry(id: msg.id)
+            manager.registerMutation(id: msg.id, mutation: .init(folderId: destFolderId, actionTag: (msg.isInInbox && destRole != .inbox) ? .some(nil) : nil))
         }
-        UndoService.shared.push(undo)
+        // Members can come from different folders; each returns to its own.
+        if let undo = UndoableAction(
+            moves: undoMessages.map { (message: $0, destinationPath: toFolderPath) },
+            timestamp: Date()) {
+            UndoService.shared.push(undo)
+        }
         manager.enqueueWriteFromSynchronousContext { [manager] in
-            for group in groups {
-                let ids = group.messages.map(\.id)
-                // Read intent BEFORE the move — see `archive(_:)`. Only the
-                // members that are actually unread at execution time get it.
-                if roleMove { await manager.markReadBeforeRoleMove(ids: ids, enabled: marksRead) }
-                await manager.move(group.messages, to: group.path)
-                for id in ids { manager.releaseOverlayEntry(id: id) }
-            }
+            await manager.move(messages, to: toFolderPath)
+            for id in compositeIds { manager.releaseOverlayEntry(id: id) }
         }
+        // Members that never resolved or were left out were never acted
+        // upon — report them skipped so the caller un-hides exactly those rows.
+        let recorded = Set(actionable.map(\.requestedId))
+        return messageIds.filter { !recorded.contains($0) }
     }
 
     /// Check if inbox qualifies as "large" (100+ messages with some older than 2 weeks).

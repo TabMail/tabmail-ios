@@ -896,8 +896,9 @@ struct DeletedFlagMergeVisibilityTests {
     /// "the whole folder came back", and that branch has NO FLOOR: every local row
     /// the fetch never went near is classified stale and deleted with its FTS
     /// entry. In the field that is a 900-message folder losing ~851 rows to one
-    /// malformed date, and it does not recover — `selfHealRecentMessages` covers 90
-    /// days and the deep crawl only re-walks `backfillComplete == false` folders.
+    /// malformed date, and it does not recover — `selfHealRecentMessages` covered 90
+    /// days (it is deleted, #1062: the catch-up now loads missing mail by UID)
+    /// and the deep crawl only re-walks `backfillComplete == false` folders.
     ///
     /// `SyncEngine.classifyEpochVerificationSample` was explicitly
     /// hardened against this exact reducer ("`mapMessageInfo` also DROPS rows

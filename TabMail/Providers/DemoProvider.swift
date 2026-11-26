@@ -166,9 +166,11 @@ actor DemoProvider: EmailProvider {
         // Undo of a drained demo archive doing nothing.
     }
 
-    func send(draft: DraftMessage) async throws {
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
         // No network and nobody to deliver to. The outbox's optimistic Sent
         // header is the demo's sent copy, as it is for a real account until sync.
+        nil
     }
 
     func appendToSentFolder(draft: DraftMessage, sentFolderPath: String?, messageId: String) async throws -> Bool {

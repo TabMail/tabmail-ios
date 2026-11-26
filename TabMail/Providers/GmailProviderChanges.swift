@@ -35,8 +35,13 @@ import Foundation
 ///
 /// `inboxOnly` changes nothing but the folder list: the history is one read for
 /// the whole account. A turn that starts with no read budget left reads nothing.
+/// An other-folder run (`.otherFolders`, #1110) reads nothing and sends nothing:
+/// every pass's history read already reports every label.
 extension GmailProvider {
     func fetchChanges(since cursor: ChangeCursor, request: ChangeRequest) async throws -> ChangeSet? {
+        if request.scope == .otherFolders {
+            return .uniform(request, account: .unchanged, status: .notRun)
+        }
         // A pass whose turn started with no read budget left reads nothing and
         // keeps its bookmark (`SyncEngine.changeReadEnd`).
         guard request.context.hasBudget() else {

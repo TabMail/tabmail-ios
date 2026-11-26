@@ -114,7 +114,10 @@ actor ChatStore {
                   AND role IN ('user', 'assistant')
                   AND \(realOnly)
                 """, arguments: [Double(cutoffMs)])
-            // Scope breakdown for diagnosis.
+            // Scope breakdown for diagnosis: a second read of the same range, grouped,
+            // that only feeds the debug line below, so it runs only while debug
+            // logging is on (CLAUDE.md rule 12).
+            guard DebugModeManager.isLoggingEnabled() else { return Set(ids) }
             let scopeRows = try Row.fetchAll(db, sql: """
                 SELECT CASE
                     WHEN sessionId LIKE 'thread:%' THEN 'thread'

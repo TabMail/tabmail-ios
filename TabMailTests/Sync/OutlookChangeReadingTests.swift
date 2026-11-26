@@ -132,7 +132,6 @@ struct OutlookChangeReadingTests {
         func foregroundPass() async throws {
             try await pool.write { db in
                 _ = try Account.filter(Column("id") == accountId).updateAll(db,
-                    Column("lastSyncedAt").set(to: nil as Date?),
                     Column("lastFullSyncAt").set(to: nil as Date?))
             }
             let engine = SyncEngine()
@@ -242,7 +241,16 @@ struct OutlookChangeReadingTests {
         }
         let world = World(pool: pool, accountId: accountId, server: server, provider: server.provider())
         await AccountManager.shared.clearRecentlyCompletedForTesting()
-        try await body(world)
+        do {
+            try await body(world)
+        } catch {
+            // A test that throws after an apply leaves no download or recount of
+            // this world's account running past its database.
+            await BackfillBodyQueue.shared.emptyForTesting()
+            await ActiveBodyQueue.shared.emptyForTesting()
+            await UnreadCountManager.shared.awaitIdleForTesting()
+            throw error
+        }
         await UnreadCountManager.shared.awaitIdleForTesting()
     }
 
@@ -749,10 +757,12 @@ struct OutlookChangeReadingTests {
             await engine.register(
                 accountId: w.accountId, provider: w.provider,
                 workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))
-            let outcome = try await engine.backgroundDeltaSync(account: try w.account(), inboxOnly: true)
+            let read = try await engine.backgroundDeltaSync(account: try w.account(), inboxOnly: true)
             await engine.remove(accountId: w.accountId)
+            let outcome = try #require(read, "the account was free, so the read ran")
             #expect(outcome.reason != "noCursor", "an Outlook push pass is not taken for one with no bookmark")
-            #expect(try w.account().lastSyncedAt.map { $0 > before } == true, "the poll is recorded")
+            let pollRecorded = try w.account().lastSyncedAt.map { $0 > before } == true
+            #expect(pollRecorded, "the poll is recorded")
         }
     }
 

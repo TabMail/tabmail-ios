@@ -29,3 +29,6 @@ IMAP; move; archive; no UIDPLUS; soft delete; relist; EXPUNGE; COPYUID; tagged O
 <!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
 **Amendment (2026-11-09, tabmail-ios #495).** The date-window crawl named above (`deepBackfillFolder`, `backfillWindow`, `SyncEngineBackfillDeep`'s two crawl sites) is deleted; it had no caller. A deep-backfill window can no longer put a message back, and the funnel `insertBackfillBatchGuardable` is fed by the walk and self-heal only.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+**Amendment (2026-11-20, tabmail-ios #1062).** The self-heal named above (`SyncEngineSelfHeal`) is deleted too. Missing IMAP mail is now found and loaded by UID by the catch-up (ADR-IOS-107, amendment of 2026-11-20), which feeds the same funnel; `insertBackfillBatchGuardable` is fed by the walk and the catch-up only.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->

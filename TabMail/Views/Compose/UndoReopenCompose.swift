@@ -25,9 +25,9 @@ struct UndoReopenCompose: View {
         // default. The compose still LOOKED like a forward (the load path quotes from
         // `draft.isForward`), but `send()` captures the VIEW property into
         // `AuthoredSendSnapshot.isForward`, so an undone-and-resent forward was
-        // recorded as a REPLY: `persistQueuedSend` set the parent's `isReplied`,
-        // cleared its Reply action tag, and stored `OutboxMessage.isForward = false`,
-        // which on delivery queues `.markReplied` and STOREs `\Answered` — never
+        // recorded as a REPLY: the queued row stored `OutboxMessage.isForward = false`,
+        // so on delivery the completion set the parent's `isReplied`, cleared its
+        // Reply action tag, queued `.markReplied` and STOREd `\Answered` — never
         // `$Forwarded`. Sync converges on the wrong answer rather than repairing it.
         //
         // Account and row are read in ONE snapshot: they are consumed together and a

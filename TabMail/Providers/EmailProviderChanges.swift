@@ -26,6 +26,17 @@ enum ChangeScope: Sendable, Equatable {
     /// A push or background pass: no folder list. A provider whose changes come
     /// in one account-wide read may still report every folder.
     case inboxOnly
+    /// A slice of an other-folder run (#1110, `SyncEngine.readOtherFolders`): the
+    /// request names only the run's folders, outside the syncable set, in the
+    /// order to read them. No folder list, no account part, no re-read list. A
+    /// reader that reads folder by folder reads them in that order and reports a
+    /// folder it sent nothing for (out of time, or its session ended before it)
+    /// as `.notRun`, so the run reads it in a later slice, and a folder whose
+    /// read it started and that did not move with `FolderChanges.readCut`
+    /// (#1358). A provider whose
+    /// changes come in one account-wide read reads nothing: every pass already
+    /// reads every folder.
+    case otherFolders
 }
 
 /// One local folder the read is asked about, as it stood at the start of the
@@ -39,10 +50,12 @@ struct ChangeFolder: Sendable, Equatable {
     /// none yet. The engine writes back what the reader returns in
     /// `FolderChanges.cursor`, in that folder's transaction.
     var cursor: String?
-    /// The folder is in the full sync's syncable set
-    /// (`SyncEngine.syncableFoldersInOrder`): a per-folder reader reads changes
-    /// only for these. A folder's re-read list (`ChangeRequest.recheck`) is read
-    /// whatever this says.
+    /// The folder's changes are read: on a pass, a folder of the full sync's
+    /// syncable set (`SyncEngine.syncableFoldersInOrder`); on an other-folder run
+    /// (`ChangeScope.otherFolders`, #1110), every folder of the request. A
+    /// per-folder reader reads changes only for these. A folder's re-read list
+    /// (`ChangeRequest.recheck`) is read whatever this says.
+    /// *Superseded (#1110):* "The folder is in the full sync's syncable set".
     var isSynced: Bool
     /// The start of the folder's held range (`Folder.oldestSyncedDate`). A hint
     /// only: the apply checks the range again inside the folder's transaction, so
@@ -95,14 +108,22 @@ struct ChangeContext: Sendable {
     let deadline: Date
     /// The clock the budget is measured on; injectable for tests.
     let clock: @Sendable () -> Date
+    /// In a slice of an other-folder run (#1110), the slice's end. The read's
+    /// FIRST folder is read in the slice's whole time: its requests start while
+    /// the clock is before this instant (each bounded as usual, none after it),
+    /// so a slow check of the session before it (IMAP's NOOP) cannot spend the
+    /// read's share and leave the slice with no folder read. Every later folder
+    /// starts only within `deadline`. Nil: every folder reads within `deadline`.
+    let firstFolderDeadline: Date?
     /// The reader calls this with the number of messages it is about to fetch,
     /// so the engine can show "downloading N".
     let onProgress: @Sendable (Int) -> Void
 
     init(deadline: Date = .distantFuture, clock: @escaping @Sendable () -> Date = { Date() },
-         onProgress: @escaping @Sendable (Int) -> Void) {
+         firstFolderDeadline: Date? = nil, onProgress: @escaping @Sendable (Int) -> Void) {
         self.deadline = deadline
         self.clock = clock
+        self.firstFolderDeadline = firstFolderDeadline
         self.onProgress = onProgress
     }
 
@@ -116,7 +137,9 @@ struct ChangeContext: Sendable {
 
 /// Built ONCE at the start of a pass; nothing in it is re-read during the pass.
 struct ChangeRequest: Sendable {
-    /// Every local folder of the account.
+    /// Every local folder of the account; on an other-folder run
+    /// (`ChangeScope.otherFolders`, #1110), the run's folders only, in the order
+    /// to read them.
     let folders: [ChangeFolder]
     let scope: ChangeScope
     /// Folder id -> message ids a change was declined for under the user's own
@@ -140,6 +163,17 @@ struct ChangeRequest: Sendable {
         self.recheck = recheck
         self.context = context
         self.localRows = localRows
+    }
+
+    /// This request with the time its first folder is read in
+    /// (`ChangeContext.firstFolderDeadline`) as its deadline, or nil when it
+    /// has none.
+    func forFirstFolder() -> ChangeRequest? {
+        guard let end = context.firstFolderDeadline else { return nil }
+        return ChangeRequest(
+            folders: folders, scope: scope, recheck: recheck,
+            context: ChangeContext(deadline: end, clock: context.clock, onProgress: context.onProgress),
+            localRows: localRows)
     }
 }
 
@@ -187,6 +221,9 @@ struct UntrackedObservation: Sendable, Equatable {
     let highestModSeq: Int?
     /// Nil when the server did not report one.
     let uidValidity: Int?
+    /// List this folder this pass whatever the counters say: the reader stopped
+    /// a check it owes for want of budget (#755).
+    var mustList = false
 }
 
 enum FolderChangeStatus: Sendable {
@@ -316,6 +353,30 @@ struct FolderChanges: Sendable {
     /// the bookmark, so a pass with no listing, a failed listing or a crash
     /// before tracking starts never leaves the bookmark without its check.
     var armCatchUpWithBookmark = false
+    /// A slice of an other-folder run (`ChangeScope.otherFolders`, #1110): the
+    /// reader sent this folder a request, and the read ended before it moved
+    /// the folder: the slice's read time ran out before the read could finish
+    /// (`.notRun`, nothing of it to apply), or a baseline passed no page
+    /// (`.baselining`: the held rows of the page it read apply, its place in
+    /// the baseline stays). Kept apart from a folder the reader sent nothing
+    /// for, and from a baseline that moved, so the run can count the folder as
+    /// tried and go on to the next one (#1358). Never set on a pass.
+    var readCut = false
+    /// The folder's rows with numeric ids in `lowerId...upperId` the read
+    /// checked: exactly `checkedIds` (bounded by the check's window). The apply
+    /// reads the folder's held ids in that range again in its transaction; a
+    /// held id the check never examined (a row that came meanwhile, even when
+    /// another one left and the count is unchanged) keeps the stored bookmark.
+    /// A checked row that left does not. Nil = nothing to verify.
+    var heldRowsProof: HeldRowsProof?
+    struct HeldRowsProof: Sendable, Equatable { let lowerId: Int; let upperId: Int; let checkedIds: Set<Int> }
+    /// The same proof for the ids the new bookmark newly covers (an IMAP read's
+    /// arrival range, the stored UIDNEXT up to the new one): the ids the read
+    /// found on the server or held there when it looked. A row inserted in that
+    /// range after the read looked (the notification merge, whose id the stored
+    /// bookmark does not claim yet) was never checked, so the stored bookmark
+    /// stays and the next read checks the row. Nil = nothing newly covered.
+    var arrivalRowsProof: HeldRowsProof?
     /// Set by the engine, never by a reader: the folder bookmark the read was
     /// issued with. A bookmark dropped between the read and the apply
     /// (`SyncEngine.dropChangeBookmark`) is never written back. Nil = not

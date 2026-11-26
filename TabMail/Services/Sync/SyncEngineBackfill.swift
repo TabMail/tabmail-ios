@@ -106,16 +106,36 @@ actor UIDWalkCursor {
     /// of one UID cannot be split, so it is set aside for this walk instead.
     /// Never serves a failed range again at its own size.
     func failRangeSmaller(from: Int, to: Int) {
-        guard to > from else {
+        guard let halves = Self.halves(from: from, to: to) else {
             failRangeForThisWalk(from: from, to: to)
             return
         }
         inFlight.removeAll { $0.from == from && $0.to == to }
-        let mid = from + (to - from) / 2
-        // Upper half first: the walk runs downward.
-        retryQueue.append((from: mid + 1, to: to))
-        retryQueue.append((from: from, to: mid))
+        // Upper half first: the walk runs downward, so the half next to its
+        // confirmed cursor goes first.
+        retryQueue.append(halves.upper)
+        retryQueue.append(halves.lower)
         consecutiveSuccesses = 0
+    }
+
+    /// The two halves a failed range is retried as, together exactly the range;
+    /// nil for a range of one UID, which cannot be split (#1006). The walk's
+    /// retries cut here. A catch-up listing range that times out lowers the
+    /// listing's width cap instead (`IMAPCatchUpState.Listing.widthCap`, #1062).
+    /// *Superseded (#1062):* "The one splitting rule for UID ranges: the walk's
+    /// retries and the catch-up's listing ranges both cut here."
+    nonisolated static func halves(from: Int, to: Int) -> (lower: (from: Int, to: Int), upper: (from: Int, to: Int))? {
+        guard to > from else { return nil }
+        let mid = from + (to - from) / 2
+        return (lower: (from: from, to: mid), upper: (from: mid + 1, to: to))
+    }
+
+    /// Whether a failed UID-range request is answered by asking a smaller range:
+    /// it timed out, or its answer was too large or could not be decoded. Any
+    /// other failure (connection, SELECT) is not the range's size.
+    nonisolated static func failureCallsForSmallerRange(_ error: Error) -> Bool {
+        let desc = "\(error)"
+        return desc.contains("PayloadTooLargeError") || desc.contains("IMAPDecoderError") || desc.contains("timed out")
     }
 
     /// Whether any range was set aside for this walk.
@@ -370,8 +390,10 @@ extension SyncEngine {
     ///
     /// The denominator has its own provider-side source (`progressTotal`), never
     /// the stored folder counters. While the provider's total is not known yet
-    /// (before this launch's first folder list) nothing is published: the bar
-    /// stays hidden rather than show 0 or the stored row count.
+    /// (IMAP before this launch's first folder list, Outlook before its first
+    /// full sync), the progress is what the database knows: the messages stored
+    /// and settled, and the completed state once every folder's walk is done
+    /// (#1273). The provider's total only sharpens the denominator once known.
     func updateBackfillProgressForAccount(_ account: Account) async {
         let accountId = account.id
         // Quick DB check: are all folders done?
@@ -382,11 +404,11 @@ extension SyncEngine {
 
         // The provider is the source (#755): Gmail keeps its profile total,
         // Exchange answers its latest folder list's sum, IMAP its folder lists'
-        // UIDNEXT. A provider not registered yet, or one with no folder list yet
-        // (`.notKnownYet`), publishes nothing: the bar waits for its source.
+        // UIDNEXT. A provider not registered yet publishes nothing. One with no
+        // folder list yet (`.notKnownYet`) adds no UID scope and no server total,
+        // so the database's counts below are published as they are.
         guard let provider = providers[accountId] else { return }
         let source = await provider.progressTotal(crawling: !headersDone)
-        if source == .notKnownYet { return }
         let uidNextByPath: [String: Int]
         if case .uidNext(let map) = source { uidNextByPath = map } else { uidNextByPath = [:] }
         let walk = Self.uidWalkProgress(folders: folders ?? [], uidNextByPath: uidNextByPath)
@@ -394,24 +416,7 @@ extension SyncEngine {
 
         // GRDB is sole authority for body status flags
         let (grdbTotal, grdbIndexed, pendingBody) = (try? await dbPool.read { db -> (Int, Int, Int) in
-            let total = try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
-            // Both predicates live on `MessageHeader` as named requests rather than
-            // inline `filter(…)` chains — see `bodySettledRequest` /
-            // `pendingBodyRequest` for what they contain and why they are named. A
-            // chain here is invisible to every SQL-text census and unreachable from
-            // the test tree, and both properties cost real defects before.
-            //
-            // `bodyMetadataOversized` counts as SETTLED, not pending: those bodies
-            // are unfetchable by this build, and leaving them in work-remaining
-            // means `pendingBodyCount` never reaches 0, `isFullyComplete` is false
-            // forever, and the sync banner never clears. Owner decision 2026-09-01.
-            // If a future fix makes these bodies fetchable again, the two requests
-            // and the body-queue admission queries drop the flag together.
-            let indexed = try MessageHeader.bodySettledRequest(accountId: accountId).fetchCount(db)
-            // Completion gates on this reaching 0, not on an exact count match
-            // against a server-reported total.
-            let pending = try MessageHeader.pendingBodyRequest(accountId: accountId).fetchCount(db)
-            return (total, indexed, pending)
+            try Self.backfillProgressCounts(db, accountId: accountId)
         }) ?? (0, 0, 1)   // pending=1 on read failure → never false-complete
 
         // Gmail/Exchange: uidTotal is 0 (no IMAP UIDs). Use the server-reported
@@ -437,6 +442,37 @@ extension SyncEngine {
                 uidTotal: uidTotal, uidWalked: uidWalked,
                 pendingBodyCount: pendingBody
             )
+    }
+
+    /// The three counts the backfill progress publishes for `accountId`, in one read:
+    /// every stored header, the settled ones and the ones still owing a body.
+    ///
+    /// All three read index entries only, never a header row (#1401): the total
+    /// through an `accountId`-led index, and both body counts through the deferred
+    /// `messageHeader_backfillProgress`, which holds every column either predicate
+    /// tests. Until that index is built they read the rows as before, with the same
+    /// results. `BackfillProgressCountTests` pins the plans and the counts.
+    nonisolated static func backfillProgressCounts(
+        _ db: Database, accountId: String
+    ) throws -> (total: Int, settled: Int, pending: Int) {
+        let total = try MessageHeader.filter(Column("accountId") == accountId).fetchCount(db)
+        // Both predicates live on `MessageHeader` as named requests rather than
+        // inline `filter(…)` chains — see `bodySettledRequest` /
+        // `pendingBodyRequest` for what they contain and why they are named. A
+        // chain here is invisible to every SQL-text census and unreachable from
+        // the test tree, and both properties cost real defects before.
+        //
+        // `bodyMetadataOversized` counts as SETTLED, not pending: those bodies
+        // are unfetchable by this build, and leaving them in work-remaining
+        // means `pendingBodyCount` never reaches 0, `isFullyComplete` is false
+        // forever, and the sync banner never clears. Owner decision 2026-09-01.
+        // If a future fix makes these bodies fetchable again, the two requests
+        // and the body-queue admission queries drop the flag together.
+        let indexed = try MessageHeader.bodySettledRequest(accountId: accountId).fetchCount(db)
+        // Completion gates on this reaching 0, not on an exact count match
+        // against a server-reported total.
+        let pending = try MessageHeader.pendingBodyRequest(accountId: accountId).fetchCount(db)
+        return (total, indexed, pending)
     }
 
     /// UID walk progress: per folder, the scope is UIDNEXT-1 (from the provider's

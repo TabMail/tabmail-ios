@@ -436,7 +436,18 @@ extension SyncEngine {
     /// exactly that folder.
     struct CrawlEpochPremise: Sendable, Equatable {
         let epoch: UInt32?
-        init(_ epoch: UInt32?) { self.epoch = epoch }
+        /// The crawl's change premise (#755), read before the range's server
+        /// read: the insert lands only while the folder's change bookmark and
+        /// state are unchanged (`fromServerInsertAllowed`). A serial caller
+        /// (inside the sync turn) holds none.
+        let guardsChange: Bool
+        let change: SyncEngine.ChangeInsertPremise?
+        init(_ epoch: UInt32?) { self.init(epoch, guardsChange: false, change: nil) }
+        init(_ epoch: UInt32?, guardsChange: Bool, change: SyncEngine.ChangeInsertPremise?) {
+            self.epoch = epoch
+            self.guardsChange = guardsChange
+            self.change = change
+        }
     }
 
     /// May a bookkeeping write from this pass land on this folder, judged against
@@ -962,27 +973,46 @@ extension SyncEngine {
     /// false when a chunk's transaction failed, so some of `headers` have no
     /// row. Neither caller moves its bookkeeping past them then: the walk keeps
     /// its page token, the catch-up writes no state. Only the catch-up sets
-    /// `catchUpReadStartedAt` (when its read began): the insert then skips a
+    /// `catchUpRead` (its read's start and over-age latch): the insert then skips a
     /// message the user's own newer action stands on, which is not a failure
     /// (`insertBackfillBatch`).
     func insertFetchedBackfillMessages(
         _ headers: [MessageHeaderInfo],
         bodies bodyData: [String: (htmlBody: String?, textBody: String?)],
         folder: Folder,
-        catchUpReadStartedAt: Date? = nil
+        catchUpRead: CatchUpReadLatch? = nil,
+        epochPremise: (premise: SyncEngine.CrawlEpochPremise, observedEpoch: UInt32)? = nil
     ) async -> (inserted: Int, allLanded: Bool) {
         // Step 1: Insert headers to GRDB (batch dedup).
-        // The premise-LESS overload, deliberately: this is the
-        // Gmail/Exchange page walk, and neither provider has a
-        // UIDVALIDITY concept at all, so there is no premise to
-        // hold and nothing a guard could compare. That overload
-        // has no refusal channel to discard (round 13 blocker 3),
-        // so this call site cannot silently swallow one.
-        let (inserted, ftsRecords, chunkFailed) = await insertBackfillBatch(
-            headers, folderId: folder.id, accountId: folder.accountId,
-            folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
-            observedEpoch: nil, catchUpReadStartedAt: catchUpReadStartedAt
-        )
+        // Without `epochPremise`, the premise-LESS overload, deliberately: the
+        // Gmail/Exchange page walk and their catch-up loads, and neither
+        // provider has a UIDVALIDITY concept at all, so there is no premise to
+        // hold and nothing a guard could compare. With one (a catch-up load
+        // whose ids carry an epoch, #1062), the premised overload: a turnover
+        // between the read and the insert refuses, and a refusal is reported
+        // as not landed (C3).
+        let inserted: Int
+        let ftsRecords: [FTSHeaderRecord]
+        let chunkFailed: Bool
+        if let epochPremise {
+            switch await insertBackfillBatch(
+                headers, folderId: folder.id, accountId: folder.accountId,
+                folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                epochPremise: epochPremise.premise, observedEpoch: epochPremise.observedEpoch,
+                catchUpRead: catchUpRead
+            ) {
+            case .landed(let count, let records, let allLanded):
+                (inserted, ftsRecords, chunkFailed) = (count, records, !allLanded)
+            case .refused:
+                return (0, false)
+            }
+        } else {
+            (inserted, ftsRecords, chunkFailed) = await insertBackfillBatch(
+                headers, folderId: folder.id, accountId: folder.accountId,
+                folderPath: folder.path, folderRole: folder.role, isInInbox: folder.role == .inbox,
+                observedEpoch: nil, catchUpRead: catchUpRead
+            )
+        }
         if !ftsRecords.isEmpty { await indexHeadersForFTS(ftsRecords) }
 
         // Step 2: Write bodies to FTS for inserted messages.
@@ -1083,7 +1113,10 @@ extension SyncEngine {
     /// IMAP: header fetch then body fetch in the same iteration (protocol limitation).
     /// After walking all folders, runs a cleanup pass for any remaining empty bodies.
     /// Returns true if any work was done.
-    func runBackfillWalk(account: Account, deadline: Date? = nil) async -> Bool {
+    ///
+    /// `space` is where the storage target is measured (#1437); nil measures
+    /// the app's own databases and storage folder. Tests pass their own.
+    func runBackfillWalk(account: Account, deadline: Date? = nil, space: StorageEstimator.SpaceSource? = nil) async -> Bool {
         runningBackfillWalks += 1
         defer { runningBackfillWalks -= 1 }
         #if DEBUG
@@ -1179,6 +1212,12 @@ extension SyncEngine {
         // recent (shallowest crawl depth), fetches older messages via UID/page-token walk.
         // IMAP: walks from UIDNEXT-1 backward to UID 1.
         // Gmail/Exchange: page-token walk from newest to oldest.
+        //
+        // Under an Email Index Limit the walk stops where the storage prune stops
+        // (`StorageEstimator.WalkCheck`, #1437): one walk of the storage folder for
+        // this run, here, and each folder pick below re-reads only the databases'
+        // page totals. nil with no limit set.
+        let storageCheck = await StorageEstimator.WalkCheck.start(space ?? .app(pool: dbPool))
         while true {
             guard !Task.isCancelled else { return didWork }
             guard !isPastDeadline() else { break }
@@ -1210,12 +1249,15 @@ extension SyncEngine {
                 }
             }
             let isExpensiveNetwork = NetworkMonitor.checkExpensive()
+            // Until #1437 the walk stopped at the whole limit, a walk of the storage
+            // folder for every folder checked here.
+            let atStorageTarget = await storageCheck?.reached() ?? false
             let folder = remaining
                 .filter { f in
                     if epochDeclinedFolderIds.contains(f.id) { return false }
                     if pageWalkSkippedFolderIds.contains(f.id) { return false }
                     if !fastSync && isExpensiveNetwork && !primaryRoles.contains(f.role) { return false }
-                    if StorageEstimator.isOverBudget() { return false }
+                    if atStorageTarget { return false }
                     return true
                 }
                 .sorted { a, b in
@@ -1790,6 +1832,20 @@ extension SyncEngine {
                                         break
                                     }
 
+                                    // The change premise, before this range's server read:
+                                    // a change read that proves one of its UIDs gone
+                                    // meanwhile refuses its insert (#755).
+                                    let changePremise: SyncEngine.ChangeInsertPremise?
+                                    do {
+                                        changePremise = try await AppDatabase.backgroundPool.read { db in
+                                            try SyncEngine.changeInsertPremise(db, folderId: folderCaptured.id)
+                                        }
+                                    } catch {
+                                        await cursor.failRange(from: range.from, to: range.to)
+                                        outcome.stoppedOnFailure = true
+                                        break
+                                    }
+
                                     // SEARCH first: discover which UIDs exist in this range
                                     let existingUIDs: [UInt32]
                                     do {
@@ -1879,9 +1935,8 @@ extension SyncEngine {
                                         }
                                     } catch {
                                         let desc = "\(error)"
-                                        let isPayloadError = desc.contains("PayloadTooLargeError") || desc.contains("IMAPDecoderError")
                                         let isTimeout = desc.contains("timed out")
-                                        if isPayloadError || isTimeout {
+                                        if UIDWalkCursor.failureCallsForSmallerRange(error) {
                                             // Never ask this range again at the same
                                             // size in this walk: its halves go back
                                             // for retry. A one-UID range is set aside
@@ -1953,14 +2008,14 @@ extension SyncEngine {
                                             await self.insertBackfillBatch(
                                                 fetchedHeaders, folderId: folderCaptured.id, accountId: folderCaptured.accountId,
                                                 folderPath: folderCaptured.path, folderRole: folderCaptured.role, isInInbox: folderCaptured.role == .inbox,
-                                                epochPremise: .init(walkWritePremise),
+                                                epochPremise: .init(walkWritePremise, guardsChange: true, change: changePremise),
                                                 observedEpoch: fetched.observedEpoch
                                             )
                                         else {
                                             await cursor.failRange(from: range.from, to: range.to)
                                             outcome.epochDisagreed = true
                                             if DebugModeManager.isLoggingEnabled() {
-                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused at INSERT — the folder no longer holds the UIDVALIDITY this pass premised, \(fetchedHeaders.count) headers discarded")
+                                                BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) range \(range.from)...\(range.to) refused at INSERT — the folder no longer holds the UIDVALIDITY or change bookmark this pass premised, \(fetchedHeaders.count) headers discarded")
                                             }
                                             break
                                         }

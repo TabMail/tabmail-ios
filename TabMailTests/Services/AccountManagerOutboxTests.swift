@@ -318,7 +318,7 @@ struct LocalIndexWipeOutboxTests {
 
     private func runWipe(_ db: DatabaseQueue) throws {
         try db.write { connection in
-            try SettingsView.localIndexWipeTxn(connection)
+            try SyncEngine.localIndexWipeTxn(connection)
         }
     }
 
@@ -481,7 +481,7 @@ struct LocalIndexWipeCalendarTests {
 
     private func runWipe(_ db: DatabaseQueue) throws {
         try db.write { connection in
-            try SettingsView.localIndexWipeTxn(connection)
+            try SyncEngine.localIndexWipeTxn(connection)
         }
     }
 

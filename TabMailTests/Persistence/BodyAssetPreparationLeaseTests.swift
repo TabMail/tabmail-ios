@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// `BodyAssetStore` prepare→publish two-phase write + expiring preparation lease.
@@ -13,12 +14,14 @@ import GRDB
 /// not the mechanism that holds them:
 ///
 /// 1. no physical deleter may unlink bytes a writer is still materialising, or
-///    bytes a manifest row already references;
-/// 2. a writer that never came back may not pin its blob forever — its lease
-///    ages out on the store's EXISTING `sweepMinAgeSeconds`, after which the
-///    ordinary sweep reclaims the blob exactly as it did before leases existed;
-/// 3. a writer whose lease expired FAILS CLOSED — it records no manifest row at
-///    all, so nothing ever claims content that may no longer be on disk.
+///    bytes a manifest row already references; and (#1376) a write in progress
+///    never touches the store: its bytes stay in `staging/` until publish moves
+///    them in with their row;
+/// 2. a writer that never came back may not pin its bytes forever — its lease
+///    ages out on the store's EXISTING `sweepMinAgeSeconds`, after which
+///    `recoverAbandonedPreparations` reclaims the staged file and the lease;
+/// 3. a writer whose lease expired FAILS CLOSED — it records no manifest row and
+///    moves no file, so nothing ever claims content the store does not hold.
 ///
 /// All tests run against an in-memory manifest queue + a per-test temporary
 /// container directory injected via `BodyAssetStore._setTestEnvironment(...)`.
@@ -49,6 +52,12 @@ struct BodyAssetPreparationLeaseTests {
 
     private static func blobExists(_ blobId: String) -> Bool {
         guard let url = blobURL(blobId) else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    /// #1376: a preparation's bytes live in `staging/<preparationId>` until publish.
+    private static func stagedExists(_ prepared: BodyAssetStore.PreparedWrite) -> Bool {
+        guard let url = BodyAssetStore.stagingURL(for: prepared) else { return false }
         return FileManager.default.fileExists(atPath: url.path)
     }
 
@@ -99,7 +108,7 @@ struct BodyAssetPreparationLeaseTests {
 
     // MARK: - The lease protects an in-flight blob
 
-    @Test("A live preparation lease stops the orphan sweep from deleting a just-prepared blob")
+    @Test("A live preparation keeps its staged bytes through the sweep and recovery, and publishes them")
     func liveLeaseSurvivesOrphanSweep() throws {
         let dir = try Self.setupTest()
         defer { Self.teardown(dir) }
@@ -114,24 +123,28 @@ struct BodyAssetPreparationLeaseTests {
             Issue.record("prepare failed")
             return
         }
-        guard let url = Self.blobURL(prepared.blobId) else {
-            Issue.record("store directory unavailable")
+        guard let stagedURL = BodyAssetStore.stagingURL(for: prepared) else {
+            Issue.record("staging directory unavailable")
             return
         }
+        // #1376: nothing enters the store before publish.
+        #expect(Self.stagedExists(prepared))
+        #expect(!Self.blobExists(prepared.blobId), "prepare must not touch the store")
 
-        // Age the FILE past the sweep threshold: the age gate can no longer save
-        // it, so only the LIVE lease stands between the sweep and these bytes.
-        try Self.ageOut(path: url.path)
+        // Age the staged FILE past the threshold: only the LIVE lease decides.
+        try Self.ageOut(path: stagedURL.path)
 
         BodyAssetStore.pruneOrphanFiles()
+        BodyAssetStore.recoverAbandonedPreparations()
 
-        #expect(Self.blobExists(prepared.blobId))
+        #expect(Self.stagedExists(prepared))
         let leasesAfterSweep = try Self.leaseCount()
         #expect(leasesAfterSweep == 1)
 
         // …and the writer that comes back still publishes the bytes it wrote.
         #expect(BodyAssetStore.publish(prepared) == prepared.blobId)
         #expect(BodyAssetStore.read(assetId: prepared.blobId) == bytes)
+        #expect(!Self.stagedExists(prepared), "publish moves the staged file into the store")
         let leasesAfterPublish = try Self.leaseCount()
         #expect(leasesAfterPublish == 0)
     }
@@ -165,14 +178,17 @@ struct BodyAssetPreparationLeaseTests {
 
         // The purge takes what it owns…
         #expect(!Self.blobExists(publishedId))
-        // …and leaves the in-flight blob AND its header directory alone. Taking
-        // either would let the writer publish a row over missing bytes.
-        #expect(Self.blobExists(prepared.blobId))
+        // …and leaves the in-flight bytes (in staging, #1376) AND the header
+        // directory alone. Taking either would fail the writer's publish.
+        #expect(Self.stagedExists(prepared))
         #expect(BodyAssetStore.publish(prepared) == prepared.blobId)
         #expect(BodyAssetStore.read(assetId: prepared.blobId) == inFlight)
     }
 
-    @Test("Discarding an orphaned preparation never unlinks a blob a live manifest row still references")
+    /// #1376: a preparation that never publishes leaves the slot EXACTLY as it was.
+    /// Before staging, `prepare` overwrote the slot's file in place, so the live row
+    /// read the abandoned v2 bytes (a row describing bytes nobody published).
+    @Test("A discarded preparation leaves the published slot's bytes and row as they were")
     func discardSparesPublishedSlot() throws {
         let dir = try Self.setupTest()
         defer { Self.teardown(dir) }
@@ -200,10 +216,14 @@ struct BodyAssetPreparationLeaseTests {
         // blob the live row references — the case a naive discard would destroy.
         #expect(prepared.blobId == assetId)
 
-        BodyAssetStore.discardPreparedIfOrphaned(prepared)
+        #expect(BodyAssetStore.read(assetId: assetId) == Data("v1".utf8),
+                "a preparation must not change the slot before it publishes")
+
+        BodyAssetStore.discardPrepared(prepared)
 
         #expect(Self.blobExists(assetId))
-        #expect(BodyAssetStore.read(assetId: assetId) == v2)
+        #expect(BodyAssetStore.read(assetId: assetId) == Data("v1".utf8))
+        #expect(!Self.stagedExists(prepared), "the discard removes its staged bytes")
         let rows = try Self.manifestRowCount(blobId: assetId)
         #expect(rows == 1)
         let leases = try Self.leaseCount()
@@ -212,7 +232,7 @@ struct BodyAssetPreparationLeaseTests {
 
     // MARK: - The lease expires, and expiry never reclaims a live asset
 
-    @Test("An abandoned preparation lease stops protecting its blob after the sweep age threshold")
+    @Test("An abandoned preparation is recovered after the age threshold: its lease and staged bytes go")
     func abandonedLeaseExpiresOnTheSweepThreshold() throws {
         let dir = try Self.setupTest()
         defer { Self.teardown(dir) }
@@ -226,25 +246,60 @@ struct BodyAssetPreparationLeaseTests {
             Issue.record("prepare failed")
             return
         }
-        guard let url = Self.blobURL(prepared.blobId) else {
-            Issue.record("store directory unavailable")
-            return
-        }
 
-        // The writer died between the lease and publication: both its bytes and
-        // its lease age past the threshold.
-        try Self.ageOut(path: url.path)
+        // The writer died between the lease and publication.
         try Self.ageOutLeases()
 
-        BodyAssetStore.pruneOrphanFiles()
+        BodyAssetStore.recoverAbandonedPreparations()
 
-        // A pinned blob would be invisible to the user's attachment cap forever,
-        // so the reclaim must actually happen.
+        // Staged bytes are invisible to the user's attachment cap (`usedBytes` sums
+        // only rows), so the reclaim must actually happen.
+        #expect(!Self.stagedExists(prepared))
         #expect(!Self.blobExists(prepared.blobId))
         let leases = try Self.leaseCount()
         #expect(leases == 0)
         let rows = try Self.manifestRowCount(blobId: prepared.blobId)
         #expect(rows == 0)
+    }
+
+    /// Recovery is exact in both directions in one run: a live preparation's staged
+    /// file stays, an abandoned one's goes, and a staged file with no lease at all
+    /// (a writer that died after its lease was reaped) goes too.
+    @Test("Recovery keeps a live preparation's staged bytes and deletes abandoned and unleased ones")
+    func recoveryKeepsLiveAndDeletesAbandonedStagedFiles() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let key = ContentKey(rawValue: "acc1:INBOX:msg-lease-recover")
+        guard let abandoned = BodyAssetStore.prepare(
+            contentKey: key, kind: .attachment, key: "1.1",
+            contentType: "application/pdf", data: Data(repeating: 0x31, count: 16),
+            identityStamp: "rfc:lease-recover@example.com"
+        ) else {
+            Issue.record("prepare failed")
+            return
+        }
+        try Self.ageOutLeases()
+        guard let live = BodyAssetStore.prepare(
+            contentKey: key, kind: .attachment, key: "1.2",
+            contentType: "application/pdf", data: Data(repeating: 0x32, count: 16),
+            identityStamp: "rfc:lease-recover@example.com"
+        ), let staging = BodyAssetStore.stagingDirectory() else {
+            Issue.record("prepare failed")
+            return
+        }
+        let unleased = staging.appendingPathComponent(UUID().uuidString)
+        try Data("no lease".utf8).write(to: unleased)
+
+        BodyAssetStore.recoverAbandonedPreparations()
+
+        #expect(Self.stagedExists(live), "a live preparation's staged bytes must stay")
+        #expect(!Self.stagedExists(abandoned), "an abandoned preparation's staged bytes must go")
+        #expect(!FileManager.default.fileExists(atPath: unleased.path),
+                "a staged file no lease names must go")
+        let leases = try Self.leaseCount()
+        #expect(leases == 1)
+        #expect(BodyAssetStore.publish(live) == live.blobId)
     }
 
     @Test("A writer whose lease expired refuses to publish and records no manifest row")
@@ -263,17 +318,54 @@ struct BodyAssetPreparationLeaseTests {
         }
 
         try Self.ageOutLeases()
-        BodyAssetStore.pruneOrphanFiles()   // reaps the abandoned lease
+        BodyAssetStore.pruneOrphanFiles()   // reaps the abandoned lease, skips staging
+        // The staged bytes are still there, so the refusal below is the lease's.
+        #expect(Self.stagedExists(prepared))
 
-        // FAIL CLOSED. Publishing here would record a row for content the sweep
-        // is now free to unlink — a row claiming content we do not have. The
-        // caller sees `nil`, treats it as a cache miss, and re-fetches.
+        // FAIL CLOSED. Publishing here would record a row the pending-delete worker
+        // may already have settled for this key (#1376). The caller sees `nil`,
+        // treats it as a cache miss, and re-fetches.
         #expect(BodyAssetStore.publish(prepared) == nil)
         let rows = try Self.manifestRowCount(blobId: prepared.blobId)
         #expect(rows == 0)
+        #expect(!Self.blobExists(prepared.blobId), "a refused publish moves nothing into the store")
         #expect(BodyAssetStore.attachmentAssetId(
             contentKey: key, section: "2.1",
             identityStamp: "rfc:lease-5@example.com") == nil)
+    }
+
+    /// #1376: a re-fetch whose lease was reaped can change nothing about the slot it
+    /// targets. Before staging, `prepare` had already overwritten the slot's file, so
+    /// the published row then served bytes its publish was refused for.
+    @Test("A refused publish leaves an existing slot's bytes and row as they were")
+    func refusedPublishLeavesTheExistingSlotUntouched() throws {
+        let dir = try Self.setupTest()
+        defer { Self.teardown(dir) }
+
+        let key = ContentKey(rawValue: "acc1:INBOX:msg-lease-7")
+        let stamp = "rfc:lease-7@example.com"
+        guard let assetId = BodyAssetStore.writeAttachment(
+            contentKey: key, section: "2", contentType: "application/pdf",
+            data: Data("v1".utf8), identityStamp: stamp
+        ), let prepared = BodyAssetStore.prepare(
+            contentKey: key, kind: .attachment, key: "2",
+            contentType: "application/pdf", data: Data("v2-longer".utf8),
+            identityStamp: stamp
+        ) else {
+            Issue.record("write or prepare failed")
+            return
+        }
+        #expect(prepared.blobId == assetId, "precondition: the re-fetch targets the same slot")
+
+        try Self.ageOutLeases()
+        BodyAssetStore.pruneOrphanFiles()
+
+        #expect(BodyAssetStore.publish(prepared) == nil)
+        #expect(BodyAssetStore.read(assetId: assetId) == Data("v1".utf8))
+        let rows = try Self.manifestRowCount(blobId: assetId)
+        #expect(rows == 1)
+        #expect(BodyAssetStore.attachmentAssetId(
+            contentKey: key, section: "2", identityStamp: stamp) == assetId)
     }
 
     @Test("A published asset survives an orphan sweep while a true orphan does not")
@@ -461,7 +553,7 @@ struct BodyAssetPreparationLeaseTests {
         BodyAssetStore.pruneOrphanFiles()
 
         #expect(Self.directoryExists(leased),
-                "unlinking here would race a writer between createDirectory and data.write")
+                "unlinking here would race a writer whose publish moves its file into this directory")
         let leases = try Self.leaseCount()
         #expect(leases == 1, "a live lease must not be reaped by the sweep")
     }
@@ -521,51 +613,39 @@ struct BodyAssetPreparationLeaseTests {
         try ageOut(path: url.path)
     }
 
-    /// A lease row whose `preparationId` is the EMPTY string, seeded fresh so the
-    /// sweep's table-wide abandoned-lease reap leaves it alone.
+    /// How many times `body` put `blobId` through the physical-delete path: the
+    /// manifest recheck `removeBlobIfUnreferenced` runs before it unlinks
+    /// (`… FROM bodyAsset WHERE id = <blobId>`), counted from a statement trace on
+    /// the test manifest's one connection (an in-memory `DatabaseQueue`).
     ///
-    /// This is a TRACER, not a production shape — production lease ids are UUIDs.
-    /// `removeBlobIfUnreferenced(_:releasingPreparationId:)` binds `""` when it has
-    /// no lease of its own to release, *precisely because* the empty preparation id
-    /// cannot match a UUID; a row that DOES carry that id is therefore consumed if
-    /// and only if the sweep put this blob through the physical-delete path.
-    ///
-    /// WHY A TRACER IS NEEDED AT ALL, stated so the next reader does not "simplify"
+    /// WHY A TRACE IS NEEDED AT ALL, stated so the next reader does not "simplify"
     /// these tests into vacuity: the classification below cannot be observed through
     /// file survival. `removeBlobIfUnreferenced` re-decides authoritatively under the
-    /// manifest writer lock (`SELECT … WHERE id = ?`), so a manifest-backed file
-    /// survives whether or not the sweep classified it correctly. What the
-    /// classification decides is whether the sweep takes a WRITE transaction per
-    /// already-accounted-for file — which is the whole point of the query, and which
-    /// only the tracer makes visible.
+    /// manifest writer lock, so a manifest-backed file survives whether or not the
+    /// sweep classified it correctly. What the classification decides is whether the
+    /// sweep takes a WRITE transaction per already-accounted-for file — which is the
+    /// whole point of the query, and which only the trace makes visible. (#1376
+    /// replaced the earlier tracer, a lease with an empty preparation id that the
+    /// delete path released: that parameter had no other caller left.)
     ///
-    /// `preparationId` is the table's PRIMARY KEY, so there is at most ONE tracer per
-    /// manifest; each test gets its own in-memory queue, and each seeds exactly one.
-    private static func insertTracerLease(blobId: String) throws {
+    /// Recorded from `expandedDescription` (bound values inline), acceptable only
+    /// because this manifest is a throwaway in-memory fixture.
+    private static func manifestStatements(during body: () -> Void) -> [String] {
         guard let queue = BodyAssetStore.manifestQueue() else {
             Issue.record("manifest queue unavailable")
-            return
+            return []
         }
-        try queue.write { db in
-            try db.execute(
-                sql: """
-                    INSERT INTO bodyAssetPreparation (preparationId, blobId, createdAt)
-                    VALUES (?, ?, ?)
-                    """,
-                arguments: ["", blobId, Int64(Date().timeIntervalSince1970 * 1000)]
-            )
+        let tape = StatementTape()
+        queue.inDatabase { db in
+            db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
         }
+        body()
+        queue.inDatabase { db in db.trace(options: .statement, nil) }
+        return tape.statements()
     }
 
-    private static func leaseCount(blobId: String) throws -> Int {
-        guard let queue = BodyAssetStore.manifestQueue() else { return -1 }
-        return try queue.read { db in
-            try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM bodyAssetPreparation WHERE blobId = ?",
-                arguments: [blobId]
-            ) ?? -1
-        }
+    private static func physicalDeleteChecks(of blobId: String, in statements: [String]) -> Int {
+        statements.filter { $0.contains("FROM bodyAsset WHERE id = '\(blobId)'") }.count
     }
 
     /// THE SYSTEM PROPERTY: for a given header directory, `pruneOrphanFiles` counts a
@@ -596,26 +676,28 @@ struct BodyAssetPreparationLeaseTests {
         try Self.insertManifestRow(blobId: known)
         try Self.writeAgedBlobFile(known, bytes: Data("known-bytes".utf8))
         try Self.writeAgedBlobFile(orphan, bytes: Data("orphan-bytes".utf8))
-        try Self.insertTracerLease(blobId: known)
 
-        BodyAssetStore.pruneOrphanFiles()
+        let statements = Self.manifestStatements { BodyAssetStore.pruneOrphanFiles() }
+        let knownChecks = Self.physicalDeleteChecks(of: known, in: statements)
+        let orphanChecks = Self.physicalDeleteChecks(of: orphan, in: statements)
 
         // ACCOUNTED FOR: the sweep never reaches the deleter for it.
-        let knownTracer = try Self.leaseCount(blobId: known)
-        #expect(knownTracer == 1,
+        #expect(knownChecks == 0,
                 "a file the manifest already accounts for must not be run through the physical-delete path")
         #expect(Self.blobExists(known), "and its bytes must still be there")
 
         // NON-VACUITY, same run, same directory: the sweep provably DID run and DID
         // bite — otherwise the assertions above would pass on a sweep that did nothing.
+        #expect(orphanChecks == 1, "the unaccounted-for file goes through the delete path once")
         #expect(!Self.blobExists(orphan),
                 "an unaccounted-for file's bytes must be reclaimed")
     }
 
     /// The same classification at the top of the hash alphabet, where the exclusive
     /// upper bound of `ffffffffffffffff` is not a hex string at all. A hash that
-    /// cannot match its own files there would silently hand every cached attachment
-    /// of those messages to the deleter on every 60s foreground sweep.
+    /// cannot match its own files there would hand every cached attachment of those
+    /// messages to the deleter whenever the sweep runs (#1376: once after the update,
+    /// and after a UIDVALIDITY reset's folder purge).
     @Test("Orphan sweep: the top of the hash alphabet still matches its own files")
     func orphanSweepMatchesFilesAtTheTopOfTheHashAlphabet() throws {
         let dir = try Self.setupTest()
@@ -628,13 +710,12 @@ struct BodyAssetPreparationLeaseTests {
         try Self.insertManifestRow(blobId: known)
         try Self.writeAgedBlobFile(known, bytes: Data("known-bytes-at-the-top".utf8))
         try Self.writeAgedBlobFile(orphan, bytes: Data("orphan-bytes-at-the-top".utf8))
-        try Self.insertTracerLease(blobId: known)
 
-        BodyAssetStore.pruneOrphanFiles()
+        let statements = Self.manifestStatements { BodyAssetStore.pruneOrphanFiles() }
 
-        let knownTracer = try Self.leaseCount(blobId: known)
-        #expect(knownTracer == 1,
+        #expect(Self.physicalDeleteChecks(of: known, in: statements) == 0,
                 "the highest possible hash must still match its own files")
+        #expect(Self.physicalDeleteChecks(of: orphan, in: statements) == 1)
         #expect(Self.blobExists(known))
 
         #expect(!Self.blobExists(orphan), "the orphan beside it must still be reclaimed")
@@ -702,7 +783,9 @@ struct BodyAssetPreparationLeaseTests {
     /// The UPGRADE half of `migrateAttachmentIdentitySchema`'s convergence claim
     /// (ADR-IOS-066 / T5.1). A manifest that predates `identityStamp` must gain the
     /// column and then behave identically to a freshly created one — otherwise every
-    /// existing install's attachment cache is a hard error rather than a miss.
+    /// existing install's attachment cache is a hard error rather than a miss. The
+    /// upgrade runs through `migrateManifestSchema`, the entry point every manifest
+    /// open calls, so the test fails if that entry point stops running the upgrade.
     @Test("A manifest that predates identityStamp upgrades and then serves stamped attachments")
     func attachmentIdentitySchemaUpgradesAnExistingManifest() throws {
         let dir = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -746,8 +829,8 @@ struct BodyAssetPreparationLeaseTests {
                 "precondition: the column really is absent before the upgrade")
 
         // Run twice — the upgrade path is also re-entered on every manifest open.
-        try queue.write { db in try BodyAssetStore.migrateAttachmentIdentitySchema(db) }
-        try queue.write { db in try BodyAssetStore.migrateAttachmentIdentitySchema(db) }
+        try queue.write { db in try BodyAssetStore.migrateManifestSchema(db) }
+        try queue.write { db in try BodyAssetStore.migrateManifestSchema(db) }
         let hasColumnAfter = try hasIdentityStampColumn()
         #expect(hasColumnAfter)
 
@@ -768,4 +851,12 @@ struct BodyAssetPreparationLeaseTests {
             contentKey: key, section: "2", identityStamp: "rfc:someone-else@example.com") == nil,
             "the upgraded manifest must refuse a different message just as a fresh one does")
     }
+}
+
+/// The statements a trace saw. `trace` fires on the database's own queue, so the
+/// buffer is lock-protected.
+private final class StatementTape: Sendable {
+    private let buffer = Mutex<[String]>([])
+    func record(_ sql: String) { buffer.withLock { $0.append(sql) } }
+    func statements() -> [String] { buffer.withLock { $0 } }
 }

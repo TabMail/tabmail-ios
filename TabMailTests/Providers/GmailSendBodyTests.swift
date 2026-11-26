@@ -37,15 +37,21 @@ struct GmailSendBodyTests {
         #expect(body["raw"] as? String != nil)
     }
 
-    @Test("Forward with a threadId also carries it (forward threads like reply)")
+    /// A forward carries the original only in References, no In-Reply-To
+    /// (#1483); with its threadId and "Fwd:" subject Gmail files it in the
+    /// original's conversation (checked live on a Workspace account, 2026-11-25).
+    @Test("Forward with a threadId also carries it (forward threads like reply), and its raw has References but no In-Reply-To")
     func forwardIncludesThreadId() {
         let draft = DraftMessage(
             to: ["bob@example.com"], subject: "Fwd: Hello", body: "FYI",
-            inReplyTo: "parent@example.com", references: ["parent@example.com"],
+            references: ["parent@example.com"],
             threadId: "gmail-thread-xyz"
         )
         let body = makeProvider().buildSendBody(draft: draft)
         #expect(body["threadId"] as? String == "gmail-thread-xyz")
+        let mime = decodeRaw(body["raw"] as? String ?? "")
+        #expect(mime.contains("References: <parent@example.com>"))
+        #expect(!mime.contains("In-Reply-To:"))
     }
 
     @Test("New compose (no threadId) omits the threadId key entirely")
@@ -88,5 +94,50 @@ struct GmailSendBodyTests {
         let mime = decodeRaw(raw)
         #expect(mime.contains("In-Reply-To: <parent@example.com>"))
         #expect(mime.contains("References: <root@example.com> <parent@example.com>"))
+    }
+}
+
+/// `users.messages.send` answers with the Message resource Gmail stores in
+/// Sent. Its `id` (and `threadId`) is the copy's identity: Gmail replaces the
+/// Message-ID the send wrote, so that id is the only key the Sent listing and
+/// the local row share.
+@Suite("GmailProvider.send names the Sent copy")
+struct GmailSentCopyIdentityTests {
+
+    private static func parse(_ json: String) -> SentCopyIdentity? {
+        GmailProvider.sentCopyIdentity(fromSendResponse: Data(json.utf8))
+    }
+
+    @Test("the send answer's id and threadId are the Sent copy's identity")
+    func fullAnswer() {
+        let identity = Self.parse(#"{"id":"msg-1","threadId":"thread-1","labelIds":["SENT"]}"#)
+        #expect(identity == SentCopyIdentity(providerMessageId: "msg-1", threadId: "thread-1"))
+    }
+
+    @Test("an answer with an id but no usable threadId still names the copy",
+          arguments: [#"{"id":"msg-1"}"#, #"{"id":"msg-1","threadId":""}"#, #"{"id":"msg-1","threadId":7}"#])
+    func idWithoutThread(json: String) {
+        #expect(Self.parse(json) == SentCopyIdentity(providerMessageId: "msg-1", threadId: nil))
+    }
+
+    @Test("an answer that names no id names no copy",
+          arguments: [#"{"threadId":"thread-1"}"#, #"{"id":"","threadId":"thread-1"}"#,
+                      #"{"id":42}"#, #"[]"#, "", "not json"])
+    func noId(json: String) {
+        #expect(Self.parse(json) == nil)
+    }
+
+    @Test("send returns the identity Gmail's answer names")
+    func sendReturnsTheAnswer() async throws {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(
+            path: "/messages/send", method: "POST",
+            response: .json(raw: #"{"id":"msg-sent","threadId":"thread-sent","labelIds":["SENT"]}"#))
+        let provider = GmailProvider(userEmail: "sender@example.com", accessToken: { _ in "tok" }, session: http.session)
+        let identity = try await provider.send(
+            draft: DraftMessage(to: ["to@example.com"], subject: "Test", body: "Body text"))
+        #expect(identity == SentCopyIdentity(providerMessageId: "msg-sent", threadId: "thread-sent"))
+        #expect(http.recordedCalls().count == 1)
     }
 }

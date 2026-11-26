@@ -79,7 +79,7 @@ struct OutlookCatchUpTests {
     /// One catch-up call for `paths`, applied by the engine. True on progress.
     @discardableResult
     static func pass(_ w: R.World, _ engine: SyncEngine, _ paths: [String], context: CatchUpContext = unlimited()) async -> Bool {
-        await engine.runCatchUp(provider: w.provider, folderIds: paths.map(w.folderId), context: context)
+        await engine.runCatchUp(provider: w.provider, folderIds: paths.map(w.folderId), context: context).progressed
     }
 
     static func state(_ w: R.World, _ path: String) throws -> ExchangeCatchUpState? {

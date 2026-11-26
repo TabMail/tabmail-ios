@@ -196,7 +196,12 @@ actor AccountManager {
     /// once by the drain at every terminal branch (success/notFound/scope/
     /// auth/badRequest) and on transient retry-back-to-queued.
     var calendarOpAwaiters: [String: CheckedContinuation<CalendarOpOutcome, Never>] = [:]
-    let syncEngine = SyncEngine()
+    /// A sync trigger that finds an account busy asks the scheduler for the
+    /// account's one follow-up stage 2 (the sync design block in
+    /// SyncEngineOneSyncAtATime.swift).
+    let syncEngine = SyncEngine(syncFollowUp: { accountId in
+        Task { @MainActor in await SyncScheduler.shared.runSyncFollowUp(accountId: accountId) }
+    })
     private var _oauthService: OAuthService?
     /// OAuthService is @MainActor (uses ASWebAuthenticationSession).
     /// Created lazily on first use from MainActor context. All callers
@@ -401,6 +406,41 @@ actor AccountManager {
         providers.removeValue(forKey: accountId)
         workQueues.removeValue(forKey: accountId)
     }
+
+    #if DEBUG
+    /// Test seam: register `provider` for `account` exactly as `connectAccount`
+    /// does: one `ProviderWorkQueue`, sized by provider, shared by the outbox and
+    /// action drains (`workQueues`) and the sync engine. Without the network
+    /// connect or the initial sync. Undo with `disconnectProviderForTesting`.
+    func connectProviderForTesting(account: Account, provider: any EmailProvider) async {
+        providers[account.id] = provider
+        let concurrency: Int
+        switch account.provider {
+        case .gmail: concurrency = SyncConfig.gmailWorkQueueConcurrency
+        case .outlook: concurrency = SyncConfig.exchangeWorkQueueConcurrency
+        default: concurrency = SyncConfig.imapMaxConnectionCeiling
+        }
+        let queue = ProviderWorkQueue(provider: provider, maxConcurrency: concurrency)
+        workQueues[account.id] = queue
+        await syncEngine.register(accountId: account.id, provider: provider, workQueue: queue)
+    }
+
+    /// Test seam: the post-drain phase (`AccountOperationExecutor.finishDrain`)
+    /// of a drain that recorded `folderKeys` (`"accountId|path"`) as folders to
+    /// sync, without executing any operation.
+    func finishDrainForTesting(foldersToSync folderKeys: [String]) async {
+        operationExecutor.beginDrain(using: self)
+        operationExecutor.recordFoldersToSyncForTesting(folderKeys, using: self)
+        await operationExecutor.finishDrain(using: self)
+    }
+
+    /// Test seam: undo `connectProviderForTesting`.
+    func disconnectProviderForTesting(accountId: String) async {
+        providers.removeValue(forKey: accountId)
+        workQueues.removeValue(forKey: accountId)
+        await syncEngine.remove(accountId: accountId)
+    }
+    #endif
 
     /// Test seam: the calendar sibling of `registerProviderForTesting`, so the
     /// calendar tools and `drainCalendarQueue` can be exercised against a
@@ -1448,16 +1488,17 @@ actor AccountManager {
     }
 
     #if DEBUG
-    /// Test seam: `IMAPProvider`'s TLS override for providers this factory builds,
-    /// so the factory and `updatePassword` can be driven against the plain-TCP
-    /// `FakeIMAPServer`. `nil` (production) lets SwiftMail choose.
+    /// Test seam: `IMAPProvider`'s TLS override for providers this factory and
+    /// `addIMAPAccount` build, so the factory, `updatePassword` and the IMAP add
+    /// can be driven against the plain-TCP `FakeIMAPServer`. `nil` (production)
+    /// lets SwiftMail choose.
     private nonisolated let imapUseTLSOverrideBox = Mutex<Bool?>(nil)
     nonisolated func setIMAPUseTLSOverrideForTesting(_ useTLS: Bool?) {
         imapUseTLSOverrideBox.withLock { $0 = useTLS }
     }
-    private nonisolated var imapUseTLSOverride: Bool? { imapUseTLSOverrideBox.withLock { $0 } }
+    nonisolated var imapUseTLSOverride: Bool? { imapUseTLSOverrideBox.withLock { $0 } }
     #else
-    private nonisolated var imapUseTLSOverride: Bool? { nil }
+    nonisolated var imapUseTLSOverride: Bool? { nil }
     #endif
 
     #if DEBUG
@@ -1516,6 +1557,18 @@ actor AccountManager {
     /// The registered provider for `accountId`, if connected.
     func provider(accountId: String) -> (any EmailProvider)? {
         providers[accountId]
+    }
+
+    /// IDLE follows the provider (#1331): every place that makes a connected mail
+    /// provider the account's live one calls this (`connectAccount`, the IMAP and
+    /// iCloud adds, a password update), and `connectAccount` also after a connect
+    /// that failed for a reason other than a refused sign-in, as its provider stays
+    /// installed. While foreground polling is on, the
+    /// scheduler starts that provider's IDLE now, so a provider that goes live
+    /// after the foreground start does not wait for the next return. Not
+    /// awaited: installing a provider never waits for the main actor.
+    func liveProviderConnected(_ account: Account) {
+        Task { @MainActor in await SyncScheduler.shared.accountConnected(account) }
     }
 
     func connectAccount(_ account: Account) async throws {
@@ -1637,6 +1690,7 @@ actor AccountManager {
             }
             authFailedAccounts.remove(account.id)
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() DONE in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms")
+            liveProviderConnected(account)
         } catch {
             BootProfiler.mark("connectAccount[\(acctTag)]: provider.connect() FAILED in \(Int((CFAbsoluteTimeGetCurrent() - connectT0) * 1000))ms (auth=\(isAuthError(error)))")
             if isAuthError(error) {
@@ -1644,6 +1698,19 @@ actor AccountManager {
                 authFailedAccounts.insert(account.id)
             } else {
                 BackgroundSyncLogger.logDebug("[AccountManager] Connect failed for \(account.emailAddress) (non-auth): \(error)")
+            }
+            // The provider stays installed (stored above), so IDLE follows it here
+            // too: a connect that failed for now (no network at a cold launch, a
+            // timeout, a temporary refusal) gets IDLE, whose own launch retry brings
+            // it up once the server answers. This is the provider's only hand-off:
+            // `ensureConnected` later reconnects it without one. A refused sign-in
+            // hands nothing off:
+            // `authFailedAccounts` holds both the typed refusal above and an IMAP
+            // password refusal, which the provider's sign-in reporter records before
+            // it throws. A server that wrongly refuses the sign-in at a cold launch
+            // gets IDLE at the next return.
+            if !authFailedAccounts.contains(account.id), !isRuntimeRemoved(account.id) {
+                liveProviderConnected(account)
             }
             throw error
         }
@@ -1784,8 +1851,14 @@ actor AccountManager {
         // Tear down the provider socket before waiting for sync tasks. Their
         // cancellation is cooperative, so a read parked in SwiftMail may not
         // return until disconnect closes the underlying connection.
+        // Removal retires the provider: a caller still holding it (a listing
+        // waiting for the sync turn) opens no new session with its credentials.
         if let provider {
-            try? await provider.disconnect()
+            if caldavConfigIds != nil {
+                await provider.disconnectForAccountRemoval()
+            } else {
+                try? await provider.disconnect()
+            }
         }
         await syncEngine.remove(accountId: account.id)
         // AI processing is now handled by ActiveBodyQueue + ActiveAIQueue actors

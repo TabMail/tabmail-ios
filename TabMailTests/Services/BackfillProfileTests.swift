@@ -158,7 +158,8 @@ struct BackfillProfileNormalDefaultTests {
     }
 }
 
-@Suite("StorageEstimator Constants")
+/// `.processGlobalState`: one test reads the limit in the standard defaults.
+@Suite("StorageEstimator Constants", .processGlobalState)
 struct StorageEstimatorConstantsTests {
 
     @Test("floorPerFolder is 50")
@@ -182,8 +183,11 @@ struct StorageEstimatorConstantsTests {
         #expect(size >= 0)
     }
 
-    @Test("isOverBudget returns false with unlimited budget")
-    func notOverBudgetWithUnlimited() {
-        #expect(StorageEstimator.isOverBudget() == false)
+    @Test("The older-mail walk's storage check is off with unlimited budget")
+    func noWalkCheckWithUnlimited() async {
+        let check = await StoragePruneTargetTests.withLimit(nil) {
+            await StorageEstimator.WalkCheck.start(.constant(Int64.max))
+        }
+        #expect(check == nil)
     }
 }
