@@ -650,7 +650,7 @@ extension AccountManager {
             let draftToSend = draftWithId
 
             BackgroundSyncLogger.logDebug("[Outbox] Sending \(current.id) via \(type(of: provider))")
-            try await queue.execute(priority: .userAction) {
+            let sentIdentity = try await queue.execute(priority: .userAction) {
                 try await provider.send(draft: draftToSend)
             }
             BackgroundSyncLogger.logDebug("[Outbox] Send succeeded for \(current.id)")
@@ -661,10 +661,16 @@ extension AccountManager {
                 outboxId: current.id, sentDate: Date()
             ) else { return }
 
+            // The copy the send named is read only now, after the durable stamp:
+            // a kill or suspension during that read can never resend the message.
+            let sentCopy = await readSentCopy(sentIdentity, queue: queue, outboxId: current.id)
+
             // Optimistic Sent folder header: insert a placeholder MessageHeader so the
             // message appears in the Sent folder immediately (before IMAP APPEND + sync).
-            // Uses rfc822MessageId for dedup — sync will replace this with the real UID.
-            await insertOptimisticSentHeader(outboxMessage: current, messageId: messageId, draft: draftWithId)
+            // Written as the provider lists its copy when that copy was read;
+            // otherwise sync replaces it by rfc822MessageId.
+            await insertOptimisticSentHeader(
+                outboxMessage: current, messageId: messageId, draft: draftWithId, sentCopy: sentCopy)
 
             // Attempt Sent folder append. If it fails, the message stays in the
             // outbox with sentAt set — drainPendingSentAppends will retry later.
@@ -825,16 +831,60 @@ extension AccountManager {
         LIMIT 1
         """
 
+    /// Reads the Sent copy the provider's send named (`SentCopyIdentity`; Gmail
+    /// answers `users.messages.send` with the message's `id` and `threadId`)
+    /// through the provider's own header listing, for the Message-ID, dates and
+    /// conversation id the provider gave it (Gmail replaces the Message-ID the
+    /// send wrote).
+    ///
+    /// Called only after `stampSentAt`, so a kill or suspension during this read
+    /// never resends the message. Never throws into the send's error handling:
+    /// a failed read, or an answer without the copy's Message-ID, gives `nil`,
+    /// and the Sent row is then the `sent-<outbox id>` placeholder that the
+    /// sync replaces with the copy it lists.
+    private func readSentCopy(
+        _ identity: SentCopyIdentity?, queue: ProviderWorkQueue, outboxId: String
+    ) async -> ListedSentCopy? {
+        guard let identity else { return nil }
+        let provider = queue.provider
+        do {
+            let listed = try await queue.execute(priority: .userAction) {
+                try await provider.fetchMessageHeaders(ids: [identity.providerMessageId])
+            }
+            guard let header = listed.first(where: { $0.messageId == identity.providerMessageId }),
+                  let rfc822 = header.rfc822MessageId, !rfc822.isEmpty else {
+                BackgroundSyncLogger.logDebug("[Outbox] Sent copy \(identity.providerMessageId) of \(outboxId) not listed with a Message-ID; placeholder row")
+                return nil
+            }
+            return ListedSentCopy(
+                identity: SentCopyIdentity(
+                    providerMessageId: identity.providerMessageId,
+                    threadId: header.threadId ?? identity.threadId),
+                rfc822MessageId: rfc822, date: header.date, providerDate: header.providerOrderDate)
+        } catch {
+            BackgroundSyncLogger.logDebug("[Outbox] Reading Sent copy \(identity.providerMessageId) of \(outboxId) failed: \(error); placeholder row")
+            return nil
+        }
+    }
+
     /// Insert a placeholder MessageHeader into the Sent folder so the message appears
-    /// immediately in the UI after send succeeds. Uses rfc822MessageId (the pre-generated
-    /// Message-ID) for dedup — when sync brings in the real IMAP UID, the placeholder is
-    /// replaced in-place (same pattern as optimistic drafts).
-    private func insertOptimisticSentHeader(outboxMessage msg: OutboxMessage, messageId: String, draft: DraftMessage) async {
+    /// immediately in the UI after send succeeds.
+    ///
+    /// When the provider's Sent copy was read (`sentCopy`, `readSentCopy`), the
+    /// row is written as the sync lists that copy: the provider's id, thread id,
+    /// Message-ID, date and order date. A sync that lists it later finds the row
+    /// it already holds. Otherwise the row is `sent-<outbox id>` and the sync
+    /// replaces it when a copy with the pre-generated Message-ID arrives (same
+    /// pattern as optimistic drafts).
+    private func insertOptimisticSentHeader(
+        outboxMessage msg: OutboxMessage, messageId: String, draft: DraftMessage, sentCopy: ListedSentCopy?
+    ) async {
         do {
             // Write transaction returns FTS data for post-transaction indexing.
             // Same pattern as queueDraftSave — headerComplete=1 must be set via the real
             // FTS pipeline, not manually, otherwise the body queue / recovery logic misbehaves.
-            let ftsInfo: (record: FTSHeaderRecord, bodyText: String)? = try await dbPool.write { db -> (FTSHeaderRecord, String)? in
+            // `bodyText` is nil when no local body was written.
+            let ftsInfo: (record: FTSHeaderRecord, bodyText: String?)? = try await dbPool.write { db -> (FTSHeaderRecord, String?)? in
                 guard let sentFolder = try Folder
                     .filter(Column("accountId") == msg.accountId && Column("role") == FolderRole.sent.rawValue)
                     .fetchOne(db) else {
@@ -842,9 +892,13 @@ extension AccountManager {
                 }
 
                 let folderId = sentFolder.id
-                let rfc822 = EmailFilter.normalizeMessageId(messageId)
+                // The provider's own Message-ID when its copy was read (Gmail
+                // replaces the one the send wrote), as the sync stores it.
+                let rfc822 = sentCopy?.rfc822MessageId ?? EmailFilter.normalizeMessageId(messageId)
 
-                // Don't insert if a header with this rfc822MessageId already exists (idempotent)
+                // Don't insert if a header with this rfc822MessageId already exists (idempotent).
+                // This is also a provider copy a sync stored before this write: it
+                // stays as the sync wrote it, and nothing more is written here.
                 if try MessageHeader.fetchOne(
                     db, sql: Self.optimisticSentDedupSQL, arguments: [folderId, rfc822]) != nil {
                     return nil
@@ -855,56 +909,73 @@ extension AccountManager {
                 let senderDisplayName = senderAccount?.displayName ?? senderEmail
                 let plainText = draft.isHTML ? EmailFilter.htmlToPlainText(draft.body) : draft.body
                 let snippet = EmailFilter.snippetFromPlainText(plainText)
-                let placeholderMsgId = "sent-\(msg.id)"
-                let headerId = "\(msg.accountId):\(sentFolder.path):\(placeholderMsgId)"
-                let now = Date()
+                let rowMessageId = sentCopy?.identity.providerMessageId ?? "sent-\(msg.id)"
+                let headerId = "\(msg.accountId):\(sentFolder.path):\(rowMessageId)"
+                // The copy's own date, as the sync stores it: the sync never
+                // rewrites the date of a row it already holds.
+                let rowDate = sentCopy?.date ?? Date()
 
                 var header = MessageHeader(
-                    messageId: placeholderMsgId,
+                    messageId: rowMessageId,
                     subject: msg.subject,
                     from: senderDisplayName,
                     fromAddress: senderEmail,
                     to: msg.to.joined(separator: ", "),
-                    date: now,
+                    date: rowDate,
                     snippet: snippet,
                     folderId: folderId,
                     accountId: msg.accountId,
                     folderPath: sentFolder.path,
-                    isInInbox: false
+                    isInInbox: false,
+                    providerDate: sentCopy?.providerDate
                 )
                 header.rfc822MessageId = rfc822
                 header.cc = msg.cc.joined(separator: ", ")
                 header.bcc = msg.bcc.joined(separator: ", ")
                 header.isRead = true
+                // A row under the provider's id is the copy the sync keeps, and the
+                // sync's update of a row it already holds leaves this as it is.
+                header.hasAttachments = sentCopy != nil && !draft.attachments.isEmpty
                 header.inReplyTo = msg.inReplyTo.map { EmailFilter.normalizeMessageId($0) }
                 header.referencesJSON = MessageHeader.encodeReferences(msg.references)
+                // The provider's conversation id, which a reply started from this
+                // row sends (`ThreadUtils.outgoingThreadHeaders`). The sync never
+                // sets it on a row it already holds.
+                header.threadId = sentCopy?.identity.threadId
                 // Thread grouping so the sent message appears in the conversation
-                try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: nil, db: db)
+                try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: sentCopy?.identity.threadId, db: db)
                 try header.insert(db)
                 try ThreadUtils.insertMessageReferences(for: header, db: db)
 
-                // Also create MessageBody so the message is viewable immediately
-                if draft.isHTML {
-                    let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: draft.body)
-                    try body.save(db)
-                } else {
-                    let htmlBody = MessageBody.plainTextToHTML(draft.body)
-                    let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: htmlBody)
-                    try body.save(db)
+                // Also create MessageBody so the message is viewable immediately.
+                // Not for a row under the provider's own id whose message has
+                // attachments: the local copy lists none, and a body fetch keeps a
+                // body that is already stored, so the row fetches the provider's
+                // copy like any listed message instead.
+                let writesLocalBody = sentCopy == nil || draft.attachments.isEmpty
+                if writesLocalBody {
+                    if draft.isHTML {
+                        let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: draft.body)
+                        try body.save(db)
+                    } else {
+                        let htmlBody = MessageBody.plainTextToHTML(draft.body)
+                        let body = MessageBody(contentKey: ContentKey(rawValue: headerId), htmlContent: htmlBody)
+                        try body.save(db)
+                    }
                 }
 
                 return (FTSHeaderRecord(
                     contentKey: ContentKey(rawValue: headerId),
                     headerId: headerId,
-                    messageId: placeholderMsgId,
+                    messageId: rowMessageId,
                     subject: msg.subject,
                     from: "\(senderDisplayName) <\(senderEmail)>",
                     to: msg.to.joined(separator: ", "),
                     cc: msg.cc.joined(separator: ", "),
                     bcc: msg.bcc.joined(separator: ", "),
-                    dateMs: Int64(now.timeIntervalSince1970 * 1000),
+                    dateMs: Int64(rowDate.timeIntervalSince1970 * 1000),
                     folderId: folderId
-                ), plainText)
+                ), writesLocalBody ? plainText : nil)
             }
 
             // FTS indexing + headerComplete — runs after GRDB write succeeds.
@@ -914,8 +985,9 @@ extension AccountManager {
             if let ftsInfo {
                 do {
                     _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
-                    if !ftsInfo.bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        _ = try await SearchIndex.shared.updateBodies([(contentKey: ftsInfo.record.contentKey, body: ftsInfo.bodyText)])
+                    if let bodyText = ftsInfo.bodyText,
+                       !bodyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        _ = try await SearchIndex.shared.updateBodies([(contentKey: ftsInfo.record.contentKey, body: bodyText)])
                     }
                 } catch {
                     BackgroundSyncLogger.logDebug("[Outbox] WARNING: FTS indexing failed for sent \(ftsInfo.record.headerId): \(error)")
@@ -927,10 +999,12 @@ extension AccountManager {
                     // up the placeholder and feeds its synthetic "sent-<UUID>" messageId to
                     // GmailProvider/GraphAPI → HTTP 400 invalid id, every cold start, until
                     // the delta-sync dedup (SyncEngineDeltaSync) replaces the row.
+                    // Without a local body (a provider-id row with attachments) the
+                    // body stays to fetch, under the provider's real id.
                     try await dbPool.write { db in
                         try db.execute(
-                            sql: "UPDATE messageHeader SET headerComplete = 1, bodyComplete = 1 WHERE id = ?",
-                            arguments: [ftsInfo.record.headerId]
+                            sql: "UPDATE messageHeader SET headerComplete = 1, bodyComplete = ? WHERE id = ?",
+                            arguments: [ftsInfo.bodyText != nil, ftsInfo.record.headerId]
                         )
                     }
                 } catch {

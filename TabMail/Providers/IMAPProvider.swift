@@ -6378,7 +6378,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         }
     }
 
-    func send(draft: DraftMessage) async throws {
+    /// SMTP's answer names no copy: the Sent copy is the APPEND that follows,
+    /// matched to the optimistic row by its Message-ID.
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
         // The SMTP session logs in with the same credentials: a retired
         // provider sends nothing.
         if openingTornDown(nil) { throw ProviderError.notConnected }
@@ -6427,6 +6430,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             try? await smtpServer.close()
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[SMTP] Send complete") }
         }
+        return nil
     }
 
     /// Append a sent message to the IMAP Sent folder. Dedup-safe: searches by Message-ID

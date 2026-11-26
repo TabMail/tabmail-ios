@@ -976,7 +976,8 @@ The owner's rulings of 2026-11-09:
      `catchUpGmailRangeSlackSeconds` may count a message within one second outside the local range as
      missing (at worst one extra re-arm). A row whose stored `providerDate` differs from Gmail's
      `internalDate` is not known to exist: `providerDate` is Gmail's `internalDate` on every write
-     path (parse, every sync, backfill and delta insert or refresh, NSE staging, copies), and rows
+     path (parse, every sync, backfill and delta insert or refresh, NSE staging, copies, and since
+     2026-11-26 the Outbox's Sent row, which takes it from the copy's header, ADR-IOS-019), and rows
      from before v91 hold it too, because Gmail's `date` was `internalDate` until v91 copied it into
      `providerDate`. Such a row would fall outside its range's list, become a candidate and be kept by
      its GET: one cheap `format=minimal` GET per listing (the first and one after each lapse since
