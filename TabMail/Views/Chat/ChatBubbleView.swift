@@ -190,14 +190,29 @@ struct ChatBubbleView: View {
 /// (the newest outgoing place, under the last email). A dashed accent outline on a faded accent
 /// fill, dark-blue text (`Palette.chatSuggestion*`), and "AI Suggestion · Tap to use" under it, so it reads plainly as not sent. A tap
 /// on the bubble or its caption opens the compose card with the suggestion written out; nothing is sent from here.
+/// Under the caption, the other reply that came with it, when there is one (`alternative`).
 struct ChatSuggestionBubble: View {
     /// The suggestion's text version (`MessageHeader.replyTextMessage`).
     let text: String
     /// The tutorial's move is this tap: a pulse ring marks it.
     var pulses = false
+    /// The "or reply:" link under the caption, with its own tap; nil, none.
+    var alternative: ChatAlternativeLink? = nil
     let onTap: () -> Void
 
     var body: some View {
+        VStack(alignment: .trailing, spacing: ChatSuggestionConfig.alternativeGap) {
+            ghost
+            if let alternative { alternative }
+        }
+        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
+            width * ChatViewLayout.bubbleMaxWidthFraction
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal)
+    }
+
+    private var ghost: some View {
         // One button, bubble and caption, so the caption's "Tap to use" is a tap target too.
         Button(action: onTap) {
             VStack(alignment: .trailing, spacing: 4) {
@@ -236,15 +251,49 @@ struct ChatSuggestionBubble: View {
         // without this, VoiceOver's double tap opened nothing.
         .accessibilityAction { onTap() }
         .accessibilityIdentifier(Self.bubbleId)
-        .containerRelativeFrame(.horizontal, alignment: .trailing) { width, _ in
-            width * ChatViewLayout.bubbleMaxWidthFraction
-        }
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        .padding(.horizontal)
     }
 
     /// The ghost, as tests find it.
     static let bubbleId = "chat.aiSuggestion"
+}
+
+/// The other reply that came with the AI Suggestion (`ChatReplyField.alternative`), as a light line
+/// under the ghost's caption: a gray "or", then the reply in blue, and a chevron (ADR-IOS-114
+/// decision 10; owner 2026-11-26, mock E3). A tap puts the reply in the field, ready to edit or
+/// send (`put`); it never sends, and the ghost keeps its own tap. It shows only while the field is
+/// empty, so a tap never replaces the user's own words. It reads them here, in its own view, so a
+/// keystroke redraws this line and not the chat. The chat gives none while a dictation is under
+/// way (`ChatReplyField.dictationChanged`).
+struct ChatAlternativeLink: View {
+    let reply: String
+    /// The chat's words key (`ChatFieldWords.key(for:)`): whose field it fills.
+    let wordsKey: String
+    let put: () -> Void
+
+    var body: some View {
+        if ChatFieldWords.shared.fill(for: wordsKey).words.isEmpty {
+            Button(action: put) {
+                Text("\(lead) \(Text(reply).fontWeight(.medium)) \(ChatSuggestionConfig.alternativeChevron)")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.accent)
+                    .multilineTextAlignment(.trailing)
+                    .lineLimit(ChatSuggestionConfig.alternativeLineLimit)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(ChatSuggestionConfig.alternativeLabel(reply))
+            .accessibilityHint("Puts it in the field")
+            .accessibilityIdentifier(Self.linkId)
+        }
+    }
+
+    /// The gray "or"; the rest of the line takes the link's blue.
+    private var lead: Text {
+        Text(ChatSuggestionConfig.alternativeLead).foregroundStyle(Theme.textSecondary)
+    }
+
+    /// The line, as tests find it.
+    static let linkId = "chat.aiSuggestionAlternative"
 }
 
 /// The user's own message from the closed field (`ChatFieldMessage`): their words, verbatim, in

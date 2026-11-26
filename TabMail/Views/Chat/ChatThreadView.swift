@@ -107,6 +107,12 @@ struct ChatThreadView: View {
     /// The user's own message the closed field's Send put up (`ChatFieldMessage`): from Send until
     /// its card is taken or the send ends.
     @State private var fieldMessage: ChatFieldMessage?
+    /// The latest tap on the line under the AI Suggestion (`ChatAlternativeLink`), carried to the
+    /// field, which puts its reply there (`ChatReplyField.alternativeTap`).
+    @State private var alternativeTap: ChatAlternativeTap?
+    /// A dictation into the field is under way (`ChatReplyField.dictationChanged`): no line under
+    /// the AI Suggestion until it ends.
+    @State private var fieldDictating = false
     /// The held ghost turning into the sent reply's bubble.
     @Namespace private var sentMorph
     @State private var agentCompose: AgentToolRouter.ComposeRequest?
@@ -503,7 +509,8 @@ struct ChatThreadView: View {
                                 if !suggestionGrowPending, case .ready(let text) = suggestion {
                                     let move = tutorialMove(thread)
                                     // A tap opens the suggestion this ghost shows (`shown`: `.ready` comes only from it).
-                                    ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
+                                    ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion,
+                                                         alternative: alternativeLink(shown: shown, on: newest)) {
                                         if let shown { openSuggestion(shown, on: newest, tutorialMove: move) }
                                     }
                                     .transition(.asymmetric(
@@ -1060,6 +1067,18 @@ struct ChatThreadView: View {
             writing: chatWorking, cardOpen: cardOpen)
     }
 
+    /// The line under the ghost for the other reply that came with the AI Suggestion it shows
+    /// (`ChatReplyField.alternative`, `ChatAlternativeLink`): signed in, outside the tutorial (its
+    /// field is read-only), and only when the suggestion has one. A tap carries the reply to the
+    /// field (`alternativeTap`), which puts it there; nothing is sent.
+    private func alternativeLink(shown: ReplyResult?, on newest: MessageHeader) -> ChatAlternativeLink? {
+        guard hasTabMailSession, !TutorialCoordinator.shared.isRunning, !fieldDictating,
+              let reply = ChatReplyField.alternative(shown: shown) else { return nil }
+        return ChatAlternativeLink(reply: reply, wordsKey: ChatFieldWords.key(for: newest)) {
+            alternativeTap = ChatAlternativeTap(reply: reply)
+        }
+    }
+
     /// The AI Suggestion's row on the newest email: the ghost of the suggestion the chat shows
     /// (`shown`, from `shownSuggestion`), else the working bubble while the AI writes it
     /// (`ChatReplyField.suggestionPhase`, the inbox row's rule). No working bubble on the user's
@@ -1124,7 +1143,6 @@ struct ChatThreadView: View {
     private func pill(on newest: MessageHeader) -> some View {
         let isOwn = thread.items.last?.isOwn ?? false
         let isNoReply = !isOwn && EmailFilter.isNoReply(newest.fromAddress)
-        let shown = shownSuggestion(on: newest, thread: thread)
         // The paperclip's card goes to the reply's people, so the paperclip shows only once the chat
         // can tell the user's own addresses from theirs: the thread loaded and the email's own
         // account read (`isLoaded` alone is also set when the context read failed).
@@ -1151,7 +1169,8 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    alternative: ChatReplyField.alternative(shown: shown),
+                    alternativeTap: alternativeTap,
+                    dictationChanged: { fieldDictating = $0 },
                     onlyTo: replyTarget.only,
                     tutorialMove: move,
                     tutorialPanelCard: tutorialPanelCard(thread),

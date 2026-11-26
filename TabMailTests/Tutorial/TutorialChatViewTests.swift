@@ -178,7 +178,7 @@ struct TutorialChatViewContentTests {
         typealias C = TutorialCoordinator
         let moves: [C.FieldMove?] = [nil, .tapSuggestion, .dragUp]
         for move in moves {
-            let hint = DynamicIslandChat.tutorialDragHint(ChatReplyField(alternative: nil, tutorialMove: move))
+            let hint = DynamicIslandChat.tutorialDragHint(ChatReplyField(tutorialMove: move))
             #expect(hint == (move == .dragUp ? "Drag up to ask TabMail" : nil), "\(String(describing: move))")
         }
     }
@@ -1389,7 +1389,7 @@ struct TutorialChatViewWiringTests {
         #expect(Self.count("tutorialPanelCard: tutorialPanelCard(thread),", in: chat) == 1)
         #expect(Self.count("guard action == .nextLesson else { return } withAnimation(Self.pillSpring) { chatExpanded = false } dismiss()", in: chat) == 1,
                 "the card's Next closes the panel and the chat")
-        #expect(Self.count("ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) { if let shown { openSuggestion(shown, on: newest, tutorialMove: move) } }", in: chat) == 1)
+        #expect(Self.count("ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion, alternative: alternativeLink(shown: shown, on: newest)) { if let shown { openSuggestion(shown, on: newest, tutorialMove: move) } }", in: chat) == 1)
         #expect(Self.count("if TutorialCoordinator.shared.isRunning, tutorialMove != .tapSuggestion { _ = TutorialCoordinator.shared.admits(.other) return }", in: chat) == 1,
                 "in the tutorial only the step that asks for it opens the card")
         #expect(Self.count("TutorialCoordinator.shared.messageOpened(accountId: opened.accountId, messageId: opened.messageId)", in: chat) == 1,

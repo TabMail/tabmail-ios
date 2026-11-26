@@ -515,6 +515,28 @@ same AI result, kept as long as the email itself is shown.
      (`ChatSuggestionConfig.replyExamples`, `newEmailExamples`, `randomExample`, `exampleLine`,
      `DynamicIslandChat.exampleLineId`), with `ChatViewLayout.fieldPulseOpacity`/`fieldPulseDuration`
      (the words no longer pulse in the field) and `ChatSuggestionConfig.fieldEditRewritesInPlace`.
+     *Amended 2026-11-26 (owner's pick of mock E3, after mock pages of the line's look):* the
+     alternative left the field, which is one line again. It is a light line under the AI
+     Suggestion's caption, on the ghost's right edge (`ChatAlternativeLink`, inside
+     `ChatSuggestionBubble`): a gray "or", then the reply in the link's blue, a little bolder, and a
+     chevron (`ChatSuggestionConfig.alternativeLead`, `alternativeChevron`); VoiceOver reads
+     "Or reply: <reply>" (`alternativeLabel`). A long reply wraps to a second line
+     (`alternativeLineLimit`). It shows only while the field is empty and signed in, never in the
+     tutorial or while a dictation is under way, and only with an AI Suggestion that has one
+     (`ChatThreadView.alternativeLink`); it reads the field's words itself (`ChatFieldWords`), so
+     a keystroke redraws the line and not the chat, and a tap never replaces words the user wrote.
+     The field tells the chat when a dictation starts and ends (`ChatReplyField.dictationChanged`,
+     from `DynamicIslandChat.isDictating`), as the field's own line hid during one: a tap then
+     would cut off an on-device transcript (it drops a transcript once the words changed) or have
+     a dictation's text added after the reply. A tap carries the reply to the
+     field (`ChatAlternativeTap` in `ChatReplyField.alternativeTap`), which puts it there with the
+     cursor at its end (`DynamicIslandChat.putAlternative`, as before); nothing is sent, and the
+     ghost keeps its own tap. Removed: `ChatSuggestionConfig.alternativeLine`,
+     `ChatReplyField.alternative` (the property; `alternative(shown:)` stays),
+     and `DynamicIslandChat.alternativeLineId`.
+     Tests: `ChatSuggestionBubbleTests.alternativeLineFillsTheField`,
+     `ChatReplyFieldRuntimeTests.alternativeTapPutsTheReply`, `ChatThreadLayoutTests.signedInEmptyField`,
+     `ChatReplyFieldTests.alternativeLine` and `suggestionLookWiring`.
    - **Send.** The words go up at once, verbatim, as the user's own bubble in the AI Suggestion's
      place (`ChatFieldMessage`, `ChatFieldMessageBubble`, `ChatThreadView.fieldSent`), pulsing
      while the email is written; the field shows its placeholder and the status line reads "Writing
@@ -1571,6 +1593,8 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      opposite of the body), shown as "alt: " under the field while the AI Suggestion shows
      (`ChatReplyField.alternative(shown:)`); with none there is no line, and the configured
      examples are deleted (decision 10, *The closed field's words are the user's own message*).
+     Since the same day's mock E3 it shows under the AI Suggestion instead, as "or <reply> ›"
+     (`ChatAlternativeLink`, decision 10's amendment).
    - **The tutorial's practice edit is a whole compose result.** `TutorialChatScript.editedReply`
      returns the edited reply with its text version (`ReplyResult`), passed through the card's edit
      path like a real edit's. Before, "Make it shorter" then Discard left Priya's chat without an AI

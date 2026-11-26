@@ -189,14 +189,13 @@ struct ChatReplyAttachTests {
     @Test("The paperclip shows for a new email's field and a thread's, and its choice reaches the one given")
     func fieldPaperclip() {
         var threadChoices: [ChatNewEmailField.AttachSource] = []
-        let thread = ChatReplyField(alternative: nil, attach: { threadChoices.append($0) })
+        let thread = ChatReplyField(attach: { threadChoices.append($0) })
         thread.paperclip?(.files)
         #expect(threadChoices == [.files], "a thread's paperclip reaches the chat")
-        #expect(ChatReplyField(alternative: nil).paperclip == nil, "nothing given: no paperclip")
+        #expect(ChatReplyField().paperclip == nil, "nothing given: no paperclip")
 
         var newEmailChoices: [ChatNewEmailField.AttachSource] = []
         let newEmail = ChatReplyField(
-            alternative: nil,
             newEmail: ChatNewEmailField(startWords: "", sessionKey: "attach-session", wordsChanged: { _ in },
                                         send: { _ in nil }, attach: { newEmailChoices.append($0) }))
         newEmail.paperclip?(.camera)

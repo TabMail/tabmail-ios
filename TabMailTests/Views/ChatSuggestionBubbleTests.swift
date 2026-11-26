@@ -22,6 +22,8 @@ import UIKit
 ///     Suggestion's place, pulsing while the email is written, still once written; then its card
 ///     opens. Closed unsent, the AI Suggestion is back unchanged (nothing stored) and so are the words.
 ///  5. The chat view says "AI Suggestion", never "AI Reply", in any string a user sees or hears.
+///  6. The other reply that came with the suggestion is a line under the ghost, outside the field:
+///     a tap puts it in the field and sends nothing; it shows only while the field is empty.
 @Suite("The chat's AI Suggestion", .serialized, .processGlobalState)
 @MainActor
 struct ChatSuggestionBubbleTests {
@@ -139,6 +141,28 @@ struct ChatSuggestionBubbleTests {
         return own + view.subviews.flatMap { fieldTexts($0) }
     }
 
+    /// The line under the ghost that offers the other reply (`ChatAlternativeLink`).
+    private static func link(in view: UIView) -> NSObject? {
+        HostedAccessibility.elements(under: view).first {
+            HostedAccessibility.identifier(of: $0) == ChatAlternativeLink.linkId
+        }
+    }
+
+    /// Types `words` into the chat's field the way UIKit reports an edit.
+    private static func type(_ words: String, in view: UIView) -> Bool {
+        if let text = view as? UITextView, text.isEditable {
+            text.text = words
+            text.delegate?.textViewDidChange?(text)
+            return true
+        }
+        if let text = view as? UITextField {
+            text.text = words
+            text.sendActions(for: .editingChanged)
+            return true
+        }
+        return view.subviews.contains { type(words, in: $0) }
+    }
+
     // MARK: - 1. The ghost
 
     @Test("The ready suggestion is a ghost labelled AI Suggestion, with its status line; the field stays empty")
@@ -150,9 +174,36 @@ struct ChatSuggestionBubbleTests {
             let texts = Self.fieldTexts(chat.view)
             #expect(!texts.isEmpty && texts.allSatisfy { $0.isEmpty }, "the field holds no AI text: \(texts)")
             #expect(!labels.contains { $0.hasPrefix("e.g. ") }, "no configured example: \(labels)")
-            // No alternative stored with this suggestion: no line under the field.
-            #expect(!HostedAccessibility.identifiers(in: chat.view).contains(DynamicIslandChat.alternativeLineId),
+            // No alternative stored with this suggestion: no line under it.
+            #expect(!HostedAccessibility.identifiers(in: chat.view).contains(ChatAlternativeLink.linkId),
                     "no alternative, no line")
+        }
+    }
+
+    @Test("The other reply is a line under the ghost: a tap puts it in the field and sends nothing; it hides while the field has words")
+    func alternativeLineFillsTheField() async throws {
+        let alternative = "Could we find another time?"
+        try await withChat { chat in
+            #expect(Self.link(in: chat.view) == nil, "control: no alternative stored yet, no line")
+            await ComposeView.writeOverCurrent(
+                ReplyResult(body: "Hello Sam,\n\nTuesday works.\n\nThanks.", textMessage: "Tuesday works.", changeCommand: alternative),
+                replyTo: chat.email, db: chat.pool)
+            try await Self.waitUntil { Self.link(in: chat.view) != nil }
+            let link = try #require(Self.link(in: chat.view), "the line shows under the AI Suggestion")
+            #expect(link.accessibilityLabel == ChatSuggestionConfig.alternativeLabel(alternative))
+            #expect(Self.fieldTexts(chat.view).allSatisfy { $0.isEmpty }, "control: the field is empty")
+            #expect(HostedAccessibility.activate(ChatAlternativeLink.linkId, in: chat.view), "the line takes a tap")
+            try await Self.waitUntil { Self.fieldTexts(chat.view).contains(alternative) }
+            #expect(Self.fieldTexts(chat.view).contains(alternative), "the reply is in the field: \(Self.fieldTexts(chat.view))")
+            #expect(chat.controller.presentedViewController == nil, "no card opened: the ghost keeps its own tap")
+            let queued = try await chat.pool.read { try OutboxMessage.fetchCount($0) }
+            #expect(queued == 0, "nothing was sent")
+            try await Self.waitUntil { Self.link(in: chat.view) == nil }
+            #expect(Self.link(in: chat.view) == nil, "with words in the field the line goes, so a tap never replaces them")
+            #expect(Self.ghost(in: chat.view) != nil, "the AI Suggestion stays")
+            #expect(Self.type("", in: chat.view), "control: the field takes an edit")
+            try await Self.waitUntil { Self.link(in: chat.view) != nil }
+            #expect(Self.link(in: chat.view) != nil, "emptied, the line is back")
         }
     }
 

@@ -272,7 +272,15 @@ enum ChatSuggestionConfig {
     /// The dots' frame cap, as the app's other AI indicators (`aiWorkingShimmer`).
     static let dotFrameInterval: Double = 1.0 / 30
 
-    /// The field's second line for the other reply that came with the AI Suggestion
-    /// (`ChatReplyField.alternative`).
-    static func alternativeLine(_ alternative: String) -> String { "alt: \(alternative)" }
+    /// The line under the ghost's line for the other reply that came with the AI Suggestion
+    /// (`ChatReplyField.alternative`, `ChatAlternativeLink`): a gray "or", then the reply in blue,
+    /// a little bolder, and a chevron (owner 2026-11-26, mock E3). VoiceOver reads
+    /// "Or reply: <reply>", without the chevron.
+    static let alternativeLead = "or"
+    static let alternativeChevron = "›"
+    static func alternativeLabel(_ alternative: String) -> String { "Or reply: \(alternative)" }
+    /// The link's room above it, under the ghost's line.
+    static let alternativeGap: CGFloat = 8
+    /// The link's lines before its end is cut; the reply is at most ten words.
+    static let alternativeLineLimit = 2
 }

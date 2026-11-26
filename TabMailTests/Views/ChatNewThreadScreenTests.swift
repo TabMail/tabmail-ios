@@ -266,8 +266,8 @@ struct ChatNewThreadScreenTests {
             let focused = Self.editableField(in: screen.view)?.isFirstResponder == true
             #expect(focused, "the field takes focus as the chat opens")
             // A new email has no AI Suggestion, so nothing offers an alternative under the field.
-            let lines = Self.labels(of: DynamicIslandChat.alternativeLineId, in: screen.view)
-            #expect(lines.isEmpty, "no line under the field: \(lines)")
+            let lines = Self.labels(of: ChatAlternativeLink.linkId, in: screen.view)
+            #expect(lines.isEmpty, "no line offering another reply: \(lines)")
             let labels = HostedAccessibility.labels(in: screen.view)
             let hasMic = labels.contains("Dictate") || labels.contains("Stop dictation")
             #expect(hasMic, "the field has its mic: \(labels.prefix(24))")
