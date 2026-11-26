@@ -668,6 +668,75 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("Once a sync has replaced the send's optimistic Sent copy with the server's copy of the same email, a follow-up from the sent email's thread is written: its field's Send opens the card, and then the follow has ended")
+    func followUpAfterTheCopyIsReplaced() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        // The send's read of its Sent copy (`ChatNewEmailSend.sentCopy`), and no other statement.
+        let reads = StatementCount("INDEXED BY messageHeader_rfc822MessageId WHERE folderId")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend(counting: reads) { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let rfc822 = EmailFilter.normalizeMessageId(messageId)
+                    // The send's optimistic copy, under its placeholder id and with its body, as the
+                    // send writes it (`AccountManagerOutbox.insertOptimisticSentHeader`).
+                    let optimistic = Self.sentFolderHeader("sent-\(row.id)", rfc822MessageId: rfc822)
+                    let isPlaceholder = isSyntheticPlaceholderId(optimistic.messageId)
+                    #expect(isPlaceholder, "control: the optimistic copy's id")
+                    let body = MessageBody(contentKey: ContentKey(rawValue: optimistic.id), htmlContent: "<p>Lunch on Friday?</p>")
+                    try await fixture.pool.write { db in
+                        try optimistic.insert(db)
+                        try body.save(db)
+                    }
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    #expect(Self.isThread(screen), "control: the chat is the sent email's thread")
+
+                    // The Sent folder's sync replaces it, in one write, with the server's copy of the
+                    // same email under the server's id, the body carried over (the optimistic dedup in
+                    // `SyncEngineChangesApply`).
+                    let server = Self.sentFolderHeader("4242", rfc822MessageId: rfc822)
+                    let carried = MessageBody(contentKey: ContentKey(rawValue: server.id), htmlContent: body.htmlContent)
+                    try await fixture.pool.write { db in
+                        _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: optimistic.id))
+                        _ = try MessageHeader.deleteOne(db, key: optimistic.id)
+                        try server.insert(db)
+                        try carried.insert(db)
+                    }
+                    for _ in 0..<3 { try await Self.settle() }
+                    #expect(Self.isThread(screen), "control: still the thread")
+
+                    let words = "Also bring the slides"
+                    #expect(ThreadChatTests.type(words, in: screen.view), "control: the thread's field takes words")
+                    try await Self.waitUntil { Self.fieldText(in: screen.view) == words }
+                    try await Self.settle()
+                    #expect(HostedAccessibility.activate("chatSend", in: screen.view), "the field's Send takes a tap")
+                    @MainActor func notWritten() -> Bool {
+                        HostedAccessibility.labels(in: screen.view).contains { $0.contains(DynamicIslandChat.notWrittenNote) }
+                    }
+                    try await Self.waitUntil { Self.topPresented(screen) != nil || notWritten() }
+                    let noteShown = notWritten()
+                    #expect(!noteShown, "the follow-up is written: no note that it couldn't be: \(HostedAccessibility.labels(in: screen.view).suffix(12))")
+                    let card = try #require(Self.topPresented(screen), "the follow-up's card opens over the thread")
+                    let cardIds = HostedAccessibility.identifiers(in: card.view)
+                    #expect(cardIds.contains(ComposeView.sendButtonId), "a compose: \(cardIds.prefix(12))")
+
+                    // On the server's copy, which no sync replaces, the follow has ended: new mail in
+                    // Sent no longer reads the send.
+                    let atServer = reads.count
+                    let after = Self.sentFolderHeader("screen-sent-after-server", rfc822MessageId: "after@example.com")
+                    try await fixture.pool.write { try after.insert($0) }
+                    for _ in 0..<3 { try await Self.settle() }
+                    #expect(reads.count == atServer, "the thread on the server's copy reads the send no more: \(reads.count - atServer) reads after it")
+
+                    card.presentingViewController?.dismiss(animated: false)
+                    try await Self.waitUntil { Self.topPresented(screen) == nil && !ActiveAgentTracker.shared.anyWorking }
+                }
+            }
+        }
+    }
+
     @Test("A reopened draft whose attachments could not be read is kept when the card sends its email: those files were not in it")
     func unreadableAttachmentsDraftKeptBySend() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
