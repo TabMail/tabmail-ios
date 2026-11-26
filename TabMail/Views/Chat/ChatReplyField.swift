@@ -102,14 +102,15 @@ struct ChatReplyField {
         return .writing
     }
 
-    /// The line above the field while the agent works: the agent's own labels, except that
+    /// The agent's status while it works from the reply field: its own labels, except that
     /// writing a reply, or a new email's chat's email, reads "Writing your email" (`writingStatus`).
     static func statusLine(_ label: String) -> String {
         label == ToolRegistry.activityLabels["email_reply"] || label == ToolRegistry.activityLabels["email_compose"]
             ? writingStatus : label
     }
 
-    /// The line above the closed field while its Send writes the email.
+    /// The line under the user's own bubble while the closed field's Send writes the email
+    /// (`ChatFieldMessageBubble.status`).
     static let writingStatus = "Writing your email"
 }
 
