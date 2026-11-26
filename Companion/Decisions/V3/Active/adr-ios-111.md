@@ -1352,7 +1352,8 @@ on the re-drive.
      before the connect and the listings, so an open while offline, or a listing that fails, still follows
      the folder. `followFolders` reads first and opens a write only when some folder is not followed yet:
      a mark is never cleared, so the usual pull (a folder already followed) never waits for the database's
-     one writer before its first read. *(Amended in review 2026-11-23: it first opened a write on every
+     one writer before its first read (apart from the merge of a notification extension's staged rows,
+     which every read waits for). *(Amended in review 2026-11-23: it first opened a write on every
      pull.)* The run starts after the change read, so a folder the reader has just baselined may be
      listed. When that read finds the account busy (it sets the account's follow-up flag and reads
      nothing, #1289), the run starts all the same and waits for the turn; it may take the turn before
@@ -1393,7 +1394,9 @@ on the re-drive.
    `CatchUpContext.accessedFolderIds` tells the provider which folders an action reached (provider-neutral).
    `SyncEngine.remove(accountId:)` drops the folders waiting for a run and cancels the running one, so a
    disconnect that keeps the account's credentials (a re-authentication, re-adding an account) does not
-   wait for it.
+   wait for its slot or its pacing window. A run still in line for the account's turn ends when the pass
+   ahead of it hands the turn over (waiting for the turn ignores cancellation by design); on a
+   re-authentication that pass's provider was just disconnected, so the wait is short.
 4. **IMAP access check** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). An untracked folder with no
    mod-sequences has no cheap check, so the daily full check alone would leave an accessed folder stale for
    up to a day. An accessed, untracked folder is listed when its stored counters (`totalCount`, the
