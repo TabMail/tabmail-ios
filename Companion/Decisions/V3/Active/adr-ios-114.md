@@ -2216,6 +2216,23 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        row names (`OutboxMessage.sentMessageId`) is kept with the chat's key, so the Sent copy is
        still found after the row has gone. A compose the bubble's Undo reopens keeps the card's
        draft, so its send again is found the same way.
+     - *One layout for the user's side (amended 2026-11-26).* A new email's chat shows its send
+       through the thread's own rows (`ChatOutgoingRows`, used by `ChatThreadView` and
+       `ChatNewThreadView`): the outbox bubbles, hidden while a bubble is held; the bubble held while
+       its card is up, which turns into the newest outbox bubble as the hold ends (one morph id,
+       `ChatOutgoing.sentMorphId`, and one ending, `ChatOutgoing.endAnimation`: a spring after a send
+       the chat shows, at once under Reduce Motion or with nothing sent); else the field's message;
+       else the chat's own last row (a thread's AI Suggestion, nothing in a new email); then the gap
+       above the field. *Superseded:* the new email's own copy of these rows, which showed the
+       Sending bubble and the held message together while the card closed (the words twice, the
+       second copy under the field), had no gap above the field, and dropped the held message with no
+       morph; seen in the simulator 2026-11-26.
+     - *An email's bubble hugs its words (amended 2026-11-26).* A bubble in the chat is as wide as
+       the wider of its words and its Details pin, never wider (`ChatBubbleStack`: the words at the
+       leading edge, the pin under them at the trailing edge), as the user's message and Sending
+       bubbles hug theirs, so a sent email keeps its bubble's width when its Sending bubble gives way
+       to it; long words wrap at the bubble column (`ChatViewLayout.bubbleMaxWidthFraction`).
+       *Superseded:* a spacer before the pin, which took every email's bubble to the whole column.
      - Its Undo is on the bubble with the chat view on (`ComposeScreen.newEmailChat`;
        `sendHasBubbleUndo` is true for that screen with no In-Reply-To), and the toast is not shown
        for it. The compose the bubble's Undo reopens records the bubble's screen
@@ -2277,7 +2294,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    each Core Animation commit, never on a display-link tick, which can fall between SwiftUI's update
    and the commit that lays it out and read a navigation bar whose new title view has no size yet
    while the screen still draws the header before it; and `threadHeaderOpensReplyTo`, the thread's
-   header in the chat's bar, its names opening Reply to; the whole
+   header in the chat's bar, its names opening Reply to; since 2026-11-26 `cardSendShowsTheWordsOnce`,
+   the user's words read after each commit from the field's Send to the settled Sending bubble, never
+   two of the user's bubbles one above the other, and the Sending bubble's gap above the field a
+   thread's; the whole
    screen hosted: Back, background, closing and their alerts, the empty field, the tray, Send's ask,
    the sheet, the chat hidden by another screen and shown again keeping what was typed, the Drafts
    row and the opens from Drafts, since 2026-11-22 a link's chat saving on background only once
@@ -2290,7 +2310,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
    hosted taking a contact pill's or a link's request, or not, compose filled through the email
    screen when the request goes to compose, and the agent's compose waiting for the cover),
    `ComposeDraftSaveTests` (the shared writer
-   against a real database), `DraftAttachmentImportTests`.
+   against a real database), `DraftAttachmentImportTests`, and since 2026-11-26
+   `ChatReplyFieldTests.newEmailSharesTheOutgoingRows` (both chats use the one set of rows and the
+   one ending) and `ChatBubbleWidthTests` (an email's bubble as wide as the user's bubble of the
+   same words, as wide as the pin for words narrower than it, the pin at the trailing edge).
 
 ## The longer index line (routed 2026-11-09)
 

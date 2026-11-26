@@ -532,6 +532,47 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    /// The new email's chat shows its send as a thread does (`ChatOutgoingRows`). Before, it drew
+    /// the send with bubbles of its own: the email's Sending bubble came up while the user's
+    /// message was still held for the closing card, a second copy of the words below it, and the
+    /// Sending bubble sat on the field with no gap.
+    @Test("The card's Send shows the user's words once: the message held while the card closes turns into the email's Sending bubble, never a second copy beside it; the Sending bubble keeps a thread's gap above the field")
+    func cardSendShowsTheWordsOnce() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let frames = OwnWordsFrames(view: screen.view)
+                    frames.start()
+                    _ = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    try await Self.settle()
+                    frames.stop()
+                    print("[OwnWordsFrames] \(frames.summary)")
+                    let recorded = frames.frames
+                    let summary = frames.summary
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    let shown = recorded.filter { $0.count == 1 }.count
+                    #expect(shown > 0, "control: the user's words were recorded: \(summary)")
+                    let apart = recorded.filter { OwnWordsFrames.showsTwoApart($0) }.count
+                    #expect(apart == 0, "the words show once: the held message and the Sending bubble never side by side: \(summary)")
+                    let settled = recorded.last?.count ?? 0
+                    #expect(settled == 1, "once settled, only the Sending bubble: \(summary)")
+
+                    // The gap above the field: the thread's, under its newest row
+                    // (`ChatThreadLayoutTests.chatScrollsBehindTheField`).
+                    let field = try #require(Self.elements(ChatNewThreadView.fieldId, in: screen.view).first?.accessibilityFrame,
+                                             "control: the field shows")
+                    let status = try #require(Self.elements(ChatUndoSendStatus.undoId, in: screen.view).first?.accessibilityFrame,
+                                              "control: the Sending bubble's status line shows")
+                    let gap = field.minY - status.maxY
+                    #expect(abs(gap - (ChatViewLayout.bubbleSpacing + ChatViewLayout.pillGap)) <= 1.5,
+                            "the Sending bubble ends \(gap) above the field; a thread's last row ends \(ChatViewLayout.bubbleSpacing + ChatViewLayout.pillGap) above it")
+                }
+            }
+        }
+    }
+
     @Test("Once the sent email's copy is in the account's Sent folder, the chat is that email's thread, and Back closes it")
     func sentCopyTurnsTheChatIntoItsThread() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
@@ -1656,6 +1697,80 @@ struct ChatNewThreadScreenTests {
     /// Lets the screen apply what just changed.
     private static func settle() async throws {
         try await Task.sleep(for: .milliseconds(300))
+    }
+}
+
+/// Where the chat shows the user's own words, frame by frame: the window frame of each element
+/// VoiceOver reads as "You said: ..." (the user's message bubble, held or writing, and the Sending
+/// bubble's words), read after every Core Animation commit between `start` and `stop`, as
+/// `SwapFrames` reads them.
+@MainActor
+private final class OwnWordsFrames {
+    private let view: UIView
+    private var observer: CFRunLoopObserver?
+    private(set) var frames: [[CGRect]] = []
+
+    init(view: UIView) {
+        self.view = view
+    }
+
+    /// Two of the user's bubbles one above the other, apart: the words twice. One turning into the
+    /// other shares its place, so the two overlap.
+    nonisolated static func showsTwoApart(_ frame: [CGRect]) -> Bool {
+        let drawn = frame.filter { $0.height > 1 }
+        for (index, one) in drawn.enumerated() {
+            for other in drawn[(index + 1)...] where one.maxY <= other.minY || other.maxY <= one.minY {
+                return true
+            }
+        }
+        return false
+    }
+
+    func start() {
+        record()
+        // After Core Animation's own commit observer on the same activities (its order is 2000000).
+        let observer = CFRunLoopObserverCreateWithHandler(
+            kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue | CFRunLoopActivity.exit.rawValue,
+            true, CFIndex.max
+        ) { [weak self] _, _ in
+            guard let self else { return }
+            MainActor.assumeIsolated { self.record() }
+        }
+        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
+        self.observer = observer
+    }
+
+    func stop() {
+        if let observer {
+            CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
+            CFRunLoopObserverInvalidate(observer)
+        }
+        observer = nil
+        record()
+    }
+
+    private func record() {
+        let own = HostedAccessibility.elements(under: view)
+            .filter { $0.accessibilityLabel?.hasPrefix("You said:") == true }
+            .map(\.accessibilityFrame)
+        frames.append(own)
+    }
+
+    /// The frames in order, each run of frames showing the same number of the user's bubbles once,
+    /// with its length and its last frame's places.
+    var summary: String {
+        var runs: [(count: Int, length: Int, last: [CGRect])] = []
+        for frame in frames {
+            if let run = runs.last, run.count == frame.count {
+                runs[runs.count - 1] = (run.count, run.length + 1, frame)
+            } else {
+                runs.append((frame.count, 1, frame))
+            }
+        }
+        return runs.map { run in
+            let places = run.last.map { "\(Int($0.minY))-\(Int($0.maxY))" }.joined(separator: ",")
+            return "\(run.count)[\(places)]x\(run.length)"
+        }.joined(separator: " -> ")
     }
 }
 

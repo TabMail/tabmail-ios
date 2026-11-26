@@ -64,6 +64,9 @@ struct ChatNewThreadView: View {
     /// That message held while its card is up, and after the card's Send until the send shows
     /// (`ChatHeldGhost`).
     @State private var heldMessage: ChatHeldGhost?
+    /// The held message turning into the card's Sending bubble (`ChatOutgoingRows`).
+    @Namespace private var sentMorph
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// The card's Send has a durable outbox row: once the card has gone, the chat goes on as the
     /// next new email (`cardClosed`).
     @State private var cardSent = false
@@ -197,21 +200,13 @@ struct ChatNewThreadView: View {
                 }
                 .padding()
                 .frame(maxWidth: .infinity)
-                // The card's send while it is in the outbox, as a thread's chat shows a reply's.
-                if let reply = cardSend?.reply {
-                    ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() },
-                                          undo: { reply.undo(on: .newEmailChat) })
-                }
-                // The field's Send: the user's own message, up at once, pulsing while its email is
-                // written, with "Writing your email" under it where "Sent" goes; then held while its
-                // card is up.
-                if let held = heldMessage {
-                    ChatFieldMessageBubble(text: held.text, pulses: false)
-                        .transition(.opacity)
-                } else if let message = fieldMessage {
-                    ChatFieldMessageBubble(text: message.text, pulses: message.pulses,
-                                           status: ChatReplyField.writingStatus)
-                        .transition(.opacity)
+                // The user's side, as a thread's chat shows it (`ChatOutgoingRows`): the field's
+                // Send puts the user's own message up at once, pulsing while its email is written,
+                // then holds it while its card is up; the card's send turns it into the email's
+                // Sending bubble; then the gap above the field.
+                ChatOutgoingRows(unsentReplies: cardSend?.reply.map { [$0] } ?? [], heldGhost: heldMessage,
+                                 fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .newEmailChat) {
+                    EmptyView()
                 }
             }
         }
@@ -371,10 +366,12 @@ struct ChatNewThreadView: View {
     }
 
     /// The held message goes once its card has closed: at once when nothing was sent, else once
-    /// the send shows.
+    /// the send shows, turning into its Sending bubble as a thread's held bubble does.
     private func endHeldMessageIfDone() {
         guard let held = heldMessage, held.ends(replyShows: cardSendShows) else { return }
-        heldMessage = nil
+        withAnimation(ChatOutgoing.endAnimation(held, reduceMotion: reduceMotion)) {
+            heldMessage = nil
+        }
     }
 
     /// The drag up on the collapsed field moved (`ChatFieldPan`): the field swells under the finger.

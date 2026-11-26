@@ -156,7 +156,7 @@ struct ChatThreadView: View {
     @State private var ghostFadesIn = false
     @AppStorage(AIService.optOutAllAIKey, store: AIService.optOutStore) private var optOutAllAI = false
 
-    private static let bottomId = "chat-bottom"
+    private static let bottomId = ChatOutgoing.bottomId
     private static let unreadLineId = "chat-unread-line"
     private static let chatSwipeId = "chat-swipe"
     /// What a drag on the reply field holds the interaction freeze under (`ChatSwipeHold`).
@@ -492,53 +492,31 @@ struct ChatThreadView: View {
                                 // Debug UI tests only: where the newest row sits during a field drag.
                                 .modifier(ChatFieldDragMarker.Row(isNewest: item.id == thread.items.last?.id))
                         }
-                        // Replies still in the outbox. Not while a ghost is held: the reply its
-                        // card sent shows as the hold ends, the ghost turning into its bubble.
-                        if heldGhost == nil {
-                            ForEach(unsentReplies) { reply in
-                                ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })
-                                    .matchedGeometryEffect(id: Self.sentMorphId(reply, newest: unsentReplies.last), in: sentMorph)
-                            }
-                        }
-                        // The AI Suggestion, where the reply lands once sent: the working bubble
-                        // while it is written, then the ghost; the ghost tapped open, or the user's
-                        // own message the field sent, stays while its card is up.
-                        if let held = heldGhost {
-                            Group {
-                                if held.isMessage {
-                                    ChatFieldMessageBubble(text: held.text, pulses: false)
+                        // The user's side of the chat's bottom, as every chat shows it: replies in
+                        // the outbox, the bubble held while its card is up, the field's message,
+                        // then the gap above the field (`ChatOutgoingRows`). Last, when none of
+                        // those shows, the AI Suggestion where the reply lands once sent: the
+                        // working bubble while it is written, then the ghost.
+                        ChatOutgoingRows(unsentReplies: unsentReplies, heldGhost: heldGhost, fieldMessage: fieldMessage,
+                                         morph: sentMorph, undoScreen: .chat) {
+                            if let newest = thread.newest, let suggestion {
+                                if !suggestionGrowPending, case .ready(let text) = suggestion {
+                                    let move = tutorialMove(thread)
+                                    // A tap opens the suggestion this ghost shows (`shown`: `.ready` comes only from it).
+                                    ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
+                                        if let shown { openSuggestion(shown, on: newest, tutorialMove: move) }
+                                    }
+                                    .transition(.asymmetric(
+                                        insertion: ghostFadesIn
+                                            ? .opacity.animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration))
+                                            : .opacity,
+                                        removal: .opacity))
                                 } else {
-                                    ChatSuggestionBubble(text: held.text) {}
+                                    ChatSuggestionWorkingBubble()
+                                        .transition(.opacity)
                                 }
-                            }
-                            .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)
-                            .transition(.opacity)
-                        } else if let message = fieldMessage {
-                            // The field's Send: the user's own message, up at once in the AI
-                            // Suggestion's place, pulsing while its email is written, with
-                            // "Writing your email" under it where "Sent" goes.
-                            ChatFieldMessageBubble(text: message.text, pulses: message.pulses,
-                                                   status: ChatReplyField.writingStatus)
-                                .transition(.opacity)
-                        } else if let newest = thread.newest, let suggestion {
-                            if !suggestionGrowPending, case .ready(let text) = suggestion {
-                                let move = tutorialMove(thread)
-                                // A tap opens the suggestion this ghost shows (`shown`: `.ready` comes only from it).
-                                ChatSuggestionBubble(text: text, pulses: move == .tapSuggestion) {
-                                    if let shown { openSuggestion(shown, on: newest, tutorialMove: move) }
-                                }
-                                .transition(.asymmetric(
-                                    insertion: ghostFadesIn
-                                        ? .opacity.animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration))
-                                        : .opacity,
-                                    removal: .opacity))
-                            } else {
-                                ChatSuggestionWorkingBubble()
-                                    .transition(.opacity)
                             }
                         }
-                        // The bottom bar's inset keeps the field's room; only the gap is added here.
-                        Color.clear.frame(height: ChatViewLayout.pillGap).id(Self.bottomId)
                     }
                     .padding(.top, 8)
                     // A new email rises from behind the field and the rows above move up with it,
@@ -1037,15 +1015,6 @@ struct ChatThreadView: View {
     /// The toolbar's Forward, as tests find it.
     static let forwardId = "chatForward"
 
-    /// The held ghost's id in `sentMorph`. The newest outbox bubble takes it too, so the ghost turns
-    /// into the reply its card sent as the hold ends.
-    static let heldGhostMorphId = "chat-held-ghost"
-
-    /// An outbox bubble's id in `sentMorph`: the newest one's is the held ghost's.
-    static func sentMorphId(_ reply: ChatUnsentReply, newest: ChatUnsentReply?) -> String {
-        reply.id == newest?.id ? heldGhostMorphId : "chat-unsent-\(reply.id)"
-    }
-
     /// The AI Suggestion's row, from `suggestionPhase`. The working bubble filling in grows the row
     /// into the ghost over `ChatSuggestionConfig.fillDuration`, and while the landing holds its
     /// target the re-pin scroll runs in the same transaction, so the growing row stays above the
@@ -1455,9 +1424,7 @@ struct ChatThreadView: View {
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[Chat] held ghost ends sent=\(held.sent) showsBubble=\(held.showsBubble) morphs=\(held.morphs)")
         }
-        let morph = Animation.spring(
-            response: ChatSuggestionConfig.sentMorphResponse, dampingFraction: ChatSuggestionConfig.sentMorphDamping)
-        withAnimation(held.morphs && !reduceMotion ? morph : nil) {
+        withAnimation(ChatOutgoing.endAnimation(held, reduceMotion: reduceMotion)) {
             heldGhost = nil
         }
     }
