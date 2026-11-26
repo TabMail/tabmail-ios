@@ -15,10 +15,11 @@ import Observation
 /// Used" can drop to, and a tap gives them back now:
 ///
 /// - Both databases upgraded: the tap runs the same steps now, in the foreground, the
-///   one run there (`SyncEngine.optimizeStorageMayRun`). Sync is not paused: each step
-///   is one short write at the background tier. The app leaving the foreground, the
-///   databases' suspension or `stop` (Settings closed) stops the steps between two;
-///   the rest waits for the night.
+///   one run there (`SyncEngine.optimizeStorageMayRun`). Sync is not paused: the
+///   run's writes are at the background tier, and a sync write waits for at most one
+///   step, one throttled checkpoint or the final TRUNCATE (ADR-IOS-121 decision 5).
+///   The app leaving the foreground, the databases' suspension or `stop` (Settings
+///   closed) stops the steps between two; the rest waits for the night.
 /// - Either database not upgraded: the row says the upgrade comes first, and the tap
 ///   opens the upgrade's notice. The upgrade's `VACUUM` gives the empty pages back
 ///   itself.

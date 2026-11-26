@@ -222,14 +222,21 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      the tap runs the same `runOvernightSpaceReturn` now (`StorageOptimizer`), on the email database's
      background pool, so a sync or user write waiting for the writer goes first, with its own check:
      the app in the foreground and the databases not suspended (`SyncEngine.optimizeStorageMayRun`), and
-     the run not stopped (`StorageOptimizer.stop`, when Settings goes or a page opens over it, cancels
-     the run, and the check reads the cancellation). The app leaving, the suspension or Settings going
+     the run not stopped (`StorageOptimizer.stop`, when Settings goes, a page is pushed over it or a
+     full-screen cover opens, cancels the run, and the check reads the cancellation; a sheet or an alert
+     over Settings lets the run finish its steps). The app leaving, the suspension or Settings going
      stops it between two steps; a step running at a stop finishes or is interrupted and rolls back, and
      the rest waits for the night. Sync is not paused, no turn is held, and polling and IDLE stay on:
      each step is one short write followed on the email database by the app's throttled checkpoint, the
      cost class of any batch writer, and the TRUNCATE at the end copies what the last checkpoint left.
+     A sync or user write that arrives during a run therefore waits for at most one of the run's writer
+     holds: a step, one throttled PASSIVE checkpoint (about 0.6 to 2 s), or the final TRUNCATE (about
+     0.4 to 1.1 s on the measured 960 MB database with 190 MB empty, at 2 to 6 ms per MB). Latency only:
+     no signal or write is dropped.
      One run at a time: a second tap while it runs starts nothing. A step that fails shows "Could not
-     finish now. Nothing was lost. TabMail will try again overnight."; a stop shows nothing. "Email Index
+     finish now. Nothing was lost. TabMail will try again overnight."; a stop by Settings going shows
+     nothing. A step the databases' suspension aborts (the app left with a step running) is a failed
+     step, so the line shows on the return; it stays true. "Email Index
      Used" (until then a walk of the storage folder in the view's body) and the row are measured off the
      main thread when Settings opens, after a run, when the upgrade's screen closes and after "Delete
      All Email Index Data". Pinned by `StorageOptimizerTests`,
@@ -296,7 +303,9 @@ back on.
    work, which waits behind the writer and runs after; the exit's start (or the return's) syncs at once.
    A pass's reads on their own connections go on during a step or a `VACUUM`; its writes wait for a step
    and the checkpoint after it, or for the `VACUUM`. The tap's run drops and delays no signal: the work
-   a signal starts runs as always, its writes waiting at most one step.
+   a signal starts runs as always, its writes waiting for at most one writer hold of the run: a step,
+   one throttled PASSIVE checkpoint (about 0.6 to 2 s), or the final TRUNCATE (about 0.4 to 1.1 s on the
+   measured 960 MB database with 190 MB empty) (decision 5).
 2. A deadline starts when its work starts: kept for the steps (a write waits for one step and its
    throttled checkpoint, as after any batch writer, or for the final TRUNCATE), the tap's steps
    included: they queue at the background tier, so a sync write waiting for the writer goes before
@@ -317,7 +326,7 @@ back on.
    exception (turned back on with the timer as in 5); back on as in 5. The tap's run stops no IDLE.
 7. Pull-to-refresh reads now, and new mail and the folder view go ahead of background slices:
    unchanged; while the upgrade screen is up the user cannot pull or open a folder. During the tap's
-   run their reads go on and their writes wait at most one step.
+   run their reads go on and their writes wait for at most one writer hold of the run, as in 1.
 8. Startup and maintenance work never starve the reads: unchanged. Neither is start-of-pass work, and
    the steps run only from the background processing job and the Optimize Storage tap
    (`IncrementalVacuumTests.theStepsRunOnlyFromTheBackgroundJobAndTheTap`,

@@ -21,9 +21,10 @@ private let startPolls = 5_000
 ///
 /// Each test drives its own `StorageOptimizer` with a fake measure, upgrade state and
 /// steps. That the app's optimizer runs the app's steps with the app's check is pinned
-/// by `IncrementalVacuumTests` (source fence and a real database).
+/// by `IncrementalVacuumTests` (source fence and a real database). A run the fakes hold
+/// that never ends fails at the time limit instead of hanging the run.
 @MainActor
-@Suite("Settings' Optimize Storage row")
+@Suite("Settings' Optimize Storage row", .timeLimit(.minutes(1)))
 struct StorageOptimizerTests {
 
     private static let megabyte: Int64 = 1024 * 1024

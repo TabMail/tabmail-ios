@@ -1595,23 +1595,40 @@ struct IncrementalVacuumTests {
         #expect(otherFunction.isEmpty, "inside the job's own function: \(otherFunction)")
     }
 
-    /// `StorageOptimizerTests` passes its own steps and check, so only the source shows
-    /// what the app's tap runs.
-    @Test("The Optimize Storage tap runs the app's steps on the email database's background pool, with the tap's check and its stop, and Settings uses the app's optimizer")
+    /// `StorageOptimizerTests` passes its own measure, upgrade state, notice, steps and
+    /// check, and calls `stop` itself, so only the source shows what the app's tap runs,
+    /// what the app's row measures, and that Settings stops the run when it goes.
+    @Test("The Optimize Storage tap runs the app's steps on the email database's background pool with the tap's check, the row measures both databases, and Settings measures on opening and stops the run when it goes")
     func theTapRunsTheAppsStepsWithItsCheck() {
         let lines = SyncEngineMaintenanceTests.productionCodeLines()
         let optimizer = lines.filter { $0.file == "StorageOptimizer.swift" }.map { $0.code }
         let appDefaults = [
+            "readMeasure: @escaping @Sendable () async -> Measure = StorageOptimizer.measureTheApp,",
+            "readNeedsUpgrade: @escaping @MainActor () async -> Bool = StorageOptimizer.theAppNeedsUpgrade,",
+            "openUpgradeNotice: @escaping @MainActor () async -> Void = { await DatabaseUpgrade.shared.openNotice() },",
             "giveBack: @escaping @Sendable (@escaping @Sendable () -> Bool) async -> [SyncEngine.SpaceReturnStep] = StorageOptimizer.giveBackTheAppsEmptyPages,",
             "mayRun: @escaping @Sendable () -> Bool = { SyncEngine.optimizeStorageMayRun() },",
             "minimumGainBytes: Int64 = SyncConfig.optimizeStorageMinimumGainBytes",
             "await giveBack { mayRun() && !Task.isCancelled }",
+            "let source = StorageEstimator.SpaceSource.app(pool: AppDatabase.dbPool)",
+            "let used = source.reportedBytes()",
+            "let pages = await source.pageTotals()",
+            "return Measure(usedBytes: used, emptyBytes: pages?.emptyBytes)",
+            "await DatabaseUpgrade.shared.refresh()",
+            "return DatabaseUpgrade.shared.needsUpgrade",
         ].filter { !optimizer.contains($0) }
+        let settings = lines.filter { $0.file == "SettingsView.swift" }.map { $0.code }
+        let settingsCalls = [
+            ".task { await optimizer.refresh() }",
+            ".onDisappear { optimizer.stop() }",
+            "if !isPresented { Task { await optimizer.refresh() } }",
+        ].filter { !settings.contains($0) }
         let optimizers = lines
             .filter { $0.code.contains("StorageOptimizer(") && !$0.code.contains("func ") }
             .map { "\($0.file): \($0.code)" }
 
-        #expect(appDefaults.isEmpty, "the app's optimizer runs the app's steps with the tap's check and its stop: missing \(appDefaults)")
+        #expect(appDefaults.isEmpty, "the app's optimizer measures both databases and runs the app's steps with the tap's check and its stop: missing \(appDefaults)")
+        #expect(settingsCalls.isEmpty, "Settings measures on opening and after the upgrade's screen closes, and stops the run when it goes: missing \(settingsCalls)")
         #expect(optimizers == ["SettingsView.swift: @State private var optimizer = StorageOptimizer()"], "Settings alone makes one, with the app's defaults: \(optimizers)")
     }
 }

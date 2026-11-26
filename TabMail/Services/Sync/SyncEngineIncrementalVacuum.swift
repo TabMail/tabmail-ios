@@ -47,7 +47,10 @@ import GRDB
 // - The Optimize Storage tap (`StorageOptimizer`, #1448): the same steps, run at once
 //   from Settings, the one run in the foreground. Its check (`optimizeStorageMayRun`)
 //   needs the app in the foreground and the databases not suspended. Sync is not
-//   paused: each step is one short write at the background tier.
+//   paused: the run's writes are at the background tier, and a sync write that
+//   arrives waits for at most one of the run's writer holds: a step, one throttled
+//   PASSIVE checkpoint (about 0.6 to 2 s), or the final TRUNCATE (about 0.4 to 1.1 s
+//   at 1 GB with 190 MB empty).
 //
 // No TRUNCATE follows a switch that failed or a database with nothing to give back:
 // whatever the WAL holds then is left to the database's later checkpoints
@@ -202,8 +205,9 @@ extension SyncEngine {
     /// The Optimize Storage tap's check (`StorageOptimizer`, #1448): the one run of the
     /// steps in the foreground. Its steps start only while the app is in the foreground
     /// and the databases are not suspended; the app leaving stops them between two, and
-    /// the rest waits for the background job. Sync is not paused: each step is one short
-    /// write, as after any batch writer (ADR-IOS-121 decision 5).
+    /// the rest waits for the background job. Sync is not paused: a sync write waits for
+    /// at most one step, one throttled checkpoint or the final TRUNCATE, as behind any
+    /// batch writer (ADR-IOS-121 decision 5).
     nonisolated static func optimizeStorageMayRun(
         isSuspended: Bool = DatabaseSuspension.isSuspended,
         isAppActive: Bool = DatabaseSuspension.isAppActive
