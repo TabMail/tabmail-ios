@@ -564,6 +564,38 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("From the Sending bubble to the sent email's thread, every frame shows the email: the new email with its Sending bubble, then the whole thread with its header, its field and the email on the user's side, never a thread still loading or still reading who the user is")
+    func sentCopyTurnsIntoTheThreadWithNoBlink() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let frames = SwapFrames(view: screen.view)
+                    frames.start()
+                    let before = frames.frames.first
+                    #expect(before?.isNewEmail == true, "control: recording starts on the new email with its Sending bubble: \(String(describing: before))")
+
+                    let copy = Self.sentFolderHeader("screen-sent-copy-frames", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    try await fixture.pool.write { try copy.insert($0) }
+                    try await Self.waitUntil { frames.frames.last?.isThread == true }
+                    try await Self.settle()
+                    frames.stop()
+
+                    let last = frames.frames.last
+                    #expect(last?.isThread == true, "control: the chat ends as the whole thread: \(String(describing: last))")
+                    let between = frames.frames.filter { !$0.isNewEmail && !$0.isThread }
+                    #expect(between.isEmpty, "no frame between the new email and the whole thread: \(frames.summary)")
+                    let firstThread = frames.frames.firstIndex { $0.isThread } ?? frames.frames.endIndex
+                    let newEmailAfter = frames.frames[firstThread...].contains { $0.isNewEmail }
+                    #expect(!newEmailAfter, "once the thread shows, the new email never comes back: \(frames.summary)")
+                }
+            }
+        }
+    }
+
     @Test("Once the chat is the sent email's thread, new mail in the Sent folder no longer reads the send: its follow has ended")
     func threadEndsTheSendFollow() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
@@ -1514,5 +1546,88 @@ struct ChatNewThreadScreenTests {
     /// Lets the screen apply what just changed.
     private static func settle() async throws {
         try await Task.sleep(for: .milliseconds(300))
+    }
+}
+
+/// What one frame of the new email's chat shows, read from its accessibility elements.
+private struct SwapFrame: Equatable, CustomStringConvertible {
+    /// The new email's chat area line.
+    var hint = false
+    /// The new email's Sending bubble, by its Undo.
+    var sending = false
+    /// The new email's field.
+    var newField = false
+    /// The header's names.
+    var header = false
+    /// An email's bubble, as a thread shows it.
+    var bubble = false
+    /// "Sent" under a bubble: the email is the user's, on the right.
+    var own = false
+    /// The thread's reply field.
+    var replyField = false
+
+    var isNewEmail: Bool { hint && sending && newField && header }
+    var isThread: Bool { !hint && header && bubble && own && replyField }
+
+    var description: String {
+        let parts = [("hint", hint), ("sending", sending), ("newField", newField), ("header", header),
+                     ("bubble", bubble), ("own", own), ("replyField", replyField)]
+        return "[" + parts.filter { $0.1 }.map { $0.0 }.joined(separator: " ") + "]"
+    }
+
+    @MainActor
+    init(view: UIView) {
+        let elements = HostedAccessibility.elements(under: view)
+        let ids = Set(elements.compactMap { HostedAccessibility.identifier(of: $0) })
+        let texts = elements.filter { $0.accessibilityTraits.contains(.staticText) }.compactMap(\.accessibilityLabel)
+        hint = ids.contains(ChatNewThreadView.hintId)
+        sending = ids.contains(ChatUndoSendStatus.undoId)
+        newField = ids.contains(ChatNewThreadView.fieldId)
+        header = ids.contains(ChatHeaderView.namesId)
+        bubble = ids.contains(ChatBubbleView.bubbleId) || ids.contains(ChatBubbleView.highlightedBubbleId)
+        own = texts.contains("Sent")
+        replyField = ids.contains(ChatThreadView.replyPillId)
+    }
+}
+
+/// Reads the chat on every display frame between `start` and `stop`, as the screen draws them.
+@MainActor
+private final class SwapFrames: NSObject {
+    private let view: UIView
+    private var link: CADisplayLink?
+    private(set) var frames: [SwapFrame] = []
+
+    init(view: UIView) {
+        self.view = view
+    }
+
+    func start() {
+        record()
+        let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+        record()
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        record()
+    }
+
+    private func record() {
+        frames.append(SwapFrame(view: view))
+    }
+
+    /// The frames in order, each run of equal frames once with its length.
+    var summary: String {
+        var runs: [(SwapFrame, Int)] = []
+        for frame in frames {
+            if let last = runs.last, last.0 == frame { runs[runs.count - 1].1 += 1 } else { runs.append((frame, 1)) }
+        }
+        return runs.map { "\($0.0)x\($0.1)" }.joined(separator: " -> ")
     }
 }
