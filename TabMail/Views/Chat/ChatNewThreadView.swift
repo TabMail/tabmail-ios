@@ -75,7 +75,10 @@ struct ChatNewThreadView: View {
     /// The sent email's thread, read whole (`ChatThreadOpened`): the chat is that thread from then
     /// on, never back.
     @State private var thread: ChatThreadOpened?
-    /// The Sent copy whose thread is being read for the swap (`readThread`).
+    /// The thread read again on the row that replaced the copy the chat became (`followSend`),
+    /// which the thread takes in place (`ChatThreadView.adoptReopened`).
+    @State private var reopened: ChatThreadOpened?
+    /// The Sent copy whose thread is being read, for the swap or for its replacement (`readThread`).
     @State private var readingCopy: String?
     /// This screen's own id among the chat modals (`undoOutcomesPresented`).
     @State private var modalId = UUID()
@@ -122,7 +125,7 @@ struct ChatNewThreadView: View {
         ZStack {
             if let thread {
                 // The sent email's thread, with its own header, Forward and reply field.
-                ChatThreadView(opened: thread)
+                ChatThreadView(opened: thread, reopened: reopened)
             } else {
                 newEmail
             }
@@ -155,9 +158,9 @@ struct ChatNewThreadView: View {
             }
         }
         .undoOutcomesPresented(by: modalId)
-        // Followed only until the chat is the sent email's thread, by either swap: then its read of
-        // the Sent folder's headers ends (memory 021).
-        .task(id: thread == nil ? sendKey : nil) { await followSend() }
+        // Followed only until the chat is the sent email's thread on a row no sync replaces
+        // (`followsSend`): then its read of the Sent folder's headers ends (memory 021).
+        .task(id: followsSend ? sendKey : nil) { await followSend() }
         .task(id: readingCopy) { await readThread() }
         .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
         // A held message whose card sent waits for the send to show, then goes.
@@ -463,10 +466,13 @@ struct ChatNewThreadView: View {
     /// Follows the card's send (`sendKey`): its bubble while its row is in the outbox, then the
     /// sent email's thread once its Sent copy is read (`swapToThread`). The email the row names
     /// goes into the key, so the copy is found after the row has gone, and a send again from the
-    /// compose its Undo reopened (a new row, the same draft) is followed too. Once the chat is the
-    /// thread, nothing here reads the send again, so the follow ends.
+    /// compose its Undo reopened (a new row, the same draft) is followed too. The copy the chat
+    /// first becomes is usually the send's optimistic one, which a sync replaces with the server's
+    /// copy of the same email under another id; the follow goes on until the thread is on that copy
+    /// (`followsSend`), which the thread then takes in place, so a Send from its field writes to
+    /// the row that is there. Then nothing here reads the send again, and the follow ends.
     private func followSend() async {
-        guard thread == nil, let key = sendKey else { return }
+        guard followsSend, let key = sendKey else { return }
         do {
             for try await found in ChatNewEmailSend.changes(key) {
                 cardSend = found
@@ -488,19 +494,41 @@ struct ChatNewThreadView: View {
     /// which the field's drag opens at will), which the change would take down. The panel is kept
     /// out of `newEmailCovered`, which also decides whether a compose card may present. The thread
     /// is read first (`readThread`), so it shows whole from its first frame.
+    /// Once the chat is the thread, a copy other than the one it shows (the server's, which replaced
+    /// the optimistic copy) is read for the thread to take in place: nothing over it is taken down.
     private func swapToThread() {
-        guard thread == nil, let copy = cardSend?.sentCopyId, !newEmailCovered, !chatExpanded else { return }
+        guard let copy = cardSend?.sentCopyId else { return }
+        if let shown = reopened ?? thread {
+            guard followsSend, copy != shown.viewModel.messageId else { return }
+        } else {
+            guard !newEmailCovered, !chatExpanded else { return }
+        }
         readingCopy = copy
     }
 
+    /// The chat still follows its send: until it is the sent email's thread on a row no sync
+    /// replaces. The send's optimistic Sent copy (`isSyntheticPlaceholderId`) is replaced by the
+    /// server's under another id, and a thread on a copy not yet read is followed too.
+    private var followsSend: Bool {
+        guard let shown = (reopened ?? thread)?.viewModel.message else { return true }
+        return isSyntheticPlaceholderId(shown.messageId)
+    }
+
     /// Reads the sent email's thread (`ChatThreadOpened.read`), then becomes it, unless something
-    /// came over the new email while it read: then the next `swapToThread` reads it again.
+    /// came over the new email while it read: then the next `swapToThread` reads it again. On the
+    /// thread already, the read of the copy that replaced the shown one goes to the thread, which
+    /// takes it in place (`ChatThreadView.adoptReopened`).
     private func readThread() async {
         guard let copy = readingCopy else { return }
         let read = await ChatThreadOpened.read(messageId: copy)
         guard !Task.isCancelled else { return }
         readingCopy = nil
-        guard thread == nil, !newEmailCovered, !chatExpanded else { return }
+        if thread != nil {
+            guard read.viewModel.message != nil else { return }
+            reopened = read
+            return
+        }
+        guard !newEmailCovered, !chatExpanded else { return }
         thread = read
     }
 
