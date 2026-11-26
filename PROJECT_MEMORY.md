@@ -92,7 +92,7 @@ Search the topic text below as subsystem keywords. Each link is mandatory when i
 | Screen Keep-Awake (chat pill) | [read in full](Companion/Memory/Current/065-screen-keep-awake-chat-pill.md) |
 | Agent Compose FIFO Queue (ADR-IOS-030) | [read in full](Companion/Memory/Current/066-agent-compose-fifo-queue-adr-ios-030.md) |
 | Outgoing Threading — reply/forward stay in-thread on every provider (ADR-IOS-043, 2026-06-23); other apps' forward copies (In-Reply-To + Fwd:/Fw:) marked forwarded, not replied (#1492) | [read in full](Companion/Memory/Current/067-outgoing-threading-reply-forward-stay-in-thread-on-every-provider-adr-io.md) |
-| Incoming Thread Detection — `ThreadDetection.findRelatedMessages` has NO subject-based fallback (by design) | [read in full](Companion/Memory/Current/068-incoming-thread-detection-threaddetection-findrelatedmessages-has-no-sub.md) |
+| Incoming Thread Detection — `ThreadDetection.findRelatedMessages` has NO subject-based fallback (by design); a forward starts its own thread on the device, nearest-ancestor probe, `excludeAcrossForwards`, forward split (#1555) | [read in full](Companion/Memory/Current/068-incoming-thread-detection-threaddetection-findrelatedmessages-has-no-sub.md) |
 | Outbox — Persistent Offline Send Queue (ADR-IOS-019) | [read in full](Companion/Memory/Current/069-outbox-persistent-offline-send-queue-adr-ios-019.md) |
 | Proactive Local Notifications (ADR-IOS-026) | [read in full](Companion/Memory/Current/070-proactive-local-notifications-adr-ios-026.md) |
 | App Icon Badge Routine (NSE counter + main-app recount) | [read in full](Companion/Memory/Current/071-app-icon-badge-routine-nse-counter-main-app-recount.md) |

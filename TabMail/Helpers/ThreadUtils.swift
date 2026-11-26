@@ -23,14 +23,26 @@ enum ThreadUtils {
     /// exists yet — it seeds a fresh group for new conversations and acts
     /// as the canonical identifier for a brand-new Gmail conversation.
     ///
+    /// A forward starts a thread of its own (ADR-IOS-043, forward split): it
+    /// never joins the thread of the email it forwards, whatever its References
+    /// or the provider's thread id say. It still joins its own copies and the
+    /// replies to it already stored. `sentAsForward` is the send's own record
+    /// (`OutboxMessage.isForward`); any other email is a forward when its
+    /// subject's first prefix is Fwd: or Fw: (`hasForwardPrefix`). Best effort:
+    /// a forward whose subject was rewritten, or that carries another
+    /// language's prefix, reads as an ordinary email.
+    ///
     /// Sets `header.computedThreadId` but does NOT insert messageReference rows —
     /// call `insertMessageReferences(for:db:)` AFTER `header.insert(db)` to satisfy FK constraints.
     /// Must be called inside a GRDB write transaction.
     static func assignComputedThreadId(
         to header: inout MessageHeader,
         nativeThreadId: String?,
+        sentAsForward: Bool = false,
         db: Database
     ) throws {
+        let forward = sentAsForward || hasForwardPrefix(header.subject)
+
         // 1. Chain-walk first — adopt an existing thread if any local message
         //    is in our inReplyTo/References lookup set. Catches Gmail thread
         //    fragmentation where two conversation IDs share a reply chain.
@@ -39,6 +51,7 @@ enum ThreadUtils {
             rfc822MessageId: header.rfc822MessageId,
             inReplyTo: header.inReplyTo,
             references: header.references,
+            isForward: forward,
             db: db
         ) {
             header.computedThreadId = adopted
@@ -47,7 +60,9 @@ enum ThreadUtils {
 
         // 2. No chain match. Use native threadId (Gmail/Exchange) as the
         //    fresh-group seed; IMAP falls back to the message's own rfc822.
-        if let tid = nativeThreadId, !tid.isEmpty, !tid.hasPrefix("subj:") {
+        //    Not for a forward: the provider files it in its source's
+        //    conversation (Gmail keeps the forward's threadId, ADR-IOS-043).
+        if !forward, let tid = nativeThreadId, !tid.isEmpty, !tid.hasPrefix("subj:") {
             header.computedThreadId = tid
             return
         }
@@ -56,13 +71,23 @@ enum ThreadUtils {
 
     /// Look up an existing `computedThreadId` to adopt for a message being
     /// inserted (or repaired), using the full forward + reverse + lateral
-    /// signal set expressed as three indexed `IN` probes over
-    /// `L = {rfc822MessageId, inReplyTo} ∪ references`.
+    /// signal set over `L = {rfc822MessageId, inReplyTo} ∪ references`: one
+    /// indexed probe per id of `L` in order, then two indexed `IN` probes.
+    ///
+    /// The forward probe takes the NEAREST stored email: another copy of this
+    /// one first, then its In-Reply-To parent, then its References from the
+    /// last (the newest ancestor) to the first. It asks one id at a time with
+    /// `LIMIT 1`, so it reads at most one row per id of `L`, however many
+    /// stored emails share an id. So a reply to a forward joins
+    /// the forward's thread, not the thread the forward came from, though its
+    /// References name both. A forward (`isForward`) looks up only its own
+    /// Message-ID: its copies, and replies to it already stored, never the
+    /// email it forwards.
     ///
     /// Returns nil if no connected message exists yet. Callers fall back to
     /// `rfc822MessageId` (or the row id) as a fresh thread root.
     ///
-    /// Used by `assignComputedThreadId` at insert time and by the v28 repair
+    /// Used by `assignComputedThreadId` at insert time and by the v47 repair
     /// migration when walking historical rows whose original chain-walk missed
     /// a shared-ancestor sibling.
     static func findAdoptableThreadId(
@@ -70,29 +95,36 @@ enum ThreadUtils {
         rfc822MessageId: String?,
         inReplyTo: String?,
         references: [String],
+        isForward: Bool = false,
         db: Database
     ) throws -> String? {
+        // Nearest first: own Message-ID (a copy), In-Reply-To, then References
+        // newest to oldest. A forward keeps only its own Message-ID.
         var lookups: [String] = []
-        if let irt = inReplyTo, !irt.isEmpty { lookups.append(irt) }
-        lookups.append(contentsOf: references)
         if let rfc = rfc822MessageId, !rfc.isEmpty { lookups.append(rfc) }
+        if !isForward {
+            if let irt = inReplyTo, !irt.isEmpty { lookups.append(irt) }
+            lookups.append(contentsOf: references.reversed())
+        }
         var dedupe = Set<String>()
         let L = lookups.filter { dedupe.insert($0).inserted }
         guard !L.isEmpty else { return nil }
 
-        let placeholders = L.map { _ in "?" }.joined(separator: ",")
-
-        // (1) Forward: ancestors whose rfc822MessageId is in L. Exclude self to
-        // handle re-inserts/upserts of the same row.
-        if let found = try String.fetchOne(db, sql: """
-            SELECT computedThreadId FROM messageHeader
-            WHERE rfc822MessageId IN (\(placeholders))
-              AND id != ?
-              AND computedThreadId != ''
-            LIMIT 1
-        """, arguments: StatementArguments(L + [myHeaderId])), !found.isEmpty {
-            return found
+        // (1) Forward: the nearest stored email in L, one id at a time. Exclude
+        // self to handle re-inserts/upserts of the same row.
+        for messageId in L {
+            if let found = try String.fetchOne(db, sql: """
+                SELECT computedThreadId FROM messageHeader
+                WHERE rfc822MessageId = ?
+                  AND id != ?
+                  AND computedThreadId != ''
+                LIMIT 1
+            """, arguments: [messageId, myHeaderId]) {
+                return found
+            }
         }
+
+        let placeholders = L.map { _ in "?" }.joined(separator: ",")
 
         // (2) + (4) Reverse + lateral via inReplyTo.
         if let found = try String.fetchOne(db, sql: """
@@ -124,8 +156,9 @@ enum ThreadUtils {
     /// no more adoptions happen (fixpoint). Used by the v54 migration to
     /// merge Gmail-fragmented threads in historic data.
     ///
-    /// Iteration is necessary because `findAdoptableThreadId` returns the
-    /// first connected ctid (no ORDER BY). For a chain M1(T1) ← M2(T2) ←
+    /// Iteration is necessary because `findAdoptableThreadId` returns ONE
+    /// connected ctid (the nearest ancestor's, else the first reverse match,
+    /// no ORDER BY), not the connected set. For a chain M1(T1) ← M2(T2) ←
     /// M3(T3), the date-ASC pass can leave M1=T2, M2=T3, M3=T3 — fully
     /// merging requires another pass that sees M2's now-adopted T3 and
     /// pulls M1 along. Each pass propagates one hop; realistic email
@@ -136,8 +169,8 @@ enum ThreadUtils {
     ///
     /// ⚠️ KNOWN, DELIBERATELY UNFIXED — `KNOWN_ISSUES.md` `IOS-THREAD-001`.
     /// `merged == 0` is a MUTATION count, not candidate coverage. Because
-    /// `findAdoptableThreadId` answers with the FIRST connected ctid it finds
-    /// (`LIMIT 1`, no ORDER BY), a row connected to two fragments whose probe
+    /// `findAdoptableThreadId` answers with ONE connected ctid (its nearest
+    /// ancestor's, else the first reverse match), a row connected to two fragments whose probe
     /// names the id it already carries never adopts — and the probe is
     /// deterministic on unchanged state, so no later pass changes that answer.
     /// Convergence can therefore be declared with fragments still split.
