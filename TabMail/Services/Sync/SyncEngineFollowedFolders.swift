@@ -47,7 +47,7 @@ extension SyncEngine {
     /// again, the Inbox at each launch, every pull of a followed folder) never
     /// waits for the database's one writer, which a header batch or an apply
     /// may hold, before the pull's first read (`AccountManager.syncFolders`).
-    /// (Like every read, it still waits while a notification extension's
+    /// (Like every async read of the sync pool, it still waits while a notification extension's
     /// staged rows are merged in; the pull's first listing read would wait for
     /// that anyway.) The write checks again inside its transaction
     /// (`markFollowed`).
