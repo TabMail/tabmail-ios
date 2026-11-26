@@ -9,8 +9,8 @@ extension DynamicIslandChat {
     /// The chat view's reply field (`ChatReplyField`): [mic] [field] [Send] on the newest email.
     /// Empty, the field shows its hint and, under it, the "alt: " line while there is one
     /// (`ChatReplyField.alternative`); while its Send's email is written, the words are up in the
-    /// chat as the user's bubble, the field shows only its hint, and the screen shows what is
-    /// happening in a line above the field (`ChatFieldStatusLine`).
+    /// chat as the user's bubble, with what is happening under it ("Writing your email",
+    /// `ChatFieldMessageBubble`), and the field shows only its hint.
     /// In the tutorial the field is read-only and sends nothing: its words go to the people, and
     /// the tutorial's requests to TabMail are made in the panel. At part 2's drag-up step it says
     /// so (`tutorialDragHint`), and its drag up, or VoiceOver's "Show TabMail chat", opens the panel.
@@ -59,10 +59,6 @@ extension DynamicIslandChat {
         } send: {
             trailingButton
         }
-        // What the agent is doing about a Send goes to the screen, which shows it above the field,
-        // outside its glass: the field never grows for it (`ChatFieldStatusLine`).
-        .preference(key: ChatFieldStatusKey.self,
-                    value: sentWorking ? (workingStatus.isEmpty ? "Thinking..." : workingStatus) : nil)
         // A drag up swells the field itself toward the panel, its top following the finger.
         .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))
     }
@@ -120,34 +116,6 @@ extension DynamicIslandChat {
 
     /// The "alt: " line, as tests find it.
     static let alternativeLineId = "chatAlternativeLine"
-}
-
-/// What the agent is doing about a Send from the chat's field ("Thinking...", its own reports), from
-/// the field to the screen around it; nil while it is not working on one, or while the panel is open.
-struct ChatFieldStatusKey: PreferenceKey {
-    static let defaultValue: String? = nil
-
-    static func reduce(value: inout String?, nextValue: () -> String?) {
-        value = value ?? nextValue()
-    }
-}
-
-/// The agent's status line above the chat's field, outside its glass, among the field's other
-/// notices: the field keeps its size, and the bar the field stands in grows by the line, so the
-/// chat moves up for it and back down when it goes. The screen that holds the field shows it.
-struct ChatFieldStatusLine: View {
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.caption)
-            .foregroundStyle(Theme.textSecondary)
-            .frame(maxWidth: .infinity)
-            .accessibilityIdentifier(Self.id)
-    }
-
-    /// The line, as tests find it.
-    static let id = "chatFieldStatus"
 }
 
 /// Closing the chat view's open TabMail panel like a sheet: a drag down on its header, or its
