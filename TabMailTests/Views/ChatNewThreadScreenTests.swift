@@ -564,8 +564,9 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("From the Sending bubble to the sent email's thread, every frame shows the email: the new email with its Sending bubble, then the whole thread with its header, its field and the email on the user's side, never a thread still loading or still reading who the user is")
-    func sentCopyTurnsIntoTheThreadWithNoBlink() async throws {
+    @Test("From the Sending bubble to the sent email's thread, every frame shows the email: the new email with its Sending bubble, then the whole thread with its header, its field and the email on the user's side, never a thread still loading or still reading who the user is",
+          arguments: [true, false])
+    func sentCopyTurnsIntoTheThreadWithNoBlink(copyHasItsBody: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation {
             try await Self.withChatView(true) {
@@ -578,18 +579,20 @@ struct ChatNewThreadScreenTests {
                     let before = frames.frames.first
                     #expect(before?.isNewEmail == true, "control: recording starts on the new email with its Sending bubble: \(String(describing: before))")
 
-                    // The copy with its body, as the send's optimistic Sent copy is written
-                    // (`AccountManagerOutbox.insertOptimisticSentHeader`).
+                    // Two copies: one with its body, as the send's optimistic Sent copy is
+                    // written (`AccountManagerOutbox.insertOptimisticSentHeader`), and one whose
+                    // body is not stored yet, as a copy synced from the server is until its
+                    // body is fetched. The second one's open takes longer to read.
                     let copy = Self.sentFolderHeader("screen-sent-copy-frames", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
                     let copyBody = MessageBody(contentKey: ContentKey(rawValue: copy.id), htmlContent: "<p>Lunch on Friday?</p>")
                     try await fixture.pool.write { db in
                         try copy.insert(db)
-                        try copyBody.save(db)
+                        if copyHasItsBody { try copyBody.save(db) }
                     }
                     try await Self.waitUntil { frames.frames.last?.isThread == true }
                     try await Self.settle()
                     frames.stop()
-                    print("[SwapFrames] \(frames.summary)")
+                    print("[SwapFrames] body=\(copyHasItsBody) \(frames.summary)")
 
                     let last = frames.frames.last
                     #expect(last?.isThread == true, "control: the chat ends as the whole thread: \(String(describing: last))")
