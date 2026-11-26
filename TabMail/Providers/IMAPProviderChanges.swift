@@ -53,6 +53,12 @@ import SwiftMail
 // session never opened (its pass-start NOOP included) keeps its failure time too; a
 // session that cannot be opened again mid-pass fails the folders not yet read
 // (`.failed`, bookmark kept, no failure time); a budget run out leaves them `.notRun`.
+// A slice of an other-folder run (`ChangeScope.otherFolders`, #1110) reads the
+// request's folders in its order, the same way, and reports a folder it did not
+// reach `.notRun` whatever stopped it, and a folder whose read it started and the
+// slice's time cut `.notRun` with `FolderChanges.readCut` (#1358). Its first
+// folder is read in the slice's whole time (`ChangeContext.firstFolderDeadline`),
+// after the pass-start NOOP however long that took, as long as the slice has time.
 
 /// IMAP's opaque per-folder change bookmark, stored as JSON in
 /// `Folder.changeCursor`. Three server-assigned integers about the mailbox
@@ -219,13 +225,27 @@ extension IMAPProvider {
                     // never a connection lost mid-pass that leaves no failure time.
                     sessionOpened = true
                     while next < work.count {
-                        guard context.hasBudget() else { budgetSpent = true; return }
+                        // A slice of an other-folder run reads its first folder in
+                        // the slice's whole time (`ChangeContext.firstFolderDeadline`),
+                        // so a slow NOOP above never leaves the slice with no folder
+                        // read (#1110); the folders after it start within the read's
+                        // own deadline.
+                        let firstFolder = results.isEmpty ? request.forFirstFolder() : nil
+                        let folderRequest = firstFolder ?? request
+                        guard folderRequest.context.hasBudget() else { budgetSpent = true; return }
                         let folder = work[next]
-                        changeReadFirst.remove(folder.id)
-                        if changeReadLast == folder.id { changeReadLast = nil }
+                        if request.scope != .otherFolders {
+                            changeReadFirst.remove(folder.id)
+                            if changeReadLast == folder.id { changeReadLast = nil }
+                        }
                         do {
-                            results[folder.id] = try await self.readChangeFolder(
-                                folder, server: server, mode: mode, request: request)
+                            var read = try await self.readChangeFolder(
+                                folder, server: server, mode: mode, request: folderRequest)
+                            // A run's folder is always sent its STATUS (or SELECT)
+                            // first: one that comes back not run was cut by the
+                            // slice's time, not left unreached (#1358).
+                            if request.scope == .otherFolders, case .notRun = read.status { read.readCut = true }
+                            results[folder.id] = read
                             if folder.role == .inbox { changeInboxTimeouts = 0 }
                         } catch {
                             // The folder's read failed, whatever the cause: it keeps its
@@ -254,7 +274,8 @@ extension IMAPProvider {
                     BackgroundSyncLogger.logDebug("[IMAPChanges] session ended on \(error)")
                 }
                 if closedByServer, generation == generationAtStart { continue }
-                if let timedOut {
+                // A run's order is the engine's (`changeReadOrder`).
+                if let timedOut, request.scope != .otherFolders {
                     // The next pass reads the folders left unread first and the one
                     // that timed out last (the inbox stays first until its read has
                     // timed out on several passes in a row).
@@ -270,8 +291,11 @@ extension IMAPProvider {
                     // again, a read that timed out, a dropped one that did not end in
                     // time), or after a teardown that ended the pass at any point, the
                     // folders not yet read fail with no failure time and are read on
-                    // the next pass.
-                    results[folder.id] = sessionOpened || generation != generationAtStart
+                    // the next pass. A slice of an other-folder run reports them
+                    // `.notRun` instead: the run reads them in a later slice (#1110).
+                    let unreached = sessionOpened || generation != generationAtStart
+                    if unreached, request.scope == .otherFolders { continue }
+                    results[folder.id] = unreached
                         ? FolderChanges(folderId: folder.id, status: .failed(error))
                         : Self.failedFolder(folder, error: error, now: context.clock())
                 }
@@ -289,18 +313,24 @@ extension IMAPProvider {
     /// read that timed out, the folders it left unread come first and the folder
     /// that timed out comes last, except that the inbox stays first until its read
     /// has timed out on several passes in a row
-    /// (`readFirst(_:first:last:inboxTimeouts:)`).
+    /// (`readFirst(_:first:last:inboxTimeouts:)`). A slice of an other-folder run
+    /// (`.otherFolders`, #1110) reads its folders in the request's order, which
+    /// the engine sets, and leaves the passes' hints as they are.
     func changeReadOrder(_ request: ChangeRequest) -> [ChangeFolder] {
-        // Hints for folders the account no longer has are dropped.
-        changeReadFirst.formIntersection(request.folders.map(\.id))
-        if let last = changeReadLast, !request.folders.contains(where: { $0.id == last }) { changeReadLast = nil }
         let candidates = request.folders.filter { folder in
             guard !folder.path.isEmpty else { return false }
             switch request.scope {
             case .inboxOnly: return folder.role == .inbox
             case .all: return folder.isSynced || !(request.recheck[folder.id] ?? []).isEmpty
+            case .otherFolders: return folder.isSynced
             }
         }
+        // A run's request names only its own folders: the hints, and the
+        // rotation, are the passes' alone.
+        if request.scope == .otherFolders { return candidates }
+        // Hints for folders the account no longer has are dropped.
+        changeReadFirst.formIntersection(request.folders.map(\.id))
+        if let last = changeReadLast, !request.folders.contains(where: { $0.id == last }) { changeReadLast = nil }
         let inbox = candidates.filter { $0.role == .inbox }
         let rest = candidates.filter { $0.role != .inbox }
         guard !rest.isEmpty else { return inbox }
@@ -735,15 +765,16 @@ extension IMAPProvider {
 
     // MARK: - Reads on the current selection
 
-    /// Full records for these UIDs (one header FETCH). A `\Deleted` message is
-    /// left out (never inserted); a record that cannot be mapped is read later.
+    /// Full records for these UIDs (one header FETCH, at most `requestTimeout`).
+    /// A `\Deleted` message is left out (never inserted); a record that cannot
+    /// be mapped is read later.
     private func fullRecords(
-        _ uids: [UInt32], server: IMAPServer
+        _ uids: [UInt32], server: IMAPServer, requestTimeout: TimeInterval
     ) async throws -> (records: [ChangeRecord], returned: Set<UInt32>, deleted: Set<UInt32>, unreadable: [String]) {
         var set = UIDSet()
         for uid in uids { set.insert(UID(uid)) }
         let requested = set
-        let infos = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+        let infos = try await withTimeout(seconds: requestTimeout) {
             try await server.fetchMessageInfosBulk(using: requested)
         }
         var records: [ChangeRecord] = []
@@ -771,10 +802,12 @@ extension IMAPProvider {
     /// The re-read list's answer: full records; a `\Deleted` message is a
     /// removal; a UID the FETCH did not return is removed only when `UID SEARCH`
     /// on the same selection confirms it is gone, otherwise it is read again.
+    /// Each request waits at most `requestTimeout`.
     func rereadIds(
-        _ ids: [UInt32], server: IMAPServer, context: ChangeContext
+        _ ids: [UInt32], server: IMAPServer, context: ChangeContext,
+        requestTimeout: TimeInterval = SyncConfig.changeReadRequestTimeoutSeconds
     ) async throws -> (records: [ChangeRecord], removals: [String], unreadable: [String]) {
-        let fetched = try await fullRecords(ids, server: server)
+        let fetched = try await fullRecords(ids, server: server, requestTimeout: requestTimeout)
         var removals = fetched.deleted.sorted().map(String.init)
         var unreadable = fetched.unreadable
         let missing = ids.filter { !fetched.returned.contains($0) }
@@ -785,7 +818,7 @@ extension IMAPProvider {
             var set = UIDSet()
             for uid in missing { set.insert(UID(uid)) }
             let missingSet = set
-            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: SyncConfig.changeReadRequestTimeoutSeconds) {
+            let found: ExtendedSearchResult<UID> = try await withTimeout(seconds: requestTimeout) {
                 try await server.extendedSearch(identifierSet: missingSet, criteria: [.all])
             }
             let confirmed = Self.confirmMissing(missing, present: try found.listed(within: missingSet))

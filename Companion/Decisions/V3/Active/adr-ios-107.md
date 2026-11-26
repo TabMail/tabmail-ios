@@ -1577,3 +1577,18 @@ seeks `(folderId=? AND providerDate<?)`. No schema change; what each range retur
 
 (range read, newestRows, newestRowsSQL, newestRowsBeforeSQL, IS NULL OR, bound is no index range,
 quadratic listing, ordered scan removed, rows after)
+
+### Amendment (2026-11-23, #1110): the catch-up checks every folder; other folders weekly
+
+Decision 1's folders: the catch-up now checks every folder of the account (`catchUpFolderIds`), the syncable
+ones first (in the full sync's order) and then the others (`CatchUpContext.otherFolderIds`), each provider
+ordering them with `CatchUpSchedule.leastRecentlyAttemptedFirst(later:)`, so the other folders' first checks
+never hold back a due check of the syncable set. An IMAP other folder with no change tracking gets its
+whole-folder check weekly (`SyncConfig.catchUpOtherFolderFullCheckIntervalSeconds`, `catchUpPlan(otherFolder:)`)
+instead of daily; a first check and a lapse are not held back. The other folders' regular change reads ride
+this runner too (`CatchUpRun.readsOtherFolders`): ADR-IOS-111, amendment 2026-11-23 (#1110).
+
+*Superseded:* "the syncable folders, then every other folder owed a check after a move retired without
+proof" (#1062).
+
+(other folder, catchUpFolderIds, otherFolderIds, weekly other-folder check, later group, #1110)

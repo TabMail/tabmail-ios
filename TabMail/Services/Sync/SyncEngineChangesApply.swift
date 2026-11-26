@@ -45,13 +45,14 @@ import GRDB
 //   applies what it carries and settles nothing, and the reader reads a listed
 //   message in full), and so is every message the provider could not read
 //   (`rereadLater`).
-//   Over `SyncConfig.changeRecheckLimit` ids, a folder the catch-up checks
-//   (`SyncEngine.isSyncable`) keeps every id already stored and only as many of
-//   this pass's additions as fit, and its catch-up is armed for the cut ones (a
-//   folder holding its own bookmark drops it instead, so it is listed again: its
-//   catch-up need not load a missing message); a
-//   folder the catch-up never checks keeps every id, since nothing else would
-//   repair a dropped one (each pass still reads at most the per-pass budget);
+//   Over `SyncConfig.changeRecheckLimit` ids, a folder keeps every id already
+//   stored and only as many of this pass's additions as fit, and its catch-up,
+//   which checks every folder (#1110), is armed for the cut ones (a folder
+//   holding its own bookmark drops it instead, so it is listed again: its
+//   catch-up need not load a missing message);
+//   *superseded (#1110):* "a folder the catch-up checks (`SyncEngine.isSyncable`)
+//   ...; a folder the catch-up never checks keeps every id, since nothing else
+//   would repair a dropped one (each pass still reads at most the per-pass budget)";
 // - the folder's own bookmark (`Folder.changeCursor`) is written in the same
 //   transaction. A refused one is cleared with the folder's coverage, a lapse
 //   mark for its catch-up and the account's full sync made due; a folder whose
@@ -174,14 +175,14 @@ extension SyncEngine {
         for id in declined.sorted() where !recheck.contains(id) { recheck.append(id) }
         // Over the limit, only this pass's own additions are cut, never an id
         // already stored (a long list of retired ids drains over passes, #903).
-        // Ids are dropped only where the catch-up will find them: arming it does
-        // nothing for a folder it never checks, so that folder keeps them all.
+        // Ids are dropped only where the catch-up will find them; it checks
+        // every folder, those outside the syncable set too (#1110).
         // A folder holding its own bookmark is listed again instead (as a
         // refused read is): its catch-up need not load a missing message (the
         // IMAP one only checks the rows a folder holds), and the bookmark would
         // move past a cut arrival.
         var cutDropsBookmark = false
-        if recheck.count > SyncConfig.changeRecheckLimit, Self.isSyncable(folder) {
+        if recheck.count > SyncConfig.changeRecheckLimit {
             let stored = Set(before.recheck)
             let room = max(0, SyncConfig.changeRecheckLimit - recheck.filter(stored.contains).count)
             var added = 0
@@ -212,8 +213,9 @@ extension SyncEngine {
         case .refused(let reason):
             // This folder only: its bookmark is gone, so it is not covered, its
             // catch-up gets one whole-folder check, and the account's full sync
-            // lists it. Its next read starts a new baseline.
-            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
+            // lists it when it syncs it (an other folder, read by its run, is not
+            // listed by the full sync, #1110). Its next read starts a new baseline.
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, listedByFullSync: Self.isSyncable(folder), db: db)
             cursor = nil
             state.tracking = false
             if case .addressEpochChanged(let served) = reason {
@@ -245,15 +247,22 @@ extension SyncEngine {
             state.tracking = false
         case .baselineReady:
             // Covered only after a window listing in a pass whose read covered it
-            // (`commitChangeBaseline`); make that listing due.
+            // (`commitChangeBaseline`); make that listing due. A folder the full
+            // sync does not list (an other folder, read by its run, #1110) leaves
+            // the account's clocks as they are: no listing would follow, and its
+            // new bookmark's one whole-folder check is the catch-up's.
             state.tracking = false
-            try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            if Self.isSyncable(folder) {
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
+            }
         case .tracked, .failed, .notRun:
             break
         }
         if cutDropsBookmark {
-            // Its catch-up gets one whole-folder check and its listing is due.
-            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, db: db)
+            // Its catch-up gets one whole-folder check and, for a folder the
+            // full sync lists, its listing is due (an other folder's next read,
+            // by its run, starts a new baseline, #1110).
+            try dropChangeBookmark(folderId: folder.id, onlyIfHeld: false, listedByFullSync: Self.isSyncable(folder), db: db)
             cursor = nil
             state.tracking = false
         }
@@ -288,9 +297,15 @@ extension SyncEngine {
     /// after its next listing, which does not reach below the window either.
     /// *Superseded (#1062):* "with `selfHealDue` and no bookmark it writes only
     /// `selfHealOwed`" (the self-heal pass, deleted, ran without the lapse).
+    /// `listedByFullSync: false` (a folder outside the syncable set, whose
+    /// changes an other-folder run reads, #1110): the account's full sync, which
+    /// does not list the folder, is not made due; the catch-up check is armed as
+    /// always.
     /// Reads the folder's raw columns only (no model is decoded), so the release
     /// boundary can call it inside `AppDatabase.init` (#876).
-    nonisolated static func dropChangeBookmark(folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, db: Database) throws {
+    nonisolated static func dropChangeBookmark(
+        folderId: String, onlyIfHeld: Bool = true, selfHealDue: Bool = false, listedByFullSync: Bool = true, db: Database
+    ) throws {
         guard let row = try Row.fetchOne(
             db, sql: "SELECT accountId, changeCursor, changeState FROM folder WHERE id = ?", arguments: [folderId])
         else { return }
@@ -316,6 +331,7 @@ extension SyncEngine {
         try db.execute(sql: "UPDATE folder SET changeCursor = NULL, changeState = ? WHERE id = ?",
                        arguments: [state.encoded, folderId])
         if !selfHealDue { try markCatchUpLapse(folderId: folderId, db: db) }
+        guard listedByFullSync else { return }
         try db.execute(sql: "UPDATE account SET lastFullSyncAt = NULL WHERE id = ?", arguments: [accountId])
     }
 

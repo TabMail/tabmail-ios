@@ -63,6 +63,27 @@ struct ChangeSeamFenceTests {
         }
     }
 
+    /// The other-folder run (#1110) reads every provider's folders through the
+    /// one change seam, and is a scan: it reads no download gate.
+    @Test("the other-folder run names no concrete provider, tests no account provider, and never reads the network type, the battery or Low Power Mode (#1110)")
+    func otherFolderRunIsProviderBlindAndUngated() throws {
+        let source = try Self.file(Self.sources(), "TabMail/Services/Sync/SyncEngineOtherFolders.swift")
+        for term in [
+            "GmailProvider", "ExchangeProvider", "IMAPProvider", "DemoProvider",
+            ".provider ==", ".provider !=", "provider as?", "provider as!", "as? IMAP", "as! IMAP",
+            "case .gmail", "case .outlook", "case .imap",
+            "checkExpensive", "isExpensiveNetwork", "batteryLevel", "batteryState", "isLowPowerModeEnabled",
+        ] {
+            #expect(!source.contains(term), "SyncEngineOtherFolders.swift names \(term)")
+        }
+        // The runner its slices go through reads no download gate either (it
+        // names no concrete provider: `missingMessageRepairIsProviderBlind`).
+        let runner = try Self.file(Self.sources(), "TabMail/Services/Sync/SyncEngineCatchUp.swift")
+        for term in ["checkExpensive", "isExpensiveNetwork", "batteryLevel", "batteryState", "isLowPowerModeEnabled"] {
+            #expect(!runner.contains(term), "SyncEngineCatchUp.swift names \(term)")
+        }
+    }
+
     @Test("the engine's older-mail check and the repair of missing messages name no concrete provider and test no account provider (#1061)")
     func missingMessageRepairIsProviderBlind() throws {
         let files = try Self.sources().filter {

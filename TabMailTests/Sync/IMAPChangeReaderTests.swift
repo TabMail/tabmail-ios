@@ -100,17 +100,29 @@ struct IMAPChangeReaderTests {
             username: server.username, password: server.password,
             smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false)
         try await provider.connect()
-        defer { Task { try? await provider.disconnect() } }
         let world = World(server: server, provider: provider, local: LocalRows())
         world.local.set(world.inboxId, inbox)
         world.local.set(world.archiveId, archive)
-        try await body(world)
+        // On every exit, a throw included, the server stops first (a held answer
+        // is abandoned, every socket closed), so the provider's logouts end at
+        // once, and its disconnect is joined: nothing of this world runs after it.
+        func end() async {
+            server.stop()
+            try? await provider.disconnect()
+        }
+        do {
+            try await body(world)
+        } catch {
+            await end()
+            throw error
+        }
         #expect(server.wrongMessageViolations().isEmpty)
         let mutations = server.recordedCommands().filter {
             let upper = $0.uppercased()
             return ["STORE", "COPY", "MOVE", "EXPUNGE", "APPEND"].contains { upper.contains("UID \($0)") || upper.hasPrefix($0) }
         }
         #expect(mutations.isEmpty, "the reader never mutates the mailbox: \(mutations)")
+        await end()
     }
 
     // MARK: - Helpers
@@ -1220,6 +1232,30 @@ struct IMAPChangeReaderTests {
             _ = try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: inboxOnly)
             #expect(await w.provider.changeReadFirst.contains(setup.leftUnread.id), "the folder left unread is still to be read first")
             #expect(await w.provider.changeReadLast == setup.timedOut.id, "the folder that timed out is still to be read last")
+        }
+    }
+
+    @Test("A slice of an other-folder run keeps the passes' read-order hints and rotation, though it reads a folder the hints name and its request leaves out the one to be read last (#1110)")
+    func otherFolderReadKeepsTheHints() async throws {
+        try await Self.withWorld(inbox: [1, 2], archive: [1]) { w in
+            guard let setup = try await Self.fourFolderTimeout(w) else { return }
+            let firstBefore = await w.provider.changeReadFirst
+            let lastBefore = await w.provider.changeReadLast
+            let rotationBefore = await w.provider.changeRotation
+            #expect(firstBefore.contains(setup.leftUnread.id), "setup: the folder left unread is to be read first")
+            #expect(lastBefore == setup.timedOut.id, "setup: the folder that timed out is to be read last")
+            // The run's request names only the folder left unread.
+            let all = Self.requestWithExtras(w, cursors: setup.cursors, context: Self.fixedClock(setup.start))
+            let run = ChangeRequest(folders: all.folders.filter { $0.id == setup.leftUnread.id }, scope: .otherFolders,
+                                    recheck: [:], context: all.context, localRows: w.local)
+            let set = try await w.provider.fetchChanges(since: ChangeCursor(account: nil), request: run)
+            let read = set?.folders.first { $0.folderId == setup.leftUnread.id }
+            let wasRead: Bool
+            if case .notRun? = read?.status { wasRead = false } else { wasRead = read != nil }
+            #expect(wasRead, "precondition: the slice read the folder left unread")
+            #expect(await w.provider.changeReadFirst == firstBefore, "the folders to be read first are as they were")
+            #expect(await w.provider.changeReadLast == lastBefore, "the folder to be read last is as it was")
+            #expect(await w.provider.changeRotation == rotationBefore, "and the rotation did not move")
         }
     }
 

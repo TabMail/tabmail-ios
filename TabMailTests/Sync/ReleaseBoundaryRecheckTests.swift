@@ -16,9 +16,10 @@ import Testing
 /// invariant pinned here: once the boundary has run and the next sync has read
 /// the changes, every message a retired action touched is where the server has
 /// it, with the server's read state, and no folder was listed to get there. A row
-/// the current model cannot decode, or a re-read list that is full in a folder
-/// the catch-up checks, arms the folder's catch-up instead; a folder the catch-up
-/// never checks keeps every id.
+/// the current model cannot decode, or a re-read list a pass takes over the
+/// limit, arms the folder's catch-up instead, in every folder (the catch-up
+/// checks the other folders too, #1110). *Superseded (#1110):* "a folder the
+/// catch-up never checks keeps every id".
 ///
 /// Worlds: a real `GmailProvider` against `StatefulGmailActionServer`
 /// (`GmailDeltaApplyInvariantTests.World`) and a real `ExchangeProvider` against
@@ -708,7 +709,7 @@ struct ReleaseBoundaryRecheckTests {
         let custom = Folder(name: "Projects", path: customPath, role: .custom, accountId: w.accountId)
         try await w.pool.write { db in try custom.insert(db) }
         #expect(!SyncEngine.isSyncable(custom),
-                "precondition: the catch-up never checks this folder")
+                "precondition: an other folder, outside the syncable set")
         return custom
     }
 
@@ -720,10 +721,12 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    /// The robustness rule behind the list limit: ids are dropped only where the
-    /// catch-up will find them. A folder the catch-up never checks keeps every
-    /// retired id, and the change passes read them all, each pass within its
+    /// Every retired id is kept whatever the list limit (#903), in an other
+    /// folder too, and the change passes read them all, each pass within its
     /// re-read budget.
+    /// *Superseded (#1110):* "The robustness rule behind the list limit: ids are
+    /// dropped only where the catch-up will find them. A folder the catch-up
+    /// never checks keeps every retired id".
     @Test("Outlook: more retired ids than the list limit in a custom folder are all kept, and every one is read again across passes")
     func customFolderKeepsEveryRetiredIdAndReadsThemAll() async throws {
         let count = SyncConfig.changeRecheckLimit + SyncConfig.changeRereadBudgetPerPass
@@ -736,7 +739,7 @@ struct ReleaseBoundaryRecheckTests {
             try Self.queue(w.pool, .markRead, ids: ids, accountId: w.accountId, from: Self.customPath)
 
             #expect(try AppDatabase.retirePreviousReleaseActionQueue(on: w.pool, currentRelease: Self.nextRelease()))
-            #expect(try w.recheck(Self.customPath) == ids, "every id is kept: no catch-up would find a dropped one")
+            #expect(try w.recheck(Self.customPath) == ids, "every retired id is kept")
             #expect(try Self.lapseCount(w.pool, folderId: custom.id) == nil)
 
             let passes = count / SyncConfig.changeRereadBudgetPerPass + 2
@@ -756,26 +759,54 @@ struct ReleaseBoundaryRecheckTests {
         }
     }
 
-    @Test("A re-read list over the limit keeps every id in a folder the catch-up never checks, and is cut, arming the catch-up, in one it checks")
-    func applyOverflowDropsOnlyWhereTheCatchUpChecks() async throws {
+    /// #1110: the catch-up checks every folder, the other folders too, so a list
+    /// over the limit is cut, arming the catch-up, in each.
+    /// *Superseded (#1110):* "A re-read list over the limit keeps every id in a
+    /// folder the catch-up never checks, and is cut, arming the catch-up, in one
+    /// it checks."
+    @Test("A re-read list over the limit is cut, arming the catch-up, in every folder, an other folder too, whose cut leaves the account's full-sync clock")
+    func applyOverflowIsCutInEveryFolder() async throws {
         try await Outlook.withWorld { w in
             let custom = try await Self.addCustomFolder(w)
-            let ids = (0...SyncConfig.changeRecheckLimit).map { "ov-\($0)" }
+            // Fixed width: the cut keeps a pass's new ids in their sorted order,
+            // so the first ids by number are the first by sort.
+            let ids = (0...SyncConfig.changeRecheckLimit).map { String(format: "ov-%04d", $0) }
             let archiveId = w.folderId(w.archive)
             try await w.pool.write { db in
                 try db.execute(sql: "UPDATE folder SET catchUpState = '{}' WHERE accountId = ?", arguments: [w.accountId])
+                try db.execute(sql: "UPDATE account SET lastFullSyncAt = ? WHERE id = ?", arguments: [Date(), w.accountId])
             }
             let customResult = try await w.pool.write { db in
                 try SyncEngine.applyFolderChanges(FolderChanges(folderId: custom.id, status: .notRun, rereadLater: ids), db: db)
             }
-            #expect(try w.recheck(Self.customPath).count == ids.count, "the custom folder keeps every id")
-            #expect(!customResult.armedCatchUp)
-            #expect(try Self.lapseCount(w.pool, folderId: custom.id) == nil)
+            let customKept = try w.recheck(Self.customPath)
+            #expect(Set(customKept) == Set(ids.prefix(SyncConfig.changeRecheckLimit)), "the other folder keeps its first ids: \(customKept.count)")
+            #expect(customResult.armedCatchUp)
+            let customLapses = try Self.lapseCount(w.pool, folderId: custom.id)
+            #expect(customLapses == 1, "and its catch-up, which checks it too, finds the rest")
+
+            // An other folder holding its own bookmark drops it, as a syncable
+            // one does, but the account's full sync, which does not list it, is
+            // not made due: its next read, by its run, starts a new baseline.
+            try await w.pool.write { db in
+                try db.execute(sql: "UPDATE folder SET changeCursor = ?, changeState = ?, catchUpState = '{}' WHERE id = ?",
+                               arguments: ["held-bookmark", FolderChangeState(recheck: []).encoded, custom.id])
+            }
+            let heldResult = try await w.pool.write { db in
+                try SyncEngine.applyFolderChanges(FolderChanges(folderId: custom.id, status: .tracked, rereadLater: ids), db: db)
+            }
+            #expect(heldResult.armedCatchUp)
+            let droppedBookmark = try w.cursor(Self.customPath)
+            #expect(droppedBookmark == nil, "the other folder's bookmark is dropped")
+            let lastFullSyncAt = try await w.pool.read { db in
+                try Date.fetchOne(db, sql: "SELECT lastFullSyncAt FROM account WHERE id = ?", arguments: [w.accountId])
+            }
+            #expect(lastFullSyncAt != nil, "an other folder's cut leaves the account's full-sync clock")
 
             let archiveResult = try await w.pool.write { db in
                 try SyncEngine.applyFolderChanges(FolderChanges(folderId: archiveId, status: .tracked, rereadLater: ids), db: db)
             }
-            #expect(try w.recheck(w.archive).count == SyncConfig.changeRecheckLimit, "a folder the catch-up checks keeps its first ids")
+            #expect(try w.recheck(w.archive).count == SyncConfig.changeRecheckLimit, "a syncable folder keeps its first ids")
             #expect(archiveResult.armedCatchUp)
             #expect(try Self.lapseCount(w.pool, folderId: archiveId) == 1, "and its catch-up finds the rest")
         }

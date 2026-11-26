@@ -40,6 +40,14 @@ actor SyncEngine {
     var accessCatchUpTasks: [String: Task<Void, Never>] = [:]
     var accessCatchUpPending: [String: Set<String>] = [:]
 
+    /// Per account: the other-folder run a clock-due foreground pass started
+    /// (#1110, `SyncEngine.startOtherFolderRun`), at most one at a time, and when
+    /// each other folder's read last finished or failed, so the next run reads
+    /// the folders read longest ago first. In memory only: a relaunch reads
+    /// every other folder in stored order at its first run.
+    var otherFolderRunTasks: [String: Task<Void, Never>] = [:]
+    var otherFolderAttemptedAt: [String: [String: Date]] = [:]
+
     #if DEBUG
     /// Test-only seam (`setCatchUpSliceStartHookForTesting`): called with the
     /// folders each catch-up slice asks, as it starts, and awaited, so a test
@@ -53,6 +61,9 @@ actor SyncEngine {
     /// Test-only seam (`setAccessCatchUpClockForTesting`): the clock access
     /// catch-up runs are measured on. Nil outside tests: the real clock.
     var accessCatchUpClockForTesting: (@Sendable () -> Date)?
+    /// Test-only seam (`setOtherFolderRunClockForTesting`): the clock other-folder
+    /// runs are measured on. Nil outside tests: the real clock.
+    var otherFolderRunClockForTesting: (@Sendable () -> Date)?
     #endif
 
     /// Generation counter per account — prevents stale task defer from clearing
@@ -415,6 +426,11 @@ actor SyncEngine {
             accessTask.cancel()
             await accessTask.value
         }
+        if let otherFolderTask = otherFolderRunTasks.removeValue(forKey: accountId) {
+            otherFolderTask.cancel()
+            await otherFolderTask.value
+        }
+        otherFolderAttemptedAt.removeValue(forKey: accountId)
     }
 
     // MARK: - Background Maintenance
@@ -940,7 +956,10 @@ actor SyncEngine {
         //    the read, so it does not hold back the rest of the account.
         let timeSinceFullSync = account.lastFullSyncAt.map { Date().timeIntervalSince($0) } ?? .infinity
         let listingNeeded = changePass?.needsListing ?? false
-        let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
+        // Due by the 15-minute clock, not only by a listing the read needs: such
+        // a pass also starts the other-folder run when it ends (#1110).
+        let clockDue = timeSinceFullSync >= fullSyncInterval
+        let fullSyncDue = clockDue || listingNeeded
         if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
             let plan = FullSyncPlan(deadline: deadline)
@@ -1012,7 +1031,10 @@ actor SyncEngine {
             throw error
         }
 
-        // 3. Background work — runs after every sync (delta or full)
+        // 3. Background work — runs after every sync (delta or full). A pass whose
+        //    full sync was due by the clock also starts the change reads of the
+        //    folders outside the syncable set (#1110), in the catch-up's slices.
+        if clockDue { startOtherFolderRun(account: account) }
         BackgroundSyncLogger.logDebug("[Sync] \(account.emailAddress) calling startBackfill")
         startBackfill(account: account)
         bulkIndexIfNeeded(account: account)

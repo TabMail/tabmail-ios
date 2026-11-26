@@ -57,6 +57,11 @@ struct CatchUpSliceResult: Sendable, Equatable {
     /// waiting for its connection sent nothing, and is reported the same way).
     /// *Superseded (#1062):* "the request may still hold that folder's connection".
     var inFlightFolderIds: Set<String> = []
+    /// A slice of an other-folder run (#1110, `SyncEngine.readOtherFolders`):
+    /// the folders whose change read is done for this run, never asked again in
+    /// it (a subset of `progressedFolderIds`). Its `inFlightFolderIds` are the
+    /// folders whose read failed, left out of the rest of the run too.
+    var finishedFolderIds: Set<String> = []
     /// An applied folder result made progress.
     var progressed: Bool { !progressedFolderIds.isEmpty }
 }
@@ -213,6 +218,12 @@ extension SyncEngine {
         /// not counted: waiting is not working time. Nil for the backfill
         /// worker's runs.
         var workSeconds: TimeInterval?
+        /// An other-folder run (#1110, `SyncEngine.startOtherFolderRun`): its
+        /// slices read the changes of the folders outside the syncable set
+        /// (`readOtherFolders`), not older mail, until each has been read once
+        /// (`CatchUpSliceResult.finishedFolderIds`), a slice reads nothing new,
+        /// or its working time (`workSeconds`) is spent.
+        var readsOtherFolders = false
         /// The clock the slices and the deadline are measured on. Injectable so a
         /// test can spend a slice deterministically; production passes `Date.init`.
         let clock: @Sendable () -> Date
@@ -264,6 +275,13 @@ extension SyncEngine {
     /// (`CatchUpRun.workSeconds`, #1109) is its slices' working time: neither the
     /// wait for the turn, the wait for the slot, nor the pacing wait between
     /// slices counts, and the run ends with the slice that spends it.
+    /// An other-folder run (`CatchUpRun.readsOtherFolders`, #1110) runs the same
+    /// slices, turn, slot, window and working time, but each reads the changes
+    /// of the folders outside the syncable set (`readOtherFolders`): those not
+    /// yet done in this run, in `otherFolderReadOrder`. A folder read once, or
+    /// whose read failed, is not asked again in the run, which ends at the turn
+    /// that finds none left (before it opens a window or asks for a slot), after
+    /// a slice that read nothing, or when its working time is spent.
     /// A foreground cycle (`run.deadline == nil`, no working time) runs one slice; the background
     /// processing job runs slices until its deadline, and stops after a slice
     /// whose folders made no progress and that left no folder out it had not
@@ -326,12 +344,15 @@ extension SyncEngine {
         // The folders whose request may still be in flight (#1062): never asked
         // again in this run. In memory only, gone when the run ends.
         var inFlight = Set<String>()
+        // An other-folder run's folders whose read is done for this run
+        // (#1110): never asked again in it. In memory only.
+        var finished = Set<String>()
         // The run's working time so far (`CatchUpRun.workSeconds`): only the
         // slices' time from their slot of the provider work queue, so neither
         // a wait for the turn nor a wait for the slot is counted.
         var worked: TimeInterval = 0
         runLoop: while !Task.isCancelled {
-            let leftOut = inFlight
+            let leftOut = inFlight.union(finished)
             let workedSoFar = worked
             let slice: CatchUpSliceOutcome = await oneSyncAtATime(accountId: accountId) {
                 let turnTaken = ContinuousClock.now
@@ -344,15 +365,36 @@ extension SyncEngine {
                     return .windowOpen(until: end)
                 }
                 guard run.sliceStartingNow(worked: workedSoFar) != nil else { return .runOver }
+                // An other-folder run asks its folders not done yet, in its
+                // order (#1110), and ends here, before it opens a window or
+                // asks for a slot, once none is left.
+                var otherFolderOrder: [String]?
+                if run.readsOtherFolders {
+                    do {
+                        otherFolderOrder = try await self.otherFolderReadOrder(accountId: accountId).filter { !leftOut.contains($0) }
+                    } catch {
+                        BackgroundSyncLogger.logDebug("[OtherFolders] folder read failed: \(error)")
+                        return .runOver
+                    }
+                    if otherFolderOrder?.isEmpty ?? true { return .runOver }
+                }
                 self.catchUpSliceWindowEnds[accountId] = Date().addingTimeInterval(run.intervalSeconds)
                 let folderIds: [String]
-                do {
-                    folderIds = try await self.syncableFolderIds(accountId: accountId).filter {
-                        !leftOut.contains($0) && (run.accessedFolderIds?.contains($0) ?? true)
+                let otherFolderIds: Set<String>
+                if let otherFolderOrder {
+                    folderIds = otherFolderOrder
+                    otherFolderIds = []
+                } else {
+                    do {
+                        let folders = try await self.catchUpFolderIds(accountId: accountId)
+                        folderIds = folders.ids.filter {
+                            !leftOut.contains($0) && (run.accessedFolderIds?.contains($0) ?? true)
+                        }
+                        otherFolderIds = folders.otherFolderIds
+                    } catch {
+                        BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
+                        return .ran(CatchUpSliceResult(), spent: 0)
                     }
-                } catch {
-                    BackgroundSyncLogger.logDebug("[CatchUp] folder read failed: \(error)")
-                    return .ran(CatchUpSliceResult(), spent: 0)
                 }
                 #if DEBUG
                 await self.catchUpSliceStartHookForTesting?(folderIds)
@@ -372,12 +414,15 @@ extension SyncEngine {
                 do {
                     sliceWork = try await queue.execute(priority: .headerFetch) { () -> CatchUpSliceWork in
                         let admitted = ContinuousClock.now
-                        guard let context = run.sliceStartingNow(worked: workedSoFar) else {
+                        guard var context = run.sliceStartingNow(worked: workedSoFar) else {
                             return CatchUpSliceWork(queueWait: asked.duration(to: admitted))
                         }
+                        context.otherFolderIds = otherFolderIds
                         let admittedAt = Date()
                         let start = run.clock()
-                        let result = await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
+                        let result = run.readsOtherFolders
+                            ? await self.readOtherFolders(account: account, provider: provider, folderIds: folderIds, context: context)
+                            : await self.runCatchUp(provider: provider, folderIds: folderIds, context: context)
                         return CatchUpSliceWork(
                             result: result, spent: run.clock().timeIntervalSince(start), admittedAt: admittedAt,
                             queueWait: asked.duration(to: admitted), work: admitted.duration(to: .now))
@@ -435,6 +480,10 @@ extension SyncEngine {
                 // the slice left out is one it added.
                 let addedInFlight = !ran.inFlightFolderIds.isSubset(of: inFlight)
                 inFlight.formUnion(ran.inFlightFolderIds)
+                // An other-folder run's folders read once are done for the run
+                // (#1110): the next slice asks the rest, and the run ends at the
+                // turn that finds none left.
+                finished.formUnion(ran.finishedFolderIds)
                 // A foreground cycle (no deadline, no working time) ends here.
                 guard !ran.progressedFolderIds.isEmpty || addedInFlight,
                       run.deadline != nil || run.workSeconds != nil else { break runLoop }
@@ -501,8 +550,8 @@ extension SyncEngine {
         var work: Duration = .zero
     }
 
-    /// The debug-gated timing line of one catch-up slice (#1109), access run or
-    /// backfill: the wait for a slot of the provider work queue, the slice's
+    /// The debug-gated timing line of one catch-up slice (#1109), access run,
+    /// backfill or other-folder run (#1110): the wait for a slot of the provider work queue, the slice's
     /// working time, and how long the slice held the account's turn (`turnHoldMs`,
     /// from its turn start: the folder read, the queue wait and the work). A pass
     /// that waited behind it logs `[SyncTurnWait]` when it starts.
@@ -511,7 +560,8 @@ extension SyncEngine {
         work: CatchUpSliceWork, turnTaken: ContinuousClock.Instant
     ) {
         BackgroundSyncLogger.logDebug({
-            let kind = run.workSeconds != nil ? "access" : (run.deadline != nil ? "backfill-background" : "backfill-foreground")
+            let kind = run.readsOtherFolders ? "other-folders"
+                : run.workSeconds != nil ? "access" : (run.deadline != nil ? "backfill-background" : "backfill-foreground")
             let shown = error.map { "\(outcome)(\($0))" } ?? outcome
             let turnHold = turnTaken.duration(to: .now)
             return "[CatchUpSlice] \(accountId.prefix(8)): kind=\(kind) outcome=\(shown)"
@@ -521,22 +571,28 @@ extension SyncEngine {
         }())
     }
 
-    /// The account's syncable folders as they are now (`syncableFoldersInOrder`,
-    /// the folders the full sync syncs), in the full sync's order, then every
+    /// Every folder of the account as it is now, for the catch-up (#1110): the
+    /// syncable ones (`syncableFoldersInOrder`, the folders the full sync syncs)
+    /// in the full sync's order, then every other folder, whose ids are also
+    /// returned on their own (`CatchUpContext.otherFolderIds`): a provider works
+    /// the syncable ones first, and gives the others their own schedule. An
     /// other folder owed a check after a move retired without proof
-    /// (`FolderChangeState.selfHealDue`, #1062), so it is always listed: its
-    /// mark clears at a clean listing, and stays open after an unclean one until
-    /// a later clean one.
+    /// (`FolderChangeState.selfHealDue`, #1062) is among them, so it is always
+    /// listed: its mark clears at a clean listing, and stays open after an
+    /// unclean one until a later clean one.
+    /// *Superseded (#1110):* "The account's syncable folders [...], then every
+    /// other folder owed a check after a move retired without proof": the first
+    /// check of an other folder, and its later lapses, are the catch-up's too.
     /// *Superseded (#1062, in place):* "so its mark always clears": an unclean
     /// completion leaves it owed.
-    private func syncableFolderIds(accountId: String) async throws -> [String] {
+    private func catchUpFolderIds(accountId: String) async throws -> (ids: [String], otherFolderIds: Set<String>) {
         let folders = try await dbPool.read { db in
             try Folder.filter(Column("accountId") == accountId).fetchAll(db)
         }
         let syncable = syncableFoldersInOrder(folders).map(\.id)
         let listed = Set(syncable)
-        let owed = folders.filter { !listed.contains($0.id) && FolderChangeState(raw: $0.changeState).selfHealDue }
-        return syncable + owed.map(\.id)
+        let others = folders.map(\.id).filter { !listed.contains($0) }
+        return (syncable + others, Set(others))
     }
 
     /// The one-time prune cutoff of a folder that has none (`CatchUpPruneCutoff`,
