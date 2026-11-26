@@ -823,7 +823,11 @@ struct ChatReplyFieldTests {
         // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
         #expect(Self.count("unsentReplies = found if left || found.contains(where: \\.filed) { viewModel.reloadThread() }", in: text) == 1)
         #expect(Self.count("unsentReplies = ", in: text) == 1, "nothing else writes them")
-        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo() })", in: text) == 1,
+        // The bubbles show through the chat's outgoing rows, as on every chat, with this screen's Undo.
+        #expect(Self.count("ChatOutgoingRows(unsentReplies: unsentReplies, heldGhost: heldGhost, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .chat) {", in: text) == 1)
+        #expect(Self.count("ChatUnsentReplyBubble(", in: text) == 0, "no outbox bubble of its own")
+        let rows = try Self.source("TabMail/Views/Chat/ChatOutgoingRows.swift")
+        #expect(Self.count("ChatUnsentReplyBubble(reply: reply, retry: { reply.retry() }, delete: { reply.delete() }, undo: { reply.undo(on: undoScreen) })", in: rows) == 1,
                 "a failed send's Retry and Delete act on its own row")
     }
 
@@ -845,11 +849,17 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".transition(.asymmetric( insertion: ghostFadesIn ? .opacity.animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration)) : .opacity, removal: .opacity))", in: text) == 1)
         #expect(Self.count(".animation(.easeInOut(duration: ChatSuggestionConfig.ghostFadeDuration))", in: text) == 1)
         let rows = try #require(text.range(of: "ForEach(thread.items) { item in"))
-        let unsent = try #require(text.range(of: "ForEach(unsentReplies) { reply in"))
+        let outgoing = try #require(text.range(of: "ChatOutgoingRows(unsentReplies: unsentReplies,"))
         let ghost = try #require(text.range(of: "if let newest = thread.newest, let suggestion {"))
-        let bottom = try #require(text.range(of: "Color.clear.frame(height: ChatViewLayout.pillGap).id(Self.bottomId)"))
-        #expect(rows.upperBound < unsent.lowerBound && unsent.upperBound < ghost.lowerBound && ghost.upperBound < bottom.lowerBound,
-                "the AI Suggestion is the last chat row")
+        #expect(rows.upperBound < outgoing.lowerBound && outgoing.upperBound < ghost.lowerBound,
+                "the AI Suggestion is the outgoing rows' last row, after the emails")
+        let shared = try Self.source("TabMail/Views/Chat/ChatOutgoingRows.swift")
+        let unsent = try #require(shared.range(of: "ForEach(unsentReplies) { reply in"))
+        let held = try #require(shared.range(of: "if let held = heldGhost {"))
+        let last = try #require(shared.range(of: "} else { last() }"))
+        let bottom = try #require(shared.range(of: "Color.clear.frame(height: ChatViewLayout.pillGap).id(ChatOutgoing.bottomId)"))
+        #expect(unsent.upperBound < held.lowerBound && held.upperBound < last.lowerBound && last.upperBound < bottom.lowerBound,
+                "outbox, then the held bubble or the field's message, then the chat's own last row, then the gap above the field")
     }
 
     @Test("A held ghost ends once its card has closed: at once unsent or with no bubble, after a send once the reply shows",
@@ -906,16 +916,27 @@ struct ChatReplyFieldTests {
                 "the reply shows as its outbox bubble or as the sent email")
         let end = try Self.body(of: "private func endHeldGhostIfDone() {", in: text)
         #expect(Self.count("guard let held = heldGhost, held.ends(replyShows: sentReplyShows) else { return }", in: end) == 1)
-        #expect(Self.count("withAnimation(held.morphs && !reduceMotion ? morph : nil) { heldGhost = nil }", in: end) == 1,
-                "the morph moves only after a send it shows, and never under Reduce Motion")
+        #expect(Self.count("withAnimation(ChatOutgoing.endAnimation(held, reduceMotion: reduceMotion)) { heldGhost = nil }", in: end) == 1,
+                "the hold ends through the one rule every chat uses")
         // While held the ghost keeps its row and the outbox bubbles wait; the newest bubble and the
-        // held ghost share one id, so the one turns into the other.
-        #expect(Self.count("if heldGhost == nil { ForEach(unsentReplies) { reply in", in: text) == 1)
-        #expect(Self.count(".matchedGeometryEffect(id: Self.sentMorphId(reply, newest: unsentReplies.last), in: sentMorph)", in: text) == 1)
+        // held ghost share one id, so the one turns into the other (`ChatOutgoingRows`).
+        let rows = try Self.source("TabMail/Views/Chat/ChatOutgoingRows.swift")
+        #expect(Self.count("if heldGhost == nil { ForEach(unsentReplies) { reply in", in: rows) == 1)
+        #expect(Self.count(".matchedGeometryEffect(id: ChatOutgoing.sentMorphId(reply, newest: unsentReplies.last), in: morph)", in: rows) == 1)
         // The held one is the ghost tapped open, or the user's own message the field sent, in the
         // ghost's look or the message's.
-        #expect(Self.count("if let held = heldGhost { Group { if held.isMessage { ChatFieldMessageBubble(text: held.text, pulses: false) } else { ChatSuggestionBubble(text: held.text) {} } } .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)", in: text) == 1)
-        #expect(Self.count("} else if let newest = thread.newest, let suggestion {", in: text) == 1, "the live ghost only when none is held")
+        #expect(Self.count("if let held = heldGhost { Group { if held.isMessage { ChatFieldMessageBubble(text: held.text, pulses: false) } else { ChatSuggestionBubble(text: held.text) {} } } .matchedGeometryEffect(id: ChatOutgoing.heldGhostMorphId, in: morph)", in: rows) == 1)
+        #expect(Self.count("} else if let message = fieldMessage {", in: rows) == 1 && Self.count("} else { last() }", in: rows) == 1,
+                "the live ghost only when none is held and the field writes nothing")
+        #expect(Self.count("morph: sentMorph, undoScreen: .chat) { if let newest = thread.newest, let suggestion {", in: text) == 1,
+                "the thread's last row is its AI Suggestion")
+        // The morph: only after a send the chat shows as its bubble, and never under Reduce Motion.
+        var sent = ChatHeldGhost(text: "Tuesday works for me", showsBubble: true)
+        sent.sent = true
+        #expect(ChatOutgoing.endAnimation(sent, reduceMotion: false) != nil, "a sent reply's bubble takes the held one's place in motion")
+        #expect(ChatOutgoing.endAnimation(sent, reduceMotion: true) == nil, "at once under Reduce Motion")
+        #expect(ChatOutgoing.endAnimation(ChatHeldGhost(text: "Tuesday works for me", showsBubble: true), reduceMotion: false) == nil,
+                "unsent, the held bubble goes at once")
     }
 
     @Test("Only the newest outbox bubble takes the held ghost's place")
@@ -925,10 +946,31 @@ struct ChatReplyFieldTests {
                             filed: false, textMessage: nil)
         }
         let older = reply("outbox-1"), newest = reply("outbox-2")
-        #expect(ChatThreadView.sentMorphId(newest, newest: newest) == ChatThreadView.heldGhostMorphId)
-        #expect(ChatThreadView.sentMorphId(older, newest: newest) != ChatThreadView.heldGhostMorphId)
-        #expect(ChatThreadView.sentMorphId(older, newest: newest) != ChatThreadView.sentMorphId(reply("outbox-3"), newest: newest),
+        #expect(ChatOutgoing.sentMorphId(newest, newest: newest) == ChatOutgoing.heldGhostMorphId)
+        #expect(ChatOutgoing.sentMorphId(older, newest: newest) != ChatOutgoing.heldGhostMorphId)
+        #expect(ChatOutgoing.sentMorphId(older, newest: newest) != ChatOutgoing.sentMorphId(reply("outbox-3"), newest: newest),
                 "every other bubble keeps an id of its own")
+    }
+
+    /// The new email's chat once drew its sending email with bubbles of its own: its held message
+    /// and its Sending bubble showed together as the card closed, and it had no gap above the field.
+    /// `ChatNewThreadScreenTests` shows the send on screen; this pins that both chats use one set of rows.
+    @Test("A new email's chat shows its send through the thread's own rows, and ends its hold by the thread's rule")
+    func newEmailSharesTheOutgoingRows() throws {
+        let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
+        #expect(Self.count("ChatOutgoingRows(unsentReplies: cardSend?.reply.map { [$0] } ?? [], heldGhost: heldMessage, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .newEmailChat) { EmptyView() }", in: view) == 1,
+                "the card's send, the held message and the field's message, in the thread's rows")
+        for bubble in ["ChatUnsentReplyBubble(", "ChatFieldMessageBubble(", ".matchedGeometryEffect("] {
+            #expect(Self.count(bubble, in: view) == 0, "\(bubble): no copy of the rows' bubbles")
+        }
+        let end = try Self.body(of: "private func endHeldMessageIfDone() {", in: view)
+        #expect(Self.count("withAnimation(ChatOutgoing.endAnimation(held, reduceMotion: reduceMotion)) { heldMessage = nil }", in: end) == 1,
+                "the held message turns into its Sending bubble as a thread's does")
+        let thread = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
+        for screen in [view, thread] {
+            #expect(Self.count("ChatOutgoingRows(", in: screen) == 1)
+            #expect(Self.count("ChatViewLayout.pillGap).id(", in: screen) == 0, "the gap above the field is the rows' own")
+        }
     }
 
     @Test("With the chat view on, the email's detail has no compose button; the classic view keeps it")

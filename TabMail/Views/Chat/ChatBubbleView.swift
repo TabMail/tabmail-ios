@@ -66,28 +66,30 @@ struct ChatBubbleView: View {
 
     private var bubble: some View {
         Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: 6) {
-                if let text = item.textMessage {
-                    Text(text)
-                        .font(.body)
-                        .foregroundStyle(item.isOwn ? Color.white : Theme.textPrimary)
-                        .multilineTextAlignment(.leading)
-                } else {
-                    // Still being summarized; already tappable.
-                    Text(item.header.subject.isEmpty ? "(No subject)" : item.header.subject)
-                        .font(.body)
-                        .foregroundStyle(item.isOwn ? Color.white : Theme.textPrimary)
-                        .lineLimit(2)
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.mini)
-                            .tint(item.isOwn ? Color.white : Theme.textSecondary)
-                        Text("Summarizing")
-                            .font(.caption)
-                            .foregroundStyle(item.isOwn ? Color.white.opacity(0.8) : Theme.textSecondary)
+            // As wide as the wider of the words and the Details pin (`ChatBubbleStack`).
+            ChatBubbleStack(spacing: 6) {
+                VStack(alignment: .leading, spacing: 6) {
+                    if let text = item.textMessage {
+                        Text(text)
+                            .font(.body)
+                            .foregroundStyle(item.isOwn ? Color.white : Theme.textPrimary)
+                            .multilineTextAlignment(.leading)
+                    } else {
+                        // Still being summarized; already tappable.
+                        Text(item.header.subject.isEmpty ? "(No subject)" : item.header.subject)
+                            .font(.body)
+                            .foregroundStyle(item.isOwn ? Color.white : Theme.textPrimary)
+                            .lineLimit(2)
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.mini)
+                                .tint(item.isOwn ? Color.white : Theme.textSecondary)
+                            Text("Summarizing")
+                                .font(.caption)
+                                .foregroundStyle(item.isOwn ? Color.white.opacity(0.8) : Theme.textSecondary)
+                        }
                     }
                 }
                 HStack(spacing: 2) {
-                    Spacer(minLength: 0)
                     Text("Details")
                     Image(systemName: "chevron.right")
                 }
