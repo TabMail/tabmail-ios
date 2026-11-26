@@ -450,38 +450,69 @@ struct IncrementalVacuumTests {
         #expect(after.autoVacuum == DatabaseVacuum.incrementalMode, "now INCREMENTAL (\(after))")
     }
 
-    @Test("On a packed older-install database, the need covers what the VACUUM writes: its temporary copy (the rewritten file's size, its pointer-map pages included), the WAL the copy passes through and the WAL index's growth")
+    /// The most the need may ask above what the rewrite writes: a few percent of margin,
+    /// so a phone with room for the rewrite is not asked for much more (#1449).
+    private static let needOverWrittenAtMost = 1.05
+
+    /// One switch of the email fixture, from an empty WAL: its space state before and
+    /// after, the WAL before, and the bytes the `VACUUM` wrote: its temporary copy (the
+    /// rewritten file's size, its pointer-map pages included), the WAL the copy passed
+    /// through and the WAL index's growth.
+    private static func measureSwitch(_ email: EmailFixture) throws -> (
+        before: DatabaseVacuum.SpaceState, after: DatabaseVacuum.SpaceState, walBefore: Int, walAfter: Int, written: Int64
+    ) {
+        try email.pool.writeWithoutTransaction { db in _ = try db.checkpoint(.truncate) }
+        let walBefore = walBytes(email.path)
+        let shmBefore = shmBytes(email.path)
+        let beforeRead = try spaceState(email.pool)
+        let before = try #require(beforeRead)
+        try email.pool.writeWithoutTransaction { db in try DatabaseVacuum.switchToIncremental(db) }
+        let walAfter = walBytes(email.path)
+        let shmAfter = shmBytes(email.path)
+        let afterRead = try spaceState(email.pool)
+        let after = try #require(afterRead)
+        return (before, after, walBefore, walAfter, after.allBytes + Int64(walAfter) + Int64(shmAfter - shmBefore))
+    }
+
+    @Test("On a packed older-install database, the need covers what the VACUUM writes (its temporary copy with its pointer-map pages, the WAL the copy passes through and the WAL index's growth), and asks at most a few percent more")
     func theNeedCoversTheCopyAndItsWAL() throws {
         let email = try makeEmailFixture()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: email.pool, directory: email.directory) }
         try seedMail(email.pool)
         // A plain VACUUM, still on NONE, packs the pages, so the switch copies about
         // as much as the data it is measured from: the case where the need is tightest.
-        try email.pool.writeWithoutTransaction { db in
-            try db.execute(sql: "VACUUM")
-            _ = try db.checkpoint(.truncate)
-        }
-        let walBefore = Self.walBytes(email.path)
-        let shmBefore = Self.shmBytes(email.path)
-        let beforeRead = try Self.spaceState(email.pool)
-        let before = try #require(beforeRead)
+        try email.pool.writeWithoutTransaction { db in try db.execute(sql: "VACUUM") }
+        let measured = try Self.measureSwitch(email)
+        let need = SyncEngine.bytesNeededForUpgrade(liveBytes: measured.before.liveBytes)
 
-        try email.pool.writeWithoutTransaction { db in try DatabaseVacuum.switchToIncremental(db) }
-        let walAfter = Self.walBytes(email.path)
-        let shmAfter = Self.shmBytes(email.path)
-        let afterRead = try Self.spaceState(email.pool)
-        let after = try #require(afterRead)
-        let written = after.allBytes + Int64(walAfter) + Int64(shmAfter - shmBefore)
-
-        #expect(walBefore == 0, "precondition: an empty WAL, so it measures the VACUUM alone (\(walBefore) bytes)")
-        #expect(before.autoVacuum == DatabaseVacuum.noneMode && before.freePages == 0, "precondition: a packed older-install database (\(before))")
-        #expect(after.autoVacuum == DatabaseVacuum.incrementalMode, "the switch ran (\(after))")
-        #expect(walAfter >= after.allBytes, "the rewritten file passed through the WAL: \(walAfter) bytes for \(after)")
-        #expect(SyncEngine.bytesNeededForUpgrade(liveBytes: before.liveBytes) >= written,
-                "the need of \(before.liveBytes) bytes of data covers the copy, the WAL and the WAL index, \(written) bytes")
+        #expect(measured.walBefore == 0, "precondition: an empty WAL, so it measures the VACUUM alone (\(measured.walBefore) bytes)")
+        #expect(measured.before.autoVacuum == DatabaseVacuum.noneMode && measured.before.freePages == 0, "precondition: a packed older-install database (\(measured.before))")
+        #expect(measured.after.autoVacuum == DatabaseVacuum.incrementalMode, "the switch ran (\(measured.after))")
+        #expect(measured.walAfter >= measured.after.allBytes, "the rewritten file passed through the WAL: \(measured.walAfter) bytes for \(measured.after)")
+        #expect(need >= measured.written,
+                "the need of \(measured.before.liveBytes) bytes of data covers the copy, the WAL and the WAL index, \(measured.written) bytes")
+        #expect(Double(need) <= Double(measured.written) * Self.needOverWrittenAtMost,
+                "the need asks at most a few percent more than the rewrite writes: \(need) for \(measured.written)")
     }
 
-    @Test("The bytes to free: none with the need free or more, the shortfall below it, rounded up; the need covers the copy of the data with its pointer-map pages, the WAL frames of that copy, the WAL's header and the WAL index's growth")
+    @Test("On an older-install database of mostly empty pages, the VACUUM writes less than the file's own size, and the need covers it")
+    func aMostlyEmptyDatabaseWritesLessThanItsFile() throws {
+        let email = try makeEmailFixture()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: email.pool, directory: email.directory) }
+        try seedMailThenDeleteMost(email.pool)
+        let measured = try Self.measureSwitch(email)
+        let need = SyncEngine.bytesNeededForUpgrade(liveBytes: measured.before.liveBytes)
+
+        #expect(measured.walBefore == 0, "precondition: an empty WAL, so it measures the VACUUM alone (\(measured.walBefore) bytes)")
+        #expect(measured.before.autoVacuum == DatabaseVacuum.noneMode && measured.before.freePages > measured.before.pageCount / 2,
+                "precondition: an older-install database of mostly empty pages (\(measured.before))")
+        #expect(measured.after.autoVacuum == DatabaseVacuum.incrementalMode, "the switch ran (\(measured.after))")
+        #expect(measured.written < measured.before.allBytes,
+                "the copy and its WAL, \(measured.written) bytes, are less than the file's own \(measured.before.allBytes): twice the file asks for far more")
+        #expect(need >= measured.written, "the need \(need) covers the \(measured.written) bytes written")
+    }
+
+    @Test("The bytes to free: none with the need free or more, the shortfall below it, rounded up; the need covers the copy of the data with its pointer-map pages, the WAL frames of that copy, the WAL's header and the WAL index's growth, and asks at most a few percent more")
     func bytesToFreeLine() {
         let pageSize: Int64 = 4_096
         /// SQLite's header on each WAL frame, on the WAL file, and the WAL index's bytes per frame.
@@ -504,6 +535,8 @@ struct IncrementalVacuumTests {
                 + copyPages * (pageSize + walFrameHeaderBytes + walIndexBytesPerFrame)
             let need = SyncEngine.bytesNeededForUpgrade(liveBytes: livePages * pageSize)
             #expect(need >= written, "\(livePages) pages of data: the need \(need) covers \(written) bytes written")
+            #expect(Double(need) <= Double(written) * Self.needOverWrittenAtMost,
+                    "\(livePages) pages of data: the need \(need) asks at most a few percent more than \(written) bytes written")
         }
     }
 
