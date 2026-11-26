@@ -256,8 +256,13 @@ enum ChatSuggestionConfig {
     /// closed (`ChatHeldGhost`): its spring. Under Reduce Motion the bubble replaces it at once.
     static let sentMorphResponse: Double = 0.45
     static let sentMorphDamping: Double = 0.85
-    /// The working bubble's dots, and the user's own message while its email is written
-    /// (`ChatFieldMessageBubble`): each pulses between this opacity and full over the period, the
+    /// The user's own message while its email is written (`ChatFieldMessageBubble.pulseOpacity`):
+    /// still at full for the delay after it goes up, so going up never reads as a blink, then a soft
+    /// pulse from full down to the dim opacity and back over each period.
+    static let fieldMessagePulseDelay: Double = 0.8
+    static let fieldMessageDimOpacity: Double = 0.6
+    static let fieldMessagePulsePeriod: Double = 1.6
+    /// The working bubble's dots: each pulses between this opacity and full over the period, the
     /// next dot this much later.
     static let dotDimOpacity: Double = 0.3
     static let dotPulsePeriod: Double = 1.2

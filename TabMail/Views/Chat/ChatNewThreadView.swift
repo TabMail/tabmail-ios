@@ -30,8 +30,6 @@ struct ChatNewThreadView: View {
     @State private var chatExpanded = false
     @State private var chatInputFocused = false
     @State private var chatWorking = false
-    /// What the agent is doing about a Send from the field, shown above it (`ChatFieldStatusKey`).
-    @State private var fieldStatus: String?
     /// A drag up on the collapsed field, which opens the TabMail panel as a thread's field does
     /// (`ChatFieldDrag`, `ChatFieldPan`); read only in modifiers, never in this body.
     @State private var fieldDrag = ChatFieldDrag.Model()
@@ -205,12 +203,14 @@ struct ChatNewThreadView: View {
                                           undo: { reply.undo(on: .newEmailChat) })
                 }
                 // The field's Send: the user's own message, up at once, pulsing while its email is
-                // written, then held while its card is up.
+                // written, with "Writing your email" under it where "Sent" goes; then held while its
+                // card is up.
                 if let held = heldMessage {
                     ChatFieldMessageBubble(text: held.text, pulses: false)
                         .transition(.opacity)
                 } else if let message = fieldMessage {
-                    ChatFieldMessageBubble(text: message.text, pulses: message.pulses)
+                    ChatFieldMessageBubble(text: message.text, pulses: message.pulses,
+                                           status: ChatReplyField.writingStatus)
                         .transition(.opacity)
                 }
             }
@@ -293,10 +293,6 @@ struct ChatNewThreadView: View {
             if !model.attachments.isEmpty {
                 ChatAttachmentTray(attachments: model.attachments) { model.removeAttachment(at: $0) }
             }
-            if let fieldStatus {
-                ChatFieldStatusLine(text: fieldStatus)
-                    .transition(.opacity)
-            }
             DynamicIslandChat(
                 isExpanded: $chatExpanded,
                 isInputFocused: $chatInputFocused,
@@ -319,10 +315,6 @@ struct ChatNewThreadView: View {
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: model.account?.id,
                 composeHostCovered: newEmailCovered)
-            // The agent's status on a Send shows above the field (`ChatFieldStatusLine`).
-            .onPreferenceChange(ChatFieldStatusKey.self) { status in
-                withAnimation(.spring(ChatThreadView.pillSpringModel)) { fieldStatus = status }
-            }
             // Drag the field up: it swells under the finger and opens the TabMail panel, as a
             // thread's field does (`ChatThreadView`). The swell grows the field's glass upward and
             // is taken back out of the layout here, so nothing moves under the drag.
