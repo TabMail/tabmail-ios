@@ -183,6 +183,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
    updates a stored row, and inserts only a message dated within the folder's held range, checked inside
    the transaction; a folder with no held range (after a reset) inserts nothing. A later round's record
    inserts at any age: a message moved in by another client appears whatever its date (#722, #536).
+   *Amended 2026-11-26 (#1363):* a folder with no held range whose older-mail walk has completed (the walk
+   found it empty) holds the whole folder and inserts at any age; see the amendment of that date at the end.
 4. **The read budget ends before the caller's deadline** (`SyncEngine.changeReadEnd`): the smaller of
    `SyncConfig.changeReadBudgetSeconds` and the caller's deadline less one request's timeout
    (`changeReadRequestTimeoutSeconds`) and the apply margin (`changeReadApplyMarginSeconds`). No request
@@ -203,7 +205,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      (`GraphAPI.stateSelection`: `id,isRead,flag,receivedDateTime,categories`). A change to a message the
      phone holds applies from that record; a message the folder does not hold whose record carries
      `receivedDateTime` (a new or moved-in message) gets its headers fetched, when the folder is tracking,
-     or during its baseline when the message is within the held range.
+     or during its baseline when the message is within the held range (with no range, every such message
+     once the folder's older-mail walk has completed; amended 2026-11-26, #1363).
    - **Why not ids only.** A delta chain keeps the `$select` it was started with (Graph encodes it in the
      next and delta links), and later rounds carry only selected fields. With `$select=id` every read or
      flag change would cost one GET per message, or might not be reported at all; a change key says only
@@ -1704,3 +1707,63 @@ syncable set, 15-minute clock, clockDue, readCut, cut folder, tried, slow link, 
 listing bound, catchUpRequestTimeoutSeconds, Outlook baseline page not passed, baselining readCut, #1110,
 #1358, runRemovalCheck, removal check step, CONDSTORE without QRESYNC, per provider call, account removal,
 headerFetch slot, staging merge, firstFolderDeadline, forFirstFolder, slow NOOP, first folder in the slice, pendingCheck kept.
+
+### Amendment 2026-11-26 (#1363): a folder the older-mail walk found empty is held whole
+
+**Context.** Decision 3 lets a baseline insert nothing in a folder with no held range, and Outlook's reader
+(decision 5) fetches nothing for it. The older-mail walk sets the held range (`Folder.oldestSyncedDate`) only
+from messages it sees, so a folder it finds empty is marked complete (`Folder.backfillComplete`) with no range.
+Mail that landed there after the walk and before the folder's first read was skipped by that read, and the
+bookmark then passed it: later reads report only later changes, and the Outlook catch-up lists only the ranges
+between the folder's own rows, of which there are none. It stayed missing from the folder's list and from
+search until the user opened the folder. This shows on folders outside the syncable set, whose first read is
+the other-folder run's (#1110): a synced folder's window listing fetches its newest `syncMessageLimit`
+messages, and sets its range once the folder holds that many. IMAP already holds the whole folder once its walk
+has completed (`IMAPProvider.heldRangeStart`, amendment 2026-11-16).
+
+**Decision.**
+1. **A folder with no held range whose older-mail walk has completed holds the whole folder.** A baseline
+   record inserts a message the folder lacks whatever the message's date. The apply reads `backfillComplete`
+   from the folder row it already loads in the folder's transaction (`SyncEngine.applyChangeRecord`). Outlook's
+   reader fetches the headers of every such message (`ExchangeProvider.needsHeader`, from
+   `ChangeFolder.olderMailComplete`, which `SyncEngine.changeFolder` already fills). Before the walk has
+   completed, a folder with no range still inserts and fetches nothing: the walk takes what is there.
+2. **A completed walk never widens a held range.** A folder with a range keeps decision 3: mail below the
+   range of a walked folder is the older-mail catch-up's (ADR-IOS-107: once the walk has completed, it lists
+   a folder that holds rows down to the epoch). A folder with no rows has no such listing, which is why the
+   no-range case above needed its own rule.
+3. **Resets are unchanged.** Every reset clears `backfillComplete` in the same write that clears or
+   re-anchors the range (`resetSyncStateTxn`, the startup resets and the shipped migration clear both;
+   Smart Reindex's `resetCrawlState` anchors the range at now), so decision 3's folder "after a reset" still
+   inserts nothing until its walk runs again.
+4. **Nothing new is stored or asked.** No new query, statement, column or migration, and no new kind of
+   request: Outlook's first read already fetches missing messages in `$batch`es, within its time budget and
+   request allowance. Only Outlook's first read carries records today (IMAP's and Gmail's set the bookmark
+   only), so nothing changes for them; the apply's rule stays provider-neutral.
+5. **Sync timing promises: unchanged** (each is listed in the change's pull request). No trigger, gate, turn,
+   deadline, skip, IDLE step or start-of-pass work changes. The header fetches run inside the read's own budget
+   and allowance; a pass reads tracked folders and the Inbox before folders on their first read; an
+   other-folder slice stays one slice; nothing is added to the startup or return path.
+
+**Consequences.**
+- A folder the walk completed empty is healed by its first read on a build with this change, mail moved in
+  with an older date included. A folder whose first read ran on an earlier build keeps what that read skipped
+  until it is opened.
+- Cost: one header fetch per message the folder lacks, inside the read's allowance; a long first read goes on
+  across slices and runs (#1358), and bodies follow by the download rules. Under a storage limit such a folder
+  may take more mail than the walk would have; the storage prune trims it as it does any folder, and a
+  re-baseline loads trimmed mail again, as for any folder.
+- The reader decides from the folder as its read began (`ChangeFolder`, a value snapshot), the apply from the
+  row in its transaction. A reset while a read is under way leaves the apply inserting nothing (the row's
+  `backfillComplete` is false again). A walk that completes while a first read is under way: that read keeps
+  the earlier rule, and the baseline's later reads take the new one.
+
+Tests: `OutlookChangeReadingTests` (`baselineWithNoHeldRangeAfterTheWalkTakesEveryMessage`, `needsHeaderRule`,
+`baselineFetchesOnlyWithinTheHeldRange` with and without a completed walk, `baselineWithNoHeldRangeInsertsNothing`
+before the walk), `ChangeApplyTests.firstReadInsertsWithinTheHeldRange`, and end to end on the Graph fake
+`OtherFolderOutlookTests.mailAfterAnEmptyWalkComesInWithTheFirstRead` (the walk finds an other folder empty, a
+new and an older moved-in message land, the run's first read inserts both).
+
+Keywords: #1363, walked empty, empty folder, no held range, held whole, oldestSyncedDate nil, backfillComplete,
+olderMailComplete, needsHeader, heldRangeApplies, first read, baseline gate, older-mail walk completed, moved in
+with an older date, other-folder run, IMAP heldRangeStart rule.

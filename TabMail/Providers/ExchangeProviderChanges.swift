@@ -22,7 +22,8 @@ import Foundation
 ///   the folder does not hold, whose record carries `receivedDateTime` (a new or
 ///   moved-in message), gets its headers fetched (`fetchMessageDetails`, in
 ///   `$batch`es) when the folder is tracking, or during its baseline when the
-///   message is within the folder's held range (`ChangeFolder.heldSince`). The
+///   message is within the folder's held range (`ChangeFolder.heldSince`; with
+///   no range, the whole folder once its older-mail walk has completed). The
 ///   folder's bookmark never passes a page until every such header is in, read
 ///   as gone, or reported unreadable (`rereadLater`); a page cut short is read
 ///   again on the next pass, which fetches only what is still missing.
@@ -244,7 +245,7 @@ extension ExchangeProvider {
                 if held.contains(record.id) || state.select == .header {
                     collected.add(Self.changeRecord(record, header: page.headers[record.id]))
                     if state.phase == .tracking { verbIds.insert(record.id) }
-                } else if Self.needsHeader(record, phase: state.phase, heldSince: folder.heldSince) {
+                } else if Self.needsHeader(record, phase: state.phase, heldSince: folder.heldSince, olderMailComplete: folder.olderMailComplete) {
                     missing.append(record.id)
                 }
             }
@@ -514,14 +515,17 @@ extension ExchangeProvider {
     /// A message the folder does not hold needs its headers fetched when its
     /// record carries `receivedDateTime` (a new or moved-in message; an update
     /// carries only what changed) and, during the baseline, that date is within
-    /// the folder's held range. Below the range, or with no range yet, the apply
-    /// would insert nothing, so nothing is fetched.
-    nonisolated static func needsHeader(_ record: GraphDeltaMessage, phase: OutlookFolderCursor.Phase, heldSince: Date?) -> Bool {
+    /// the folder's held range. Below the range the apply would insert nothing,
+    /// so nothing is fetched. With no range yet, the whole folder is in range
+    /// once its older-mail walk has completed (`olderMailComplete`: the walk
+    /// found it empty, so it holds no date; IMAP's rule, "every UID once the walk
+    /// has completed"); before that, nothing is fetched (#1363).
+    nonisolated static func needsHeader(_ record: GraphDeltaMessage, phase: OutlookFolderCursor.Phase, heldSince: Date?, olderMailComplete: Bool) -> Bool {
         guard let raw = record.receivedDateTime, let date = Date.fromISO8601(raw) else { return false }
         switch phase {
         case .tracking: return true
         case .baseline:
-            guard let heldSince else { return false }
+            guard let heldSince else { return olderMailComplete }
             return date >= heldSince
         }
     }
