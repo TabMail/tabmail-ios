@@ -285,6 +285,18 @@ enum SyncConfig {
     static let backgroundBackfillDeadlineSeconds: TimeInterval = 5 * 60
     /// Pruning batch size — how many messages to process per iteration when over budget.
     static let pruneChunkSize = 50
+    /// The storage prune under an Email Index Limit (`SyncEngine.runPruneIfOverBudget`)
+    /// compares the space it counts (`StorageEstimator.SpaceMeter`: the space
+    /// Settings reports, less the WAL files and empty pages of the email and search databases)
+    /// with these percentages of the limit. In the background processing job it
+    /// starts once that space reaches `storagePruneOvernightStartPercent`; in the
+    /// foreground maintenance task, once it reaches
+    /// `storagePruneForegroundStartPercent`. Either way it deletes until the space is
+    /// at or below `storagePruneTargetPercent`, which leaves room for new mail; the
+    /// older-mail walk stops there too (`StorageEstimator.WalkCheck`).
+    static let storagePruneOvernightStartPercent = 90
+    static let storagePruneForegroundStartPercent = 95
+    static let storagePruneTargetPercent = 80
     /// FTS bulk-index batch size — headers indexed per folder page.
     static let ftsIndexBatchSize = 200
     /// Yield interval during FTS body backfill — sleep briefly every N updates.
@@ -452,6 +464,10 @@ enum SyncConfig {
     /// in a large inbox trigger a suggestion to archive.
     /// Matches TB's inboxManagement.archiveAgeDays.
     static let archiveAgeDays = 14
+    /// Rows per read of the Settings "Archive old messages" sweep
+    /// (`SettingsView.oldInboxPage`): each read is one bounded statement over
+    /// one inbox folder's old messages, instead of one statement over all of them.
+    static let archiveOldReadPageSize = 500
 
     // MARK: - Polling & Background Intervals (seconds)
 
@@ -576,6 +592,17 @@ enum SyncConfig {
     /// (the embedding queue) from over-checkpointing while still bounding the WAL. SQLite
     /// autocheckpoint is disabled (see `AppDatabase.makePool`).
     static let walCheckpointMinIntervalSeconds: TimeInterval = 1.5
+    /// Entries of `bodyAssetPendingDelete` per batch of the pending-delete worker
+    /// (`BodyAssetMaintenance.processPendingDeletes`): one manifest read, one
+    /// main-database read and one main-database write per batch (#1376).
+    static let bodyAssetPendingDeleteBatchSize = 200
+    /// Wall-clock budget of one pending-delete pass; the rest of the list waits for
+    /// the next foreground maintenance pass.
+    static let bodyAssetPendingDeletePassBudgetSeconds: TimeInterval = 5
+    /// Manifest keys per page of the one-time orphan sweep
+    /// (`BodyAssetMaintenance.runOrphanSweepOnce`): one manifest read and one
+    /// main-database write per page.
+    static let bodyAssetOrphanSweepPageSize = 500
     /// Timeout for WiFi check (NWPathMonitor). Returns false if exceeded.
     static let wifiCheckTimeoutSeconds: TimeInterval = 5
     /// Timeout for per-account background delta sync (ensureConnected + delta).

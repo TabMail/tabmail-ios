@@ -15,12 +15,17 @@ import GRDB
 /// immediately, so a remote archive (e.g. from Thunderbird) clears the iOS
 /// banner as soon as delta sync commits.
 ///
+/// The map starts EMPTY (#1385): no read at launch. It learns a row from any
+/// insert or update of it after the observer is registered, so an email that
+/// arrives (or is touched) after launch and then leaves the inbox has its banner
+/// cleared. A row that sat untouched in the inbox since before launch is not in
+/// the map; the banners that launch might otherwise leave behind are removed
+/// when the user opens the app (`EmailBannerOpenClear`).
+///
 /// Performance contract:
-///   - No full table reads at steady state. Per-commit cost is one rowid
-///     B-tree `SELECT … WHERE rowid IN (touched rowids)` scoped to the write
-///     batch.
-///   - One-time startup populate: `SELECT … WHERE isInInbox = 1`, served by
-///     the partial index `messageHeader_isInInbox_date`.
+///   - No full table reads, at launch or at steady state. Per-commit cost is
+///     one rowid B-tree `SELECT … WHERE rowid IN (touched rowids)` scoped to
+///     the write batch.
 ///   - Callbacks fire on the GRDB writer queue (background). Never main.
 ///   - Notification clear is called synchronously on the writer queue.
 ///     `UNUserNotificationCenter.removeDeliveredNotifications` is documented
@@ -28,9 +33,10 @@ import GRDB
 ///     injecting `clear` MUST NOT re-enter GRDB writes — would deadlock.
 final class InboxNotificationObserver: TransactionObserver, @unchecked Sendable {
 
-    /// Map of rowids → (accountId, messageId) for rows currently in inbox.
-    /// Touched ONLY by observer callbacks, which are serialized on the GRDB
-    /// writer queue, so no Mutex is needed. `@unchecked Sendable` is correct
+    /// Map of rowids → (accountId, messageId) for inbox rows written since the
+    /// observer was registered (it starts empty). Touched ONLY by observer
+    /// callbacks, which are serialized on the GRDB writer queue, so no Mutex is
+    /// needed. `@unchecked Sendable` is correct
     /// per CLAUDE.md rule (single-threaded by construction).
     private var currentlyInInbox: [Int64: (accountId: String, messageId: String)] = [:]
 
@@ -47,34 +53,32 @@ final class InboxNotificationObserver: TransactionObserver, @unchecked Sendable 
         self.clear = clear
     }
 
-    /// Seed `currentlyInInbox` from the live database. MUST be called inside
-    /// the same `dbPool.write` block that registers the observer
-    /// (`db.add(transactionObserver:)`), so no other writer can interleave
-    /// between seed and observer activation.
-    func seed(_ db: Database) throws {
-        let rows = try Row.fetchAll(db, sql: """
-            SELECT rowid, accountId, messageId
-            FROM messageHeader
-            WHERE isInInbox = 1
-        """)
-        currentlyInInbox.removeAll(keepingCapacity: true)
-        currentlyInInbox.reserveCapacity(rows.count)
-        for row in rows {
-            let rid: Int64 = row["rowid"]
-            let acct: String = row["accountId"]
-            let mid: String = row["messageId"]
-            currentlyInInbox[rid] = (acct, mid)
-        }
-    }
-
     // MARK: - TransactionObserver
 
     /// Pre-filter — restrict observation to messageHeader insert/update/delete.
     /// All other table writes (folder, pendingOperation, chatTurn, …) skip
     /// the observer entirely.
+    ///
+    /// An update that writes only `htmlCachedAt` is skipped too. Only the
+    /// HTML-cache pair's triggers and its one-time fill write that column
+    /// (`HTMLCachePair`), and none of them changes `isInInbox`, so they never
+    /// move a row into or out of the inbox. Without this, every body save or
+    /// delete, and the fill over every cached header, would put those headers'
+    /// rowids into the post-commit read below. GRDB passes the column names an
+    /// update statement writes, a trigger's included, so this is decided per
+    /// statement: a statement that also writes another `messageHeader` column
+    /// is still observed.
     func observes(eventsOfKind eventKind: DatabaseEventKind) -> Bool {
-        eventKind.tableName == MessageHeader.databaseTableName
+        guard eventKind.tableName == MessageHeader.databaseTableName else { return false }
+        if case .update(_, let columnNames) = eventKind,
+           columnNames.isSubset(of: Self.ignoredUpdateColumns) {
+            return false
+        }
+        return true
     }
+
+    /// `messageHeader` columns whose updates alone cannot change inbox membership.
+    static let ignoredUpdateColumns: Set<String> = [HTMLCachePair.column]
 
     /// Called once per affected row, INSIDE the in-flight transaction.
     /// Cheap by design — just record the rowid. No SQL.

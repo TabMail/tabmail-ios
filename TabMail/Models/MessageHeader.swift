@@ -106,7 +106,7 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     var accountId: String
     var folderPath: String
     // Read by InboxNotificationObserver — schema changes here require lockstep
-    // updates to seed() and the post-commit SELECT.
+    // updates to its post-commit SELECT.
     var isInInbox: Bool
     var messageId: String
     /// UIDVALIDITY observed by the exact IMAP SELECT/FETCH that supplied this

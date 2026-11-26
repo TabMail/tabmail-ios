@@ -93,6 +93,8 @@ The owner's rulings of 2026-11-09:
    - The provider reads local rows through `CatchUpLocalRowReader`. It gets ids and the read and
      flagged state, never content (ADR-004), and reads by numeric range, by first id, by an id list,
      or as an ordered scan. Nothing loads a whole folder.
+     *Superseded (2026-11-24, #1380):* "or as an ordered scan". That accessor,
+     `rows(folderId:after:limit:)`, had no caller and is deleted; see the amendment of that date.
    - It returns provider-blind results: flag updates, removed ids, the epoch the ids belong to, and
      the new opaque state.
    - **The catch-up is not the backfill (owner 2026-11-10).** It changes or removes only rows the
@@ -1551,3 +1553,27 @@ follow-up stage 2 it asks for waits in line.
 
 (slice clock, queue admission, provider work queue slot, sync timing promise 2, access run working time,
 spent run ends, turn hold, pacing window from the slot, CatchUpSlice log, SyncTurnWait log, queueWaitMs, turnHoldMs, #766 gap, #1109)
+
+### Amendment (2026-11-24, #1380): every range read of a listing starts at its bound
+
+**Amended 2026-11-24 (#1380): every range read of a listing starts at its bound.** The Gmail and Outlook
+listings cut their ranges newest first with `SyncEngineCatchUpRowReader.newestRows`, once per range,
+each time with the previous range's oldest date as the bound. The read was one statement,
+`WHERE folderId = ? AND (? IS NULL OR providerDate < ?)`, and `(? IS NULL OR providerDate < ?)` is no
+index range: SQLite sought `messageHeader_folderId_providerDate` on `folderId` alone and stepped over
+every row newer than the bound before it reached the range. A complete listing of a folder of N rows
+read about N²/1000 index entries. The reader now runs one of two statements: `newestRowsSQL` (no bound,
+the first range) and `newestRowsBeforeSQL` (`providerDate < ?`, every later range), and the later one
+seeks `(folderId=? AND providerDate<?)`. No schema change; what each range returns is unchanged.
+
+- **Deleted:** `CatchUpLocalRowReader.rows(folderId:after:limit:)` and its implementation, the "ordered
+  scan" of the reader bullet in decision 1. It had no caller outside the tests and the same unbounded
+  shape (`? IS NULL OR messageId > ?`).
+- **Tests:** `GmailCatchUpTests.rangeReadsSeekTheirBound` records the statements the reader runs for a
+  first and a later range on a database built by the production migrations and requires the exact seek
+  of each range, with no scan and no sort of the folder, with no statistics and after `ANALYZE`;
+  `theReplacedRangeReadBreaksTheRule` checks that the replaced statement fails the same rule.
+  `GmailCatchUpTests.orderDateAccessor` keeps pinning what each range returns.
+
+(range read, newestRows, newestRowsSQL, newestRowsBeforeSQL, IS NULL OR, bound is no index range,
+quadratic listing, ordered scan removed, rows after)

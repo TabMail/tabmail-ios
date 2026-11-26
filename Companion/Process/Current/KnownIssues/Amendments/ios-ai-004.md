@@ -17,6 +17,10 @@ the user-open fetch routes through the same function with `aiWindowExempt: true`
 window-bounded. The bound exists for
 the install flood — `ActiveBodyQueue.repopulateFromDatabase` is Inbox-wide and unbounded, so
 without the admission window a first install would run AI over the entire historical Inbox.
+*Correction (2026-11-24, #1400):* the body refill is no longer unbounded: it reads one window of the
+newest `SyncConfig.bodyFetchRepopulateLimit` waiting rows at a time, and successive refills still reach
+every waiting row of the Inbox (`IOS-BODY-007`). So it still brings the whole historical Inbox's bodies
+in over a first install, a window at a time, and the AI admission window stays the bound on AI work.
 
 **The window no longer applies to arrival/user-intent events (owner directive 2026-08-19,
 ADR-IOS-078 pathway regating).** Opening a message (including the failure bubble's Retry),

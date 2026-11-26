@@ -511,220 +511,6 @@ struct GenerateMessageIdFormatTests {
     }
 }
 
-// MARK: - Suite 6: Finalize Outbox ReplyDetect
-
-@Suite("Finalize Outbox ReplyDetect")
-struct FinalizeOutboxReplyDetectTests {
-
-    /// Replicate the DB-level logic of finalizeOutboxMessage for reply detection.
-    /// Returns the originalMessageHeaderId if reply detect fired (actionTag was .reply).
-    private func simulateFinalize(
-        _ db: DatabaseQueue, outboxId: String
-    ) throws -> String? {
-        try db.write { dbConn in
-            guard let msg = try OutboxMessage.fetchOne(dbConn, key: outboxId) else { return nil }
-            try OutboxMessage.deleteOne(dbConn, key: outboxId)
-
-            if let originalId = msg.originalMessageHeaderId {
-                if msg.isForward {
-                    try dbConn.execute(
-                        sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?",
-                        arguments: [originalId]
-                    )
-                    if let original = try MessageHeader.fetchOne(dbConn, key: originalId) {
-                        var markForwardedOp = PendingOperation(
-                            type: .markForwarded,
-                            messageIds: [original.stableId],
-                            accountId: original.accountId,
-                            folderPath: original.folderPath
-                        )
-                        try markForwardedOp.insert(dbConn)
-                    }
-                } else {
-                    if var original = try MessageHeader.fetchOne(dbConn, key: originalId) {
-                        original.isReplied = true
-                        var markRepliedOp = PendingOperation(
-                            type: .markReplied,
-                            messageIds: [original.stableId],
-                            accountId: original.accountId,
-                            folderPath: original.folderPath
-                        )
-                        try markRepliedOp.insert(dbConn)
-                        if original.actionTag == .reply {
-                            original.actionTag = ActionTag.none
-                            original.tagSortOrder = ActionTag.none.sortOrder
-                            var tagOp = PendingOperation(
-                                type: .setTag,
-                                messageIds: [original.stableId],
-                                accountId: original.accountId,
-                                folderPath: original.folderPath,
-                                tagValue: ActionTag.none.rawValue
-                            )
-                            try tagOp.insert(dbConn)
-                            try original.update(dbConn)
-                            return originalId
-                        }
-                        try original.update(dbConn)
-                    }
-                }
-            }
-            return nil
-        }
-    }
-
-    @Test("Reply to message with actionTag .reply: sets isReplied, clears tag, queues ops")
-    func replyDetectClearsReplyTag() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        let folder = try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "100", folderId: folder.id, actionTag: .reply
-        )
-
-        let outboxId = try insertOutboxMessageSQL(
-            db, originalMessageHeaderId: header.id, isForward: false
-        )
-
-        let replyDetectId = try simulateFinalize(db, outboxId: outboxId)
-
-        #expect(replyDetectId == header.id)
-
-        // Outbox message deleted
-        let outbox = try db.read { try OutboxMessage.fetchOne($0, key: outboxId) }
-        #expect(outbox == nil)
-
-        // Original header updated
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == true)
-        #expect(updated?.actionTag == ActionTag.none)
-        #expect(updated?.tagSortOrder == ActionTag.none.sortOrder)
-
-        // Two pending ops: markReplied + setTag
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 2)
-        let opTypes = Set(ops.map(\.type))
-        #expect(opTypes.contains(.markReplied))
-        #expect(opTypes.contains(.setTag))
-        let setTagOp = ops.first { $0.type == .setTag }
-        #expect(setTagOp?.tagValue == ActionTag.none.rawValue)
-    }
-
-    @Test("Reply to message with actionTag != .reply: sets isReplied but does NOT clear tag")
-    func replyWithoutReplyTagSetsIsRepliedOnly() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        let folder = try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "101", folderId: folder.id, actionTag: .archive
-        )
-
-        let outboxId = try insertOutboxMessageSQL(
-            db, originalMessageHeaderId: header.id, isForward: false
-        )
-
-        let replyDetectId = try simulateFinalize(db, outboxId: outboxId)
-
-        // No reply detect fired (tag was not .reply)
-        #expect(replyDetectId == nil)
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == true)
-        // actionTag unchanged
-        #expect(updated?.actionTag == .archive)
-
-        // Only markReplied pending op (no setTag)
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .markReplied)
-    }
-
-    @Test("Reply to message with no actionTag: sets isReplied, no tag ops")
-    func replyWithNoTagSetsIsReplied() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        let folder = try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "102", folderId: folder.id, actionTag: nil
-        )
-
-        let outboxId = try insertOutboxMessageSQL(
-            db, originalMessageHeaderId: header.id, isForward: false
-        )
-
-        let replyDetectId = try simulateFinalize(db, outboxId: outboxId)
-        #expect(replyDetectId == nil)
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == true)
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .markReplied)
-    }
-
-    @Test("Forward: sets isForwarded and queues markForwarded op")
-    func forwardSetsIsForwarded() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        let folder = try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "103", folderId: folder.id
-        )
-
-        let outboxId = try insertOutboxMessageSQL(
-            db, originalMessageHeaderId: header.id, isForward: true
-        )
-
-        let replyDetectId = try simulateFinalize(db, outboxId: outboxId)
-        #expect(replyDetectId == nil) // reply detect only fires for non-forward + .reply tag
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isForwarded == true)
-        #expect(updated?.isReplied == false)
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.count == 1)
-        #expect(ops[0].type == .markForwarded)
-    }
-
-    @Test("No originalMessageHeaderId: deletes outbox message, no pending ops")
-    func noOriginalHeaderJustDeletes() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-
-        let outboxId = try insertOutboxMessageSQL(db, originalMessageHeaderId: nil)
-
-        let replyDetectId = try simulateFinalize(db, outboxId: outboxId)
-        #expect(replyDetectId == nil)
-
-        let outbox = try db.read { try OutboxMessage.fetchOne($0, key: outboxId) }
-        #expect(outbox == nil)
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.isEmpty)
-    }
-
-    @Test("originalMessageHeaderId references deleted header: deletes outbox, no crash")
-    func deletedOriginalHeaderNoCrash() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-
-        // Reference a header that does not exist
-        let outboxId = try insertOutboxMessageSQL(
-            db, originalMessageHeaderId: "nonexistent-header-id", isForward: false
-        )
-
-        let replyDetectId = try simulateFinalize(db, outboxId: outboxId)
-        #expect(replyDetectId == nil)
-
-        let outbox = try db.read { try OutboxMessage.fetchOne($0, key: outboxId) }
-        #expect(outbox == nil)
-
-        let ops = try db.read { try PendingOperation.fetchAll($0) }
-        #expect(ops.isEmpty)
-    }
-}
-
 // MARK: - Suite 7: Drain Ordering and Filtering
 
 @Suite("Outbox Drain Ordering and Filtering")
@@ -851,100 +637,248 @@ struct OutboxDrainOrderingTests {
     }
 }
 
-// MARK: - Suite 8: Optimistic isReplied/isForwarded on Queue
+// MARK: - Suite 8: The completion step writes the original's marks
 
-@Suite("Outbox Optimistic Reply Flag")
-struct OutboxOptimisticReplyFlagTests {
+/// Drives the real completion step, `AccountManager.deleteCompletedSendAtomic`.
+/// Queuing a send never touches the original message; `SendReplyMarksTests` pins
+/// that, Undo and the discard of a failed send against the Gmail, Outlook and IMAP
+/// worlds. These tests pin what the completion writes to the original's row. The
+/// fixture account is Gmail, whose provider ids are always addressable, so every
+/// mark is admitted. They replace `FinalizeOutboxReplyDetectTests`, which re-implemented
+/// the completion's writes inside the test instead of running them.
+@Suite("Outbox completion writes the original's marks")
+struct OutboxCompletionMarksOriginalTests {
 
-    @Test("Queue reply sets isReplied on original message")
-    func queueReplySetsIsReplied() throws {
+    /// Seeds a sent, Sent-appended outbox row naming `originalId` and runs the
+    /// completion step on it, as the drain and the foreground reconcile do.
+    /// `inReplyTo` is the original's Message-ID as the send carries it: a reply's
+    /// In-Reply-To, a forward's last References id (a forward has no In-Reply-To,
+    /// #1483).
+    static func complete(
+        _ db: DatabaseQueue, originalId: String?, inReplyTo: String?, isForward: Bool
+    ) throws -> CompletedSendCleanupDisposition {
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: isForward ? "Fwd: Test" : "Re: Test",
+                inReplyTo: isForward ? nil : inReplyTo,
+                references: isForward ? (inReplyTo.map { [$0] } ?? []) : []),
+            originalMessageHeaderId: originalId,
+            isForward: isForward)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        return try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
+        }
+    }
+
+    static func opCount(_ db: DatabaseQueue, _ type: OperationType) throws -> Int {
+        try db.read { try PendingOperation.filter(Column("type") == type.rawValue).fetchCount($0) }
+    }
+
+    @Test("Completing a reply to a Reply-tagged original marks it replied, re-stamps the cleared tag, and queues one tag op and one server mark")
+    func replyCompletionMarksRepliedAndClearsReplyTag() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "100", rfc822MessageId: "<orig@example.com>")
-
-        // Simulate queueSend transaction: insert outbox + optimistic flag
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "100", rfc822MessageId: "<orig@example.com>", actionTag: .reply)
+        let taggedAt = Date().addingTimeInterval(-3_600)
         try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "Re: Test", inReplyTo: "<orig@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
+            try dbConn.execute(
+                sql: "UPDATE messageHeader SET actionTagSetAt = ? WHERE id = ?",
+                arguments: [taggedAt, header.id])
         }
+        let completedFrom = Date().addingTimeInterval(-1)
+
+        let disposition = try Self.complete(
+            db, originalId: header.id, inReplyTo: "<orig@example.com>", isForward: false)
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(updated?.isReplied == true)
         #expect(updated?.isForwarded == false)
+        #expect(updated?.actionTag == ActionTag.none)
+        #expect(updated?.tagSortOrder == ActionTag.none.sortOrder)
+        let stampedAt = try #require(updated?.actionTagSetAt)
+        #expect(stampedAt > completedFrom, "the cleared tag is a new tag value and carries a fresh stamp")
+        let ops = try db.read { try PendingOperation.fetchAll($0) }
+        #expect(ops.count == 2, "exactly one tag op and one server mark: \(ops.map(\.type))")
+        let setTags = ops.filter { $0.type == .setTag }
+        #expect(setTags.count == 1)
+        #expect(setTags.first?.tagValue == ActionTag.none.rawValue)
+        let serverMarks = ops.filter { $0.type == .markReplied }
+        #expect(serverMarks.count == 1)
+        #expect(disposition.changedOriginalHeaderId == header.id)
     }
 
-    @Test("Queue forward sets isForwarded on original message")
-    func queueForwardSetsIsForwarded() throws {
+    @Test("Completing a forward marks the original forwarded and keeps its Reply tag")
+    func forwardCompletionMarksForwardedAndKeepsReplyTag() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "200", rfc822MessageId: "<fwd@example.com>")
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "200", rfc822MessageId: "<fwd@example.com>", actionTag: .reply)
 
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "Fwd: Test", inReplyTo: "<fwd@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: true
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [header.id])
+        let disposition = try Self.complete(
+            db, originalId: header.id, inReplyTo: "<fwd@example.com>", isForward: true)
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(updated?.isForwarded == true)
+        #expect(updated?.isReplied == false)
+        #expect(updated?.actionTag == .reply, "a forward is not a reply; the Reply tag stays")
+        let markForwardedOps = try Self.opCount(db, .markForwarded)
+        #expect(markForwardedOps == 1)
+        let setTagOps = try Self.opCount(db, .setTag)
+        #expect(setTagOps == 0)
+        #expect(disposition.changedOriginalHeaderId == header.id)
+    }
+
+    /// A forward still in the Outbox when the app updates was queued with the
+    /// original in BOTH In-Reply-To and References (the builder before #1483
+    /// appended the original's id to References last, as it still does). The
+    /// completion reads a forward's original from References, so it is still
+    /// marked forwarded, never replied.
+    @Test("A forward queued before forwards dropped In-Reply-To still marks its original forwarded")
+    func forwardQueuedWithInReplyToStillMarksForwarded() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "210", rfc822MessageId: "<old-fwd@example.com>", actionTag: .reply)
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: "Fwd: Test",
+                inReplyTo: "old-fwd@example.com",
+                references: ["root@example.com", "old-fwd@example.com"]),
+            originalMessageHeaderId: header.id,
+            isForward: true)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        let disposition = try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
         }
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(updated?.isForwarded == true)
         #expect(updated?.isReplied == false)
+        #expect(updated?.actionTag == .reply, "a forward is not a reply; the Reply tag stays")
+        let markForwardedOps = try Self.opCount(db, .markForwarded)
+        #expect(markForwardedOps == 1)
+        #expect(disposition.changedOriginalHeaderId == header.id)
     }
 
-    @Test("Idempotent: setting isReplied twice does not error")
-    func idempotentIsReplied() throws {
+    /// A forward names its original only as its LAST References id. A queued
+    /// forward whose References ends with another message's id names no
+    /// original the completion can prove, so it fails closed: nothing is marked.
+    @Test("A forward whose last References id is not the original marks nothing")
+    func forwardWhoseLastReferenceIsNotTheOriginalMarksNothing() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "300", rfc822MessageId: "<idem@example.com>")
-
-        // Set once (optimistic)
-        try db.write { dbConn in
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "220", rfc822MessageId: "<fwd-target@example.com>", actionTag: .reply)
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: "Fwd: Test",
+                references: ["fwd-target@example.com", "other@example.com"]),
+            originalMessageHeaderId: header.id,
+            isForward: true)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        let disposition = try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
         }
-        // Set again (finalize — simulates finalizeOutboxMessage)
-        try db.write { dbConn in
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(updated?.isForwarded == false)
+        #expect(updated?.isReplied == false)
+        #expect(updated?.actionTag == .reply)
+        let markForwardedOps = try Self.opCount(db, .markForwarded)
+        #expect(markForwardedOps == 0)
+        #expect(disposition.changedOriginalHeaderId == nil)
+    }
+
+    /// A reply names its original by In-Reply-To, not by its last References id.
+    /// The two differ when the original's own References already listed another
+    /// message after its id, so a reply read from References would miss it.
+    @Test("A reply whose last References id is not the original still marks the original replied")
+    func replyWhoseLastReferenceIsNotTheOriginalMarksReplied() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "230", rfc822MessageId: "<reply-target@example.com>", actionTag: .reply)
+        var outbox = OutboxMessage(
+            accountId: "acc1",
+            draft: DraftMessage(
+                to: ["to@example.com"], subject: "Re: Test",
+                inReplyTo: "reply-target@example.com",
+                references: ["reply-target@example.com", "other@example.com"]),
+            originalMessageHeaderId: header.id,
+            isForward: false)
+        outbox.status = OutboxStatus.sending.rawValue
+        outbox.sentAt = Date()
+        outbox.appendedToSent = true
+        let seeded = outbox
+        let disposition = try db.write { dbConn in
+            try seeded.insert(dbConn)
+            return try AccountManager.deleteCompletedSendAtomic(outboxId: seeded.id, db: dbConn)
         }
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(updated?.isReplied == true)
+        #expect(updated?.isForwarded == false)
+        #expect(updated?.actionTag == ActionTag.none)
+        let markRepliedOps = try Self.opCount(db, .markReplied)
+        #expect(markRepliedOps == 1)
+        #expect(disposition.changedOriginalHeaderId == header.id)
     }
 
-    @Test("nil replyToHeaderId does not touch any message")
-    func nilReplyToHeaderIdIsNoOp() throws {
+    @Test("Completing a reply keeps a tag other than Reply")
+    func replyCompletionKeepsOtherTags() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "400")
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "910", rfc822MessageId: "<keep@example.com>", actionTag: .archive)
 
-        // Simulate queueSend with no replyToHeaderId
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "New message"),
-                originalMessageHeaderId: nil,
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            // No flag update — replyToHeaderId is nil
-        }
+        _ = try Self.complete(db, originalId: header.id, inReplyTo: "<keep@example.com>", isForward: false)
+
+        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
+        #expect(updated?.isReplied == true)
+        #expect(updated?.actionTag == .archive)
+        let setTagOps = try Self.opCount(db, .setTag)
+        #expect(setTagOps == 0)
+    }
+
+    @Test("A send that is not a reply or forward touches no message")
+    func completionWithoutOriginalTouchesNothing() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "400", rfc822MessageId: "<other@example.com>", actionTag: .reply)
+
+        let disposition = try Self.complete(db, originalId: nil, inReplyTo: nil, isForward: false)
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(updated?.isReplied == false)
         #expect(updated?.isForwarded == false)
+        #expect(updated?.actionTag == .reply)
+        let ops = try db.read { try PendingOperation.fetchAll($0) }
+        #expect(ops.isEmpty, "a new message queues no gesture: \(ops.map(\.type))")
+        #expect(disposition.changedOriginalHeaderId == nil)
     }
 
     /// ⚠️ RE-SCOPED (`IOS-TEST-004`). **Previous display name: *"Original message not
@@ -996,7 +930,7 @@ struct OutboxOptimisticReplyFlagTests {
         }
 
         // Nothing was resolved, so nothing downstream of the resolve may have run.
-        #expect(disposition.replyDetectHeaderId == nil)
+        #expect(disposition.changedOriginalHeaderId == nil)
 
         let after = try db.read { try MessageHeader.fetchOne($0, key: bystander.id) }
         #expect(after?.isReplied == false)
@@ -1012,247 +946,26 @@ struct OutboxOptimisticReplyFlagTests {
         #expect(remaining == nil)
     }
 
-    @Test("Multiple replies to same message — idempotent flag")
-    func multipleRepliesToSameMessage() throws {
+    @Test("Two replies and a forward to one message each complete into the same marks")
+    func repliesAndForwardToOneMessage() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
         try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "600", rfc822MessageId: "<multi@example.com>")
+        let header = try TestDatabase.insertMessageHeader(
+            db, messageId: "600", rfc822MessageId: "<multi@example.com>")
 
-        // First reply
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["a@test.com"], subject: "Re: Multi", inReplyTo: "<multi@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-        }
-        // Second reply to same message
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["b@test.com"], subject: "Re: Re: Multi", inReplyTo: "<multi@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-        }
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == true)
-        let outboxCount = try db.read { try OutboxMessage.fetchCount($0) }
-        #expect(outboxCount == 2)
-    }
-
-    @Test("Reply + forward to same message — both flags set independently")
-    func replyAndForwardToSameMessage() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "700", rfc822MessageId: "<both@example.com>")
-
-        // Reply
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["a@test.com"], subject: "Re: Both", inReplyTo: "<both@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-        }
-        // Forward same message
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["b@test.com"], subject: "Fwd: Both", inReplyTo: "<both@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: true
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [header.id])
-        }
+        _ = try Self.complete(db, originalId: header.id, inReplyTo: "<multi@example.com>", isForward: false)
+        _ = try Self.complete(db, originalId: header.id, inReplyTo: "<multi@example.com>", isForward: false)
+        _ = try Self.complete(db, originalId: header.id, inReplyTo: "<multi@example.com>", isForward: true)
 
         let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
         #expect(updated?.isReplied == true)
         #expect(updated?.isForwarded == true)
-    }
-
-    @Test("Finalize after optimistic still creates PendingOperation for server flag")
-    func finalizeCreatesPendingOpAfterOptimistic() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "800", rfc822MessageId: "<pending@example.com>")
-
-        // Step 1: optimistic update (queueSend)
-        let outboxId = UUID().uuidString
-        try db.write { dbConn in
-            var outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "Re: Pending", inReplyTo: "<pending@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: false
-            )
-            outbox.id = outboxId
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-        }
-
-        // Verify no PendingOperation yet (optimistic doesn't queue server flag)
-        let pendingBefore = try db.read {
-            try PendingOperation.filter(Column("type") == OperationType.markReplied.rawValue).fetchCount($0)
-        }
-        #expect(pendingBefore == 0)
-
-        // Step 2: simulate finalizeOutboxMessage (after send succeeds)
-        try db.write { dbConn in
-            try OutboxMessage.deleteOne(dbConn, key: outboxId)
-            // finalizeOutboxMessage sets flag again (idempotent) + queues PendingOp
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-            var markRepliedOp2 = PendingOperation(
-                type: .markReplied,
-                messageIds: [header.stableId],
-                accountId: header.accountId,
-                folderPath: header.folderPath
-            )
-            try markRepliedOp2.insert(dbConn)
-        }
-
-        // PendingOperation now exists for server-side \Answered flag
-        let pendingAfter = try db.read {
-            try PendingOperation.filter(Column("type") == OperationType.markReplied.rawValue).fetchCount($0)
-        }
-        #expect(pendingAfter == 1)
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == true)
-    }
-
-    @Test("Transaction rolls back both outbox and flag on failure")
-    func transactionRollbackOnFailure() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(db, messageId: "500", rfc822MessageId: "<rollback@example.com>")
-
-        // Simulate transaction failure after flag update but before commit
-        do {
-            try db.write { dbConn in
-                let outbox = OutboxMessage(
-                    accountId: "acc1",
-                    draft: DraftMessage(to: ["to@test.com"], subject: "Re: Rollback", inReplyTo: "<rollback@example.com>"),
-                    originalMessageHeaderId: header.id,
-                    isForward: false
-                )
-                try outbox.insert(dbConn)
-                try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-                // Force a rollback by throwing
-                throw CancellationError()
-            }
-        } catch is CancellationError {
-            // Expected
-        }
-
-        // Both outbox insert and flag update should be rolled back
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == false)
+        let markRepliedOps = try Self.opCount(db, .markReplied)
+        #expect(markRepliedOps == 2)
+        let markForwardedOps = try Self.opCount(db, .markForwarded)
+        #expect(markForwardedOps == 1)
         let outboxCount = try db.read { try OutboxMessage.fetchCount($0) }
-        #expect(outboxCount == 0)
-    }
-
-    @Test("Queue reply clears actionTag .reply to .none optimistically")
-    func queueReplyClearsReplyTag() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "900", rfc822MessageId: "<tag@example.com>", actionTag: .reply
-        )
-        #expect(header.actionTag == .reply)
-
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "Re: Tag", inReplyTo: "<tag@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-            // Clear reply tag optimistically
-            try dbConn.execute(
-                sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ? WHERE id = ?",
-                arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, header.id]
-            )
-        }
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == true)
-        #expect(updated?.actionTag == ActionTag.none)
-    }
-
-    @Test("Queue reply does NOT clear non-reply actionTags")
-    func queueReplyPreservesOtherTags() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "910", rfc822MessageId: "<keep@example.com>", actionTag: .archive
-        )
-
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "Re: Keep", inReplyTo: "<keep@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: false
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isReplied = 1 WHERE id = ?", arguments: [header.id])
-            // Only clear if actionTag == .reply — archive should be preserved
-            let current = try MessageHeader.fetchOne(dbConn, key: header.id)
-            if current?.actionTag == .reply {
-                try dbConn.execute(
-                    sql: "UPDATE messageHeader SET actionTag = ?, tagSortOrder = ? WHERE id = ?",
-                    arguments: [ActionTag.none.rawValue, ActionTag.none.sortOrder, header.id]
-                )
-            }
-        }
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isReplied == true)
-        #expect(updated?.actionTag == .archive)
-    }
-
-    @Test("Forward does NOT clear actionTag .reply")
-    func forwardDoesNotClearReplyTag() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let header = try TestDatabase.insertMessageHeader(
-            db, messageId: "920", rfc822MessageId: "<fwdtag@example.com>", actionTag: .reply
-        )
-
-        try db.write { dbConn in
-            let outbox = OutboxMessage(
-                accountId: "acc1",
-                draft: DraftMessage(to: ["to@test.com"], subject: "Fwd: Tag", inReplyTo: "<fwdtag@example.com>"),
-                originalMessageHeaderId: header.id,
-                isForward: true
-            )
-            try outbox.insert(dbConn)
-            try dbConn.execute(sql: "UPDATE messageHeader SET isForwarded = 1 WHERE id = ?", arguments: [header.id])
-            // Forward path should NOT clear reply tag
-        }
-
-        let updated = try db.read { try MessageHeader.fetchOne($0, key: header.id) }
-        #expect(updated?.isForwarded == true)
-        #expect(updated?.actionTag == .reply)
+        #expect(outboxCount == 0, "every completed send leaves the outbox")
     }
 }

@@ -1,10 +1,14 @@
 # IOS-PERF-009
 
-- Register classification: `accepted`
+- Register classification: `resolved` (was `accepted` from 2026-08-18 to 2026-11-24)
 - New post-freeze record (2026-08-12) added through the amendment surface; no row in the
   hash-pinned archive and therefore no original row hash.
 
 ## Status
+
+✅ **RESOLVED (2026-11-24): the pre-designed `INDEXED BY messageHeader_folderId_isRead_date` hint ships
+(#1403, PR #1429) on a simulator proof, which replaces the 2026-08-18 device-first gate for this read.**
+Read *✅ DISPOSITION 2026-11-24* at the end of this file. Everything below is preserved as written.
 
 🔓 **OPEN — MEASURED AND NARROWED (2026-08-15).** The multi-inbox plan remains reachable, but the
 20,000-unread confirmation gate did not reproduce a user-significant cost and the query is off-main,
@@ -226,6 +230,8 @@ understate the device by 2–4×, so a warm median well under ~25 ms means the d
 
 ### Pre-designed fix — ⛔ DO NOT SHIP; valid only after the gate is crossed
 
+> Superseded 2026-11-24: this fix shipped on a simulator proof (#1403); see the last section.
+
 One clause and nothing else: `FROM messageHeader INDEXED BY messageHeader_folderId_isRead_date` in
 `recordRecentUnreadForNSE`.
 
@@ -256,3 +262,41 @@ One clause and nothing else: `FROM messageHeader INDEXED BY messageHeader_folder
 - Assert the blocking-index invariant. **No timing assertion.**
 - Update this record and the `KNOWN_ISSUES.md` row with the device number at that point; re-registering a
   GitHub tracker row is the owner's call, since #12 was closed on 2026-08-18.
+
+## ✅ DISPOSITION 2026-11-24 — FIXED: THE HINT SHIPS ON A SIMULATOR PROOF (#1403)
+
+**Owner decision (2026-11-24): for this read, a simulator proof replaces the 2026-08-18 device-first
+gate.** The pre-designed fix above ships with nothing added: `UnreadCountManager.recentUnreadForNSESQL`
+reads `FROM messageHeader INDEXED BY messageHeader_folderId_isRead_date` (#1403, PR #1429). There is no
+per-folder rewrite and no tie-break, and `messageHeader_folderId_isRead_date` stays in the blocking
+migration chain (a test pins that it is not in `SyncEngine.deferredIndexes`).
+
+**The proof** (`BadgeDedupRecentUnreadProofTests`, gated): the app's own SQLite on the simulator, databases
+built by the production migrations and the deferred-index build, medians, old = the unhinted statement.
+
+| Database | Statistics | Time ms, old / new | Pages read, old / new | Rows visited, old / new |
+|---|---|---|---|---|
+| large (4 inboxes, 7,443 unread inbox rows) | none | 7.30 / 2.16 | 2,524 / 461 | 65,719 / 8,017 |
+| large | after `ANALYZE` | 7.03 / 2.00 | 2,524 / 461 | 65,719 / 8,017 |
+| all unread (4 inboxes, 24,600 unread inbox rows) | none | 8.19 / 3.31 | 2,832 / 470 | 204,325 / 8,171 |
+| all unread | after `ANALYZE` | 7.86 / 2.08 | 2,832 / 470 | 204,325 / 8,171 |
+| medium (4 inboxes, 154 unread inbox rows) | none | 0.91 / 0.86 | 58 / 59 | 2,581 / 2,581 |
+| medium | after `ANALYZE` | 0.95 / 0.88 | 58 / 59 | 2,581 / 2,581 |
+| one inbox (583 unread inbox rows) | none | 1.12 / 1.15 | 133 / 133 | 1,634 / 1,634 |
+| one inbox | after `ANALYZE` | 1.14 / 1.16 | 133 / 133 | 1,634 / 1,634 |
+
+**Accepted with it:** below the limit (the medium database) the hinted read takes one more page, 59 against
+58, with the same rows visited and the same time. Both statements then read every unread inbox row, and the
+date index's entries are wider than those of `messageHeader_folderId_isRead`.
+
+**The device number.** The read logs a debug-gated `[BadgeDedupRead]` line through the shared
+`ReadCostMeter` (inbox folder count, rows returned and the limit, then the meter's counts). The 1.11.6
+TestFlight logs give the phone number before the App Store release. If they show this read slower than
+before, the hint is reverted before that release.
+
+**Tests shipped with it** follow the test plan above: the statement as a named static; the plan test with
+no planner statistics and after `ANALYZE`, red-first (with the hint removed the plan tests fail); the row
+differential against the unhinted statement as the oracle, with equal dates compared by the tie contract
+(same dates in the same order, same ids after the last date, the same number of rows at the last date);
+and the blocking-index invariant. The regular suites carry no timing assertion; only the gated proof suite
+measures.

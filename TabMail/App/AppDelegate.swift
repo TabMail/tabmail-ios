@@ -564,7 +564,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
         // NSE email pushes: suppress in foreground, trigger sync instead.
         // Fan-out chain stops naturally — app's sync discovers all new messages.
-        if let provider, ["gmail", "outlook", "imap_new_mail"].contains(provider) {
+        if let provider, EmailNotificationBuilder.newMailPushProviders.contains(provider) {
             startForegroundNotificationWork()
             return []  // Suppress — user is already in the app
         }
@@ -988,9 +988,16 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
         UNUserNotificationCenter.current().delegate = notificationDelegate
         registerNotificationCategories()
+        // #1385: the first activation of this process (the user opening the app)
+        // removes every delivered email banner; a background launch removes none.
+        EmailBannerOpenClear.shared.start()
         // 0xdead10cc defense: suspend GRDB databases just before process
         // suspension, resume on foreground/push/BGTask (ADR-IOS-041).
         DatabaseSuspension.shared.start()
+        // #1376: an asset publish for a content key that no longer names a message
+        // is refused, so no manifest row is left that the pending-delete list will
+        // never name. Installed before anything can fetch a body.
+        BodyAssetMaintenance.installPublishOwnerCheck()
         // synchronous=NORMAL durability valve: fsync the WAL just before the app suspends,
         // so committed user intent (PendingOperation / OutboxMessage) survives an unclean
         // power-off while backgrounded (NORMAL doesn't fsync per commit). `beginBackgroundWork`

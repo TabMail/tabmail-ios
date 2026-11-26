@@ -36,3 +36,55 @@ Performance; migrations; `v83_markAllAsReadUnreadSweepIndex`; `messageHeader_unr
 **⚠️ WHAT THIS DOES NOT LICENSE — the negative case, because this row is the sentence a future migration will quote.** An index may be deferred ONLY if its absence degrades PERFORMANCE and nothing else. A column, a data repair a reader assumes, a UNIQUE index a write depends on, or an index a query names in an `INDEXED BY` clause (SQLite **errors** when such an index is missing) all stay blocking. `messageHeader_unreadSweep` qualifies exactly: every one of the three sweep statements returns the same rows without it, no write depends on it, and it is named in no `INDEXED BY` clause anywhere in `TabMail/ Shared/ TabMailNotificationService/` — a checked fact (the three `INDEXED BY` sites name `messageHeader_triage_display`, `messageHeader_folderId_messageId` and `messageHeader_rfc822MessageId`), and the check to re-run before deferring the next one.
 
 **Pinned non-vacuously, both sides in the same run.** `migrationChainDoesNotBuildTheDeferredIndex` asserts the index is ABSENT straight after the chain — which is what fails if somebody "restores" `v83`'s body, and without which every other assertion here would be vacuous — and `maintenancePassBuildsTheDeferredIndexAndConverges` asserts the pass produces it and reports `.alreadyPresent` the second time, so a pass that rebuilt on every foreground poll (a worse defect than the one this fixes) turns it red.
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Amendment 2026-11-23 (#1354): `messageBody_staleEvict` joins the deferred set, and its step waits for it
+
+`SyncEngine.deferredIndexes` gains `messageBody_staleEvict` on `messageBody(fetchedAt)`, the index the stale-body evict step's keyset page seeks (IOS-PERF-002, amendment of the same date). It qualifies under this row's rule: its absence changes no result, no write depends on it, and nothing names it in an `INDEXED BY`. Its build is the most expensive deferred build so far, because `fetchedAt` is stored after the HTML: it reads every cached body once. That is why it is deferred rather than put in a migration.
+
+**Where it differs from the others: the step that needs it is gated, not left slow.** An unindexed `messageHeader_unreadSweep` makes `markAllAsRead` slower. An unindexed evict page would scan and sort the whole body table inside each short write, the very hold #1354 removes. So during this row's transient window the evict step does not run at all (`runEvictStaleBodiesIfIndexed`): stale bodies stay cached until the pass after the build, which costs disk space and nothing else. The non-recovering case is the same as above: a device whose maintenance pass never completes keeps its stale bodies, which costs disk space, no data, no intention and no correctness.
+
+**One-time hold.** The build is one background-tier write. Point (ii) above applies unchanged: it runs in the first maintenance pass after the upgrade that completes it, from a foreground poll (scheduled after the poll's read stage) or from the `.full` BGProcessing drain, whichever comes first (never in the notification extension), and a `.priority` write issued during it (a Send) waits for it once.
+
+**The order in the real pass.** `indexBuildBeforeAnalyzeConvergesInOnePass` calls the two helpers in the order it supplies itself. `StaleBodyEvictRunTests.theMaintenancePassBuildsTheIndexThenTheNextPassEvicts` pins the order `runWALMaintenance` uses: the first pass's statistics cover `messageBody_staleEvict`, and the next pass leaves them as they were (it does not analyze again).
+
+## Amendment 2026-11-24: the build moves into the statistics refresh's write
+
+**What changed.** The deferred-index build is no longer a step of its own. `SyncEngine.runRefreshPlannerStatisticsIfStale` now builds every missing deferred index, runs the whole-database `ANALYZE`, and reads `schema_version` for its marker, all in ONE write (label `AnalyzePlannerStatistics`). `runBuildDeferredIndexesIfMissing` and its outcomes `.built` / `.alreadyPresent` are gone; `runWALMaintenance` calls the one function where it used to call the two, and its timing line reports one `indexBuildAndAnalyze` bucket. The refresh looks for missing deferred indexes before it reads its marker, so a deferred index added by a later release is built on a device whose statistics are already fresh (`DeferredIndexBuildTests.newDeferredIndexIsBuiltDespiteFreshStatistics`). The paragraphs above that name the old function, its outcomes or "the order of the two steps" describe the shape before this date and stay as history.
+
+**Why: the window between the two commits.** A connection loads `sqlite_stat1` when it (re)loads the schema, and it reloads only when `schema_version` has moved since its last read. `CREATE INDEX` moves it; `ANALYZE` does not once `sqlite_stat1` exists. With two writes, a connection that read between them (a pool reader serving the inbox, a count, a work list) loaded the new index with NO statistics for it, beside the old statistics of every other index, and kept planning from that mix after the `ANALYZE` committed, until GRDB closed it (on entering the background or a memory warning). A host census (SQLite 3.54; 14 `messageHeader` statements the app runs; five statistics regimes: none, analyzed while empty, at 1%, at half and at today's rows; two index shapes, a four-column completeness index and a partial inbox-member index; at 5k, 20k and 100k rows) found such window connections planning differently from a fresh connection in every regime for the four-column shape, for example the unread inbox page reading 367 pages instead of 71 at 100k rows. In one write there is no such moment: a connection that read before the write reloads after it and sees the index and its statistics together.
+
+**Two narrower fixes do not hold.** `ANALYZE <index>` alone in the build's write gives the new index statistics, but next to statistics of the other indexes taken at another time; the census found it exact only when those were current. A table-level `ANALYZE messageHeader` in the build's write converged everywhere, but the pass runs the whole-database `ANALYZE` anyway (ADR-IOS-029 rule 5), so the one write runs that.
+
+**Cost.** The same work as before, in one write instead of two: on the host, building the four-column index took 124 ms at 100k rows and 459 ms at 500k, and the whole-database `ANALYZE` 185 ms and 1,002 ms. A `.priority` write issued during the pass now waits for one longer write instead of one of two shorter ones; the pass still runs at most once per schema change, at `.background`. Either the whole write commits or none of it does: a cancelled or failing pass leaves no index without statistics and its marker stale, so a later pass does it all again.
+
+**Pinned.** `DeferredIndexStatisticsTests.everyConnectionConverges`: for both index shapes and all five regimes, a reader that read inside the pass's write slot, a connection first opened there, and a control reader each plan all 14 statements exactly as a fresh connection does after the pass, and the new index has statistics. With the build in its own earlier write the window connections diverge.
+
+## Amendment 2026-11-24 (#1401): `messageHeader_backfillProgress` joins the deferred set
+
+`SyncEngine.deferredIndexes` gains `messageHeader_backfillProgress` on `messageHeader(accountId, bodyComplete, bodyEmptyConfirmed, bodyMetadataOversized, headerComplete)`, the index the backfill progress counts read (`SyncEngine.backfillProgressCounts`; ADR-IOS-029 amendment of the same date). It qualifies under this row's rule: its absence changes no result, no write depends on it, and nothing names it in an `INDEXED BY`. Its build reads every header once. During this row's transient window the counts read header rows as they did before, with the same results, so nothing is gated on it. Point (ii) above applies unchanged to the one-time build. It is built in the statistics refresh's one write, like every deferred index since the amendment above.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Amendment 2026-11-24 (#1433): `messageHeader_htmlCachedAt` replaces `messageBody_staleEvict` in the deferred set
+
+The stale-body evict reads its candidates from `messageHeader_htmlCachedAt` (ADR-IOS-119), so nothing
+reads `messageBody_staleEvict` any more and it is out of `SyncEngine.deferredIndexes`.
+`messageHeader_htmlCachedAt` takes its place there, with a fill: migration v116 adds only the column
+`messageHeader.htmlCachedAt` and its triggers, and the deferred step's one write fills the column from
+`messageBody` (`HTMLCachePair.fillSQL`, only while the index is missing), builds the index and runs
+`ANALYZE`. The fill reads every cached body once, as `messageBody_staleEvict`'s build did, and also
+rewrites one header row per cached body, and the index build reads every header (the index is partial:
+it holds only the cached headers outside the inbox), all in the one write, so
+the step costs more than that build did (`StaleBodyEvictPairProofTests` reports it at 105k and 525k
+headers, with the WAL size its write leaves and the time of the TRUNCATE checkpoint the step runs
+after it commits, a second writer hold). This row's points apply to it as they did to that build: it runs
+in the first background maintenance pass after the upgrade, never on the launch path, and a
+`.priority` write issued during it (a Send) waits for it once. The evict waits for it
+(`runEvictStaleBodiesIfIndexed`, now pointed at `messageHeader_htmlCachedAt`). **A named exception to
+this row's negative case** (and ADR-IOS-029 NEGATIVE CASE 3): the fill is a data repair a reader
+assumes, deferred only because until the step commits a body cached before v116 reads as not cached,
+so it may be fetched or merged again; nothing is deleted and no message is given another's content
+(ADR-IOS-119 decision 7). It licenses no other deferred repair. As of
+2026-11-24 no released or TestFlight build ran the step with `messageBody_staleEvict` in the list, so
+no user's database holds it. The 2026-11-23 amendment above describes the state from #1354 to #1433
+and stays as history.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->

@@ -258,7 +258,7 @@ extension SyncEngine {
                         var fts: [FTSHeaderRecord] = []
                         // The inserted rows' In-Reply-To and Message-ID, for
                         // reply discovery in both directions after the loop.
-                        var insertedInReplyTos: [String?] = []
+                        var insertedSentCopies: [ReplyParentResolver.SentCopy] = []
                         var insertedRfc822Ids: [String] = []
                         var inserted = 0
                         var unread = 0
@@ -379,7 +379,7 @@ extension SyncEngine {
 
                             inserted += 1
                             if !info.isRead { unread += 1 }
-                            insertedInReplyTos.append(info.inReplyTo)
+                            insertedSentCopies.append(.init(inReplyTo: info.inReplyTo, subject: info.subject))
                             if let rfc822 = header.rfc822MessageId { insertedRfc822Ids.append(rfc822) }
 
                             fts.append(FTSHeaderRecord(
@@ -400,7 +400,7 @@ extension SyncEngine {
                         // inserted (a stored reply marked its parent when it was
                         // inserted) — no-op when folderRole != .sent.
                         var parents = try ReplyParentResolver.markParentsReplied(
-                            inReplyTos: insertedInReplyTos,
+                            sentCopies: insertedSentCopies,
                             folderRole: folderRole,
                             accountId: accountId,
                             db: db

@@ -12,6 +12,14 @@ private let inboxPath = "INBOX"
 private let allMailPath = GmailProvider.archivePath
 private let labelPath = "Label_7"
 
+/// The SQL a connection ran. `trace` fires on the database's own queue, hence the `Mutex`.
+private final class CatchUpSQLTape: Sendable {
+    private let statements = Mutex<[String]>([])
+    func record(_ sql: String) { statements.withLock { $0.append(sql) } }
+    var all: [String] { statements.withLock { $0 } }
+    func clear() { statements.withLock { $0.removeAll() } }
+}
+
 /// ADR-IOS-107 for Gmail: the catch-up of server-side changes to OLDER mail (a
 /// read or starred change, or a message leaving a folder) that no sync window and
 /// no delta reaches. Since #766 the backfill worker runs it after the folders'
@@ -1079,6 +1087,158 @@ struct GmailCatchUpTests {
         #expect(below.map(\.messageId) == ["r2b", "r2a"], "before the bound, newest first, ties by id descending")
         let all = try await reader.newestRows(folderId: folderId, orderDatesBefore: nil, limit: 10)
         #expect(all.map(\.messageId) == ["r4", "r3", "r2b", "r2a", "r1"])
+    }
+
+    /// The seek a range read must plan: the folder, and for every range after the first
+    /// the previous range's oldest date, bound the walk of the folder-date index.
+    private static let firstRangeSeek =
+        "SEARCH messageHeader USING INDEX messageHeader_folderId_providerDate (folderId=?)"
+    private static let laterRangeSeek =
+        "SEARCH messageHeader USING INDEX messageHeader_folderId_providerDate (folderId=? AND providerDate<?)"
+
+    /// What breaks the rule in `sql`'s plan: a scan, a sort of everything the seek
+    /// admits, or a plan without the exact seek of its range. A sort of the last ORDER BY
+    /// term only (`messageId` among rows of one date) is not a sort of the folder.
+    ///
+    /// Planned on a fresh connection, never a pool reader: a connection loads
+    /// `sqlite_stat1` when it loads the schema, and `ANALYZE` does not move
+    /// `schema_version` once that table exists, so a pool reader that read before the
+    /// caller's `ANALYZE` would plan the analyzed case with the statistics it loaded
+    /// earlier.
+    private static func rangeReadViolations(_ sql: String, later: Bool, in pool: DatabasePool) throws -> [String] {
+        var configuration = Configuration()
+        configuration.readonly = true
+        let fresh = try DatabaseQueue(path: pool.path, configuration: configuration)
+        defer { try? fresh.close() }
+        let plan = try fresh.read { db in
+            try Row.fetchAll(db, sql: "EXPLAIN QUERY PLAN " + sql).map { $0["detail"] as String }
+        }
+        var broken = plan.filter { $0.hasPrefix("SCAN ") || $0.contains("USE TEMP B-TREE FOR ORDER BY") }
+        let seek = later ? laterRangeSeek : firstRangeSeek
+        if !plan.contains(seek) {
+            broken.append("no `\(seek)` in \(plan)")
+        }
+        return broken
+    }
+
+    /// #1380: a Gmail or Outlook listing reads its local rows a range at a time, newest
+    /// first, each range below the previous one's oldest date. Each read must start at its
+    /// bound, so a range costs its own rows and not every row newer than it: written as
+    /// `(? IS NULL OR providerDate < ?)`, the bound was no index range and every read started
+    /// at the folder's newest row. The statements are recorded from the reader itself on a
+    /// database built by the production migrations, and planned with no statistics and
+    /// with statistics of the filled folders.
+    @Test("Each range read of a listing seeks its bound on the folder-date index, with and without statistics")
+    func rangeReadsSeekTheirBound() async throws {
+        let clock = Clock()
+        let tape = CatchUpSQLTape()
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var config = Configuration()
+        config.foreignKeysEnabled = true
+        config.prepareDatabase { db in
+            db.trace(options: .statement) { event in tape.record(event.expandedDescription) }
+        }
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path, configuration: config)
+        let appDb = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prev = current; current = appDb; return prev
+        }
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "gcu-range-plan"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: inboxPath, role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: labelPath, role: .custom, pool: pool)
+        try Self.insert((0..<40).map { Local(id: "in\($0)", path: inboxPath, date: clock.hoursAgo(Double($0))) }
+                        + (0..<40).map { Local(id: "lb\($0)", path: labelPath, date: clock.hoursAgo(Double($0))) },
+                        accountId: accountId, pool: pool)
+        let reader = SyncEngineCatchUpRowReader(pool: PrioritizedDatabase(pool: pool))
+        let folderId = "\(accountId):\(inboxPath)"
+        let firstIds = (0..<10).map { "in\($0)" }
+        let laterIds = (10..<20).map { "in\($0)" }
+
+        for analyzed in [false, true] {
+            if analyzed {
+                try await pool.write { try $0.execute(sql: "ANALYZE") }
+            }
+            tape.clear()
+            let first = try await reader.newestRows(folderId: folderId, orderDatesBefore: nil, limit: 10)
+            let later = try await reader.newestRows(folderId: folderId, orderDatesBefore: first.last?.orderDate, limit: 10)
+            let firstRead = first.map(\.messageId)
+            let laterRead = later.map(\.messageId)
+            #expect(firstRead == firstIds, "precondition: the first range")
+            #expect(laterRead == laterIds, "precondition: the range below it")
+
+            let reads = tape.all.filter { $0.contains("FROM messageHeader") && $0.contains("ORDER BY providerDate DESC") }
+            #expect(reads.count == 2, "analyzed \(analyzed): one statement per range: \(tape.all)")
+            guard reads.count == 2 else { continue }
+            let firstBroken = try Self.rangeReadViolations(reads[0], later: false, in: pool)
+            let laterBroken = try Self.rangeReadViolations(reads[1], later: true, in: pool)
+            #expect(firstBroken.isEmpty, "analyzed \(analyzed): \(firstBroken) by \(reads[0])")
+            #expect(laterBroken.isEmpty, "analyzed \(analyzed): \(laterBroken) by \(reads[1])")
+        }
+    }
+
+    /// #1380, what each range returns: walking a folder range by range, each range below
+    /// the previous one's oldest date, the reader returns exactly the rows and order dates
+    /// the replaced statement returned for the same bound, with runs of equal dates and a
+    /// second folder present.
+    @Test("Every range of a walk returns what the replaced statement returned for the same bound", arguments: [1, 4, 7, 100])
+    func rangeReadsMatchTheReplacedRead(limit: Int) async throws {
+        let clock = Clock()
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let accountId = "gcu-range-diff"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .gmail, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: inboxPath, role: .inbox, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: labelPath, role: .custom, pool: pool)
+        // Thirty inbox rows in runs of three equal dates, inserted newest run last so that
+        // insertion order is not date order; the label folder holds rows of the same dates.
+        let inbox = (0..<30).reversed().map { Local(id: "in\($0)", path: inboxPath, date: clock.hoursAgo(Double($0 / 3))) }
+        let label = (0..<12).map { Local(id: "lb\($0)", path: labelPath, date: clock.hoursAgo(Double($0))) }
+        try Self.insert(inbox + label, accountId: accountId, pool: pool)
+        let reader = SyncEngineCatchUpRowReader(pool: PrioritizedDatabase(pool: pool))
+        let folderId = "\(accountId):\(inboxPath)"
+        let replacedSQL = """
+            SELECT messageId, providerDate FROM messageHeader
+            WHERE folderId = ? AND (? IS NULL OR providerDate < ?)
+            ORDER BY providerDate DESC, messageId DESC LIMIT ?
+            """
+
+        var upper: Date? = nil
+        var ranges = 0
+        var seen = 0
+        while true {
+            let bound = upper
+            let read = try await reader.newestRows(folderId: folderId, orderDatesBefore: bound, limit: limit)
+            let replacedRows: [String] = try await pool.read { db in
+                try Row.fetchAll(db, sql: replacedSQL, arguments: [folderId, bound, bound, limit]).map { row -> String in
+                    let id: String = row["messageId"]
+                    let date: Date? = row["providerDate"]
+                    return "\(id)@\(String(describing: date))"
+                }
+            }
+            let readRows = read.map { "\($0.messageId)@\(String(describing: $0.orderDate))" }
+            #expect(readRows == replacedRows, "limit \(limit), range \(ranges) below \(String(describing: bound))")
+            ranges += 1
+            seen += read.count
+            guard read.count == limit, let oldest = read.last?.orderDate, ranges < 100 else { break }
+            upper = oldest
+        }
+        #expect(seen > 0, "precondition: the walk read rows")
+    }
+
+    @Test("Negative control: the range read this fix replaced breaks the same rule")
+    func theReplacedRangeReadBreaksTheRule() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let replaced = """
+            SELECT messageId, isRead, isFlagged, providerDate FROM messageHeader
+            WHERE folderId = 'acc:INBOX' AND ('2000-01-01' IS NULL OR providerDate < '2000-01-01')
+            ORDER BY providerDate DESC, messageId DESC LIMIT 501
+            """
+        let broken = try Self.rangeReadViolations(replaced, later: true, in: pool)
+        #expect(!broken.isEmpty, "the rule must catch the replaced read; its plan broke nothing")
     }
 
     /// The lapse marker: the cursor moves, and every catch-up state of that

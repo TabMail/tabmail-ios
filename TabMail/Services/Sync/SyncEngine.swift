@@ -435,7 +435,7 @@ actor SyncEngine {
     /// - BodyAssetStore steps read a NON-WAL App-Group `DatabaseQueue` whose read lock
     ///   cannot be aborted at process suspension (`0xdead10cc`) → foreground-only.
     /// See ADR-IOS-046.
-    func scheduleMaintenanceInBackground(includePrune: Bool = false) {
+    func scheduleMaintenanceInBackground(prune: StorageEstimator.PruneGate?) {
         maintenanceTask?.cancel()
         let pool = AppDatabase.backgroundPool
         let pruneOrder = pruneOrderByAccount()
@@ -445,10 +445,10 @@ actor SyncEngine {
                 Set(UndoService.shared.undoStack.flatMap { $0.messages.map(\.id) })
             }
             await SyncEngine.runWALMaintenance(
-                dbPool: pool, includePrune: includePrune,
+                dbPool: pool, prune: prune,
                 undoProtectedBodyIds: undoProtectedBodyIds, pruneOrder: pruneOrder
             )
-            await SyncEngine.checkpointWALThrottled(truncate: includePrune)
+            await SyncEngine.checkpointWALThrottled(truncate: prune != nil)
             await SyncEngine.runBodyAssetMaintenance()
         }
     }
@@ -472,33 +472,43 @@ actor SyncEngine {
     /// want maintenance to happen whenever EITHER fires. Abandons on suspend at each
     /// step (ADR-IOS-046).
     ///
-    /// `async` because its last TWO steps are: the deferred index build and the
-    /// deferred `ANALYZE` both have to reach the priority write queue, and a
-    /// non-async caller binds `PriorityGate`'s pass-through synchronous `write`
+    /// `async` because its last step is: the deferred index build and the deferred
+    /// `ANALYZE`, one write since 2026-11-24, have to reach the priority write queue,
+    /// and a non-async caller binds `PriorityGate`'s pass-through synchronous `write`
     /// overload instead — which has no tier at all and holds SQLite's single writer
     /// ahead of every queued `.priority` write. (This sentence read *"ONLY because
-    /// its last step is"* while `ANALYZE` was the only deferred step;
-    /// `runBuildDeferredIndexesIfMissing` joined it on 2026-08-06.) Every other step
-    /// here is unchanged and still synchronous. Both callers already run inside
-    /// detached tasks, so this adds no new concurrency.
+    /// its last step is"* while `ANALYZE` was the only deferred step; the index build
+    /// joined it as a separate step on 2026-08-06, and moved into the `ANALYZE`'s
+    /// write on 2026-11-24.) The AI cache
+    /// expiry is async as well, only so it can await a WAL checkpoint between its
+    /// batches; its reads and writes stay synchronous. The stale-body evict awaits
+    /// the throttled WAL checkpoint between its pages (#1354); its page writes stay
+    /// the pass-through write. The storage prune awaits its in-use measure and each
+    /// header batch's release (#1437); its reads and writes stay the pass-through
+    /// ones. Every other step here is unchanged and still synchronous. Both callers
+    /// already run inside detached tasks, so this adds no new concurrency.
+    ///
+    /// `prune` is which storage prune runs first, if any: `.foreground` from the
+    /// foreground poll, `.overnight` from the background processing job
+    /// (`StorageEstimator.PruneGate`, #1437).
     nonisolated static func runWALMaintenance(
         dbPool: PrioritizedDatabase,
-        includePrune: Bool,
+        prune: StorageEstimator.PruneGate?,
         undoProtectedBodyIds: Set<String>,
         pruneOrder: [String: StaleWindowMode]
     ) async {
         func shouldRun() -> Bool { !Task.isCancelled && !DatabaseSuspension.isSuspended }
         let t0 = CFAbsoluteTimeGetCurrent()
-        if includePrune && shouldRun() {
-            runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder)
+        if let prune, shouldRun() {
+            await runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder, gate: prune)
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runEvictStaleBodies(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
+            await runEvictStaleBodiesIfIndexed(dbPool: dbPool, undoProtectedBodyIds: undoProtectedBodyIds)
         }
         let t2 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            runPurgeExpiredAICache(dbPool: dbPool)
+            await runPurgeExpiredAICache(dbPool: dbPool)
         }
         let t3 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
@@ -523,31 +533,24 @@ actor SyncEngine {
             runReclaimRetiredCalendarOps(dbPool: dbPool)
         }
         let t4 = CFAbsoluteTimeGetCurrent()
-        // 🚨 BEFORE THE `ANALYZE`, NOT AFTER — the order is the convergence argument.
-        // `CREATE INDEX` is DDL and bumps SQLite's `schema_version`, which is the very
-        // marker `runRefreshPlannerStatisticsIfStale` latches on. Building first means
-        // the analysis below reads the POST-index version and settles it, so ONE pass
-        // converges. After it, the analysis would record version N, the index bump it
-        // to N+1, and the next pass would re-run a whole-database `ANALYZE` for
-        // nothing. See `runBuildDeferredIndexesIfMissing`.
-        if shouldRun() {
-            await runBuildDeferredIndexesIfMissing(dbPool: dbPool)
-        }
-        let t5 = CFAbsoluteTimeGetCurrent()
         // LAST on purpose. It is the only step here that can cost seconds unconditionally,
         // it runs at most once per schema change, and nothing above depends on it — so
         // putting it last means a suspension mid-`ANALYZE` costs the cheap reclaim steps
         // nothing. It is on THIS side of the maintenance split because `ANALYZE` is a
         // main-DB WAL write (see `runRefreshPlannerStatisticsIfStale`, and ADR-IOS-046
         // for why the `runBodyAssetMaintenance` side would be a `0xdead10cc` bug).
+        // It also builds every missing deferred index, in the same write and before the
+        // `ANALYZE`, so an index and its statistics commit together and one pass
+        // converges (the two used to be separate steps; see "Building a deferred index"
+        // in SyncEngineMaintenance.swift).
         if shouldRun() {
             await runRefreshPlannerStatisticsIfStale(dbPool: dbPool)
         }
-        let t6 = CFAbsoluteTimeGetCurrent()
-        if includePrune {
-            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+        let t5 = CFAbsoluteTimeGetCurrent()
+        if prune != nil {
+            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: prune=\(Int((t1-t0)*1000))ms evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuildAndAnalyze=\(Int((t5-t4)*1000))ms")
         } else {
-            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuild=\(Int((t5-t4)*1000))ms analyze=\(Int((t6-t5)*1000))ms")
+            BackgroundSyncLogger.logDebug("[Sync] WAL maintenance: evict=\(Int((t2-t1)*1000))ms purge=\(Int((t3-t2)*1000))ms chatEvict=\(Int((t3b-t3)*1000))ms calReclaim=\(Int((t4-t3b)*1000))ms indexBuildAndAnalyze=\(Int((t5-t4)*1000))ms")
         }
     }
 
@@ -563,7 +566,13 @@ actor SyncEngine {
     /// merge / a user action can't inherit a checkpoint stall (the ~1-2s "tic"). Hanging it
     /// off the constantly-running backfill — not just the sparse per-poll maintenance, which
     /// ran 0x in a 44-min capture — is what bounds the WAL reliably.
-    nonisolated static func checkpointWALThrottled(truncate: Bool = false) async {
+    ///
+    /// `pool` is `backgroundPool` for every caller in the app. The deferred index step
+    /// passes the pool it wrote to (`runRefreshPlannerStatisticsIfStale`), so a pass run
+    /// on another database (a test, the size proof) checkpoints that database.
+    nonisolated static func checkpointWALThrottled(
+        truncate: Bool = false, pool: PrioritizedDatabase = AppDatabase.backgroundPool
+    ) async {
         let now = CFAbsoluteTimeGetCurrent()
         let go = walCheckpointState.withLock { last -> Bool in
             guard now - last >= SyncConfig.walCheckpointMinIntervalSeconds else { return false }
@@ -573,7 +582,7 @@ actor SyncEngine {
         guard go, !DatabaseSuspension.isSuspended else { return }
         let sql = truncate ? "PRAGMA wal_checkpoint(TRUNCATE)" : "PRAGMA wal_checkpoint(PASSIVE)"
         let t0 = CFAbsoluteTimeGetCurrent()
-        let frames = try? await AppDatabase.backgroundPool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
+        let frames = try? await pool.writeWithoutTransaction { db -> (log: Int, ckpt: Int) in
             guard let row = try Row.fetchOne(db, sql: sql) else { return (-1, -1) }
             let log: Int = row[1] ?? -1
             let ckpt: Int = row[2] ?? -1
@@ -586,10 +595,12 @@ actor SyncEngine {
         }
     }
 
-    /// NON-WAL BodyAssetStore maintenance: evict attachments over the user's cap, then
-    /// sweep cross-DB/filesystem orphans (NSE-written assets whose push got dropped,
-    /// eviction crashes, etc.). Both are no-ops on cold/empty state and idempotent;
-    /// order matters (evict first so the sweep skips freshly-evicted files).
+    /// NON-WAL BodyAssetStore maintenance: evict attachments over the user's cap,
+    /// recover abandoned writes (their leases and staging files), run the one-time
+    /// orphan sweep if it has not completed, then delete the assets of the keys
+    /// queued on `bodyAssetPendingDelete` (#1376; nothing walks the whole store any
+    /// more). All are no-ops on cold/empty state and idempotent; the sweep runs
+    /// before the worker so the keys it queues are handled in the same pass.
     ///
     /// FOREGROUND-ONLY. The manifest is a non-WAL `DatabaseQueue` in the App-Group
     /// container (shared with the NSE); its read holds a SQLite lock that RunningBoard
@@ -612,10 +623,17 @@ actor SyncEngine {
         }
         let t1 = CFAbsoluteTimeGetCurrent()
         if shouldRun() {
-            await BodyAssetMaintenance.pruneOrphans()
+            BodyAssetStore.recoverAbandonedPreparations()
+        }
+        if shouldRun() {
+            await BodyAssetMaintenance.runOrphanSweepOnce()
         }
         let t2 = CFAbsoluteTimeGetCurrent()
-        BackgroundSyncLogger.logDebug("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms assetSweep=\(Int((t2-t1)*1000))ms")
+        if shouldRun() {
+            await BodyAssetMaintenance.processPendingDeletes()
+        }
+        let t3 = CFAbsoluteTimeGetCurrent()
+        BackgroundSyncLogger.logDebug("[Sync] BodyAsset maintenance: assetEvict=\(Int((t1-t0)*1000))ms recoverAndSweepOnce=\(Int((t2-t1)*1000))ms pendingDeletes=\(Int((t3-t2)*1000))ms")
     }
 
     /// Two-tier sync: tries delta sync first (fast), falls back to full sync (robust).
@@ -1227,7 +1245,7 @@ actor SyncEngine {
 
                 // Sent-folder reply discovery — no-op when folder.role != .sent.
                 var discovered = try ReplyParentResolver.markParentsReplied(
-                    inReplyTos: headers.map(\.inReplyTo),
+                    sentCopies: headers.map { .init(inReplyTo: $0.inReplyTo, subject: $0.subject) },
                     folderRole: folder.role,
                     accountId: folder.accountId,
                     db: db

@@ -478,297 +478,6 @@ struct BodyCacheEvictionTests {
     }
 }
 
-// MARK: - AI Cache Purge Tests
-
-@Suite("AI Cache Purge Algorithm")
-struct AICachePurgeTests {
-
-    private func makeExpiredCache(
-        _ db: DatabaseQueue,
-        key: String,
-        rfc822MessageId: String?,
-        daysAgo: Int
-    ) throws {
-        let expiredDate = Calendar.current.date(byAdding: .day, value: -daysAgo, to: Date())!
-        try db.write { dbConn in
-            var cache = MessageAICache(key: key, rfc822MessageId: rfc822MessageId)
-            cache.summaryBlurb = "Summary for \(key)"
-            cache.updatedAt = expiredDate
-            try cache.insert(dbConn)
-        }
-    }
-
-    @Test("Expired AI cache entry with no inbox message is purged")
-    func expiredNonInboxPurged() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-        let rfc = "<msg1@example.com>"
-        // Message is NOT in inbox
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "1", folderId: "acc1:Sent", folderPath: "Sent",
-            isInInbox: false, rfc822MessageId: rfc
-        )
-        try makeExpiredCache(db, key: "acc1:Sent:\(rfc)", rfc822MessageId: rfc, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        var purged = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = Date()
-                        try entry.update(dbConn)
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-        #expect(purged == 1)
-        let remaining = try db.read { dbConn in try MessageAICache.fetchCount(dbConn) }
-        #expect(remaining == 0)
-    }
-
-    @Test("Expired AI cache entry rescued when rfc822MessageId still in inbox")
-    func expiredInboxRescued() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-        let rfc = "<msg1@example.com>"
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "1", isInInbox: true, rfc822MessageId: rfc
-        )
-        try makeExpiredCache(db, key: "acc1:INBOX:\(rfc)", rfc822MessageId: rfc, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let now = Date()
-        var purged = 0
-        var rescued = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = now
-                        try entry.update(dbConn)
-                        rescued += 1
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-        #expect(purged == 0)
-        #expect(rescued == 1)
-
-        let cache = try db.read { dbConn in
-            try MessageAICache.fetchOne(dbConn, key: "acc1:INBOX:\(rfc)")
-        }
-        #expect(cache != nil)
-        #expect(cache!.updatedAt >= now.addingTimeInterval(-1))
-    }
-
-    @Test("AI cache entry with nil rfc822MessageId is always purged")
-    func nilRfc822AlwaysPurged() throws {
-        let db = try TestDatabase.make()
-        try makeExpiredCache(db, key: "acc1:INBOX:none", rfc822MessageId: nil, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        var purged = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    // Would check inbox, but rfc822MessageId is nil so we skip
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = Date()
-                        try entry.update(dbConn)
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-        #expect(purged == 1)
-    }
-
-    @Test("AI cache entry with empty rfc822MessageId is always purged")
-    func emptyRfc822AlwaysPurged() throws {
-        let db = try TestDatabase.make()
-        try makeExpiredCache(db, key: "acc1:INBOX:empty", rfc822MessageId: "", daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        var purged = 0
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = Date()
-                        try entry.update(dbConn)
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-        #expect(purged == 1)
-    }
-
-    @Test("Recent AI cache entry is not purged")
-    func recentAICacheNotPurged() throws {
-        let db = try TestDatabase.make()
-        try db.write { dbConn in
-            var cache = MessageAICache(key: "acc1:INBOX:<fresh@example.com>", rfc822MessageId: "<fresh@example.com>")
-            cache.summaryBlurb = "Fresh"
-            cache.updatedAt = Date()
-            try cache.insert(dbConn)
-        }
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let expiredCount = try db.read { dbConn in
-            try MessageAICache.filter(Column("updatedAt") < cutoff).fetchCount(dbConn)
-        }
-        #expect(expiredCount == 0)
-    }
-
-    @Test("Mixed purge and rescue in same batch")
-    func mixedPurgeAndRescue() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-
-        let rfcInbox = "<inbox@example.com>"
-        let rfcSent = "<sent@example.com>"
-
-        // One message in inbox, one not
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "1", isInInbox: true, rfc822MessageId: rfcInbox
-        )
-        try TestDatabase.insertFolder(db, name: "Sent", path: "Sent", role: .sent)
-        try TestDatabase.insertMessageHeader(
-            db, messageId: "2", folderId: "acc1:Sent", folderPath: "Sent",
-            isInInbox: false, rfc822MessageId: rfcSent
-        )
-
-        try makeExpiredCache(db, key: "acc1:INBOX:\(rfcInbox)", rfc822MessageId: rfcInbox, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-        try makeExpiredCache(db, key: "acc1:Sent:\(rfcSent)", rfc822MessageId: rfcSent, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let now = Date()
-        var purged = 0
-        var rescued = 0
-
-        try db.write { dbConn in
-            let batch = try MessageAICache.filter(Column("updatedAt") < cutoff).fetchAll(dbConn)
-            for var entry in batch {
-                if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                    let headers = try MessageHeader
-                        .filter(Column("rfc822MessageId") == msgId)
-                        .limit(5)
-                        .fetchAll(dbConn)
-                    if headers.contains(where: { $0.isInInbox }) {
-                        entry.updatedAt = now
-                        try entry.update(dbConn)
-                        rescued += 1
-                        continue
-                    }
-                }
-                try entry.delete(dbConn)
-                purged += 1
-            }
-        }
-
-        #expect(purged == 1)
-        #expect(rescued == 1)
-        let remaining = try db.read { dbConn in try MessageAICache.fetchCount(dbConn) }
-        #expect(remaining == 1)
-    }
-
-    @Test("Purge skips offset for rescued entries correctly")
-    func purgeSkipOffsetForRescued() throws {
-        let db = try TestDatabase.make()
-        try TestDatabase.insertAccount(db)
-        try TestDatabase.insertFolder(db)
-
-        // Create 3 expired entries, all with inbox messages (all rescued)
-        for i in 0..<3 {
-            let rfc = "<msg\(i)@example.com>"
-            try TestDatabase.insertMessageHeader(
-                db, messageId: "\(i)", isInInbox: true, rfc822MessageId: rfc
-            )
-            try makeExpiredCache(db, key: "acc1:INBOX:\(rfc)", rfc822MessageId: rfc, daysAgo: SyncConfig.aiCacheTTLDays + 1)
-        }
-
-        let cutoff = Calendar.current.date(byAdding: .day, value: -SyncConfig.aiCacheTTLDays, to: Date())!
-        let now = Date()
-        let chunkSize = 2
-        var purged = 0
-        var rescued = 0
-        let skipCount = 0
-
-        while true {
-            let batchResult = try db.write { dbConn -> (purged: Int, rescued: Int, batchEmpty: Bool) in
-                let batch = try MessageAICache
-                    .filter(Column("updatedAt") < cutoff)
-                    .limit(chunkSize, offset: skipCount)
-                    .fetchAll(dbConn)
-                guard !batch.isEmpty else { return (0, 0, true) }
-
-                var batchPurged = 0
-                var batchRescued = 0
-                for var entry in batch {
-                    if let msgId = entry.rfc822MessageId, !msgId.isEmpty {
-                        let headers = try MessageHeader
-                            .filter(Column("rfc822MessageId") == msgId)
-                            .limit(5)
-                            .fetchAll(dbConn)
-                        if headers.contains(where: { $0.isInInbox }) {
-                            entry.updatedAt = now
-                            try entry.update(dbConn)
-                            batchRescued += 1
-                            continue
-                        }
-                    }
-                    try entry.delete(dbConn)
-                    batchPurged += 1
-                }
-                return (batchPurged, batchRescued, false)
-            }
-            if batchResult.batchEmpty { break }
-            purged += batchResult.purged
-            rescued += batchResult.rescued
-            // NOTE: rescued entries had updatedAt bumped past cutoff, so they naturally
-            // drop out of the filter — no need to increment skipCount for them.
-        }
-
-        #expect(purged == 0)
-        #expect(rescued == 3)
-    }
-}
-
 // MARK: - Stale Tag Sweep Tests
 
 @Suite("Stale Action Tag Sweep Logic")
@@ -1405,13 +1114,18 @@ struct PlannerStatisticsRefreshTests {
     /// The row count `ANALYZE` last recorded for `table`, read out of `sqlite_stat1`.
     /// `nil` when statistics have never been computed (the table does not exist yet)
     /// or when they do not cover this table.
+    ///
+    /// Each row's leading integer is the number of entries in that row's index. A
+    /// full index holds every row of the table, a partial index (`WHERE ...`) only
+    /// the rows it matches, so the table's count is the largest leading integer.
+    /// Any single row is not enough: `ANALYZE` writes the newest index first, and a
+    /// partial index built last reads below the table's count.
     private func recordedRowCount(_ pool: DatabasePool, table: String) throws -> Int? {
         try pool.read { db in
             guard try db.tableExists("sqlite_stat1") else { return nil }
-            let stat = try String.fetchOne(
-                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ? LIMIT 1", arguments: [table])
-            guard let leading = stat?.split(separator: " ").first else { return nil }
-            return Int(leading)
+            let stats = try String.fetchAll(
+                db, sql: "SELECT stat FROM sqlite_stat1 WHERE tbl = ?", arguments: [table])
+            return stats.compactMap { stat in stat.split(separator: " ").first.flatMap { Int($0) } }.max()
         }
     }
 
@@ -1618,6 +1332,36 @@ struct PlannerStatisticsRefreshTests {
     /// production tree, never listed by hand, so a third caller added in a new file is
     /// caught rather than silently uncovered (`MIS-007` — a hand-written census stops
     /// being complete the day the thing it counts grows).
+    /// Which storage prune each caller runs (#1437): the background processing
+    /// job's maintenance the overnight one (from 90% of the limit), the foreground
+    /// poll's the foreground one (from 95%), and the maintenance pass runs the one it
+    /// is handed first. The tests that call the prune pass their gate, so only the
+    /// source shows which gate production runs. Every production line that names
+    /// a gate, forwards one or calls the prune is discovered by walking the tree.
+    @Test("The background job's maintenance runs the overnight prune, the foreground poll's the foreground prune, and the pass runs the gate it is handed")
+    func eachMaintenanceCallerRunsItsPruneGate() {
+        let uses = SyncEngineMaintenanceTests.productionCodeLines()
+            .filter { line in
+                ["prune: .", "prune: prune", "prune: StorageEstimator", "runPruneIfOverBudget("]
+                    .contains { line.code.contains($0) }
+                    // The gate binding as a whole word: catch-up's `if let pruneCutoff` is not a gate.
+                    || line.code.range(of: #"if let prune\b"#, options: .regularExpression) != nil
+            }
+            .map { "\($0.file): \($0.code)" }
+            .sorted()
+        let expected = [
+            "SyncEngine.swift: await runPruneIfOverBudget(dbPool: dbPool, pruneOrder: pruneOrder, gate: prune)",
+            "SyncEngine.swift: dbPool: pool, prune: prune,",
+            "SyncEngine.swift: func scheduleMaintenanceInBackground(prune: StorageEstimator.PruneGate?) {",
+            "SyncEngine.swift: if let prune, shouldRun() {",
+            "SyncEngine.swift: prune: StorageEstimator.PruneGate?,",
+            "SyncEngineMaintenance.swift: nonisolated static func runPruneIfOverBudget(",
+            "SyncScheduler.swift: await manager.syncEngine.scheduleMaintenanceInBackground(prune: .foreground)",
+            "SyncScheduler.swift: dbPool: AppDatabase.backgroundPool, prune: .overnight,",
+        ].sorted()
+        #expect(uses == expected, "the prune's gates as production passes them: \(uses)")
+    }
+
     @Test("No production caller runs WAL maintenance above .background")
     func everyWALMaintenanceCallSitePassesABackgroundPool() throws {
         // …/tabmail-ios/TabMailTests/Services/<this file>

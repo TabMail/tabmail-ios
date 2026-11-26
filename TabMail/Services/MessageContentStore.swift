@@ -21,16 +21,19 @@ import GRDB
 ///
 /// ## Why this exists — the mass-deletion hazard
 ///
-/// Four sweeps decide what content is garbage by asking whether its key is still
+/// Three sweeps decide what content is garbage by asking whether its key is still
 /// a `messageHeader.id`:
 ///
 /// - `SyncEngine.pruneFTSOrphans`
 /// - `SyncEngine.backfillFolderIdsIfNeeded`
-/// - `BodyAssetMaintenance.pruneOrphans`
-/// - `SyncEngine.runEvictStaleBodies` — the fourth, gated at Stage D. Stage C's
-///   census named only the first three: this one is a TTL cache evictor whose
-///   orphan branch was unreachable while the FK cascade front-ran it, and Stage D
-///   is precisely what makes it live.
+/// - `BodyAssetMaintenance.pruneOrphans`, since #1376 the pending-delete worker
+///   `BodyAssetMaintenance.processPendingDeletes` (same gate, over the keys the
+///   main database queued instead of the whole manifest)
+///
+/// `SyncEngine.runEvictStaleBodies` was the fourth from Stage D until #1433: a TTL
+/// cache evictor that also deleted bodies with no header, gated through this type.
+/// Since #1433 it reads its candidates from the headers (`HTMLCachePair`), so a body
+/// with no header is never one of them and it asks nothing here.
 ///
 /// The instant a content key stops equalling `messageHeader.id`, **every** FTS row
 /// and **every** asset row of a UID-addressed account reads as an orphan and is
@@ -41,7 +44,8 @@ import GRDB
 /// ## 🚨 THE FAIL-SAFE DIRECTION — never symmetric, never traded for tidiness
 ///
 /// On error, on ambiguity, on any inability to decide: **DO NOT DELETE.** A leaked
-/// row is disk garbage that the very sweeps above reclaim on a later pass. An
+/// row is disk garbage: an FTS or asset row is reclaimed by the sweeps above on a
+/// later pass, and a body row stays as a harmless leftover (#1446). An
 /// over-eviction is a message silently missing from search with no signal to the
 /// user and no path back except a full re-index. Every `catch` in this file
 /// therefore resolves to "keep".
@@ -71,7 +75,10 @@ import GRDB
 /// The consequence for every caller: **`.body` is no longer implicit.** A site that
 /// deletes a header and wants its cached HTML reclaimed must either pass `.body`
 /// here or delete the row itself in the same transaction. Anything missed degrades
-/// to a bounded leak that `runEvictStaleBodies` reclaims — never to over-eviction.
+/// to a body row with no header, which nothing reclaims (#1446; the releases that
+/// are skipped are #1445) — never to over-eviction. No new message can adopt such a
+/// row: a folder's UIDVALIDITY reset deletes every body in the folder's id range
+/// (`AccountManager.uidValidityResetPurgeTxn`).
 enum MessageContentStore {
 
     // MARK: - Scope

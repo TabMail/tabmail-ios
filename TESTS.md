@@ -1391,3 +1391,20 @@ archive and Undo of the replacement are legitimate. `replyDraftShapedIdIsJudgedB
 `generationScopeAndReDrive` pin `FolderResetGeneration.refuses(headerId:accountId:)`: an id is judged
 by the folder it names through `MessageIdentity.headerIdBelongsToFolder`, never a hand split, so a
 reply-draft id with extra colons is refused only when its own folder was reset.
+
+## Database proof harness
+
+`DBProofHarnessTests` keeps the shared query-proof harness (`TabMailTests/Helpers/DBProofHarness.swift`,
+iOS memory 159) honest on its small shape. The build through the production migrations is deterministic
+(two builds, one fingerprint) and has the requested shape: headers per account and folder, `isInInbox`
+exactly on INBOX rows, every action tag bucket plus untagged rows with matching `tagSortOrder`, read and
+unread rows, labels only on INBOX and Archive rows with dense labels far larger than sparse ones, the
+deferred indexes present, and dates inside each folder's range. The statistics states differ only as
+intended (no `sqlite_stat1` rows against the rows `ANALYZE` writes, both files in WAL), a variant's setup
+reaches only its own file, the measurer tells a full scan from a seek (full-scan steps, pages read, sorts,
+the same pages on a repeat run, no pages written by a read), a write mode counts pages written and leaves
+the prepared file unchanged with no clone left behind, the time verdict uses the old runs' spread as the
+noise, and `compare` writes the report and the manifest for every mode and statistics state. The large
+build (105,000 headers) runs only when `TABMAIL_DB_PROOF_DIR` is set. The Mac side,
+`Scripts/db-proof-mac.py --self-test`, checks the same scan, seek and write properties with the host
+`sqlite3`.

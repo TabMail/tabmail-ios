@@ -114,7 +114,10 @@ actor ChatStore {
                   AND role IN ('user', 'assistant')
                   AND \(realOnly)
                 """, arguments: [Double(cutoffMs)])
-            // Scope breakdown for diagnosis.
+            // Scope breakdown for diagnosis: a second read of the same range, grouped,
+            // that only feeds the debug line below, so it runs only while debug
+            // logging is on (CLAUDE.md rule 12).
+            guard DebugModeManager.isLoggingEnabled() else { return Set(ids) }
             let scopeRows = try Row.fetchAll(db, sql: """
                 SELECT CASE
                     WHEN sessionId LIKE 'msg:%' THEN 'msg'
@@ -489,8 +492,8 @@ actor ChatStore {
     /// Static + pure so tests can run it against an in-memory DB.
     nonisolated static func inboxSessionScopeSQL(demoActive: Bool) -> String {
         demoActive
-            ? "sessionId LIKE 'demo:%' AND sessionId NOT LIKE 'demo:msg:%' AND sessionId NOT LIKE 'demo:compose:%'"
-            : "sessionId NOT LIKE 'demo:%' AND sessionId NOT LIKE 'msg:%' AND sessionId NOT LIKE 'compose:%'"
+            ? "sessionId LIKE 'demo:%' AND sessionId NOT LIKE 'demo:thread:%' AND sessionId NOT LIKE 'demo:msg:%' AND sessionId NOT LIKE 'demo:compose:%'"
+            : "sessionId NOT LIKE 'demo:%' AND sessionId NOT LIKE 'thread:%' AND sessionId NOT LIKE 'msg:%' AND sessionId NOT LIKE 'compose:%'"
     }
 
     /// Load the last K distinct **inbox** sessions, ordered newest-last (rightmost in swipe UI).

@@ -212,8 +212,8 @@ struct DemoIsolationTests {
         try queue.write { db in
             try db.execute(sql: "CREATE TABLE chatTurn (sessionId TEXT, timestamp DOUBLE)")
             let sessions = [
-                "user-inbox-uuid", "msg:real-1:stable", "compose:d1", "task:h1",
-                "demo:inbox-uuid", "demo:msg:demo-account:stable", "demo:compose:d2",
+                "user-inbox-uuid", "thread:real-1:t1", "msg:real-1:stable", "compose:d1", "task:h1",
+                "demo:inbox-uuid", "demo:thread:demo-account:t1", "demo:msg:demo-account:stable", "demo:compose:d2",
             ]
             for (i, sid) in sessions.enumerated() {
                 try db.execute(sql: "INSERT INTO chatTurn VALUES (?, ?)", arguments: [sid, Double(i)])
@@ -231,7 +231,7 @@ struct DemoIsolationTests {
             }
         }
 
-        // Demo mode: ONLY demo inbox sessions (msg/compose contexts have their own load paths).
+        // Demo mode: ONLY demo inbox sessions (thread/msg/compose contexts have their own load paths).
         #expect(try listed(demoActive: true) == ["demo:inbox-uuid"])
         // Normal mode: user inbox + task sessions; no demo sessions of any shape.
         #expect(try listed(demoActive: false) == ["user-inbox-uuid", "task:h1"])

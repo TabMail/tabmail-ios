@@ -200,6 +200,13 @@ final class ChatPillState {
             return text
         }
 
+        /// The inbox reminder count `observeMessageReminders` tracks. GRDB re-runs it
+        /// after a write to a column it reads (`isInInbox`, `reminderContent`,
+        /// `isReplied`), so a write of `htmlCachedAt` alone (the HTML-cache pair's
+        /// triggers and fill, #1433) does not re-run it.
+        nonisolated static let reminderCountSQL =
+            "SELECT COUNT(*) FROM messageHeader WHERE isInInbox = 1 AND reminderContent IS NOT NULL AND isReplied = 0"
+
         /// Observe inbox message reminder count changes via GRDB ValueObservation.
         /// First emission populates activeReminders (initial load). Subsequent changes
         /// rebuild Buffer 2. The view handles propagation to Buffer 1 based on visibility.
@@ -207,7 +214,7 @@ final class ChatPillState {
         /// 2-second quiet period before regenerating.
         func observeMessageReminders() async {
             let observation = ValueObservation.tracking { db in
-                try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM messageHeader WHERE isInInbox = 1 AND reminderContent IS NOT NULL AND isReplied = 0") ?? 0
+                try Int.fetchOne(db, sql: Self.reminderCountSQL) ?? 0
             }
             .removeDuplicates()
             var isFirstEmission = true

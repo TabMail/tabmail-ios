@@ -122,6 +122,20 @@ actor SearchIndex {
     private var dbPool: DatabasePool?
     private var isInitialized = false
 
+    init() {}
+
+    #if DEBUG
+    /// Test seam: the folder this index opens its database in instead of Application Support, and a
+    /// receiver for the SQL of every statement its connections run. Both nil outside tests.
+    private var directoryForTesting: URL?
+    private var statementTraceForTesting: (@Sendable (String) -> Void)?
+
+    init(directoryForTesting: URL, statementTraceForTesting: @escaping @Sendable (String) -> Void) {
+        self.directoryForTesting = directoryForTesting
+        self.statementTraceForTesting = statementTraceForTesting
+    }
+    #endif
+
     /// Close the database pool for nuke operation. Must reinitialize after.
     func closeForNuke() {
         dbPool = nil
@@ -203,7 +217,12 @@ actor SearchIndex {
         guard !isInitialized else { return }
 
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        #if DEBUG
+        let ftsDir = directoryForTesting ?? appSupport.appendingPathComponent("tabmail_fts", isDirectory: true)
+        let statementTrace = statementTraceForTesting
+        #else
         let ftsDir = appSupport.appendingPathComponent("tabmail_fts", isDirectory: true)
+        #endif
         try FileManager.default.createDirectory(at: ftsDir, withIntermediateDirectories: true)
 
         let dbPath = ftsDir.appendingPathComponent("fts.db").path
@@ -219,6 +238,11 @@ actor SearchIndex {
         // (PRAGMA WAL set below), so reads stay available while suspended.
         config.observesSuspensionNotifications = true
         config.prepareDatabase { db in
+            #if DEBUG
+            if let statementTrace {
+                db.trace(options: .statement) { event in statementTrace(event.expandedDescription) }
+            }
+            #endif
             // Register sqlite-vec vec0 module on this connection (belt-and-suspenders
             // alongside sqlite3_auto_extension — ensures vec0 is available on every
             // GRDB reader/writer connection regardless of auto_extension behavior).
@@ -247,10 +271,10 @@ actor SearchIndex {
         try dbPool!.read { db in try loadKnownYears(db: db) }
         isInitialized = true
 
-        let count = try documentCount()
+        // No document count here: counting reads one index entry per indexed email, on every open.
         if DebugModeManager.isLoggingEnabled() {
             let shardList = knownYears.sorted().map(String.init).joined(separator: ", ")
-            BackgroundSyncLogger.logDebug("[SearchIndex] Initialized with \(count) documents, shards: [\(shardList)]")
+            BackgroundSyncLogger.logDebug("[SearchIndex] Initialized, shards: [\(shardList)]")
         }
 
         // Tokenizer migration: rebuild shards created with an outdated tokenize=
@@ -262,6 +286,12 @@ actor SearchIndex {
         }
     }
 
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     private func createSchema() throws {
         guard let dbPool else { return }
         try dbPool.write { db in
@@ -296,6 +326,13 @@ actor SearchIndex {
     }
 
     /// Migrate FTS schema for new features (runs after createSchema).
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     private func migrateSchema() throws {
         guard let dbPool else { return }
         try dbPool.write { db in
@@ -727,6 +764,18 @@ actor SearchIndex {
         return rowid
     }
 
+    #if DEBUG
+    /// TEST ONLY: the columns the unchanged check of `indexHeaders(_:skippingUnchanged:)`
+    /// compares (`HeaderEntryWrite`): the shard row's, then the `message_meta` row's.
+    static var unchangedCheckColumnsForTesting: (shard: [String], meta: [String]) {
+        let key = ContentKey(rawValue: "account:INBOX:1")
+        let record = FTSHeaderRecord(contentKey: key, headerId: key.rawValue, messageId: "1",
+                                     subject: "", from: "", to: "", dateMs: 0)
+        let write = HeaderEntryWrite(record, year: 2000, body: "")
+        return (write.shard.map(\.name), write.meta.map(\.name))
+    }
+    #endif
+
     /// TEST ONLY: the stored CREATE statement for a year shard.
     func testShardCreateSQL(year: Int) async throws -> String? {
         guard let dbPool else { return nil }
@@ -789,25 +838,38 @@ actor SearchIndex {
 
     // MARK: - Document Count
 
-    func documentCount() throws -> Int {
-        guard let dbPool else { return 0 }
-        return try dbPool.read { db in
-            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM message_meta") ?? 0
-        }
-    }
-
     /// Count FTS documents belonging to a specific account.
-    /// Header IDs use format "accountId:folderPath:messageId" so LIKE prefix matches.
+    /// Header IDs use format "accountId:folderPath:messageId", so the account's
+    /// entries are exactly the `message_ids` keys in `accountHeaderIdRange`.
     func documentCountForAccount(accountId: String) throws -> Int {
         guard let dbPool else { return 0 }
-        let prefix = accountId + ":%"
-        return try dbPool.read { db in
-            try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM message_ids WHERE headerId LIKE ?",
-                arguments: [prefix]
-            ) ?? 0
-        }
+        return try dbPool.read { db in try Self.accountDocumentCount(db, accountId: accountId) }
+    }
+
+    /// The read behind `documentCountForAccount`, on a connection to the index's database.
+    nonisolated static func accountDocumentCount(_ db: Database, accountId: String) throws -> Int {
+        let range = accountHeaderIdRange(accountId: accountId)
+        return try Int.fetchOne(
+            db,
+            sql: accountDocumentCountSQL,
+            arguments: [range.lower, range.upper]
+        ) ?? 0
+    }
+
+    /// Counts one account's `message_ids` entries by a key range on the table's
+    /// primary key, so the count reads only that account's index entries. A
+    /// `headerId LIKE '<accountId>:%'` prefix cannot use that index (SQLite's
+    /// `LIKE` is case-insensitive and the key is BINARY): it read the whole
+    /// table, every other account's entries included, after every sync.
+    static let accountDocumentCountSQL =
+        "SELECT COUNT(*) FROM message_ids WHERE headerId >= ? AND headerId < ?"
+
+    /// The `[lower, upper)` key range, in BINARY order, holding exactly the
+    /// header ids of one account (`"<accountId>:<folderPath>:<messageId>"`):
+    /// every key that starts with `"<accountId>:"`, and no other. `upper` raises
+    /// the prefix's last character, `:` (0x3A), to the next one, `;` (0x3B).
+    static func accountHeaderIdRange(accountId: String) -> (lower: String, upper: String) {
+        (accountId + ":", accountId + ";")
     }
 
     /// Remove all FTS entries for a given account (used during account removal).
@@ -982,7 +1044,92 @@ actor SearchIndex {
     private enum HeaderUpsertResult {
         case inserted
         case updated
+        /// The entry already held every value the write sets, and the caller asked
+        /// to leave such an entry alone (`indexHeaders(_:skippingUnchanged:)`).
+        case unchanged
         case refusedOlderGeneration
+    }
+
+    /// The columns `upsertHeader` sets on an entry already at its content key, each
+    /// with the value it sets. The shard and `message_meta` writes are built from
+    /// these two lists, and the unchanged check compares the stored rows with the
+    /// same lists, so it checks every column the write sets.
+    /// `SearchIndexHeaderSkipTests` fails if the upsert sets any other column.
+    private struct HeaderEntryWrite {
+        typealias Column = (name: String, value: DatabaseValue)
+
+        /// The shard row's columns, the body included.
+        let shard: [Column]
+        /// The `message_meta` row's columns.
+        let meta: [Column]
+
+        /// What the upsert writes for `record` into the shard of `year`, with `body`
+        /// (the stored body it keeps, or the empty body it clears to).
+        init(_ record: FTSHeaderRecord, year: Int, body: String) {
+            shard = [
+                ("msgId", record.messageId.databaseValue),
+                ("subject", record.subject.databaseValue),
+                ("from_", record.from.databaseValue),
+                ("to_", record.to.databaseValue),
+                ("cc", record.cc.databaseValue),
+                ("bcc", record.bcc.databaseValue),
+                ("body", body.databaseValue),
+            ]
+            meta = [
+                ("dateMs", record.dateMs.databaseValue),
+                ("accountId", SearchIndex.accountId(of: record.contentKey).databaseValue),
+                ("shardYear", year.databaseValue),
+                ("folderId", record.folderId.databaseValue),
+                ("identityTokenVersion", SearchIndex.identityTokenVersion.databaseValue),
+                ("identityRfc822MessageId", record.rfc822MessageId.databaseValue),
+                ("identityUidValidity", record.uidValidity.databaseValue),
+                ("identityResetAtMs", record.resetAtMs.databaseValue),
+                ("identityStableProvider",
+                 record.contentKeySpace.map { $0 == .stableProviderId }.databaseValue),
+            ]
+        }
+
+        /// `name = ?` for each column, comma-separated, for an UPDATE's SET.
+        static func assignments(_ columns: [Column]) -> String {
+            columns.map { "\($0.name) = ?" }.joined(separator: ", ")
+        }
+
+        /// Whether `shardRow` and `metaRow` already hold every value this write sets.
+        func isStored(shardRow: Row, metaRow: Row) -> Bool {
+            Self.holds(shardRow, shard) && Self.holds(metaRow, meta)
+        }
+
+        /// Whether `row` holds each of `columns` exactly as the write would store it.
+        /// A column the row lacks counts as different.
+        private static func holds(_ row: Row, _ columns: [Column]) -> Bool {
+            columns.allSatisfy { column in
+                guard row.hasColumn(column.name) else { return false }
+                let stored: DatabaseValue = row[column.name]
+                return sameStoredValue(stored, column.value)
+            }
+        }
+
+        /// Equal only when SQLite holds the same value: the same storage class, and
+        /// text compared byte for byte. (`DatabaseValue`'s `==` compares text with
+        /// Swift's `String` equality, which also treats two Unicode forms of the same
+        /// text as equal; skipping on that would keep the stored form where the write
+        /// stores the other.)
+        private static func sameStoredValue(_ stored: DatabaseValue, _ written: DatabaseValue) -> Bool {
+            switch (stored.storage, written.storage) {
+            case (.null, .null):
+                return true
+            case let (.int64(lhs), .int64(rhs)):
+                return lhs == rhs
+            case let (.double(lhs), .double(rhs)):
+                return lhs == rhs
+            case let (.string(lhs), .string(rhs)):
+                return lhs.utf8.elementsEqual(rhs.utf8)
+            case let (.blob(lhs), .blob(rhs)):
+                return lhs == rhs
+            default:
+                return false
+            }
+        }
     }
 
     /// What a header write may do to the CONTENT (indexed body + embedding) already
@@ -1062,7 +1209,13 @@ actor SearchIndex {
     /// `SyncEngineBackfillDeep`, `AccountManagerActions`, `AccountManagerOutbox`,
     /// `DemoModeService`. All nine pass a real `folderId`, which is why the meta
     /// UPDATE below may refresh that column without blanking a correct one.
-    func indexHeaders(_ records: [FTSHeaderRecord]) throws -> Int {
+    ///
+    /// `skippingUnchanged`: leave alone an entry that already holds every value the
+    /// write would set (`HeaderEntryWrite`), with its body and embedding kept. The
+    /// index ends exactly as the write would leave it, without rewriting the entry.
+    /// Only the bulk index walk asks for it: it re-indexes every header of an
+    /// account, nearly all of them held already (`SyncEngine.bulkIndexWritePage`).
+    func indexHeaders(_ records: [FTSHeaderRecord], skippingUnchanged: Bool = false) throws -> Int {
         ensureReady()
         guard let dbPool, !records.isEmpty else { return 0 }
 
@@ -1072,13 +1225,13 @@ actor SearchIndex {
             // LOOP VARIANT: the number of elements of `records` not yet visited,
             // which strictly decreases by exactly one per iteration and is bounded
             // below by 0. `continue` advances to the next element like any other
-            // arm — no arm re-enters an element, and none of the three results can
+            // arm — no arm re-enters an element, and none of the four results can
             // extend the sequence — so the refusal arm cannot hang the loop.
             for record in records {
-                switch try upsertHeader(record, db: db) {
+                switch try upsertHeader(record, skippingUnchanged: skippingUnchanged, db: db) {
                 case .inserted:
                     inserted += 1
-                case .updated:
+                case .updated, .unchanged:
                     break
                 case .refusedOlderGeneration:
                     continue
@@ -1094,17 +1247,18 @@ actor SearchIndex {
     ///
     /// PORT (`v2final:SearchIndex.upsertLiveHeader`, `486bafd4b`), keyed by
     /// `ContentKey` rather than the reference's raw `headerId` string.
+    ///
+    /// Both reads take the whole row (`meta.*`, `*`): the unchanged check compares
+    /// every column the write sets, and each row is read by key either way.
     private func upsertHeader(
         _ record: FTSHeaderRecord,
+        skippingUnchanged: Bool,
         db: Database
     ) throws -> HeaderUpsertResult {
         guard let mapping = try Row.fetchOne(
             db,
             sql: """
-                SELECT mi.rowid, meta.shardYear, meta.identityTokenVersion,
-                       meta.identityRfc822MessageId,
-                       meta.identityUidValidity, meta.identityResetAtMs,
-                       meta.identityStableProvider
+                SELECT mi.rowid, meta.*
                 FROM message_ids mi
                 JOIN message_meta meta ON meta.rowid = mi.rowid
                 WHERE mi.headerId = ?
@@ -1120,7 +1274,7 @@ actor SearchIndex {
         let oldTable = ftsTableName(year: oldYear)
         guard let oldFTS = try Row.fetchOne(
             db,
-            sql: "SELECT body FROM \(oldTable) WHERE rowid = ?",
+            sql: "SELECT * FROM \(oldTable) WHERE rowid = ?",
             arguments: [rowid]
         ) else {
             // Dangling mapping — id + meta rows with no shard row behind them.
@@ -1155,32 +1309,28 @@ actor SearchIndex {
         }
 
         let newYear = yearFromDateMs(record.dateMs)
+        let write = HeaderEntryWrite(record, year: newYear, body: body)
+        // Only a kept entry is skipped: clearing also deletes the embedding, which
+        // the column lists do not cover. A kept entry's body is the stored body, so
+        // only its header columns and its meta row can differ.
+        if skippingUnchanged, case .preserveAndAdopt = disposition,
+           write.isStored(shardRow: oldFTS, metaRow: mapping) {
+            return .unchanged
+        }
+
         if newYear == oldYear {
             try db.execute(
-                sql: """
-                    UPDATE \(oldTable)
-                    SET msgId = ?, subject = ?, from_ = ?, to_ = ?,
-                        cc = ?, bcc = ?, body = ?
-                    WHERE rowid = ?
-                    """,
-                arguments: [
-                    record.messageId, record.subject, record.from, record.to,
-                    record.cc, record.bcc, body, rowid,
-                ]
+                sql: "UPDATE \(oldTable) SET \(HeaderEntryWrite.assignments(write.shard)) WHERE rowid = ?",
+                arguments: StatementArguments(write.shard.map(\.value) + [rowid.databaseValue])
             )
         } else {
             try ensureShard(year: newYear, db: db)
             let newTable = ftsTableName(year: newYear)
+            let names = write.shard.map(\.name).joined(separator: ", ")
+            let placeholders = Array(repeating: "?", count: write.shard.count).joined(separator: ", ")
             try db.execute(
-                sql: """
-                    INSERT OR REPLACE INTO \(newTable)
-                        (rowid, msgId, subject, from_, to_, cc, bcc, body)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                arguments: [
-                    rowid, record.messageId, record.subject, record.from,
-                    record.to, record.cc, record.bcc, body,
-                ]
+                sql: "INSERT OR REPLACE INTO \(newTable) (rowid, \(names)) VALUES (?, \(placeholders))",
+                arguments: StatementArguments([rowid.databaseValue] + write.shard.map(\.value))
             )
             try db.execute(
                 sql: "DELETE FROM \(oldTable) WHERE rowid = ?",
@@ -1199,24 +1349,9 @@ actor SearchIndex {
             )
         }
 
-        let stableProvider: Bool? = record.contentKeySpace.map {
-            $0 == .stableProviderId
-        }
         try db.execute(
-            sql: """
-                UPDATE message_meta
-                SET dateMs = ?, accountId = ?, shardYear = ?, folderId = ?,
-                    identityTokenVersion = ?, identityRfc822MessageId = ?,
-                    identityUidValidity = ?, identityResetAtMs = ?,
-                    identityStableProvider = ?
-                WHERE rowid = ?
-                """,
-            arguments: [
-                record.dateMs, Self.accountId(of: record.contentKey), newYear,
-                record.folderId, Self.identityTokenVersion,
-                record.rfc822MessageId, record.uidValidity, record.resetAtMs,
-                stableProvider, rowid,
-            ]
+            sql: "UPDATE message_meta SET \(HeaderEntryWrite.assignments(write.meta)) WHERE rowid = ?",
+            arguments: StatementArguments(write.meta.map(\.value) + [rowid.databaseValue])
         )
         return .updated
     }
@@ -2775,6 +2910,24 @@ actor SearchIndex {
             try db.execute(sql: "VACUUM")
         }
         BackgroundSyncLogger.logDebug("[SearchIndex] VACUUM complete")
+    }
+
+    /// The search database's pages and empty pages (`StorageEstimator.PageTotals`),
+    /// whose data the Email Index Limit's measure counts together with the email
+    /// database's (#1437). nil when the database cannot be opened or read.
+    func pageTotals() -> StorageEstimator.PageTotals? {
+        ensureReady()
+        guard let dbPool else { return nil }
+        return (try? dbPool.read { db in try StorageEstimator.PageTotals.read(db) }) ?? nil
+    }
+
+    /// The allocated size of the search database file and its WAL file, in bytes
+    /// (#1437): the storage measure counts the database's data instead
+    /// (`StorageEstimator.SpaceMeter`), as it does the email database's.
+    func databaseFileBytes() -> Int64 {
+        ensureReady()
+        guard let dbPool else { return 0 }
+        return StorageEstimator.databaseFileBytes(ofDatabaseAt: dbPool.path)
     }
 
 

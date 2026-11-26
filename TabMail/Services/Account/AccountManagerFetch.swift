@@ -202,8 +202,9 @@ extension AccountManager {
             BackgroundSyncLogger.logDebug("[FetchBody] Opening: id=\(message.id.prefix(40)) msgId=\(message.messageId.prefix(30)) folder=\(message.folderPath)")
         }
 
-        // Body already loaded — nothing to do
-        let hasBody = (try? await dbPool.read { db in try MessageBody.fetchOne(db, key: message.id) != nil }) ?? false
+        // Body already loaded — nothing to do. Asked of the HTML-cache pair, which
+        // reads the header row and never the HTML (#1433).
+        let hasBody = (try? await dbPool.read { db in try HTMLCachePair.isCached(db, headerId: message.id) }) ?? false
         guard replaceExistingBody || !hasBody else { return }
 
         // Address not corroborated: this UID names a DIFFERENT message on the wire right now,

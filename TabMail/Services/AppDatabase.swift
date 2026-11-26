@@ -174,7 +174,7 @@ final class AppDatabase: Sendable {
                 "Calendar crash recovery failed; residue preserved for the next launch.",
                 source: "AppDatabase")
         }
-        self.inboxNotificationObserver = try Self.makeInboxNotificationObserver(on: pool)
+        self.inboxNotificationObserver = Self.makeInboxNotificationObserver(on: pool)
     }
 
     /// Test-only initializer: accepts an already-configured DatabasePool (e.g.
@@ -184,19 +184,15 @@ final class AppDatabase: Sendable {
         try self.init(pool: dbPool, runStartupResets: false)
     }
 
-    /// Wires production-flavored `InboxNotificationObserver` to the pool.
-    /// Atomic seed + register inside one write block — GRDB-documented idiomatic
-    /// pattern (`db.add(transactionObserver:)` from inside `pool.write`). Caller
-    /// MUST retain the returned observer; GRDB holds it weakly at
+    /// Wires production-flavored `InboxNotificationObserver` to the pool. It
+    /// starts with an empty map, so registering it reads nothing (#1385).
+    /// Caller MUST retain the returned observer; GRDB holds it weakly at
     /// `.observerLifetime`.
-    private static func makeInboxNotificationObserver(on pool: DatabasePool) throws -> InboxNotificationObserver {
+    private static func makeInboxNotificationObserver(on pool: DatabasePool) -> InboxNotificationObserver {
         let observer = InboxNotificationObserver(clear: { acct, mid in
             NSEDataBridge.clearNotification(accountId: acct, messageId: mid)
         })
-        try pool.write { db in
-            try observer.seed(db)
-            db.add(transactionObserver: observer)
-        }
+        pool.add(transactionObserver: observer)
         return observer
     }
 
@@ -395,9 +391,8 @@ final class AppDatabase: Sendable {
     /// provider-authoritative "already done" (`IOS-GRAPH-005`, #114).
     ///
     /// A THROW PROPAGATES OUT OF `init`, deliberately. `init` already throws on a
-    /// failed migration and on the observer-seeding write that follows, and
-    /// `AppStartup` turns that into the "couldn't open its local database"
-    /// failure WITHOUT publishing the pool. A database that cannot take this
+    /// failed migration, and `AppStartup` turns that into the "couldn't open its
+    /// local database" failure WITHOUT publishing the pool. A database that cannot take this
     /// write must not go on to release new claims into unreconciled state, so
     /// there is no `try?`, no retry ladder (migrations have none) and no
     /// swallow-and-log.
@@ -563,6 +558,13 @@ final class AppDatabase: Sendable {
     /// production caller (`createNSEStagingDBIfNeeded`) gates the version marker
     /// on this so a failed open/write retries on the next launch instead of being
     /// permanently skipped.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     @discardableResult
     static func createNSEStagingDB(atPath path: String) -> Bool {
         var config = Configuration()
@@ -829,6 +831,13 @@ final class AppDatabase: Sendable {
     /// The identifier strings and bodies below are what GRDB records in
     /// `grdb_migrations`: **immutable once applied**. Never edit an applied
     /// migration — add a new one.
+    ///
+    /// QUERY COST (keep this note; QueryCostNoteFenceTests checks it): every query,
+    /// index, table or column added here, and every query that reads them, must be as
+    /// cheap as the data allows. It must not add a new table or index scan unless no
+    /// index or plainer query can avoid it; then state why at the query. Prove a query
+    /// or index change on a mail-sized database with the DBProof harness
+    /// (TabMailTests/Helpers/DBProofHarness.swift).
     static func registerAllMigrations(on migrator: inout DatabaseMigrator) {
         migrator.registerTimedMigration("v1_createTables") { db in
             // Account
@@ -1731,8 +1740,9 @@ final class AppDatabase: Sendable {
             try db.create(index: "messageHeader_accountId_bodyComplete",
                           on: "messageHeader", columns: ["accountId", "bodyComplete"])
 
-            // P0: Reminder count — ChatPillState ValueObservation re-runs on EVERY
-            // messageHeader write. Without this index, each re-run does a full 250K scan.
+            // P0: Reminder count — ChatPillState ValueObservation re-runs on every
+            // messageHeader insert or delete and every update of a column it reads.
+            // Without this index, each re-run does a full 250K scan.
             // Also used by ReminderBuilder.collectMessageReminders().
             // Partial index: only rows with reminderContent (typically <100 rows).
             try db.execute(sql: """
@@ -2543,7 +2553,7 @@ final class AppDatabase: Sendable {
             //   device — needs ≈3× the table free at peak, and leaves the file at
             //   ≈2× until a `VACUUM` the app never runs outside `AppDataWiper`.
             //   That permanent growth feeds `StorageEstimator.totalSizeMB()` →
-            //   `isOverBudget()` → `SyncEngine.runPruneIfOverBudget`, which deletes
+            //   `isOverBudget()` (the check before #1437) → `SyncEngine.runPruneIfOverBudget`, which deletes
             //   `MessageHeader` ROWS oldest-first: a schema-only migration causing
             //   MESSAGE pruning. `StorageEstimator.defaultBudgetMB == Int.max`, so
             //   this table is unbounded and multi-GB is normal. On a device without
@@ -2579,8 +2589,8 @@ final class AppDatabase: Sendable {
             // deterministic (`headerHash(contentKey)/assetHash(cid|section)`) and
             // written with `ON CONFLICT(id) DO UPDATE`, so a re-fetch re-attaches
             // the SAME rows and the SAME files — it cannot duplicate either. The
-            // assets stay owned (their headers are untouched, so
-            // `BodyAssetMaintenance.pruneOrphans` correctly protects them), stay
+            // assets stay owned (their headers are untouched, so no delete queues
+            // their keys on `bodyAssetPendingDelete`, #1376), stay
             // bounded (`evictIfOverCap` against `attachmentsBudgetMB`, default
             // 1024 MB), and are still reclaimed when their header dies via the
             // routed `MessageContentStore.releaseUnowned(… .assets)` sites. Clearing
@@ -2664,6 +2674,11 @@ final class AppDatabase: Sendable {
         //     messageHeader` spelled twice (`v1`, then `v2`'s rebuild — both dropped
         //     by `v70`), and `v82`'s rebuild re-spelling the three label edges `v33`
         //     first declared. THE GREP COUNTS DEAD DDL; THE PRAGMA DOES NOT.
+        //     Re-derived 2026-11-24 over the chain through `v115` (#1386): the live
+        //     schema returns 11 foreign keys, all `CASCADE` — the 10 above plus
+        //     `userLabelLastUsed → userLabel` — and the source DDL is 17 declarations,
+        //     the same six of them dead. The counts above are the `271d13334`
+        //     measurement, kept as it was taken.
         //     ⚠️ `MIS-033` — this census read *"returns 19 lines, 3 of which are
         //     prose, leaving 16"* and the truth was 20 and 4. The uncounted fourth
         //     prose line was A LINE OF THIS BANNER: it quotes the search token, so
@@ -3189,14 +3204,17 @@ final class AppDatabase: Sendable {
         //    `TabMail/ Shared/ TabMailNotificationService/`:
         //      · `rg -c --pcre2 '^(?!\s*(///|//)).*references\("userLabel"'` → **2**,
         //        both in this file (`v33`'s create and step 4 below) and BOTH of them
-        //        `messageUserLabel`. (Naive: 3.)
+        //        `messageUserLabel`. (Naive: 3.) Since `v115` it returns 3: the third
+        //        is `userLabelLastUsed`, which `v115` creates long after this
+        //        migration has run, so it does not exist while v82 drops `userLabel`.
         //      · `rg -c --pcre2 '^(?!\s*(///|//)).*references\("messageUserLabel"'` →
         //        **no output, exit 1** — nothing can be cascaded into. (Naive: 1.)
         //      · `rg -i -c --pcre2 '^(?!\s*(///|//)).*CREATE TRIGGER'` → **4**,
         //        all later v85 direct-AI lifecycle triggers. None exists while v82
         //        runs, and SQLite's implicit `DROP TABLE` delete does not fire
         //        triggers in any case. (Before v85 this live census was zero.)
-        //    Non-vacuity for the predicates: the FIRST returns a non-empty 2 and the
+        //    Non-vacuity for the predicates: the FIRST returns a non-empty 2 (3 since
+        //    `v115`) and the
         //    trigger predicate returns 4, so the lookahead demonstrably does not
         //    swallow live code.
         //    The two `CREATE TABLE … AS SELECT` snapshots carry no constraints (SQLite
@@ -3471,7 +3489,7 @@ final class AppDatabase: Sendable {
         //
         // 🚨🚨 THE BODY OF THIS MIGRATION IS EMPTY AS OF 2026-08-06. THE INDEX IS
         // REAL AND STILL REQUIRED; ONLY ITS BUILD MOVED. It is created by
-        // `SyncEngine.runBuildDeferredIndexesIfMissing`, the background WAL
+        // `SyncEngine.runRefreshPlannerStatisticsIfStale`, the background WAL
         // maintenance pass, from the SAME `CREATE INDEX IF NOT EXISTS` statement —
         // `SyncEngine.deferredIndexes` is the one place the DDL lives now. Everything
         // below about WHY the index exists, WHY it is partial, and WHY it must be
@@ -3722,7 +3740,7 @@ final class AppDatabase: Sendable {
         //     """)
         //
         // and that statement now lives in `SyncEngine.deferredIndexes`, executed by
-        // `SyncEngine.runBuildDeferredIndexesIfMissing` from the background WAL
+        // `SyncEngine.runRefreshPlannerStatisticsIfStale` from the background WAL
         // maintenance pass. The identifier and the registration stay because a
         // registered migration's NAME is frozen once any database has run it (Data
         // Integrity rule 5) — deleting the registration would make GRDB see an applied
@@ -4463,6 +4481,214 @@ final class AppDatabase: Sendable {
         ) { db in
             try db.alter(table: "folder") { t in
                 t.add(column: "isFollowed", .boolean).notNull().defaults(to: false)
+            }
+        }
+
+        // #1374 (ADR-IOS-029): the AI cache purge reads the expired entries,
+        // `messageAICache WHERE updatedAt < ?`, after every AI queue drain and in
+        // maintenance. No index led with `updatedAt`, so its count and every batch
+        // SCANNED the whole cache. This index serves both: the count is a covering
+        // range read and a batch reads only expired entries. Statistics come from
+        // the background ANALYZE after the schema change; nothing else to do here.
+        // IF NOT EXISTS, like every index migration here, keeps the DDL idempotent.
+        migrator.registerTimedMigration(
+            "v113_messageAICacheExpiryIndex", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: "CREATE INDEX IF NOT EXISTS messageAICache_expiry ON messageAICache(updatedAt)")
+        }
+
+        // #1376: a message's cached inline images and attachments are deleted BY
+        // CONSTRUCTION instead of by a sweep over the whole asset store. The
+        // manifest lives in its own App Group database (the notification extension
+        // writes it), so no foreign key can reach it; instead SQLite itself writes
+        // "this content key's assets may be gone" into `bodyAssetPendingDelete` in
+        // the same transaction as every header delete, a foreign-key cascade from an
+        // account removal included, and every in-place change of a header's id.
+        // `BodyAssetMaintenance.processPendingDeletes` drains it. The list holds only
+        // deletes not done yet. Besides these triggers, two writers add keys: the
+        // notification-extension merge (`NSEDataBridge.queueStagedAssetKey`, a staged
+        // key whose staging row it lets go) and the one-time sweep
+        // (`BodyAssetMaintenance.runOrphanSweepOnce`, keys no header names). Every
+        // entry only asks the worker to judge a key again, so the list cannot drift
+        // from `messageHeader`.
+        //
+        // - Rowid key and NO unique constraint: a trigger's INSERT takes the outer
+        //   statement's conflict policy (under an `UPDATE OR IGNORE` of a header, a
+        //   unique clash here would silently drop the entry), so nothing here can
+        //   clash. A duplicate key is harmless because the worker is idempotent.
+        // - No index on `contentKey`: the worker reads in rowid order and deletes by
+        //   rowid.
+        // - A move re-keys by DELETE + INSERT (`MessageHeaderRekey.apply`), so the
+        //   DELETE trigger covers it; the manifest rows follow the header through
+        //   `BodyAssetStore.rekeyContentKey`, after which the old key's entry finds
+        //   nothing to delete.
+        // - Independent of every other migration: it reads no column but `id` and
+        //   touches no other table, so it holds whatever runs before or after it. A
+        //   later migration that rebuilds `messageHeader` drops these triggers with
+        //   the old table and must create them again (`BodyAssetPendingDeleteTriggerTests`
+        //   checks them after the whole chain).
+        // Existing databases start with an empty list; assets orphaned before this
+        // version are reclaimed by the one-time sweep in the maintenance pass.
+        migrator.registerTimedMigration(
+            "v114_addBodyAssetPendingDelete", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: """
+                CREATE TABLE bodyAssetPendingDelete (
+                    id INTEGER PRIMARY KEY,
+                    contentKey TEXT NOT NULL
+                )
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_queueAssetDelete
+                AFTER DELETE ON messageHeader
+                BEGIN
+                    INSERT INTO bodyAssetPendingDelete (contentKey) VALUES (OLD.id);
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_queueAssetRekey
+                AFTER UPDATE OF id ON messageHeader
+                WHEN OLD.id IS NOT NEW.id
+                BEGIN
+                    INSERT INTO bodyAssetPendingDelete (contentKey) VALUES (OLD.id);
+                END
+                """)
+        }
+
+        // #1386 (ADR-IOS-118): the label menu lists the labels the user applied most
+        // recently in this app above the A-to-Z list, instead of ranking every label by
+        // how many inbox messages carry it (which read every inbox message and its label
+        // rows each time the menu opened). No existing column records when a label was
+        // applied: `messageUserLabel` holds only the pair, `userLabel` only the label,
+        // and the queued `pendingOperation` row is deleted once it has run. So this is
+        // its own small table:
+        // - One row per label, keyed by the label's surrogate id (`userLabel.id`, which
+        //   carries the account), removed with the label and so with its account.
+        // - Written only by the label menu's apply, in the transaction that writes the
+        //   label's join row (`UserLabelStore.recordUse`); read only by the menu.
+        // - Starts empty, with nothing backfilled: a label has no time until the user
+        //   applies it here, and until then the menu is the A-to-Z list alone.
+        // - No index beyond the primary key: it holds one row per label the user has
+        //   applied here, so the menu reads all of it, a small read; the primary key
+        //   also serves the cascade's lookup when a label is deleted.
+        // - A later migration that rebuilds `userLabel` (as v82 did) cascades these rows
+        //   away unless it carries them across.
+        migrator.registerTimedMigration(
+            "v115_addUserLabelLastUsed", foreignKeyChecks: .immediate
+        ) { db in
+            try db.create(table: "userLabelLastUsed") { t in
+                t.primaryKey("userLabelId", .text)
+                    .references("userLabel", onDelete: .cascade)
+                t.column("lastUsedAt", .datetime).notNull()
+            }
+        }
+
+        // #1433: the header records when its message's HTML was cached, so the
+        // body-cache evict reads only the bodies it may delete. Before this, the evict
+        // walked every cached body older than the TTL and read each one's header,
+        // keeping the inbox ones, on every maintenance pass (about 19,000 kept bodies
+        // and 7 s per pass at 105k headers).
+        //
+        // - `messageHeader.htmlCachedAt` is the `fetchedAt` of the message's
+        //   `messageBody` row, NULL when it has none: the pair of the HTML cache, as
+        //   `bodyComplete` is the pair of the search text (ADR-IOS-050). No existing
+        //   column says whether a header's HTML is cached.
+        // - SQLite keeps it exact, whatever code writes either table: a body insert,
+        //   a body update that changes `fetchedAt` or `id`, a body delete, a header
+        //   insert (a body written before its header, or a header deleted and inserted
+        //   again under a new id) and an update of a header's `id`. Each trigger writes
+        //   the state at the end of its own statement, so any order of header and body
+        //   writes ends exact. The column is not part of the `MessageHeader` record,
+        //   so a record `insert`/`update`/`save` never writes it; `HTMLCachePair` is
+        //   the only reader.
+        // - The triggers match a body to its header by id, which holds while
+        //   `ContentKey.forHeader` returns the header id. The change that makes
+        //   content keys differ from header ids must point these triggers at the
+        //   content key the header holds (`HTMLCachePairTests` fails that day).
+        // - This migration adds the column, empty, and the triggers: an `ALTER TABLE`
+        //   that adds a nullable column rewrites no row, and creating a trigger reads
+        //   no data, so it costs the same at any size on every launch path. The bodies
+        //   cached before it are recorded by the fill, and the evict's index
+        //   `messageHeader_htmlCachedAt` is built, in the deferred index step
+        //   (`SyncEngine.deferredIndexes`, `HTMLCachePair.fillSQL` and `.indexSQL`),
+        //   in one write with the `ANALYZE` that gives the index its statistics
+        //   (#1401, ADR-IOS-029). Until that write commits, those bodies read as not
+        //   cached and the evict waits (`HTMLCachePair`, "Before the deferred index
+        //   step").
+        // - Write cost: a body save or delete also rewrites its header row, and once
+        //   the index exists moves one index entry; a header insert or id change
+        //   probes `messageBody` by primary key and, when a body is there, reads its
+        //   `fetchedAt` through the body's pages (it is stored after the HTML). A
+        //   delete of many bodies fires the delete trigger once per body, one header
+        //   seek each.
+        // - A later migration that rebuilds `messageHeader` or `messageBody` drops
+        //   these triggers with the old table and must create them again
+        //   (`HTMLCachePairTests` checks the pair after the whole chain).
+        migrator.registerTimedMigration(
+            "v116_addMessageHeaderHTMLCachedAt", foreignKeyChecks: .immediate
+        ) { db in
+            try db.execute(sql: "ALTER TABLE messageHeader ADD COLUMN htmlCachedAt DATETIME")
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtInsert
+                AFTER INSERT ON messageBody
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NEW.fetchedAt WHERE id = NEW.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtUpdate
+                AFTER UPDATE OF id, fetchedAt ON messageBody
+                WHEN OLD.id IS NOT NEW.id OR OLD.fetchedAt IS NOT NEW.fetchedAt
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NULL
+                    WHERE id = OLD.id AND OLD.id IS NOT NEW.id;
+                    UPDATE messageHeader SET htmlCachedAt = NEW.fetchedAt WHERE id = NEW.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageBody_htmlCachedAtDelete
+                AFTER DELETE ON messageBody
+                BEGIN
+                    UPDATE messageHeader SET htmlCachedAt = NULL WHERE id = OLD.id;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_htmlCachedAtInsert
+                AFTER INSERT ON messageHeader
+                WHEN NEW.htmlCachedAt IS NOT (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                BEGIN
+                    UPDATE messageHeader
+                    SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                    WHERE rowid = NEW.rowid;
+                END
+                """)
+            try db.execute(sql: """
+                CREATE TRIGGER messageHeader_htmlCachedAtRekey
+                AFTER UPDATE OF id ON messageHeader
+                WHEN OLD.id IS NOT NEW.id
+                BEGIN
+                    UPDATE messageHeader
+                    SET htmlCachedAt = (SELECT fetchedAt FROM messageBody WHERE id = NEW.id)
+                    WHERE rowid = NEW.rowid;
+                END
+                """)
+        }
+
+        // #1490: Send marks the original at once again (its replied or forwarded
+        // mark, and a Reply tag changed to none), and a send that leaves the
+        // Outbox unsent undoes exactly what its queuing changed. The row records
+        // those changes (`OutboxMessage.QueuedOriginalChanges`) because nothing
+        // else on disk keeps the original's state from before the send: the queue
+        // write overwrites the original's row, and no other outbox column can
+        // carry it (ADR-IOS-019 amendment, #1490). Written with the row, read
+        // with it, gone with it. NULL for every existing row: such a send changed
+        // nothing when it was queued and behaves as before. No index: it is read
+        // only from a row already fetched by its primary key.
+        migrator.registerTimedMigration(
+            "v117_addOutboxOriginalChangesAtQueue", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "originalChangesAtQueue", .integer)
             }
         }
     }
