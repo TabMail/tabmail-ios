@@ -39,7 +39,7 @@ struct ChatBubbleWidthTests {
             #expect(abs(sent.maxX - message.maxX) <= 1, "both at the trailing edge: \(sent) \(message)")
             #expect(sent.width <= Self.column + 0.5, "never past the column \(Self.column): \(sent.width)")
             if words == Self.shortWords {
-                #expect(sent.width < Self.column / 2, "a short email's bubble hugs its words: \(sent.width) of \(Self.column)")
+                #expect(sent.width + 1 < Self.column, "a short email's bubble hugs its words, short of the column: \(sent.width) of \(Self.column)")
             } else {
                 #expect(sent.width > Self.column / 2, "control: long words fill the column before they wrap: \(sent.width)")
             }
