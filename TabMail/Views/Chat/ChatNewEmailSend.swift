@@ -57,14 +57,16 @@ struct ChatNewEmailSend: Equatable, Sendable {
     }
 
     /// The copy of `email` in its account's Sent folder: the optimistic copy the send writes, or
-    /// the server's once a sync has brought it.
+    /// the server's once a sync has brought it, under the Message-ID the copy carries (its
+    /// provider's own, when it gave one: `SentCopyLink`).
     private nonisolated static func sentCopy(of email: Email, db: Database) throws -> String? {
         guard let sent = try Folder
             .filter(Column("accountId") == email.accountId && Column("role") == FolderRole.sent.rawValue)
             .fetchOne(db) else { return nil }
+        let copyMessageId = SentCopyLink.copyMessageId(accountId: email.accountId, sentMessageId: email.messageId)
         return try String.fetchOne(
             db, sql: "SELECT id FROM messageHeader INDEXED BY messageHeader_rfc822MessageId WHERE folderId = ? AND rfc822MessageId = ? LIMIT 1",
-            arguments: [sent.id, email.messageId])
+            arguments: [sent.id, copyMessageId])
     }
 
     /// The send `key` names, now and after every change, from one observation.

@@ -914,6 +914,14 @@ extension AccountManager {
     private func insertOptimisticSentHeader(
         outboxMessage msg: OutboxMessage, messageId: String, draft: DraftMessage, sentCopy: ListedSentCopy?
     ) async {
+        // The Message-ID the send wrote, which the outbox row and the summary made at Send carry.
+        let sentMessageId = EmailFilter.normalizeMessageId(messageId)
+        // A copy under a Message-ID of the provider's own (Gmail): the reads that look for this
+        // email's Sent copy by the send's Message-ID find it from the row's commit on.
+        if let sentCopy {
+            SentCopyLink.record(
+                accountId: msg.accountId, sentMessageId: sentMessageId, copyMessageId: sentCopy.rfc822MessageId)
+        }
         do {
             // Write transaction returns FTS data for post-transaction indexing.
             // Same pattern as queueDraftSave — headerComplete=1 must be set via the real
@@ -929,7 +937,7 @@ extension AccountManager {
                 let folderId = sentFolder.id
                 // The provider's own Message-ID when its copy was read (Gmail
                 // replaces the one the send wrote), as the sync stores it.
-                let rfc822 = sentCopy?.rfc822MessageId ?? EmailFilter.normalizeMessageId(messageId)
+                let rfc822 = sentCopy?.rfc822MessageId ?? sentMessageId
 
                 // Don't insert if a header with this rfc822MessageId already exists (idempotent).
                 // This is also a provider copy a sync stored before this write: it
@@ -977,9 +985,10 @@ extension AccountManager {
                 // row sends (`ThreadUtils.outgoingThreadHeaders`). The sync never
                 // sets it on a row it already holds.
                 header.threadId = sentCopy?.identity.threadId
-                // The summary made at Send, under this email's own Message-ID.
+                // The summary made at Send, under the Message-ID the send wrote; from here on it
+                // is kept under the row's (the provider's own, when it gave the copy one).
                 try MessageAICache.restoreIfCached(
-                    into: &header, accountId: msg.accountId, folderPath: sentFolder.path, db: db)
+                    into: &header, from: sentMessageId, accountId: msg.accountId, folderPath: sentFolder.path, db: db)
                 // Thread grouping so the sent message appears in the conversation
                 try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: sentCopy?.identity.threadId, db: db)
                 try header.insert(db)

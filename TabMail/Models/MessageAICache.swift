@@ -61,8 +61,15 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
 
     /// Restore cached AI state into a newly created or re-addressed MessageHeader.
     /// Preserves first-compute-wins: doesn't overwrite actionTag if already set from server.
+    ///
+    /// `sourceMessageId`: the Message-ID the entry was written under, when it is not the header's
+    /// own: a send's Sent copy that its provider gave a Message-ID of its own (Gmail), whose summary
+    /// was made at Send under the one the send wrote. The entry is then kept under the header's
+    /// Message-ID too, so it lives with the email; the one under `sourceMessageId` is left to the
+    /// orphaned-entry purge.
     static func restoreIfCached(
         into header: inout MessageHeader,
+        from sourceMessageId: String? = nil,
         accountId: String,
         folderPath: String,
         db: Database
@@ -70,7 +77,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         guard let key = cacheKey(
             accountId: accountId,
             folderPath: folderPath,
-            rfc822MessageId: header.rfc822MessageId
+            rfc822MessageId: sourceMessageId ?? header.rfc822MessageId
         ) else { return }
 
         guard var cached = try MessageAICache
@@ -107,6 +114,11 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         }
 
         cached.updatedAt = Date()
+        if let headerKey = cacheKey(accountId: accountId, folderPath: folderPath, rfc822MessageId: header.rfc822MessageId),
+           headerKey != key {
+            cached.key = headerKey
+            cached.rfc822MessageId = header.rfc822MessageId
+        }
         try cached.save(db)
 
         if DebugModeManager.isLoggingEnabled() { print("[AICache] Restored for \(header.messageId)") }

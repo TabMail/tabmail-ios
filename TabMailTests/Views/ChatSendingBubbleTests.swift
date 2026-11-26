@@ -10,16 +10,18 @@ import UIKit
 @testable import TabMail
 
 /// A reply in the outbox, from the queue write to its email in the chat, through the real outbox,
-/// AI cache, send path and hosted chat. The bubble is read from the database alone:
-/// nothing about a send is kept in memory.
+/// AI cache, send path and hosted chat. The bubble is read from the database, and nothing about a
+/// send is kept in memory but the Message-ID a provider gave its Sent copy (`SentCopyLink`).
 ///
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The queued email has its own Message-ID from the queue write, and the send uses it.
 ///  2. The summary made at Send is the email's own: written under its Sent folder and Message-ID,
-///     its Sent copy shows it, and no other email does, even one in Sent without a summary.
+///     its Sent copy shows it, and no other email does, even one in Sent without a summary. A copy
+///     its provider gave a Message-ID of its own (Gmail) shows it too, and keeps it under that one.
 ///  3. The chat shows the reply from the queue write: "Summarizing" and "Sending", the summary as
 ///     soon as it is made while still sending, and once sent the email itself with that same
-///     summary and no second bubble.
+///     summary and no second bubble, whatever Message-ID the provider gave the copy; a new email's
+///     chat finds its copy the same way.
 ///  4. Which rows show (I5): every unsent row answering an email of the chat, from any account,
 ///     "Sending", or "Not sent" once failed; a sent row, a deleted row and a reply to an email of
 ///     another chat show nothing.
@@ -98,6 +100,24 @@ struct ChatSendingBubbleTests {
         return try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) })
     }
 
+    /// Queues a new email as a new email's compose card does (no In-Reply-To), and returns its
+    /// outbox row.
+    private static func queueNewEmail(_ fixture: Fixture, draftId: String) async throws -> OutboxMessage {
+        try await fixture.pool.write { db in
+            var draft = Draft(
+                id: draftId, accountId: Self.account, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Lunch on Friday", body: "Friday?", replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        let queued = try await AccountManager.persistQueuedSend(
+            draft: DraftMessage(to: ["friend@example.com"], subject: "Lunch on Friday", body: "Friday works for lunch?"),
+            accountId: Self.account, replyToHeaderId: nil, isForward: false, serverDraftId: nil,
+            draftId: draftId, instanceEpoch: "E1", holdsForUndo: false)
+        return try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) })
+    }
+
     /// The server's listing of `header`, as a Sent folder sync reads it.
     private static func serverInfo(_ header: MessageHeader) -> MessageHeaderInfo {
         MessageHeaderInfo(
@@ -108,18 +128,47 @@ struct ChatSendingBubbleTests {
             isFlagged: false, hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil)
     }
 
+    /// How the provider keeps the sent email's copy in its Sent folder.
+    enum CopyShape: String, CaseIterable, Sendable {
+        /// Under the Message-ID the send wrote; the send names no copy (IMAP, Exchange).
+        case sendsMessageId
+        /// Under a Message-ID of the provider's own, the copy the send's answer names (Gmail).
+        case providersMessageId
+    }
+
+    /// The normalized Message-ID the provider's Sent copy of `row` carries.
+    nonisolated private static func copyMessageId(of row: OutboxMessage, _ shape: CopyShape) throws -> String {
+        let sent = try #require(row.sentMessageId, "control: the queued email has its Message-ID")
+        switch shape {
+        case .sendsMessageId: return EmailFilter.normalizeMessageId(sent)
+        case .providersMessageId: return "gm-\(row.id)@mail.example.com"
+        }
+    }
+
     /// Claims and sends the row through the real send path with a mock provider. The provider's
     /// Sent folder then lists the sent email under its own server id, plus `alsoListed`, as a
     /// server does after the append: the send's own Sent folder sync runs on its own schedule and
     /// replaces the optimistic copy with that one, so the tests hold whichever copy is there.
-    private static func send(_ row: OutboxMessage, alsoListed: [MessageHeader] = []) async throws -> MockEmailProvider {
+    /// `shape` is how the provider keeps the copy; with `.providersMessageId` its send names the copy
+    /// and its header listing reads it, as Gmail's does. `keepsRow`: the Sent append is refused, so
+    /// the outbox row stays, sent, as it is between the Sent copy and the send's cleanup.
+    private static func send(
+        _ row: OutboxMessage, alsoListed: [MessageHeader] = [], shape: CopyShape = .sendsMessageId, keepsRow: Bool = false
+    ) async throws -> MockEmailProvider {
         #expect(await AccountManager.shared.atomicClaimForTesting(row), "control: the row is claimed")
         let claimed = try #require(try await AppDatabase.dbPool.read { try OutboxMessage.fetchOne($0, key: row.id) })
         let provider = MockEmailProvider()
-        var serverCopy = Self.header("server-\(row.id)", folder: "Sent", from: "me@example.com", inReplyTo: row.inReplyTo.map(EmailFilter.normalizeMessageId))
-        serverCopy.rfc822MessageId = claimed.sentMessageId.map(EmailFilter.normalizeMessageId)
+        var serverCopy = Self.header(
+            shape == .providersMessageId ? "gm-\(row.id)" : "server-\(row.id)", folder: "Sent", from: "me@example.com",
+            inReplyTo: row.inReplyTo.map(EmailFilter.normalizeMessageId))
+        serverCopy.rfc822MessageId = try Self.copyMessageId(of: claimed, shape)
         serverCopy.subject = row.subject
         await provider.setFetchMessagesResult([Self.serverInfo(serverCopy)] + alsoListed.map(Self.serverInfo))
+        if shape == .providersMessageId {
+            await provider.setSendResult(SentCopyIdentity(providerMessageId: serverCopy.messageId, threadId: nil))
+            await provider.setFetchMessageHeadersResult([Self.serverInfo(serverCopy)])
+        }
+        if keepsRow { await provider.setAppendToSentResult(false) }
         await TestProviderRegistry.withRegisteredProvider(accountId: Self.account, provider: provider) {
             await AccountManager.shared.sendClaimedOutboxMessageForTesting(claimed, messageId: try! #require(claimed.sentMessageId))
         }
@@ -134,15 +183,16 @@ struct ChatSendingBubbleTests {
 
     // MARK: - 1, 2. The summary at Send
 
-    @Test("The summary made at Send is the queued email's own: its Sent copy shows it, no other email does")
-    func summaryAtSendIsTheEmailsOwn() async throws {
+    @Test("The summary made at Send is the queued email's own: its Sent copy shows it, whatever Message-ID the provider gave the copy, and keeps it with the email; no other email gets it",
+          arguments: CopyShape.allCases)
+    func summaryAtSendIsTheEmailsOwn(_ shape: CopyShape) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
         let restoreAISetting = AITestSetting.save()
         AITestSetting.set(aiOff: false)
         defer { restoreAISetting() }
         let fixture = try await Self.makeFixture(pool)
-        let row = try await Self.queueReply(fixture, draftId: "draft-own", holdsForUndo: false)
+        let row = try await Self.queueReply(fixture, draftId: "draft-own-\(shape.rawValue)", holdsForUndo: false)
         let messageId = try #require(row.sentMessageId, "the queued email has its Message-ID from the queue write")
         // Another email of the user's in Sent, not summarized: another device's, or an older one.
         let other = Self.header("sent-elsewhere", folder: "Sent", from: fixture.account.emailAddress,
@@ -161,24 +211,32 @@ struct ChatSendingBubbleTests {
         let first = try #require((object["messages"] as? [[String: Any]])?.first)
         #expect(first["is_sent_by_user"] as? Bool == true, "summarized as the user's own email")
 
-        let provider = try await Self.send(row, alsoListed: [other])
+        let provider = try await Self.send(row, alsoListed: [other], shape: shape)
         #expect(await provider.sentDrafts.first?.messageId == messageId, "the send uses the Message-ID of the queue write")
         let sent = try await Self.sentHeaders(pool)
-        let copy = try #require(sent.first { $0.rfc822MessageId == EmailFilter.normalizeMessageId(messageId) },
+        let copyMessageId = try Self.copyMessageId(of: row, shape)
+        let copy = try #require(sent.first { $0.rfc822MessageId == copyMessageId },
                                 "control: the Sent copy is there: \(sent.map(\.rfc822MessageId))")
         #expect(copy.summaryTextMessage == "I said Tuesday works.", "the sent email's first row shows the summary made at Send")
         #expect(sent.first { $0.id == other.id }?.summaryBlurb == nil, "another email never gets it")
+        // The summary lives with the email: a copy the sync stores again restores it by its own Message-ID.
+        let kept = try await pool.read { db in
+            try MessageAICache.cacheKey(accountId: Self.account, folderPath: "Sent", rfc822MessageId: copyMessageId)
+                .flatMap { try MessageAICache.fetchOne(db, key: $0) }?.summaryTextMessage
+        }
+        #expect(kept == "I said Tuesday works.", "the AI cache keeps the summary under the copy's own Message-ID")
     }
 
-    @Test("A Sent copy that arrives before the summary returns takes it when it does")
-    func lateSummaryReachesTheSentCopy() async throws {
+    @Test("A Sent copy that arrives before the summary returns takes it when it does, whatever Message-ID the provider gave the copy",
+          arguments: CopyShape.allCases)
+    func lateSummaryReachesTheSentCopy(_ shape: CopyShape) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
         let restoreAISetting = AITestSetting.save()
         AITestSetting.set(aiOff: false)
         defer { restoreAISetting() }
         let fixture = try await Self.makeFixture(pool)
-        let row = try await Self.queueReply(fixture, draftId: "draft-late", holdsForUndo: false)
+        let row = try await Self.queueReply(fixture, draftId: "draft-late-\(shape.rawValue)", holdsForUndo: false)
 
         // The backend holds its answer until the email has gone out and its Sent copy is in.
         let asked = DispatchSemaphore(value: 0)
@@ -198,8 +256,11 @@ struct ChatSendingBubbleTests {
         let wasAsked = await Task.detached { Self.waited(for: asked) }.value
         #expect(wasAsked, "control: the summary was asked at Send")
 
-        _ = try await Self.send(row)
+        _ = try await Self.send(row, shape: shape)
         #expect(try await Self.sentHeaders(pool).map(\.summaryBlurb) == [nil], "control: the copy arrived unsummarized")
+        let copyMessageId = try Self.copyMessageId(of: row, shape)
+        #expect(try await Self.sentHeaders(pool).map(\.rfc822MessageId) == [copyMessageId],
+                "control: the copy carries the Message-ID its provider gave it")
         answer.signal()
         await summarizing.value
         let final = try await Self.sentHeaders(pool)
@@ -341,6 +402,54 @@ struct ChatSendingBubbleTests {
         #expect(try await shown()[sent.id]?.filed == true, "its copy is in the database, not yet in the chat: the chat reloads")
         #expect(try await shown()[sending.id]?.filed == false, "control: an unsent reply is never filed")
         #expect(try await shown(chat.union([sentId]))[sent.id] == nil, "once the copy is one of the chat's emails, the bubble ends")
+    }
+
+    @Test("A sent reply's bubble hands over to the Sent copy the send wrote, whatever Message-ID the provider gave the copy: filed once the copy is in, ended once the copy is one of the chat's emails",
+          arguments: CopyShape.allCases)
+    func sentReplyHandsOverToItsCopy(_ shape: CopyShape) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let fixture = try await Self.makeFixture(pool)
+        let parentId = try #require(fixture.parent.rfc822MessageId)
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(parentId)]
+        let row = try await Self.queueReply(fixture, draftId: "draft-handover-\(shape.rawValue)", holdsForUndo: false)
+
+        _ = try await Self.send(row, shape: shape, keepsRow: true)
+        let copyMessageId = try Self.copyMessageId(of: row, shape)
+        let sent = try await Self.sentHeaders(pool)
+        #expect(sent.map(\.rfc822MessageId) == [copyMessageId], "control: the send wrote the copy as its provider keeps it")
+        let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+        #expect(bubbles.map(\.id) == [row.id], "control: the sent row waits for its cleanup and shows")
+        #expect(bubbles.first?.filed == true, "its Sent copy is in the database, not yet in the chat: the chat reloads")
+        let handedOver = try await pool.read { try ChatUnsentReply.fetch(answering: chat.union([copyMessageId]), db: $0) }
+        #expect(handedOver.isEmpty, "once the copy is one of the chat's emails, the bubble ends: the email shows once")
+    }
+
+    @Test("A new email's chat finds its email's Sent copy, whatever Message-ID the provider gave the copy, while the send's row waits and after the row is gone",
+          arguments: CopyShape.allCases)
+    func newEmailFollowFindsItsCopy(_ shape: CopyShape) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let fixture = try await Self.makeFixture(pool)
+        let draftId = "draft-new-email-\(shape.rawValue)"
+        let row = try await Self.queueNewEmail(fixture, draftId: draftId)
+
+        _ = try await Self.send(row, shape: shape, keepsRow: true)
+        let sent = try await Self.sentHeaders(pool)
+        let copyMessageId = try Self.copyMessageId(of: row, shape)
+        #expect(sent.map(\.rfc822MessageId) == [copyMessageId], "control: the send wrote the copy as its provider keeps it")
+        let copyId = try #require(sent.first?.id)
+        let waiting = try await pool.read { try ChatNewEmailSend.fetch(ChatNewEmailSend.Key(draftId: draftId), db: $0) }
+        #expect(waiting.reply != nil, "control: the sent row waits for its cleanup")
+        #expect(waiting.sentCopyId == copyId, "the chat becomes the sent email's thread")
+
+        // The send's cleanup removes the row; the chat keeps the email the row named.
+        _ = try await pool.write { try OutboxMessage.deleteOne($0, key: row.id) }
+        let cleaned = try await pool.read {
+            try ChatNewEmailSend.fetch(ChatNewEmailSend.Key(draftId: draftId, email: waiting.email), db: $0)
+        }
+        #expect(cleaned.reply == nil, "control: the row is gone")
+        #expect(cleaned.sentCopyId == copyId, "the chat still finds the sent email's copy")
     }
 
     // MARK: - 5. The gate of the summary at Send
