@@ -54,6 +54,8 @@ struct RootView: View {
     /// Set when an earlier significant update notice for this version never
     /// returned: the banner offers it instead of an unasked call (#1010).
     @State private var significantUpdateBannerVersion: String?
+    /// The one-time database upgrade (ADR-IOS-121): its banner and its screen.
+    @State private var databaseUpgrade = DatabaseUpgrade.shared
     @Environment(\.requestAgeRange) private var requestAgeRange
     /// Set while signing out after a failed age check: the person has just
     /// read why, so the generic "Signed Out" alert is not shown on top.
@@ -184,8 +186,14 @@ struct RootView: View {
                                 Task { await openSignificantUpdateNotice() }
                             }
                         }
+                        if databaseUpgrade.needsUpgrade {
+                            DatabaseUpgradeBanner {
+                                Task { await databaseUpgrade.openNotice() }
+                            }
+                        }
                         MailNavigationView(initialSelection: nil)
                     }
+                    .task { await databaseUpgrade.checkAfterLaunch() }
                 }
             } else if !navigationStore.isInitialLoadComplete {
                 // Still loading accounts from GRDB — show splash (not login)
@@ -280,8 +288,14 @@ struct RootView: View {
                         Task { await openSignificantUpdateNotice() }
                     }
                 }
+                if databaseUpgrade.needsUpgrade {
+                    DatabaseUpgradeBanner {
+                        Task { await databaseUpgrade.openNotice() }
+                    }
+                }
                 MailNavigationView()
             }
+            .task { await databaseUpgrade.checkAfterLaunch() }
         }
     }
 
@@ -454,6 +468,12 @@ struct RootView: View {
         // opens as unsaved).
         .fullScreenCover(item: $reopenSnapshot) { snapshot in
             UndoReopenCompose(snapshot: snapshot)
+        }
+        // The one-time database upgrade: its notice, then its progress and result
+        // (ADR-IOS-121). A full-screen cover cannot be swiped away: Later and
+        // Done close it, and nothing closes it while the upgrade runs.
+        .fullScreenCover(isPresented: $databaseUpgrade.isPresented) {
+            DatabaseUpgradeView(upgrade: databaseUpgrade)
         }
         // loadInitialData() is called eagerly in TabMailApp.init() (after DB creation)
         // so isInitialLoadComplete is already true before the first render.

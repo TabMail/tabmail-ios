@@ -45,6 +45,16 @@ during `AppDatabase.init`" describes the earlier design.
   on open. When its email later leaves the inbox in a process started after the nudge was posted, the
   observer has not seen that row (its map starts empty), so the nudge stays until the 24-hour sweep. The
   removed launch seed used to clear it.
+- The one-time `VACUUM` that switches the email database to `auto_vacuum = INCREMENTAL` (the upgrade the
+  user starts, ADR-IOS-121, #1450) empties the map once it commits (`InboxNotificationObserver.forgetInboxRows`,
+  called from `SyncEngine.switchEmailDatabaseToIncremental` inside the same write), because the map is keyed
+  by rowid and SQLite documents that a `VACUUM` may renumber the rowids of a table without an INTEGER PRIMARY
+  KEY (it keeps them on `messageHeader`, measured). The map is then as at a fresh launch: a row learned before
+  the switch that leaves the inbox after it keeps its banner until the app is opened or the 24-hour sweep. A
+  switch that fails, or is interrupted while it builds its copy, rolls back and leaves the map as it was (a
+  copy-back is not interrupted, memory 162: it commits, and the map is emptied then). The nightly `incremental_vacuum`
+  steps move pages, not rows, and leave it. Pinned by `IncrementalVacuumTests.theSwitchEmptiesTheInboxObserversMap`
+  and `aSuspensionRollsTheUpgradeBack`.
 
 **Supersedes in memory 078** (left unchanged there, its text is hash-pinned): the observer's "Startup
 populate via `WHERE isInInbox = 1` once during `AppDatabase.init`", and "Survives FG" for active

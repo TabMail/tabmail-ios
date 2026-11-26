@@ -53,6 +53,9 @@ struct SearchIndexOpenScanTests {
         "query_only", "schema_version", "user_version", "data_version", "application_id", "page_size",
         "wal_autocheckpoint", "table_info", "table_xinfo", "index_list", "index_info", "index_xinfo",
         "foreign_key_list",
+        // The file's size in pages, from its header: `DatabaseVacuum.setIncrementalOnNewFile` reads it on every
+        // writer open to tell a new file (ADR-IOS-121).
+        "page_count",
     ]
 
     /// Statement verbs whose plan says what they read.
@@ -270,6 +273,7 @@ struct SearchIndexOpenScanTests {
         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'messages\\_fts\\_%' ESCAPE '\\'",
         "PRAGMA table_info(message_meta)",
         "PRAGMA journal_mode = WAL",
+        "PRAGMA page_count",
         "BEGIN DEFERRED TRANSACTION",
         "RELEASE SAVEPOINT grdb",
         "CREATE INDEX IF NOT EXISTS idx_meta_headerId ON message_meta(headerId)",
