@@ -337,6 +337,77 @@ struct ChatSendingBubbleTests {
         await queue.setDispatchSuppressedForTesting(false)
     }
 
+    @Test("Through the real send, from a reply's Sending bubble to the sent email in the thread's chat, every frame shows the user's words, whatever Message-ID the provider gave the copy: the bubble stays until the chat shows the sent email, even once the send's cleanup has deleted its row",
+          arguments: CopyShape.allCases, 0..<3)
+    func sentReplyKeepsTheWordsOnScreen(_ shape: CopyShape, attempt: Int) async throws {
+        // Each attempt sends once: where the row's delete falls between two frames varies.
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation {
+            try await sentReplyKeepsTheWordsOnScreenBody(shape, attempt: attempt)
+        }
+    }
+
+    private func sentReplyKeepsTheWordsOnScreenBody(_ shape: CopyShape, attempt: Int) async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let fixture = try await Self.makeFixture(pool)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: fixture.parent.id) }
+            .environment(NavigationStore()))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func labels() -> [String] { HostedAccessibility.labels(in: controller.view) }
+        func count(_ words: String) -> Int { labels().filter { $0.contains(words) }.count }
+        func waitFor(_ done: () -> Bool) async throws {
+            for _ in 0..<80 where !done() { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        try await waitFor { count("Lunch plans") > 0 }
+
+        // The reply with its summary made, so its bubble and its email in the chat read the same words.
+        let row = try await Self.queueReply(fixture, draftId: "draft-frames", holdsForUndo: false)
+        let text = "I said Tuesday works."
+        let http = Self.summaryBackend(textMessage: text)
+        defer { http.close() }
+        await SentEmailSummary.summarize(
+            outboxId: row.id,
+            aiService: AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil }))
+        try await waitFor { count(text) == 1 && count("Sending") == 1 }
+        #expect(count(text) == 1 && count("Sending") == 1, "control: the reply's Sending bubble shows its summary: \(labels().prefix(20))")
+
+        let frames = OwnWordsFrames(view: controller.view)
+        frames.start()
+        _ = try await Self.send(row, shape: shape)
+        let rowGone = try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } == nil
+        #expect(rowGone, "control: the send's cleanup deleted the row")
+        try await waitFor { count("Sending") == 0 && count(text) == 1 }
+        try await Task.sleep(for: .milliseconds(300))
+        frames.stop()
+        print("[OwnWordsFrames] thread reply shape=\(shape.rawValue) attempt=\(attempt) \(frames.summary)")
+
+        #expect(count("Sending") == 0 && count(text) == 1, "control: the chat ends on the sent email: \(labels().prefix(20))")
+        let none = frames.frames.filter(OwnWordsFrames.showsNone).count
+        #expect(none == 0, "every frame shows the user's words; \(none) of \(frames.frames.count) show none: \(frames.summary)")
+        let apart = frames.frames.filter(OwnWordsFrames.showsTwoApart).count
+        #expect(apart == 0, "and never twice: \(frames.summary)")
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+    }
+
     // MARK: - 4. Which rows show
 
     @Test("Every reply to an email of the chat shows until the chat shows it, from any account: Sending, or Not sent once failed; a sent reply stays until its Sent copy is one of the chat's emails; a deleted or another chat's reply shows nothing")
