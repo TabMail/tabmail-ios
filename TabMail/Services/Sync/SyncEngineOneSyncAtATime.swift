@@ -270,6 +270,9 @@ extension SyncEngine {
                     let passed = waiting[firstChunk...].filter(\.isBackgroundChunk).count
                     BackgroundSyncLogger.logDebug("[SyncTurn] \(accountId.prefix(8)): \(caller) goes ahead of \(passed) waiting catch-up slice(s)")
                 }
+                #if DEBUG
+                syncTurnOvertakesForTesting += 1
+                #endif
                 waiting.insert(waiter, at: firstChunk)
             } else {
                 waiting.append(waiter)
@@ -353,9 +356,10 @@ extension SyncEngine {
     #endif
 
     /// Ends a pass: the first waiter in line takes the turn, or the account is
-    /// free. The first in line is the oldest waiter, except that a follow-up
-    /// joined the line ahead of the catch-up slices waiting (`waitForSyncTurn`,
-    /// #1360). *Superseded (#1360):* "the oldest waiter takes the turn".
+    /// free. The first in line is the oldest waiter, except that a follow-up or
+    /// the folder view's listing (`.aheadOfBackgroundChunks`) joined the line
+    /// ahead of the catch-up slices waiting (`waitForSyncTurn`, #1360).
+    /// *Superseded (#1360):* "the oldest waiter takes the turn".
     /// Once it is free with the flag still set, it asks for the follow-up stage 2
     /// again (`followUpPass`, which clears the flag when it takes the turn). A
     /// foreground flag's follow-up is usually already waiting, so the turn went

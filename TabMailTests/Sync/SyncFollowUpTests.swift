@@ -784,7 +784,9 @@ struct SyncFollowUpTests {
     /// account never runs two passes at once, and the flag is empty whenever all
     /// is quiet. Over the seeds, both trigger kinds find the account busy. Half
     /// the held work waits as catch-up slices, which the follow-up joins the
-    /// line ahead of (#1360): the invariants hold with the line reordered too.
+    /// line ahead of (#1360): the invariants hold with the line reordered too,
+    /// and over the seeds some follow-up does join ahead of a waiting slice
+    /// (`syncTurnOvertakesForTesting`).
     /// RED with a trigger that waits for its turn and counts its time limit from
     /// its arrival (#1289): one behind held work reaches its turn with no time
     /// left and reads nothing.
@@ -792,6 +794,7 @@ struct SyncFollowUpTests {
     func fuzzEveryTriggerGetsALaterRead() async throws {
         var asksSeen = 0
         var checkpoints = 0
+        var overtakes = 0
         let busyKinds = BusyKinds()
         for seed in Self.fuzzSeeds {
             try await O.withAppDB { pool in
@@ -868,10 +871,12 @@ struct SyncFollowUpTests {
                         "seed \(seed): a trigger got no change read that started after it (\(seen.triggers) triggers, \(seen.reads) reads)")
                 #expect(seen.overlaps.isEmpty, "seed \(seed): two passes of the account ran at once: \(seen.overlaps)")
                 #expect(!followUps.outcomes.contains("threw"), "seed \(seed): a follow-up stage 2 failed: \(followUps.outcomes)")
+                overtakes += await engine.syncTurnOvertakesForTesting
                 await engine.remove(accountId: Self.accountId)
             }
         }
         #expect(asksSeen > 0, "precondition: no seed made a trigger find the account busy")
+        #expect(overtakes > 0, "precondition: no seed had a follow-up join the line ahead of a waiting catch-up slice")
         let busy = busyKinds.snapshot
         #expect(busy["change read", default: 0] > 0 && busy["stage 2", default: 0] > 0,
                 "precondition: not every trigger kind found the account busy: \(busy)")

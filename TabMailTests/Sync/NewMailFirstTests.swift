@@ -18,10 +18,10 @@ import Testing
 /// The timing tests drive production code end to end on `FakeHTTP` with a real
 /// `GmailProvider` and a real `DatabasePool`. The background readers are
 /// real catch-up runs (`runCatchUpRun`), one slice each. Each trigger is fired
-/// through the engine call its production path makes:
-/// - push: `backgroundSyncOne(inboxOnly: true)`
-/// - IDLE: `backgroundSyncForAccount`
-/// - poll: `foregroundSyncOne`
+/// through the engine call its production path makes (`Trigger`):
+/// - push: `SyncEngine.backgroundDeltaSync(inboxOnly: true)`
+/// - IDLE: `SyncEngine.backgroundDeltaSync`
+/// - poll: `SyncEngine.syncOrFollowUp`
 /// The turn is above the provider boundary, so Gmail stands in for IDLE's IMAP
 /// account. A runner stands in for `SyncScheduler.runSyncFollowUp`
 /// (`SyncFollowUpTests.FollowUps`). The folder view's listing takes the same
@@ -99,8 +99,7 @@ struct NewMailFirstTests {
     /// marked as a background chunk, or the follow-up does not ask for its place
     /// ahead of them: the follow-up then queues behind both. RED if the
     /// follow-up went in before the last slice rather than the first: one slice
-    /// then reads first. Pinned for each trigger kind (r2: push, IDLE and the
-    /// poll each).
+    /// then reads first. Pinned for each trigger kind: push, IDLE and the poll.
     @Test("A new-mail trigger during a catch-up slice reads right after that slice, ahead of the other readers' slices already waiting",
           arguments: Trigger.allCases)
     func newMailReadsAheadOfQueuedSlices(trigger: Trigger) async throws {
@@ -258,6 +257,7 @@ struct NewMailFirstTests {
         SyncEngine.standaloneListingAfterLookupTestHook.withLock {
             $0 = { accountId in if accountId == Self.accountId { log.append("listing") } }
         }
+        defer { SyncEngine.standaloneListingAfterLookupTestHook.withLock { $0 = nil } }
         let hold = AsyncStream<Void>.makeStream()
         let slices = await Self.runningSliceAndTwoQueued(
             engine: engine, account: account, folderIds: (inbox.id, folders[0].id, folders[1].id),
@@ -277,7 +277,7 @@ struct NewMailFirstTests {
         await pull?.value
         let viewDone = await O.eventually { !view.isRefreshing && log.snapshot.contains("listing") }
         let entries = log.snapshot
-        SyncEngine.standaloneListingAfterLookupTestHook.withLock { $0 = nil }
+        // Inline, not in a defer: it is async. Nothing between its set and here throws.
         await engine.setCatchUpSliceStartHookForTesting(nil)
         // Also stops the access run the view started after its change read.
         await AccountManager.shared.disconnectProviderForTesting(accountId: Self.accountId)
@@ -405,8 +405,14 @@ struct NewMailFirstTests {
     /// The follow-up's place in the line: right before the first background
     /// chunk waiting, never ahead of a pass that is not a chunk and joined
     /// before it; a chunk that joins later queues behind it; with no chunk
-    /// waiting it joins the back. RED if the follow-up went to the front (it
-    /// passes the listing), or if a later chunk could pass it.
+    /// waiting it joins the back. A second pass at that place (the folder
+    /// view's listing) joins behind the follow-up, still ahead of the first
+    /// waiting chunk. RED if the follow-up went to the front (it passes the
+    /// listing), if a later chunk could pass it, if it went in after the last
+    /// pass that is not a chunk rather than before the first chunk (the wider
+    /// reorder the owner ruled out on 2026-11-26: "slice 1" and "listing 2"
+    /// would then run before it), or if the second pass at that place went in
+    /// ahead of the first.
     @Test("The follow-up goes in before the first waiting slice only: earlier passes stay ahead, later slices queue behind",
           arguments: [true, false])
     func followUpTakesItsPlaceBeforeTheFirstWaitingSlice(sliceWaiting: Bool) async {
@@ -421,7 +427,9 @@ struct NewMailFirstTests {
         typealias Arrival = (name: String, place: SyncTurnPlace)
         var arrivals: [Arrival] = [(name: "listing", place: SyncTurnPlace.arrivalOrder)]
         if sliceWaiting { arrivals.append((name: "slice 1", place: SyncTurnPlace.backgroundChunk)) }
+        arrivals.append((name: "listing 2", place: SyncTurnPlace.arrivalOrder))
         arrivals.append((name: "follow-up", place: SyncTurnPlace.aheadOfBackgroundChunks))
+        arrivals.append((name: "folder-view listing", place: SyncTurnPlace.aheadOfBackgroundChunks))
         arrivals.append((name: "slice 2", place: SyncTurnPlace.backgroundChunk))
         for (index, arrival) in arrivals.enumerated() {
             passes.append(Self.pass(engine, arrival.name, place: arrival.place, log: log))
@@ -432,8 +440,8 @@ struct NewMailFirstTests {
         hold.continuation.finish()
         for pass in passes { await pass.value }
         let expected = sliceWaiting
-            ? ["running", "listing", "follow-up", "slice 1", "slice 2"]
-            : ["running", "listing", "follow-up", "slice 2"]
+            ? ["running", "listing", "follow-up", "folder-view listing", "slice 1", "listing 2", "slice 2"]
+            : ["running", "listing", "listing 2", "follow-up", "folder-view listing", "slice 2"]
         #expect(log.snapshot == expected, "the passes took the turn in the wrong order: \(log.snapshot)")
     }
 }

@@ -431,13 +431,20 @@ and then for every other reader's slice already in line.
    whether opening a folder should too: items 6 and 7.)*
 6. **The follow-up's place stays where item 1 puts it (owner, 2026-11-26).** It goes right before the first
    waiting catch-up slice, and so passes whatever queued behind that slice (a listing, `sync(account:)`, a
-   Settings pass), which waits one more quick check. Work that queued before the first waiting slice stays
-   ahead of it. No wider reorder.
+   Settings pass). That work then also waits for the follow-up's stage 2: usually one change read, and
+   also the full sync when it is due (`foregroundPass`: every `fullSyncInterval`, about 15 min, or when the
+   change read needs a listing). The stage 2 has no outer time limit; its deadline
+   (`SyncConfig.perAccountSyncTimeoutSeconds`, 60 s) bounds its quick sync and the full sync's
+   deadline-bounded steps. Work that queued before the first waiting slice stays ahead of it. No wider
+   reorder. *Corrected 2026-11-26:* the text first said the passed work "waits one more quick check",
+   which holds only when no full sync is due.
 7. **The folder view's listing takes the follow-up's place (owner, 2026-11-26): pulling to refresh the
    folders on screen, and opening a folder, so neither waits behind the background readers' slices.**
    Both run the view's one sync (`InboxViewModel.startSync` and `refreshSync` -> `performSync` ->
    `AccountManager.syncFolders`, its only caller), which lists each folder with
-   `SyncEngine.syncFolderMessages(place: .aheadOfBackgroundChunks)` -> `oneSyncAtATime(place:)`. Each
+   `SyncEngine.syncFolderMessages(place: .aheadOfBackgroundChunks)` -> `oneSyncAtATime(place:)`.
+   `startSync` runs on every appearance of the folder view (`InboxView.onAppear`): opening a folder, going
+   back to it from a message, and the first view at launch. Each
    folder's listing asks for its place when it starts, so only the running work, and a follow-up or
    listing that took that place before it, are ahead of it. The view's change read is unchanged (a
    trigger: it takes a free turn or sets the flag), and so is the access run it starts after it (its
@@ -448,6 +455,10 @@ and then for every other reader's slice already in line.
 **Cost:** one bool per waiter and one scan of the waiting line when a follow-up or the folder view's
 listing joins it (a handful of waiters at most). Nothing on the startup, resume, push or IDLE paths changes; a
 debug-gated `[SyncTurn] … <caller> goes ahead of N waiting catch-up slice(s)` line records each overtake.
+Waiting slices, and the work queued behind them, no longer have a first-in-first-out bound: every follow-up
+and folder-view listing that joins while they wait passes them, so a steady stream of triggers (or of
+folder-view appearances) holds them until it pauses. No sync timing promise covers the catch-up or those
+listings.
 *Superseded (item 7):* "when a follow-up joins it" and the log text "follow-up goes ahead of N waiting
 catch-up slice(s)".
 **Rejected:** a priority queue or a second line for new mail (a new layer); the follow-up taking or flagging
@@ -462,11 +473,14 @@ during a running catch-up slice, with two other readers' slices in line, reads r
 slice and ahead of both, which then run in their order) and
 `followUpTakesItsPlaceBeforeTheFirstWaitingSlice` (a listing that joined before the first waiting slice
 stays ahead of the follow-up; a slice that joins after it queues behind it; with no slice waiting it joins
-the back). `folderViewListsAheadOfQueuedSlices` (item 7, for opening a folder and for pulling to refresh
+the back; a listing that joined behind the first waiting slice stays behind the follow-up, which pins item 6
+against the wider reorder; a second waiter at the follow-up's place joins behind it, ahead of the slices).
+`folderViewListsAheadOfQueuedSlices` (item 7, for opening a folder and for pulling to refresh
 it, each through its `InboxViewModel` entry point: during a running catch-up slice, with two other
 readers' slices in line, the folder is listed right after the running slice and ahead of both) and
 `otherListingsKeepTheirPlace` (item 7: any other single-folder listing, `syncFolderMessages` with its
 default place, waits behind both). `SyncFollowUpTests.fuzzEveryTriggerGetsALaterRead` now runs half its held work as catch-up
 slices, so its invariants (every trigger gets a later read, passes never overlap, the flag ends empty) hold
-with the follow-up overtaking them. `OneSyncAtATimeTests.waitingPassesRunOneAtATimeInArrivalOrder` still
+with the follow-up overtaking them, and checks over the seeds that some follow-up did join ahead of a
+waiting slice (a debug-only counter, `syncTurnOvertakesForTesting`). `OneSyncAtATimeTests.waitingPassesRunOneAtATimeInArrivalOrder` still
 pins arrival order for every other pass.

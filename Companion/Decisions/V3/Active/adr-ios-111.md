@@ -1358,7 +1358,10 @@ on the re-drive.
      listed. When that read finds the account busy (it sets the account's follow-up flag and reads
      nothing, #1289), the run starts all the same and waits for the turn; it may take the turn before
      the follow-up stage 2, and an Outlook folder the follow-up has yet to baseline is then not listed by
-     this run (decision 5) but by the ordinary catch-up once it is baselined;
+     this run (decision 5) but by the ordinary catch-up once it is baselined. *(Amended 2026-11-26,
+     #1360, ADR-IOS-104: the run's slices wait as catch-up slices, behind the follow-up once that is in
+     line; the run takes the turn before the follow-up only when the turn frees before the follow-up
+     has joined.)*;
    - a drained move, archive or delete: its source and its destination (`AccountOperationExecutor.finishDrain`,
      `DrainContext.foldersAccessed`);
    - opening a message, from a folder, a search result, or a chat or AI answer alike

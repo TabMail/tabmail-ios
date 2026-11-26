@@ -92,9 +92,16 @@ actor SyncEngine {
 
     /// The accounts with a sync pass running, and for each the passes waiting
     /// their turn, in turn order (`oneSyncAtATime`): oldest first, except a
-    /// follow-up, which stands ahead of the catch-up slices waiting (#1360).
+    /// follow-up or the folder view's listing (`.aheadOfBackgroundChunks`),
+    /// which stands ahead of the catch-up slices waiting (#1360).
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
+    #if DEBUG
+    /// Test harness only: how many waiters went in ahead of a waiting catch-up
+    /// slice (`waitForSyncTurn`), so a fuzz can check that its seeds reordered
+    /// the line at all (#1360).
+    var syncTurnOvertakesForTesting = 0
+    #endif
     /// For each account whose turn is held, where the pass holding it was
     /// started (`caller:line`), so a pass that waited names in the debug log
     /// what it waited behind (`[SyncTurnWait]`). Read by nothing else. A label
