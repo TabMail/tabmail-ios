@@ -59,6 +59,9 @@ extension ChatViewConfig {
 struct ChatThreadView: View {
     @State var viewModel: MessageDetailViewModel
     let highlightsOpenedMessage: Bool
+    /// The header of a thread another screen hosts (`ChatThreadOpened`): that screen's own toolbar
+    /// item shows it, and this view keeps its people and takes its tap. Nil: this view's own item.
+    let hostedHeader: ChatThreadHeader?
 
     @State private var context = ChatThreadContext()
     /// Emails that were unread when they first showed here; marked read as they show.
@@ -176,24 +179,36 @@ struct ChatThreadView: View {
             messageId: messageId, expectedRfc822MessageId: expectedRfc822MessageId,
             expectedObservedUidValidity: expectedObservedUidValidity))
         self.highlightsOpenedMessage = highlightsOpenedMessage
+        self.hostedHeader = nil
     }
 
-    /// A thread read before it shows (`ChatThreadOpened`): its first frame has the email, its
-    /// header and the user's own emails on the user's side. Its own load and context reads go on
-    /// as for any open.
+    /// A thread read before it shows (`ChatThreadOpened`): its first frame has the email and the
+    /// user's own emails on the user's side, and the screen hosting it shows its header from the
+    /// same frame. Its own load and context reads go on as for any open.
     init(opened: ChatThreadOpened) {
         self._viewModel = State(initialValue: opened.viewModel)
         self._context = State(initialValue: opened.context)
         self.highlightsOpenedMessage = false
+        self.hostedHeader = opened.header
     }
 
     // MARK: - Members
 
-    private var members: [MessageHeader] {
+    private var members: [MessageHeader] { Self.members(of: viewModel) }
+
+    /// The opened email and the thread's other emails read so far.
+    static func members(of viewModel: MessageDetailViewModel) -> [MessageHeader] {
         (viewModel.message.map { [$0] } ?? []) + viewModel.threadMessages
     }
 
     private var thread: ChatThread {
+        Self.thread(members: members, context: context, unreadAtOpen: unreadAtOpen, preferredId: viewModel.message?.id)
+    }
+
+    /// The chat of `members`, with `context` telling the user's own emails and folders apart.
+    static func thread(
+        members: [MessageHeader], context: ChatThreadContext, unreadAtOpen: Set<String>, preferredId: String?
+    ) -> ChatThread {
         let accounts = context.accounts
         return ChatThread(
             members: members,
@@ -205,7 +220,7 @@ struct ChatThreadView: View {
             draftFolderIds: context.draftFolderIds,
             sentFolderIds: context.sentFolderIds,
             unreadAtOpen: unreadAtOpen,
-            preferredId: viewModel.message?.id)
+            preferredId: preferredId)
     }
 
     /// Changes whenever a bubble's content can change: a member arrives or leaves, its text
@@ -297,12 +312,13 @@ struct ChatThreadView: View {
         }
         .toolbar {
             // Who the reply goes to, in the navigation bar as in Messages: the avatars level with
-            // Back, the names under them.
-            ToolbarItem(placement: .principal) {
-                if viewModel.message != nil {
-                    ChatHeaderView(thread: thread) {
-                        guard TutorialCoordinator.shared.admits(.other) else { return }
-                        showsReplyTo = true
+            // Back, the names under them. A hosted thread's header is its host's own item, there
+            // for the host's whole life, so the bar never loses its header when the host becomes
+            // this thread: a new item comes into the bar some commits after the content.
+            if hostedHeader == nil {
+                ToolbarItem(placement: .principal) {
+                    if viewModel.message != nil {
+                        ChatHeaderView(thread: thread) { openReplyTo() }
                     }
                 }
             }
@@ -321,6 +337,15 @@ struct ChatThreadView: View {
             }
         }
         .onChange(of: viewModel.hasLoadedThread) { _, _ in scrollOnceLoaded() }
+        // A hosted header shows this thread's people, and its names open who the reply goes to.
+        .onChange(of: thread.replyPeople, initial: true) { _, people in
+            if let hostedHeader, hostedHeader.people != people { hostedHeader.people = people }
+        }
+        .onChange(of: hostedHeader?.asksReplyTo == true) { _, asks in
+            guard asks else { return }
+            hostedHeader?.asksReplyTo = false
+            openReplyTo()
+        }
         // Part 3 of the tutorial: the email reference opened this chat at Jordan's email.
         .task(id: viewModel.message?.id) {
             guard let opened = viewModel.message else { return }
@@ -790,6 +815,12 @@ struct ChatThreadView: View {
                 viewModel.markReadIfNeeded(member)
             }
         }
+    }
+
+    /// The header's names: who the reply goes to. The tutorial's mail actions are off.
+    private func openReplyTo() {
+        guard TutorialCoordinator.shared.admits(.other) else { return }
+        showsReplyTo = true
     }
 
     /// The first scroll, once the thread and its extras are in: to the opened email when it came

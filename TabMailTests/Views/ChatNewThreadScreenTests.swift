@@ -564,6 +564,36 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("On the sent email's thread, the chat's header is the thread's: its names change who gets the reply and open Reply to")
+    func threadHeaderOpensReplyTo() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.namesHint(screen) == ChatHeaderView.newEmailHint, "control: the new email's header")
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let copy = Self.sentFolderHeader("screen-sent-copy-names", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    try await fixture.pool.write { try copy.insert($0) }
+                    try await Self.waitUntil { Self.isThread(screen) && Self.namesHint(screen) == ChatHeaderView.replyHint }
+                    #expect(Self.isThread(screen), "control: the chat is the sent email's thread")
+                    #expect(Self.namesHint(screen) == ChatHeaderView.replyHint, "the header is the thread's")
+
+                    #expect(HostedAccessibility.activate(ChatHeaderView.namesId, in: screen.view), "the names take a tap")
+                    try await Self.waitUntil { Self.presentedLabels(screen).contains(ChatReplyToSheet.replyToTitle) }
+                    #expect(Self.presentedLabels(screen).contains(ChatReplyToSheet.replyToTitle),
+                            "Reply to opens: \(Self.presentedLabels(screen).prefix(12))")
+                    let ids = Self.topPresented(screen).map { HostedAccessibility.identifiers(in: $0.view) } ?? []
+                    #expect(ids.contains(ChatReplyToSheet.personId), "with the reply's people: \(ids.prefix(12))")
+                    #expect(!Self.presentedLabels(screen).contains(ChatReplyToSheet.addRecipientTitle), "not the new email's Add recipient")
+                    Self.topPresented(screen)?.dismiss(animated: false)
+                    try await Self.waitUntil { Self.topPresented(screen) == nil }
+                }
+            }
+        }
+    }
+
     @Test("From the Sending bubble to the sent email's thread, every frame shows the email: the new email with its Sending bubble, then the whole thread with its header, its field and the email on the user's side, never a thread still loading or still reading who the user is",
           arguments: [true, false], 0..<3)
     func sentCopyTurnsIntoTheThreadWithNoBlink(copyHasItsBody: Bool, attempt: Int) async throws {
@@ -1453,6 +1483,11 @@ struct ChatNewThreadScreenTests {
     /// The header's button: "Add recipient" or the names.
     private static func names(in view: UIView) -> NSObject? {
         HostedAccessibility.elements(under: view).first { HostedAccessibility.identifier(of: $0) == ChatHeaderView.namesId }
+    }
+
+    /// What the header's names do, as VoiceOver says it: the new email's or a thread's.
+    private static func namesHint(_ screen: Screen) -> String? {
+        names(in: screen.view)?.accessibilityHint
     }
 
     /// The field's words, nil while there is no editable field.

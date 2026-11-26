@@ -1767,7 +1767,12 @@ struct ChatReplyFieldTests {
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
         #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
-        #expect(Self.count("ChatHeaderView(thread: thread) { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
+        // The names open who the reply goes to, from the thread's own header or, for a thread a
+        // new email's chat hosts, from the chat's header (`ChatThreadHeader.asksReplyTo`).
+        #expect(Self.count("ChatHeaderView(thread: thread) { openReplyTo() }", in: chat) == 1)
+        #expect(Self.count("private func openReplyTo() { guard TutorialCoordinator.shared.admits(.other) else { return } showsReplyTo = true }", in: chat) == 1)
+        #expect(Self.count("guard asks else { return } hostedHeader?.asksReplyTo = false openReplyTo() }", in: chat) == 1)
+        #expect(Self.count("showsReplyTo = true", in: chat) == 1, "nothing else opens it")
         #expect(Self.count("Button { guard TutorialCoordinator.shared.admits(.other) else { return } forwardMessage = thread.newest }", in: chat) == 1)
         #expect(Self.count(".fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }", in: chat) == 1)
         #expect(Self.count(".onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }", in: chat) == 1,

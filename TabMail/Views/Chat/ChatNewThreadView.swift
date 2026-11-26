@@ -137,6 +137,20 @@ struct ChatNewThreadView: View {
                 .accessibilityLabel("Back")
                 .accessibilityIdentifier(Self.backId)
             }
+            // Who the email goes to, then, once the chat is the sent email's thread, who its reply
+            // goes to: one item for the screen's whole life, so the bar keeps a header through the
+            // swap. Each branch bringing its own item, the new email's left with it and the
+            // thread's came into the bar some commits after the thread's content.
+            ToolbarItem(placement: .principal) {
+                if let thread {
+                    if thread.viewModel.message != nil {
+                        ChatHeaderView(people: thread.header.people) { thread.header.asksReplyTo = true }
+                    }
+                } else {
+                    ChatHeaderView(people: model.people, emptyTitle: ChatReplyToSheet.addRecipientTitle,
+                                   hint: ChatHeaderView.newEmailHint) { showsAddRecipient = true }
+                }
+            }
         }
         .undoOutcomesPresented(by: modalId)
         // Followed only until the chat is the sent email's thread, by either swap: then its read of
@@ -187,12 +201,6 @@ struct ChatNewThreadView: View {
         .dismissKeyboardOnTap()
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                ChatHeaderView(people: model.people, emptyTitle: ChatReplyToSheet.addRecipientTitle,
-                               hint: ChatHeaderView.newEmailHint) { showsAddRecipient = true }
-            }
-        }
         .safeAreaBar(edge: .top, spacing: 0) { ChatNewEmailSubjectLine(subject: model.carried.shownSubject) }
         .safeAreaBar(edge: .bottom, spacing: 0) { bottomBar }
         // The user's addresses are captured as the body runs, so the body depends on them and runs
