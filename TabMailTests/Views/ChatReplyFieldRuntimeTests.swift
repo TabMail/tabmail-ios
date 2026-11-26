@@ -14,8 +14,8 @@ import UIKit
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The mounted field holds only the user's words: the AI Suggestion never enters it (it waits
 ///     as a ghost bubble in the chat), not on open, not when it arrives late, not in the open
-///     sheet, not after a completion. Under the empty field the "e.g." line shows its change; a
-///     tap puts the change in the field and sends nothing. Words the user typed are never
+///     sheet, not after a completion. Under the empty field the "alt: " line shows the AI
+///     Suggestion's alternative reply; a tap puts it in the field and sends nothing. Words the user typed are never
 ///     replaced. The two completions are private to `ChatThreadView`, so which ones empty the
 ///     field is read from the source (`clearWiring`).
 ///  2. A send names the pill's email as the send starts: after the newest email changes, the next
@@ -24,7 +24,7 @@ import UIKit
 ///     debug logging is off, in every failure branch: the words can quote the email, and a resend
 ///     or rewind replays them. The gate is in
 ///     `BackgroundSyncLogger.logChatError`, so it covers every caller.
-///  4. The pill wires 2 into every send. The field's Send and the "e.g." line are pressed for real,
+///  4. The pill wires 2 into every send. The field's Send and the "alt: " line are pressed for real,
 ///     through accessibility (`HostedAccessibility`), where they ask the agent nothing (an empty
 ///     field, the line). The agent route sends to the live backend client, which has no test seam,
 ///     so a press there would reach the backend: its wiring is read from the source.
@@ -54,8 +54,8 @@ struct ChatReplyFieldRuntimeTests {
         var working = false
         /// Signed in: the open sheet shows its input bar, not the sign-in bar.
         var signedIn = false
-        /// The "e.g." line's change.
-        var example: String? = "politely decline"
+        /// The "alt: " line's alternative reply.
+        var alternative: String? = "No rush, reply whenever you can"
         /// Words the field sent to the agent (`onFieldSend`).
         var fieldSends: [String] = []
         init(_ message: MessageHeader) { self.message = message }
@@ -66,7 +66,7 @@ struct ChatReplyFieldRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
-                replyField: ChatReplyField(example: host.example),
+                replyField: ChatReplyField(alternative: host.alternative),
                 onFieldSend: { host.fieldSends.append($0) })
             .environment(\.hasTabMailSession, host.signedIn)
         }
@@ -140,31 +140,34 @@ struct ChatReplyFieldRuntimeTests {
         return view.subviews.contains { type(words, in: $0) }
     }
 
-    @Test("The e.g. line shows under the empty field; a tap puts its change in the field and never sends it")
-    func exampleLinePutsTheChange() async throws {
+    @Test("The alt line shows under the empty field; a tap puts its reply in the field and never sends it; with no alternative there is no line")
+    func alternativeLinePutsTheReply() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted line")
-        try await HostedAccessibility.withAutomation { try await exampleLinePutsTheChangeBody() }
+        try await HostedAccessibility.withAutomation { try await alternativeLinePutsTheReplyBody() }
     }
 
-    private func exampleLinePutsTheChangeBody() async throws {
-        try await withMountedField(Self.header("field-eg", ready: "A ready reply")) { host, controller in
+    private func alternativeLinePutsTheReplyBody() async throws {
+        let alternative = "No rush, reply whenever you can"
+        try await withMountedField(Self.header("field-alt", ready: "A ready reply")) { host, controller in
             host.signedIn = true
             try await Self.settle()
-            #expect(HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.exampleLineId),
+            #expect(HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.alternativeLineId),
                     "the empty field shows the line: \(HostedAccessibility.identifiers(in: controller.view))")
-            #expect(HostedAccessibility.activate(DynamicIslandChat.exampleLineId, in: controller.view), "the line takes a tap")
+            #expect(HostedAccessibility.labels(in: controller.view).contains("alt: \(alternative)"),
+                    "it reads alt: and the reply: \(HostedAccessibility.labels(in: controller.view))")
+            #expect(HostedAccessibility.activate(DynamicIslandChat.alternativeLineId, in: controller.view), "the line takes a tap")
             try await Self.settle()
-            #expect(Self.fieldTexts(controller.view).contains("politely decline"), "the change is in the field: \(Self.fieldTexts(controller.view))")
+            #expect(Self.fieldTexts(controller.view).contains(alternative), "the reply is in the field: \(Self.fieldTexts(controller.view))")
             #expect(host.fieldSends.isEmpty, "nothing was sent")
             #expect(!host.working && !host.expanded, "the agent was not asked, and no sheet opened")
-            #expect(!HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.exampleLineId),
+            #expect(!HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.alternativeLineId),
                     "with words in the field the line goes")
         }
-        try await withMountedField(Self.header("field-eg-none")) { host, controller in
+        try await withMountedField(Self.header("field-alt-none")) { host, controller in
             host.signedIn = true
-            host.example = nil
+            host.alternative = nil
             try await Self.settle()
-            #expect(!HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.exampleLineId), "no change, no line")
+            #expect(!HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.alternativeLineId), "no alternative, no line")
             _ = HostedAccessibility.activate("chatSend", in: controller.view)
             try await Self.settle()
             #expect(host.fieldSends.isEmpty, "an empty field sends nothing")
@@ -370,7 +373,7 @@ struct ChatReplyFieldRuntimeTests {
         return String(rest[..<(rest.range(of: "private func ")?.lowerBound ?? rest.endIndex)])
     }
 
-    /// The reply field writes the email (`composeFromField`); only the open panel talks to the
+    /// The reply field writes the email (`ChatFieldCompose`); only the open panel talks to the
     /// agent. So no send to the agent, its retry, re-send, rewind and resume included, carries the
     /// field's request or its words: a grep of the send finds no field path into it.
     @Test("No send to the agent carries the reply field: its retry, re-send, rewind and resume name no field request or words")

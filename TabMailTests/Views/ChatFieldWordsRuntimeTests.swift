@@ -30,8 +30,8 @@ import UIKit
 ///  8. Words typed in a chat pushed inside a sheet, as Search opens chats, survive the sheet's
 ///     dismissal, by its own dismiss and by a UIKit programmatic teardown, and are in the field
 ///     when the chat opens again, in this run and the next.
-///  9. The closed field's Send is the reply's compose edit (ADR-IOS-114 decision 10, amended
-///     2026-11-25), and its card transitions the words of the chat it was SENT from: an earlier
+///  9. The closed field's Send writes the reply that says the user's words (ADR-IOS-114 decision
+///     10, amended 2026-11-26), and its card transitions the words of the chat it was SENT from: an earlier
 ///     compose's card, sent after the pill moved to another chat, leaves that chat's unsent words
 ///     in the field, in storage and in a new run; a card sent after the chat was torn down still
 ///     empties the words sent, so they never return on reopen; newer words typed while the reply
@@ -67,12 +67,10 @@ struct ChatFieldWordsRuntimeTests {
     struct PillView: View {
         @Bindable var host: Host
         let replyField: Bool
-        /// The AI Suggestion the reply field shows (`ChatReplyField.suggestion`); nil: none.
-        var suggestion: ReplyResult? = nil
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded,
-                replyField: replyField ? ChatReplyField(example: nil, suggestion: suggestion) : nil,
+                replyField: replyField ? ChatReplyField(alternative: nil) : nil,
                 // The field's pill stands for the chat view, which takes no card here: the closed
                 // field's compose card waits on the app's router, where the test ends it
                 // (`finishFieldCompose`).
@@ -117,7 +115,7 @@ struct ChatFieldWordsRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: message, isExpanded: $expanded,
-                replyField: ChatReplyField(example: nil))
+                replyField: ChatReplyField(alternative: nil))
         }
     }
 
@@ -176,25 +174,8 @@ struct ChatFieldWordsRuntimeTests {
             ChatPillState.shared.removeAllSessions()
             ChatFieldWords.shared = ChatFieldWords()
         }
-        try await withReplyTool(on: pool) { try await body(pool) }
+        try await body(pool)
         await ChatFieldWords.shared.written()
-    }
-
-    /// Runs `body` with the registry's reply tool, which the closed field's Send composes through,
-    /// reading `pool` (the registry's tools keep the database they were made with), and puts the
-    /// registry's own back after.
-    static func withReplyTool(on pool: DatabasePool, _ body: @MainActor () async throws -> Void) async throws {
-        let registry = ToolRegistry.shared
-        await registry.ensureDefaultToolsRegistered()
-        let registered = await registry.tool(named: EmailReplyTool.registeredName)
-        await registry.register(EmailReplyTool(context: ToolContext(db: pool, translator: ChatIdTranslator.shared)))
-        do {
-            try await body()
-        } catch {
-            if let registered { await registry.register(registered) }
-            throw error
-        }
-        if let registered { await registry.register(registered) }
     }
 
     /// Ends the closed field's compose: its own card, queued on the app's router (no screen here
@@ -512,8 +493,8 @@ struct ChatFieldWordsRuntimeTests {
 
     // MARK: - 9. A field compose's card lands on the chat it was sent from
 
-    /// The closed field's Send is the reply's compose edit (ADR-IOS-114 decision 10, amended
-    /// 2026-11-25); its card's Send completes the words on the chat it was sent from
+    /// The closed field's Send writes the reply that says the user's words (ADR-IOS-114 decision
+    /// 10, amended 2026-11-26); its card's Send completes the words on the chat it was sent from
     /// (`ToolInvocation.fieldWordsKey`, ADR-IOS-117).
     @Test("An earlier field compose's card, sent after the pill moved to another chat, never touches that chat's unsent words")
     func olderRequestNeverClearsAnotherChatsWords() async throws {
@@ -541,33 +522,32 @@ struct ChatFieldWordsRuntimeTests {
         ChatFieldWords.shared.apply(.put(wordsB), to: keyB)
         await ChatFieldWords.shared.written()
         let backend = ThreadChatTests.Backend(holdAnswers: true)
-        try await Self.withReplyTool(on: pool) {
-            try await ThreadChatTests.withBackend(backend, chatView: true) {
-                let host = Host(first)
-                let pill = try await Self.mount(PillView(host: host, replyField: true))
-                defer { pill.close() }
-                // A's words go out from the closed field as its reply's compose edit; they stay, pulsing.
-                try await ThreadChatTests.ask("Tell them Friday works", in: pill.view, backend: backend, answered: false)
-                let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
-                #expect(asked, "control: A's compose edit reached the backend")
-                // The pill moves to B while A's compose runs.
-                try ThreadChatTests.insert(newer, pool: pool)
-                host.message = newer
-                try await Self.settle()
-                #expect(Self.fieldTexts(pill.view).contains(wordsB), "control: the field shows B's words: \(Self.fieldTexts(pill.view))")
+        try await ThreadChatTests.withBackend(backend, chatView: true) {
+            let host = Host(first)
+            let pill = try await Self.mount(PillView(host: host, replyField: true))
+            defer { pill.close() }
+            // A's words go out from the closed field as the user's message; the reply that says
+            // them is written while they stay in the field.
+            try await ThreadChatTests.ask("Tell them Friday works", in: pill.view, backend: backend, answered: false)
+            let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
+            #expect(asked, "control: A's field compose reached the backend")
+            // The pill moves to B while A's compose runs.
+            try ThreadChatTests.insert(newer, pool: pool)
+            host.message = newer
+            try await Self.settle()
+            #expect(Self.fieldTexts(pill.view).contains(wordsB), "control: the field shows B's words: \(Self.fieldTexts(pill.view))")
 
-                // A's compose returns; its card opens and goes out.
-                backend.proceed.signal()
-                try await Self.finishFieldCompose(.sent)
-                #expect(ChatFieldWords.shared.fill(for: keyB).words == wordsB, "A's card left B's words")
-                try await Task.sleep(for: .milliseconds(600))
-                #expect(backend.bodies.count == 1, "control: one compose edit, no agent turn: \(backend.bodies.count)")
-                #expect(Self.fieldTexts(pill.view).contains(wordsB), "B's field still holds B's words: \(Self.fieldTexts(pill.view))")
-                #expect(ChatFieldWords.shared.fill(for: keyA).words.isEmpty, "A's sent words finished: its card's Send emptied them")
-                await ChatFieldWords.shared.written()
-                let stored = try Self.stored(pool)
-                #expect(stored == [keyB: wordsB], "only B's words are kept: \(stored)")
-            }
+            // A's compose returns; its card opens and goes out.
+            backend.proceed.signal()
+            try await Self.finishFieldCompose(.sent)
+            #expect(ChatFieldWords.shared.fill(for: keyB).words == wordsB, "A's card left B's words")
+            try await Task.sleep(for: .milliseconds(600))
+            #expect(backend.bodies.count == 1, "control: one field compose, no agent turn: \(backend.bodies.count)")
+            #expect(Self.fieldTexts(pill.view).contains(wordsB), "B's field still holds B's words: \(Self.fieldTexts(pill.view))")
+            #expect(ChatFieldWords.shared.fill(for: keyA).words.isEmpty, "A's sent words finished: its card's Send emptied them")
+            await ChatFieldWords.shared.written()
+            let stored = try Self.stored(pool)
+            #expect(stored == [keyB: wordsB], "only B's words are kept: \(stored)")
         }
         // A fresh store, as the next app run: B's words come back, A's sent words do not.
         await Self.newRun { PrioritizedDatabase(pool: pool) }
@@ -611,7 +591,7 @@ struct ChatFieldWordsRuntimeTests {
                 defer { if !closed { pill.close() } }
                 try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
                 let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
-                #expect(asked, "control: the compose edit reached the backend")
+                #expect(asked, "control: the field compose reached the backend")
                 #expect(ChatFieldWords.shared.fill(for: key).words == sent, "control: the sent words stay while it works")
                 switch end {
                 case .sent:
@@ -759,7 +739,7 @@ struct ChatFieldWordsRuntimeTests {
                     let sent = "Reply that Friday works"
                     try await ThreadChatTests.ask(sent, in: pill.view, backend: backend, answered: false)
                     let asked = await Task.detached { ThreadChatTests.waited(for: backend.asked) }.value
-                    #expect(asked, "control: the compose edit reached the backend")
+                    #expect(asked, "control: the field compose reached the backend")
                     backend.proceed.signal()
                     try await Self.finishFieldCompose(.sent)
                     try await Self.settle()

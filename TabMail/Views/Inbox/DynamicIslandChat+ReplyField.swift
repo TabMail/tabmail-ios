@@ -7,9 +7,10 @@ import SwiftUI
 /// The chat's reply field (`ChatReplyField`): today's Chat pill on the chat's newest email.
 extension DynamicIslandChat {
     /// The chat view's reply field (`ChatReplyField`): [mic] [field] [Send] on the newest email.
-    /// Empty, the field shows its hint and, under it, the "e.g." line (`ChatReplyField.example`);
-    /// while the agent works, the words pulse, and the screen shows what it is doing in a line above
-    /// the field (`ChatFieldStatusLine`).
+    /// Empty, the field shows its hint and, under it, the "alt: " line while there is one
+    /// (`ChatReplyField.alternative`); while its Send's email is written, the words are up in the
+    /// chat as the user's bubble, the field shows only its hint, and the screen shows what is
+    /// happening in a line above the field (`ChatFieldStatusLine`).
     /// In the tutorial the field is read-only and sends nothing: its words go to the people, and
     /// the tutorial's requests to TabMail are made in the panel. At part 2's drag-up step it says
     /// so (`tutorialDragHint`), and its drag up, or VoiceOver's "Show TabMail chat", opens the panel.
@@ -43,9 +44,9 @@ extension DynamicIslandChat {
         } text: {
             if let attach = field.paperclip {
                 // The paperclip sits at the field's end on Send's row: bottom-aligned with the
-                // words and the "e.g." line as the row aligns Send, so it stays level with Send
+                // words and the "alt: " line as the row aligns Send, so it stays level with Send
                 // whether or not that line shows. It stays in its place in every state; while
-                // the agent works on a Send it is dimmed and not tappable.
+                // a Send's email is written it is dimmed and not tappable.
                 HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
                     fieldText(field)
                     ChatPaperclipButton(attach: attach)
@@ -66,45 +67,46 @@ extension DynamicIslandChat {
         .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))
     }
 
-    /// The agent works on a Send from the field: its words pulse in the field.
+    /// A Send from the field is being written: its words are up as the user's bubble.
     private var sentWorking: Bool {
-        isWorking && fieldSentText != nil
+        isWorking && fieldSending
     }
 
-    /// The field's text: the sent words pulsing while the agent works on them, else the input with
-    /// the "e.g." line under it.
+    /// The field's text: while a Send's email is written, only the field's hint (the words are the
+    /// user's bubble in the chat, and they come back here if the send ends with nothing sent); else
+    /// the input with the "alt: " line under it.
     private func fieldText(_ field: ChatReplyField) -> some View {
         VStack(alignment: .leading, spacing: 2) {
-            if isWorking, let sent = fieldSentText {
-                Text(sent)
-                    .lineLimit(1...6)
+            if sentWorking {
+                Text(ChatReplyField.writePlaceholder)
+                    .foregroundStyle(Theme.textSecondary)
+                    .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .opacity(fieldPulse ? ChatViewLayout.fieldPulseOpacity : 1)
-                    // The drag stays on while the agent works: so does its VoiceOver action.
+                    // The drag stays on while the email is written: so does its VoiceOver action.
                     .showChatAction(field.showChat, isExpanded: isExpanded)
             } else {
                 replyInput(field)
-                if showsExample, let example = field.example {
-                    exampleLine(example)
+                if showsAlternative, let alternative = field.alternative {
+                    alternativeLine(alternative)
                 }
             }
         }
     }
 
     private func replyInput(_ field: ChatReplyField) -> some View {
-        inputField(placeholder: hasTabMailSession ? field.placeholder : "Sign in to reply",
+        inputField(placeholder: hasTabMailSession ? ChatReplyField.writePlaceholder : "Sign in to reply",
                    showChat: field.showChat, focus: .replyField)
     }
 
-    /// The "e.g." line shows under the empty field, signed in, while nothing is being said.
-    private var showsExample: Bool {
+    /// The "alt: " line shows under the empty field, signed in, while nothing is being said.
+    private var showsAlternative: Bool {
         hasTabMailSession && inputText.isEmpty && !isDictating
     }
 
-    /// The "e.g." line: a tap puts its change in the field, ready to send or edit; it never sends.
-    private func exampleLine(_ example: String) -> some View {
-        Button { putExample(example) } label: {
-            Text(ChatSuggestionConfig.exampleLine(example))
+    /// The "alt: " line: a tap puts its reply in the field, ready to send or edit; it never sends.
+    private func alternativeLine(_ alternative: String) -> some View {
+        Button { putAlternative(alternative) } label: {
+            Text(ChatSuggestionConfig.alternativeLine(alternative))
                 .font(.caption)
                 .foregroundStyle(Theme.textSecondary)
                 .lineLimit(1)
@@ -113,11 +115,11 @@ extension DynamicIslandChat {
         }
         .buttonStyle(.plain)
         .accessibilityHint("Puts it in the field")
-        .accessibilityIdentifier(Self.exampleLineId)
+        .accessibilityIdentifier(Self.alternativeLineId)
     }
 
-    /// The "e.g." line, as tests find it.
-    static let exampleLineId = "chatExampleLine"
+    /// The "alt: " line, as tests find it.
+    static let alternativeLineId = "chatAlternativeLine"
 }
 
 /// What the agent is doing about a Send from the chat's field ("Thinking...", its own reports), from

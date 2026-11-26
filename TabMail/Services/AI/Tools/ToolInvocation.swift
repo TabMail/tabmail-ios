@@ -20,10 +20,10 @@ struct ToolInvocation: Sendable {
     let uiSink: (any AgentUISink)?
     /// Invoking session key, for logging/correlation only.
     let sessionKey: String?
-    /// Set when the request was sent from the chat's reply field: the email the field replies to
-    /// and who the user chose in Reply to, as they were when it was sent (ADR-IOS-114 decision 11).
-    /// The agent's reply to that email carries it (`ComposeRequest.fieldReply`); nil for every
-    /// other request.
+    /// Set when the chat view's closed field sent the request: the email the field replies to and
+    /// who the user chose in Reply to, as they were when it was sent (ADR-IOS-114 decision 11).
+    /// The field's reply carries it (`ChatFieldCompose.reply`, `ComposeRequest.fieldReply`); nil
+    /// for every other request, the agent's included.
     let fieldReply: ChatFieldReply?
     /// The chat that sent the request, where a compose card the turn asks for opens (ADR-IOS-053
     /// Phase 2): only a screen of that kind showing that chat takes the request. Nil when no screen
@@ -34,23 +34,23 @@ struct ToolInvocation: Sendable {
     /// the field (a compose card opening, its reply going out) land on this key in
     /// `ChatFieldWords`, never on whichever chat a pill shows by then (ADR-IOS-117).
     let fieldWordsKey: String?
-    /// Set when the chat view's closed reply field sent the request: the text version of the email
-    /// written goes into the AI Suggestion's bubble, and the call returns once it has been there
-    /// long enough to read (`ChatThreadView.landFieldWritten`). The reply tool calls it just before
-    /// it opens the compose card (ADR-IOS-114 decision 10, amended 2026-11-25).
-    let landWritten: (@MainActor @Sendable (String) async -> Void)?
+    /// Set when the chat view's closed field sent the request: its email is written, so the user's
+    /// own bubble stops pulsing, and the call returns once it has stayed up long enough to read
+    /// (`ChatThreadView.fieldMessageWritten`). The field's compose calls it just before it opens the
+    /// compose card (ADR-IOS-114 decision 10, amended 2026-11-26).
+    let fieldWritten: (@MainActor @Sendable () async -> Void)?
 
     init(
         uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, fieldReply: ChatFieldReply? = nil,
         composeOrigin: ComposeOrigin? = nil, fieldWordsKey: String? = nil,
-        landWritten: (@MainActor @Sendable (String) async -> Void)? = nil
+        fieldWritten: (@MainActor @Sendable () async -> Void)? = nil
     ) {
         self.uiSink = uiSink
         self.sessionKey = sessionKey
         self.fieldReply = fieldReply
         self.composeOrigin = composeOrigin
         self.fieldWordsKey = fieldWordsKey
-        self.landWritten = landWritten
+        self.fieldWritten = fieldWritten
     }
 
     /// The no-UI invocation used by every non-interactive completion caller and

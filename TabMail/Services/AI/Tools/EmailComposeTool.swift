@@ -112,43 +112,6 @@ struct EmailComposeTool: AgentTool, Sendable {
         return outcome.describeForLLM
     }
 
-    /// Send in a new email's closed field (ADR-IOS-114 decision 10, amended 2026-11-25): the
-    /// words, typed or said, are the request of the new email's compose edit (mode `edit_new`, as
-    /// Thunderbird's `runComposeEdit` writes a new email) to `to`, the people picked in the chat,
-    /// and never reach the agent. The compose card opens with the email written and its text
-    /// version (`ComposeRequest.suggestion`), where the chat that asked opens it
-    /// (`invocation.composeOrigin`). A compose edit that fails, or writes no email (only an
-    /// answer), opens nothing: a card without the user's words is not what was asked.
-    func composeFromField(_ words: String, to: [String], invocation: ToolInvocation) async -> EmailReplyTool.Written {
-        guard let origin = invocation.composeOrigin else { return .failed(ComposeOrigin.noScreenReason) }
-        let result: InlineEditResult
-        do {
-            result = try await Self.runComposeEdit(
-                to: to, cc: [], subject: nil, body: nil, request: words, mode: "edit_new", db: ctx.db, composeEdit: composeEdit)
-        } catch {
-            return .failed("the email could not be written; nothing was done")
-        }
-        guard let body = result.body else { return .failed("the email could not be written; nothing was done") }
-        let written = ReplyResult(body: body, textMessage: result.textMessage, changeCommand: result.changeCommand)
-        let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
-            AgentToolRouter.ComposeRequest(
-                mode: .compose, replyTo: nil, to: to, cc: [], bcc: [], subject: result.subject, body: body,
-                origin: origin, suggestion: written, onOutcome: onOutcome, outcomeState: state)
-        }
-        return .card(outcome)
-    }
-
-    /// `composeFromField` on the compose tool the agent runs (the registry's), so the field's
-    /// compose and the agent's new emails read one database through one compose edit.
-    static func composeWithRegisteredTool(_ words: String, to: [String], invocation: ToolInvocation) async -> EmailReplyTool.Written {
-        let registry = ToolRegistry.shared
-        await registry.ensureDefaultToolsRegistered()
-        guard let tool = await registry.tool(named: registeredName) as? EmailComposeTool else {
-            return .failed("the email writer is not available; nothing was done")
-        }
-        return await tool.composeFromField(words, to: to, invocation: invocation)
-    }
-
     // MARK: - Compose Edit (TB Parity)
 
     /// Shared compose edit flow matching TB's `runComposeEdit()`.

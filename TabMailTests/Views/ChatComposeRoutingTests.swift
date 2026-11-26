@@ -20,9 +20,10 @@ import UIKit
 ///     whose own cards are Reply All, never takes the chat's request.
 ///  2. A request whose chat is not showing opens nothing on the screen under it, and opens as asked
 ///     when the chat shows again, once: closing the chat and showing it again opens no second card.
-///  3. With the TabMail panel closed, the field's words are the reply's compose edit, never a turn
-///     for the agent (ADR-IOS-114 decision 10, amended 2026-11-25): no chat request, no bubble, the
-///     card carries the email written with its text version, and the sheet stays closed after it.
+///  3. With the TabMail panel closed, the field's words are the user's own message, written into
+///     the reply's email, never a turn for the agent (ADR-IOS-114 decision 10, amended 2026-11-26):
+///     no chat request, no agent bubble, the card carries the email written with the words as its
+///     text version, and the sheet stays closed after it.
 ///     A compose that fails opens nothing and leaves the words in the field.
 ///  4. A screen's pill takes its requests only while the screen is on screen: the inbox's request
 ///     waits while the chat is pushed over the inbox (whose pill stays mounted under it), and opens
@@ -47,7 +48,7 @@ import UIKit
 ///
 /// Each case mounts the real screens in a window: a NavigationStack with the inbox (or the email
 /// screen) at its root and the chat pushed over it, both mounted as in the app (case 5 mounts the
-/// root screen alone). The requests go to a fake backend that answers the field's compose edit with
+/// root screen alone). The requests go to a fake backend that answers the field's compose with
 /// a written email, and asks a chat turn for `email_reply` on the email the request names, answering
 /// "Done" once the tool has returned. The user picks who gets the
 /// reply in Reply to and taps the field's Send (or the open pill's Send) for real; the reply's
@@ -115,12 +116,12 @@ struct ChatComposeRoutingTests {
         case email
     }
 
-    /// The fake backend: the compose edit a closed field's Send runs (`system_prompt_compose_interactive`)
+    /// The fake backend: the compose a closed field's Send runs (`system_prompt_compose_text`)
     /// is answered with `composed`; a chat request with no saved state asks for `email_reply` on the
     /// email it names (unless `asksForReply` is false), or on the email set with `reply(to:)` for a
     /// request that names none (the inbox's chat), or for `email_compose` of a new email with
     /// `asksForNewEmail`; one carrying the tool's result is answered "Done". With `failsFirst`, the
-    /// first `failures` requests fail that way. The compose edit writes `composedSubject` as the
+    /// first `failures` requests fail that way. The field's compose writes `composedSubject` as the
     /// subject, as a new email's does (a reply's keeps its own).
     final class Backend: @unchecked Sendable {
         let http = FakeHTTP.Scenario()
@@ -131,10 +132,10 @@ struct ChatComposeRoutingTests {
         private let record = Record()
 
         static let newEmailTo = "sam@example.com"
-        /// The email the compose edit writes, with its text version and change command.
+        /// The email the field's compose writes, with its text version and alternative.
         static let composed = ReplyResult(
             body: "Hi,\n\nFriday works for us.\n\nMe", textMessage: "Friday works for us.", changeCommand: "suggest Monday")
-        static let composeEditPrompt = "system_prompt_compose_interactive"
+        static let fieldComposePrompt = "system_prompt_compose_text"
 
         init(asksForReply: Bool = true, asksForNewEmail: Bool = false,
              failsFirst: ChatReplyRecoveryTests.Failure? = nil, failures: Int = 1, composedSubject: String = "") {
@@ -151,7 +152,7 @@ struct ChatComposeRoutingTests {
                     }
                 }
                 let final: [String: Any]
-                if body.contains(Backend.composeEditPrompt) {
+                if body.contains(Backend.fieldComposePrompt) {
                     final = ["assistant": ComposeEditJSON.make(
                         response: "Done.", subject: composedSubject, body: Backend.composed.body,
                         textMessage: Backend.composed.textMessage ?? "", changeCommand: Backend.composed.changeCommand ?? "")]
@@ -186,8 +187,8 @@ struct ChatComposeRoutingTests {
         }
 
         var bodies: [String] { record.bodies.withLock { $0 } }
-        /// The requests that were chat turns for the agent, not the field's compose edit.
-        var chatTurns: [String] { bodies.filter { !$0.contains(Backend.composeEditPrompt) } }
+        /// The requests that were chat turns for the agent, not the field's compose.
+        var chatTurns: [String] { bodies.filter { !$0.contains(Backend.fieldComposePrompt) } }
 
         /// The email, by its number in the chat, a request that names none asks to reply to.
         func reply(to number: Int) {
@@ -457,7 +458,7 @@ struct ChatComposeRoutingTests {
         ThreadChatTests.type(words, in: view)
     }
 
-    /// Asks for a reply in the field (its compose edit) or in the open pill's input (the agent), its
+    /// Asks for a reply in the field (its compose) or in the open pill's input (the agent), its
     /// card held behind a compose already on screen, and returns the request as it was queued.
     private static func askHeld(in screens: Screens, backend: Backend) async throws -> AgentToolRouter.ComposeRequest {
         let router = AgentToolRouter.shared
@@ -633,16 +634,19 @@ struct ChatComposeRoutingTests {
                 let asked = ComposeOrigin(sessionKey: screens.threadKey, screen: .chat, fromAccountId: Self.account)
                 #expect(request.origin == asked,
                         "the field's request names the chat view that asked, and the account its new emails are sent from: \(request.origin)")
-                // The panel is closed, so the words are the reply's compose edit and never a turn
-                // for the agent: no chat request, no bubble of them in the chat.
+                // The panel is closed, so the words are written into the reply and never a turn
+                // for the agent: no chat request, no agent bubble of them in the chat.
                 #expect(backend.chatTurns.isEmpty, "the closed field asks the agent nothing: \(backend.chatTurns.map { $0.suffix(300) })")
                 #expect(backend.bodies.count == 1 && backend.bodies[0].contains("Tell them Friday works"),
-                        "one compose edit, its request the field's words: \(backend.bodies.map { $0.suffix(300) })")
+                        "one compose, its request the field's words: \(backend.bodies.map { $0.suffix(300) })")
                 let bubbles = ChatPillState.shared.session(for: screens.threadKey).chatMessages.filter { $0.role == .user }
                 #expect(bubbles.isEmpty, "no chat bubble of the words: \(bubbles.map(\.content))")
-                // The card carries the email the compose wrote, with its text version and change command.
-                #expect(request.suggestion == Backend.composed,
-                        "the card is the composition, its text version with it: \(String(describing: request.suggestion))")
+                // The card carries the email the compose wrote, the user's words as its text
+                // version, and the alternative the compose offered.
+                let written = ReplyResult(body: Backend.composed.body, textMessage: "Tell them Friday works",
+                                          changeCommand: Backend.composed.changeCommand)
+                #expect(request.suggestion == written,
+                        "the card is the email written, the words its text version: \(String(describing: request.suggestion))")
 
                 router.composePresentationDidEnd()
                 let card = try await Self.openedCard(in: screens)
@@ -715,7 +719,7 @@ struct ChatComposeRoutingTests {
                 // The card closes and the field's send ends, with nothing asked of the agent.
                 try await Self.closeCard(in: screens)
                 try await Self.waitUntil { !ActiveAgentTracker.shared.anyWorking }
-                #expect(backend.bodies.count == 1, "control: the compose edit was the only request: \(backend.bodies.count)")
+                #expect(backend.bodies.count == 1, "control: the field's compose was the only request: \(backend.bodies.count)")
 
                 // The chat closes and shows again, then opens a card of its own: the first card it
                 // opens is that one, so the reply it already opened was not waiting to open again.
@@ -776,7 +780,7 @@ struct ChatComposeRoutingTests {
                 try await Self.waitUntil { backend.bodies.count == 1 && !ActiveAgentTracker.shared.anyWorking }
                 try await Task.sleep(for: .milliseconds(500))
                 #expect(backend.bodies.count == 1 && backend.chatTurns.isEmpty,
-                        "one compose edit, which failed, and no turn for the agent: \(backend.bodies.map { $0.suffix(200) })")
+                        "one compose, which failed, and no turn for the agent: \(backend.bodies.map { $0.suffix(200) })")
                 #expect(router.composeQueueDepth == 0 && screens.presented.isEmpty, "no card opens without the words written")
                 let fill = ChatFieldWords.shared.fill(for: ChatFieldWords.key(for: screens.email))
                 #expect(fill.words == words && fill.unsent == words, "the words are the user's again: \(fill)")
@@ -804,11 +808,11 @@ struct ChatComposeRoutingTests {
                 try await Self.waitUntil { router.composeQueueDepth == 0 && !ActiveAgentTracker.shared.anyWorking }
                 #expect(!router.recentlySentCompose.isRecentlySent(sent), "the field's Send records nothing for a later ask to be refused by")
 
-                // At once, the user sends from the field again: a new compose edit, and its card.
+                // At once, the user sends from the field again: a new compose, and its card.
                 let second = try await Self.askHeld(in: screens, backend: backend)
                 #expect(second.isFieldsOwnReply && second.replyTo?.id == screens.email.id, "the second Send asks for its own card")
                 #expect(backend.bodies.count == 2 && backend.chatTurns.isEmpty,
-                        "two compose edits, no turn for the agent: \(backend.bodies.map { $0.suffix(200) })")
+                        "two composes, no turn for the agent: \(backend.bodies.map { $0.suffix(200) })")
                 router.composePresentationDidEnd()
                 router.composePresentationDidEnd()
                 let card = try await Self.openedCard(in: screens)

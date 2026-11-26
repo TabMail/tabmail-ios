@@ -103,9 +103,6 @@ enum ChatViewLayout {
     /// The jump-to-bottom button shows once the bottom is this far below the screen.
     static let jumpButtonThreshold: CGFloat = 240
     static let jumpButtonSize: CGFloat = 40
-    /// The reply field's words pulse to this opacity while TabMail writes, as compose does.
-    static let fieldPulseOpacity: Double = 0.35
-    static let fieldPulseDuration: Double = 0.8
     /// Chat and bubble swipes: each revealed button's width and its round button.
     static let swipeButtonWidth: CGFloat = 76
     static let swipeCircleSize: CGFloat = 44
@@ -244,19 +241,11 @@ enum ChatSuggestionConfig {
     static let label = "AI Suggestion"
     /// The line under the ghost.
     static let statusLine = "\(label) · Tap to use"
-    /// What a reply request typed or said in the field does while the AI Suggestion shows: it is
-    /// a compose edit of the suggestion (`EmailReplyTool`), and the compose card then opens with
-    /// the edited email either way. True: the edit also replaces the stored suggestion first, so
-    /// a card closed unsent leaves the ghost showing the edit; false: the stored suggestion stays
-    /// as it was. The one place this choice is made (amended 2026-11-25: before, true opened no
-    /// card).
-    static let fieldEditRewritesInPlace = true
     /// The line under the working bubble while the suggestion is written.
     static let writingLine = "\(label) · Writing"
-    /// How long the email the closed field's Send wrote stays in the AI Suggestion's bubble, once
-    /// it has landed there, before its compose card opens, so it can be read
-    /// (`ChatThreadView.landFieldWritten`). Under Reduce Motion the text lands at once and only
-    /// this hold remains.
+    /// How long the user's own message stays up once the email that says it is written, still
+    /// and no longer pulsing, before its compose card opens, so it can be read
+    /// (`ChatThreadView.fieldMessageWritten`).
     static let writtenHold: Double = 0.5
     /// The working bubble growing into the ghost, the re-pin scroll in the same transaction.
     static let fillDuration: Double = 0.3
@@ -267,8 +256,9 @@ enum ChatSuggestionConfig {
     /// closed (`ChatHeldGhost`): its spring. Under Reduce Motion the bubble replaces it at once.
     static let sentMorphResponse: Double = 0.45
     static let sentMorphDamping: Double = 0.85
-    /// The working bubble's dots: each pulses between this opacity and full over the period, the
-    /// next one this much later.
+    /// The working bubble's dots, and the user's own message while its email is written
+    /// (`ChatFieldMessageBubble`): each pulses between this opacity and full over the period, the
+    /// next dot this much later.
     static let dotDimOpacity: Double = 0.3
     static let dotPulsePeriod: Double = 1.2
     static let dotStagger: Double = 0.2
@@ -276,40 +266,8 @@ enum ChatSuggestionConfig {
     static let dotSpacing: CGFloat = 4
     /// The dots' frame cap, as the app's other AI indicators (`aiWorkingShimmer`).
     static let dotFrameInterval: Double = 1.0 / 30
-    /// Changes a reply can ask for, shown one at a time as the field's "e.g." line, picked again
-    /// each time a chat opens. Content changes only: the text version is already short, so no
-    /// style tweaks ("make it shorter").
-    static let replyExamples = [
-        "politely decline",
-        "say I'm happy to",
-        "say yes and suggest Tuesday",
-        "ask them to resend the file",
-        "thank them and say I'll reply by Friday",
-        "say I'm out until Monday",
-        "ask for one more week",
-        "say I'll call them tomorrow",
-        "agree and ask what is next",
-        "ask who else should join",
-    ]
 
-    /// What a new email's field can ask for (`ChatNewEmailField`), shown the same way: a new email
-    /// has nothing to reply to, so each is an email to write.
-    static let newEmailExamples = [
-        "ask for the Q2 numbers",
-        "invite them to lunch on Friday",
-        "thank them for yesterday's meeting",
-        "ask when they are free next week",
-        "send them the slides from today",
-        "ask how the launch went",
-        "remind them about Thursday's review",
-        "introduce yourself and ask for a call",
-    ]
-
-    /// One example from `examples`, at random; nil for an empty set.
-    static func randomExample(from examples: [String] = replyExamples) -> String? {
-        examples.randomElement()
-    }
-
-    /// The field's second line for `example`.
-    static func exampleLine(_ example: String) -> String { "e.g. \(example)" }
+    /// The field's second line for the other reply that came with the AI Suggestion
+    /// (`ChatReplyField.alternative`).
+    static func alternativeLine(_ alternative: String) -> String { "alt: \(alternative)" }
 }

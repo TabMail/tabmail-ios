@@ -100,13 +100,11 @@ struct ChatThreadView: View {
     /// The ghost tapped open, or the email the field's Send wrote, held in its place while its
     /// card is up (`ChatHeldGhost`).
     @State private var heldGhost: ChatHeldGhost?
-    /// The AI Suggestion's bubble while the closed field's Send writes the email
-    /// (`ChatFieldWriting`): from Send until its card is taken or the send ends.
-    @State private var fieldWriting: ChatFieldWriting?
+    /// The user's own message the closed field's Send put up (`ChatFieldMessage`): from Send until
+    /// its card is taken or the send ends.
+    @State private var fieldMessage: ChatFieldMessage?
     /// The held ghost turning into the sent reply's bubble.
     @Namespace private var sentMorph
-    /// The field's "e.g." example, picked once as the chat opens.
-    @State private var example = ChatSuggestionConfig.randomExample()
     @State private var agentCompose: AgentToolRouter.ComposeRequest?
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
@@ -281,10 +279,11 @@ struct ChatThreadView: View {
         .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
         // A held ghost whose card sent waits for the reply to show, then turns into its bubble.
         .onChange(of: sentReplyShows) { _, _ in endHeldGhostIfDone() }
-        // The field's send ended (nothing written, Stop, or its card done): the bubble is the
-        // chat's own AI Suggestion again.
+        // The field's send ended (nothing written, Stop, or its card done): the user's bubble goes
+        // (its words are back in the field unless the email went out), and the row is the chat's own
+        // AI Suggestion again.
         .onChange(of: chatWorking) { _, working in
-            if !working { fieldWriting = nil }
+            if !working { fieldMessage = nil }
         }
         .toolbar {
             // Who the reply goes to, in the navigation bar as in Messages: the avatars level with
@@ -457,22 +456,23 @@ struct ChatThreadView: View {
                             }
                         }
                         // The AI Suggestion, where the reply lands once sent: the working bubble
-                        // while it is written, then the ghost; the ghost tapped open, or the email
-                        // the field wrote, stays while its card is up.
+                        // while it is written, then the ghost; the ghost tapped open, or the user's
+                        // own message the field sent, stays while its card is up.
                         if let held = heldGhost {
-                            ChatSuggestionBubble(text: held.text) {}
-                                .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)
-                                .transition(.opacity)
-                        } else if let writing = fieldWriting {
-                            // The field's Send writing the email: the suggestion shown pulses in
-                            // its place (none: the working bubble), and the email written lands in it.
-                            if let text = writing.text {
-                                ChatSuggestionBubble(text: text, writing: writing.pulses) {}
-                                    .transition(.opacity)
-                            } else {
-                                ChatSuggestionWorkingBubble()
-                                    .transition(.opacity)
+                            Group {
+                                if held.isMessage {
+                                    ChatFieldMessageBubble(text: held.text, pulses: false)
+                                } else {
+                                    ChatSuggestionBubble(text: held.text) {}
+                                }
                             }
+                            .matchedGeometryEffect(id: Self.heldGhostMorphId, in: sentMorph)
+                            .transition(.opacity)
+                        } else if let message = fieldMessage {
+                            // The field's Send: the user's own message, up at once in the AI
+                            // Suggestion's place, pulsing while its email is written.
+                            ChatFieldMessageBubble(text: message.text, pulses: message.pulses)
+                                .transition(.opacity)
                         } else if let newest = thread.newest, let suggestion {
                             if !suggestionGrowPending, case .ready(let text) = suggestion {
                                 let move = tutorialMove(thread)
@@ -544,10 +544,10 @@ struct ChatThreadView: View {
                 .onChange(of: suggestion, initial: true) { old, new in
                     showSuggestion(new, from: old, proxy: proxy)
                 }
-                // The email the field wrote landing in the bubble grows the row as the fill does:
-                // the re-pin runs with the same animation, so the row stays above the field.
-                .onChange(of: fieldWriting?.written) { _, written in
-                    guard written != nil, let target = scrollTarget else { return }
+                // The user's own message going up in the AI Suggestion's place changes the row's
+                // height: the re-pin runs with the fill's animation, so the row stays above the field.
+                .onChange(of: fieldMessage?.text) { _, text in
+                    guard text != nil, let target = scrollTarget else { return }
                     withAnimation(reduceMotion ? nil : .easeInOut(duration: ChatSuggestionConfig.fillDuration)) {
                         proxy.scrollTo(target.id, anchor: target.anchor)
                     }
@@ -1119,7 +1119,7 @@ struct ChatThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    example: ChatReplyField.example(shown: shown, configured: example),
+                    alternative: ChatReplyField.alternative(shown: shown),
                     onlyTo: replyTarget.only,
                     tutorialMove: move,
                     tutorialPanelCard: tutorialPanelCard(thread),
@@ -1127,11 +1127,10 @@ struct ChatThreadView: View {
                     // The drag's VoiceOver equivalent (decision 12: every chat swipe has a named
                     // action), on the text field VoiceOver focuses; not over the panel.
                     showChat: opensPanel ? { withAnimation(Self.pillSpring) { chatExpanded = true } } : nil,
-                    suggestion: shown,
                     // A closure, as `showChat`'s: the method itself is MainActor-isolated.
                     attach: knowsAudience ? { attachFromField($0) } : nil),
-                onFieldSend: { _ in fieldSent(shown: shown) },
-                onFieldWritten: { await landFieldWritten($0) },
+                onFieldSend: { fieldSent($0) },
+                onFieldWritten: { await fieldMessageWritten() },
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,
                 composeHostCovered: isAnyPresentation)
@@ -1282,54 +1281,47 @@ struct ChatThreadView: View {
     }
 
     /// A compose card this chat's agent asked for, taken by this chat's pill (ADR-IOS-053 Phase 2),
-    /// never one another screen asked for. The reply the reply field asked for
-    /// (`ComposeRequest.isFieldsOwnReply`, any copy of its email, in any account): the agent's
-    /// closing words open nothing. Who the card goes to travels with the request (`fieldReply`);
-    /// this chat's own state decides nothing.
+    /// never one another screen asked for. The reply the closed field's Send wrote
+    /// (`ComposeRequest.isFieldsOwnReply`): no closing words open anything after it. Who the card
+    /// goes to travels with the request (`fieldReply`); this chat's own state decides nothing.
     private func openAgentCompose(_ req: AgentToolRouter.ComposeRequest) {
         // A new email opens from the account bound when its turn started, looked up in the app's
         // accounts as the card is taken; when it is not there the request ends and nothing opens.
         guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return }
         fieldComposeOpened = req.isFieldsOwnReply
-        // The field's own reply: the email written, landed in the AI Suggestion's bubble, is held
-        // there while its card is up, as a tapped ghost is, and turns into the reply once sent.
-        if req.isFieldsOwnReply, let writing = fieldWriting {
+        // The field's own reply: the user's own message is held in its place while its card is
+        // up, as a tapped ghost is, and turns into the reply once sent.
+        if req.isFieldsOwnReply, let message = fieldMessage {
             if DebugModeManager.isLoggingEnabled() {
-                BackgroundSyncLogger.logDebug("[Chat] field card opens landed=\(writing.written != nil)")
+                BackgroundSyncLogger.logDebug("[Chat] field card opens written=\(message.written)")
             }
-            heldGhost = writing.written.map {
-                ChatHeldGhost(text: $0, showsBubble: composeScreen(answering: req.replyTo) == .chat)
-            }
-            fieldWriting = nil
+            heldGhost = ChatHeldGhost(
+                text: message.text, isMessage: true, showsBubble: composeScreen(answering: req.replyTo) == .chat)
+            fieldMessage = nil
         }
         agentCompose = req
     }
 
-    /// The closed field's Send: the AI Suggestion's bubble shows the email being written, the
-    /// suggestion shown (`shown`) pulsing in its place, or the working bubble (`ChatFieldWriting`).
-    private func fieldSent(shown: ReplyResult?) {
+    /// The closed field's Send: the words go up at once, verbatim, as the user's own bubble in the
+    /// AI Suggestion's place (`ChatFieldMessage`), pulsing while the email that says them is written.
+    private func fieldSent(_ text: String) {
         fieldComposeOpened = false
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Chat] field send writes, suggestionShown=\(shown?.textMessage != nil)")
+            BackgroundSyncLogger.logDebug("[Chat] field send: message up len=\(text.count)")
         }
-        fieldWriting = ChatFieldWriting(shown: shown?.textMessage)
+        fieldMessage = ChatFieldMessage(text: text)
     }
 
-    /// The email the closed field's Send wrote lands in the AI Suggestion's bubble, and stays
-    /// there `ChatSuggestionConfig.writtenHold` to be read; the reply tool awaits this before its
-    /// compose card opens (`ToolInvocation.landWritten`). It lands with the fill's animation (at
-    /// once under Reduce Motion). Stop ends the hold early, and no card opens; an edit already
-    /// stored in place stays the AI Suggestion, as when its card is closed unsent.
-    private func landFieldWritten(_ text: String) async {
-        guard fieldWriting != nil else { return }
+    /// The email the closed field's Send wrote is ready: the user's bubble stops pulsing and stays
+    /// `ChatSuggestionConfig.writtenHold` to be read; the field's compose awaits this before its
+    /// card opens (`ToolInvocation.fieldWritten`). Stop ends the hold early, and no card opens.
+    private func fieldMessageWritten() async {
+        guard fieldMessage != nil else { return }
         if DebugModeManager.isLoggingEnabled() {
-            BackgroundSyncLogger.logDebug("[Chat] field email lands len=\(text.count) hadSuggestion=\(fieldWriting?.shown != nil)")
+            BackgroundSyncLogger.logDebug("[Chat] field email written; the message holds before its card")
         }
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: ChatSuggestionConfig.fillDuration)) {
-            fieldWriting?.written = text
-        }
-        let landing = reduceMotion ? 0 : ChatSuggestionConfig.fillDuration
-        try? await Task.sleep(for: .seconds(landing + ChatSuggestionConfig.writtenHold))
+        fieldMessage?.written = true
+        try? await Task.sleep(for: .seconds(ChatSuggestionConfig.writtenHold))
     }
 
     /// The agent finished a request from the field with something to say: the sheet rises with
