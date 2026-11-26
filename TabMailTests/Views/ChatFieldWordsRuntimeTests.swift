@@ -70,7 +70,7 @@ struct ChatFieldWordsRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded,
-                replyField: replyField ? ChatReplyField(alternative: nil) : nil,
+                replyField: replyField ? ChatReplyField() : nil,
                 // The field's pill stands for the chat view, which takes no card here: the closed
                 // field's compose card waits on the app's router, where the test ends it
                 // (`finishFieldCompose`).
@@ -115,7 +115,7 @@ struct ChatFieldWordsRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: message, isExpanded: $expanded,
-                replyField: ChatReplyField(alternative: nil))
+                replyField: ChatReplyField())
         }
     }
 

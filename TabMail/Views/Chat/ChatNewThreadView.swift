@@ -294,8 +294,6 @@ struct ChatNewThreadView: View {
                 isWorking: $chatWorking,
                 onAgentReply: { _ in agentAnswered() },
                 replyField: ChatReplyField(
-                    // A new email has no AI Suggestion, so no "alt: " line.
-                    alternative: nil,
                     drag: fieldDrag,
                     // The drag's VoiceOver equivalent, as in a thread's chat; not over the panel.
                     showChat: opensPanel ? { withAnimation(.spring(ChatThreadView.pillSpringModel)) { chatExpanded = true } } : nil,

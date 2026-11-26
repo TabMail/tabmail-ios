@@ -14,19 +14,20 @@ import UIKit
 /// THE SYSTEM PROPERTIES pinned here:
 ///  1. The mounted field holds only the user's words: the AI Suggestion never enters it (it waits
 ///     as a ghost bubble in the chat), not on open, not when it arrives late, not in the open
-///     sheet, not after a completion. Under the empty field the "alt: " line shows the AI
-///     Suggestion's alternative reply; a tap puts it in the field and sends nothing. Words the user typed are never
-///     replaced. The two completions are private to `ChatThreadView`, so which ones empty the
-///     field is read from the source (`clearWiring`).
+///     sheet, not after a completion. A tap on the line under the AI Suggestion, in the chat,
+///     reaches the field (`ChatReplyField.alternativeTap`): its reply goes in the field and nothing
+///     is sent; each tap puts it again. The field draws no line of its own. The two completions
+///     are private to `ChatThreadView`, so which ones empty the field is read from the source
+///     (`clearWiring`).
 ///  2. A send names the pill's email as the send starts: after the newest email changes, the next
 ///     request names the new email, never the number found for the earlier one.
 ///  3. A failed chat request's persistent log keeps the error and never the user's words while
 ///     debug logging is off, in every failure branch: the words can quote the email, and a resend
 ///     or rewind replays them. The gate is in
 ///     `BackgroundSyncLogger.logChatError`, so it covers every caller.
-///  4. The pill wires 2 into every send. The field's Send and the "alt: " line are pressed for real,
-///     through accessibility (`HostedAccessibility`), where they ask the agent nothing (an empty
-///     field, the line). The agent route sends to the live backend client, which has no test seam,
+///  4. The pill wires 2 into every send. The field's Send is pressed for real, through
+///     accessibility (`HostedAccessibility`), where it asks the agent nothing (an empty field).
+///     The agent route sends to the live backend client, which has no test seam,
 ///     so a press there would reach the backend: its wiring is read from the source.
 ///  5. A completion empties only what was sent: a draft typed in the sheet after the send stays.
 @Suite("Chat reply field at run time", .serialized, .processGlobalState)
@@ -54,8 +55,8 @@ struct ChatReplyFieldRuntimeTests {
         var working = false
         /// Signed in: the open sheet shows its input bar, not the sign-in bar.
         var signedIn = false
-        /// The "alt: " line's alternative reply.
-        var alternative: String? = "No rush, reply whenever you can"
+        /// The latest tap on the line under the AI Suggestion, as the chat passes it on.
+        var alternativeTap: ChatAlternativeTap?
         /// Words the field sent to the agent (`onFieldSend`).
         var fieldSends: [String] = []
         init(_ message: MessageHeader) { self.message = message }
@@ -66,7 +67,7 @@ struct ChatReplyFieldRuntimeTests {
         var body: some View {
             DynamicIslandChat(
                 message: host.message, isExpanded: $host.expanded, isWorking: $host.working,
-                replyField: ChatReplyField(alternative: host.alternative),
+                replyField: ChatReplyField(alternativeTap: host.alternativeTap),
                 onFieldSend: { host.fieldSends.append($0) })
             .environment(\.hasTabMailSession, host.signedIn)
         }
@@ -140,37 +141,34 @@ struct ChatReplyFieldRuntimeTests {
         return view.subviews.contains { type(words, in: $0) }
     }
 
-    @Test("The alt line shows under the empty field; a tap puts its reply in the field and never sends it; with no alternative there is no line")
-    func alternativeLinePutsTheReply() async throws {
-        #expect(HostedAccessibility.isAvailable, "control: the test can press the hosted line")
-        try await HostedAccessibility.withAutomation { try await alternativeLinePutsTheReplyBody() }
+    @Test("A tap on the line under the AI Suggestion puts its reply in the field and never sends it; each tap puts it again; the field draws no line")
+    func alternativeTapPutsTheReply() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read and press the hosted field")
+        try await HostedAccessibility.withAutomation { try await alternativeTapPutsTheReplyBody() }
     }
 
-    private func alternativeLinePutsTheReplyBody() async throws {
+    private func alternativeTapPutsTheReplyBody() async throws {
         let alternative = "No rush, reply whenever you can"
         try await withMountedField(Self.header("field-alt", ready: "A ready reply")) { host, controller in
             host.signedIn = true
             try await Self.settle()
-            #expect(HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.alternativeLineId),
-                    "the empty field shows the line: \(HostedAccessibility.identifiers(in: controller.view))")
-            #expect(HostedAccessibility.labels(in: controller.view).contains("alt: \(alternative)"),
-                    "it reads alt: and the reply: \(HostedAccessibility.labels(in: controller.view))")
-            #expect(HostedAccessibility.activate(DynamicIslandChat.alternativeLineId, in: controller.view), "the line takes a tap")
+            let labels = HostedAccessibility.labels(in: controller.view)
+            #expect(labels.contains(ChatReplyField.writePlaceholder), "control: the signed-in field shows its hint: \(labels.prefix(20))")
+            #expect(!labels.contains { $0.hasPrefix("alt: ") || $0.hasPrefix("Or reply: ") }, "the field draws no line of its own: \(labels.prefix(20))")
+            #expect(Self.fieldTexts(controller.view).allSatisfy { $0.isEmpty }, "control: the field starts empty")
+            host.alternativeTap = ChatAlternativeTap(reply: alternative)
             try await Self.settle()
             #expect(Self.fieldTexts(controller.view).contains(alternative), "the reply is in the field: \(Self.fieldTexts(controller.view))")
             #expect(host.fieldSends.isEmpty, "nothing was sent")
             #expect(!host.working && !host.expanded, "the agent was not asked, and no sheet opened")
-            #expect(!HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.alternativeLineId),
-                    "with words in the field the line goes")
-        }
-        try await withMountedField(Self.header("field-alt-none")) { host, controller in
-            host.signedIn = true
-            host.alternative = nil
+            // Emptied by the user, then the same reply tapped again: a new tap, so it is put again.
+            #expect(Self.type("", in: controller.view), "control: the field takes an edit")
             try await Self.settle()
-            #expect(!HostedAccessibility.identifiers(in: controller.view).contains(DynamicIslandChat.alternativeLineId), "no alternative, no line")
-            _ = HostedAccessibility.activate("chatSend", in: controller.view)
+            #expect(Self.fieldTexts(controller.view).allSatisfy { $0.isEmpty }, "control: the user emptied the field")
+            host.alternativeTap = ChatAlternativeTap(reply: alternative)
             try await Self.settle()
-            #expect(host.fieldSends.isEmpty, "an empty field sends nothing")
+            #expect(Self.fieldTexts(controller.view).contains(alternative), "a second tap puts it again: \(Self.fieldTexts(controller.view))")
+            #expect(host.fieldSends.isEmpty, "still nothing sent")
         }
     }
 

@@ -13,11 +13,16 @@ import GRDB
 /// in the way they would text it. Send there puts them up at once as the user's bubble, and the
 /// email that says them is written to the people of this chat (`ChatFieldCompose`),
 /// never a message to the agent; the words typed in the open TabMail panel go to the agent. Under
-/// the empty field an "alt: " line offers another reply the user could send instead (`alternative`);
-/// a tap puts it in the field and never sends it.
+/// the AI Suggestion, while the field is empty, a line offers another reply the user could send
+/// instead (`ChatAlternativeLink`, `alternativeTap`); a tap puts it in the field and never sends it.
 struct ChatReplyField {
-    /// The other reply the "alt: " line offers; nil shows no line.
-    let alternative: String?
+    /// The latest tap on the line under the AI Suggestion (`ChatAlternativeLink`): its reply goes
+    /// in the field (`DynamicIslandChat.putAlternative`); nil, none yet.
+    var alternativeTap: ChatAlternativeTap? = nil
+    /// Told whenever a dictation into the field starts or ends (`DynamicIslandChat.isDictating`):
+    /// while its words are coming, the chat shows no line under the AI Suggestion, so a tap never
+    /// cuts off or mixes with them; nil, not told.
+    var dictationChanged: ((Bool) -> Void)? = nil
     /// The reply goes only to these people; nil for Reply All.
     var onlyTo: [ChatThread.Person]? = nil
     /// In the tutorial, the step's move in the read-only field (part 2); nil, none.
@@ -54,7 +59,7 @@ struct ChatReplyField {
     static let panelPlaceholder = "Ask TabMail"
 
     /// The ready AI Suggestion of the thread's newest email, the one value the ghost bubble and the
-    /// "alt: " line read (`MessageHeader.suggestion`): shown while its full
+    /// line under it read (`MessageHeader.suggestion`): shown while its full
     /// reply and its text version are stored. Nothing on the user's turn, for a no-reply sender,
     /// or while the reply goes only to people chosen in Reply to (`onlyTo`): the suggestion was
     /// written for everyone.
@@ -72,8 +77,9 @@ struct ChatReplyField {
         return suggestion
     }
 
-    /// The "alt: " line's reply: while the AI Suggestion shows (`shown`), the other reply that came
-    /// with it, one line in the user's voice that goes the other way (stored in the suggestion's
+    /// The reply of the line under the AI Suggestion (`ChatAlternativeLink`): while the suggestion
+    /// shows (`shown`), the other reply that came with it, one line in the user's voice that goes
+    /// the other way (stored in the suggestion's
     /// one-line slot, `ReplyResult.changeCommand`); nil when no suggestion shows or it has none.
     static func alternative(shown: ReplyResult?) -> String? {
         guard let line = shown?.changeCommand?.trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty else {
@@ -171,6 +177,14 @@ struct ChatNewEmailField {
     static func isSessionKey(_ key: String) -> Bool { key.hasPrefix(sessionKeyPrefix) }
 }
 
+/// A tap on the line under the AI Suggestion (`ChatAlternativeLink`), carried from the chat to its
+/// field (`ChatReplyField.alternativeTap`): the reply to put there. Each tap is a new value, so the
+/// same reply tapped again is put again.
+struct ChatAlternativeTap: Equatable {
+    let id = UUID()
+    let reply: String
+}
+
 /// The chat input's words, which are all the reply field shows: the AI Suggestion never enters the
 /// field (it waits as a ghost bubble in the chat). A completed send empties only the words that
 /// were sent. The field and the open chat sheet share the words, so the rule is the same in both.
@@ -226,7 +240,7 @@ struct ChatFieldFill: Equatable {
         /// transcript's last write (the change counter).
         case heard(String)
         /// The words become this text: the user's edit of the input, or words the app puts in for
-        /// them (an Edit of an earlier message, or the "alt: " line's reply).
+        /// them (an Edit of an earlier message, or the reply of the line under the AI Suggestion).
         case put(String)
         /// Send from the open sheet: the words go, and nothing is left to complete.
         case sentFromSheet

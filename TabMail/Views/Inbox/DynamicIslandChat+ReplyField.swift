@@ -7,10 +7,11 @@ import SwiftUI
 /// The chat's reply field (`ChatReplyField`): today's Chat pill on the chat's newest email.
 extension DynamicIslandChat {
     /// The chat view's reply field (`ChatReplyField`): [mic] [field] [Send] on the newest email.
-    /// Empty, the field shows its hint and, under it, the "alt: " line while there is one
-    /// (`ChatReplyField.alternative`); while its Send's email is written, the words are up in the
-    /// chat as the user's bubble, with what is happening under it ("Writing your email",
-    /// `ChatFieldMessageBubble`), and the field shows only its hint.
+    /// Empty, the field shows its hint, on one line; the other reply that came with the AI
+    /// Suggestion is a line under the ghost in the chat (`ChatAlternativeLink`), not here. While its
+    /// Send's email is written, the words are up in the chat as the user's bubble, with what is
+    /// happening under it ("Writing your email", `ChatFieldMessageBubble`), and the field shows only
+    /// its hint.
     /// In the tutorial the field is read-only and sends nothing: its words go to the people, and
     /// the tutorial's requests to TabMail are made in the panel. At part 2's drag-up step it says
     /// so (`tutorialDragHint`), and its drag up, or VoiceOver's "Show TabMail chat", opens the panel.
@@ -44,9 +45,9 @@ extension DynamicIslandChat {
         } text: {
             if let attach = field.paperclip {
                 // The paperclip sits at the field's end on Send's row: bottom-aligned with the
-                // words and the "alt: " line as the row aligns Send, so it stays level with Send
-                // whether or not that line shows. It stays in its place in every state; while
-                // a Send's email is written it is dimmed and not tappable.
+                // words as the row aligns Send, so it stays level with Send however many lines
+                // they take. It stays in its place in every state; while a Send's email is
+                // written it is dimmed and not tappable.
                 HStack(alignment: .bottom, spacing: ChatViewLayout.fieldTextGap) {
                     fieldText(field)
                     ChatPaperclipButton(attach: attach)
@@ -70,7 +71,7 @@ extension DynamicIslandChat {
 
     /// The field's text: while a Send's email is written, only the field's hint (the words are the
     /// user's bubble in the chat, and they come back here if the send ends with nothing sent); else
-    /// the input with the "alt: " line under it.
+    /// the input.
     private func fieldText(_ field: ChatReplyField) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             if sentWorking {
@@ -82,9 +83,6 @@ extension DynamicIslandChat {
                     .showChatAction(field.showChat, isExpanded: isExpanded)
             } else {
                 replyInput(field)
-                if showsAlternative, let alternative = field.alternative {
-                    alternativeLine(alternative)
-                }
             }
         }
     }
@@ -93,29 +91,6 @@ extension DynamicIslandChat {
         inputField(placeholder: hasTabMailSession ? ChatReplyField.writePlaceholder : "Sign in to reply",
                    showChat: field.showChat, focus: .replyField)
     }
-
-    /// The "alt: " line shows under the empty field, signed in, while nothing is being said.
-    private var showsAlternative: Bool {
-        hasTabMailSession && inputText.isEmpty && !isDictating
-    }
-
-    /// The "alt: " line: a tap puts its reply in the field, ready to send or edit; it never sends.
-    private func alternativeLine(_ alternative: String) -> some View {
-        Button { putAlternative(alternative) } label: {
-            Text(ChatSuggestionConfig.alternativeLine(alternative))
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityHint("Puts it in the field")
-        .accessibilityIdentifier(Self.alternativeLineId)
-    }
-
-    /// The "alt: " line, as tests find it.
-    static let alternativeLineId = "chatAlternativeLine"
 }
 
 /// Closing the chat view's open TabMail panel like a sheet: a drag down on its header, or its

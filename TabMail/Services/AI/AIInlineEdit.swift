@@ -128,8 +128,8 @@ struct InlineEditResult: Sendable {
     let bccDelta: RecipientDelta?
     /// The email as a short text message (`text_message`): what the chat's AI Suggestion shows.
     let textMessage: String?
-    /// A one-line alternative message in the user's voice (`change_command`), shown under the chat
-    /// view's field as its "alt: " line.
+    /// A one-line alternative message in the user's voice (`change_command`), shown in the chat
+    /// view as the line under the AI Suggestion (`ChatAlternativeLink`).
     let changeCommand: String?
     let raw: String        // Raw LLM response for storing in chat history
 }

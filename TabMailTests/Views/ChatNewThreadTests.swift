@@ -340,8 +340,8 @@ struct ChatNewThreadTests {
 
     @Test("A new email's field asks for the user's own message, as a thread's does")
     func fieldPlaceholder() throws {
-        let newEmail = ChatReplyField(alternative: nil, newEmail: Self.newEmailField())
-        #expect(newEmail.newEmail != nil && ChatReplyField(alternative: nil).newEmail == nil)
+        let newEmail = ChatReplyField(newEmail: Self.newEmailField())
+        #expect(newEmail.newEmail != nil && ChatReplyField().newEmail == nil)
         #expect(ChatReplyField.writePlaceholder == "Write your message")
         // One hint for both: the field's input reads no per-field placeholder.
         let bar = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")

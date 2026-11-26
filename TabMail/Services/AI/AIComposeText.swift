@@ -33,7 +33,8 @@ extension AIService {
     /// words say. The draft it is written for is `context` (its recipients by role, the sending
     /// account, and for a reply or follow-up the email shown with its body) with `subject`. The
     /// answer is the compose edit JSON, read as every compose edit's (`runComposeEditRequest`);
-    /// its `change_command` is the one-line alternative the field offers next ("alt: ").
+    /// its `change_command` is the one-line alternative offered next, under the AI Suggestion
+    /// (`ChatAlternativeLink`).
     ///
     /// The words are never wrapped in an instruction, and no AI Suggestion, edit history or
     /// request goes with them.

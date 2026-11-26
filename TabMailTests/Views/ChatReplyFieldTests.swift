@@ -63,7 +63,7 @@ struct ChatReplyFieldTests {
 
     // MARK: - 1. The AI Suggestion
 
-    @Test("The alt line offers the suggestion's alternative reply while it shows; with no AI Suggestion there is no line",
+    @Test("The line under the AI Suggestion offers its alternative reply while it shows; with no AI Suggestion there is no line",
           arguments: [
             (true, "No rush, reply whenever you can" as String?, "No rush, reply whenever you can" as String?),
             (true, "  ask for Friday \n", "ask for Friday"),
@@ -75,7 +75,9 @@ struct ChatReplyFieldTests {
     func alternativeLine(_ shows: Bool, _ alternative: String?, _ expected: String?) {
         let shown = shows ? ReplyResult(body: "Hi Alex", textMessage: "Tuesday works", changeCommand: alternative) : nil
         #expect(ChatReplyField.alternative(shown: shown) == expected)
-        #expect(ChatSuggestionConfig.alternativeLine("No rush") == "alt: No rush")
+        #expect(ChatSuggestionConfig.alternativeLabel("No rush") == "Or reply: No rush", "VoiceOver reads it as a reply")
+        #expect(ChatSuggestionConfig.alternativeLead == "or" && ChatSuggestionConfig.alternativeChevron == "›",
+                "the line reads: or <reply> ›")
     }
 
     @Test("The AI Suggestion shows the reply's text message only for someone else's email with a full reply, to everyone")
@@ -681,6 +683,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("TextField(placeholder, text: typedText,", in: text) == 1)
         #expect(Self.count("Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })", in: text) == 1)
         #expect(Self.count("dictation.isActive || speech.isRecording || speech.isStarting", in: text) == 1)
+        #expect(Self.count(".onChange(of: isDictating, initial: true) { _, dictating in replyField?.dictationChanged?(dictating) }", in: text) == 1,
+                "a dictation's start and end reach the chat, which shows no line under the AI Suggestion meanwhile")
         // ONE API: the view only reads the words and whether they are the sent words (both
         // read-only state); every change is a `fieldFill.apply`.
         #expect(Self.count("var inputText: String { fieldFill.words }", in: text) == 1)
@@ -789,8 +793,11 @@ struct ChatReplyFieldTests {
         let readyEnded = try Self.body(of: "private func readyCardEnded(_ outcome: ComposeOutcome) {", in: text)
         #expect(readyEnded.hasPrefix(" guard case .sent = outcome else { return } heldGhost?.sent = true replyTarget = .replyAll }"),
                 "only a sent reply resets who the next one goes to and ends a held ghost as a send, and the field is never emptied: \(readyEnded)")
-        #expect(Self.count("alternative: ChatReplyField.alternative(shown: shown),", in: text) == 1,
-                "the alt line reads the shown AI Suggestion, nothing else")
+        #expect(Self.count("guard hasTabMailSession, !TutorialCoordinator.shared.isRunning, !fieldDictating, let reply = ChatReplyField.alternative(shown: shown) else { return nil }", in: text) == 1,
+                "the line under the AI Suggestion reads the shown AI Suggestion, nothing else, and shows only signed in, outside the tutorial and with no dictation under way")
+        #expect(Self.count("ChatReplyField.alternative(shown:", in: text) == 1, "one reader")
+        #expect(Self.count("alternative: alternativeLink(shown: shown, on: newest)", in: text) == 1, "the line sits in the ghost")
+        #expect(Self.count("dictationChanged: { fieldDictating = $0 },", in: text) == 1, "the field tells the chat a dictation's start and end")
         #expect(Self.count("randomExample", in: text) == 0, "no configured example")
         #expect(Self.count("composeEnded(", in: text) == 2, "only agent compose cards end through it")
         // Who the reply goes to and whose turn it is decide whether the suggestion shows.
@@ -1023,7 +1030,7 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".presentationCompactAdaptation(.popover)", in: text) >= 1, "a pop-up on iPhone too, never a sheet")
     }
 
-    @Test("The ghost is dashed on a faded fill and captioned in one button; the alt line hides while dictating; compose's stored edits refresh the chat")
+    @Test("The ghost is dashed on a faded fill and captioned in one button; the line under it is a gray or, then the reply in blue; compose's stored edits refresh the chat")
     func suggestionLookWiring() throws {
         let bubble = try Self.source("TabMail/Views/Chat/ChatBubbleView.swift")
         let ghost = try #require(bubble.range(of: "struct ChatSuggestionBubble: View {")
@@ -1051,9 +1058,20 @@ struct ChatReplyFieldTests {
         #expect(Self.count("Text(ChatSuggestionConfig.writingLine)", in: working) == 1 && Self.count(".accessibilityIdentifier(Self.bubbleId)", in: working) == 1)
         #expect(Self.count("Button(", in: working) == 0, "nothing to tap")
 
+        // The line under the ghost (the owner's mock E3): a gray "or", then the reply in the link's
+        // blue with a chevron, right-aligned and wrapping to two lines at most. Its place, its tap
+        // and when it shows are pinned in the running chat (`ChatSuggestionBubbleTests`).
+        let link = try #require(bubble.range(of: "struct ChatAlternativeLink: View {")
+            .flatMap { start in bubble[start.lowerBound...].range(of: "static let linkId").map { String(bubble[start.lowerBound..<$0.lowerBound]) } })
+        #expect(Self.count("Text(ChatSuggestionConfig.alternativeLead).foregroundStyle(Theme.textSecondary)", in: link) == 1, "a gray \"or\"")
+        #expect(Self.count(".foregroundStyle(Theme.accent)", in: link) == 1, "the rest in the link's blue")
+        #expect(Self.count("\\(ChatSuggestionConfig.alternativeChevron)", in: link) == 1, "with the chevron")
+        #expect(Self.count(".multilineTextAlignment(.trailing)", in: link) == 1, "on the ghost's right edge")
+        #expect(Self.count(".lineLimit(ChatSuggestionConfig.alternativeLineLimit)", in: link) == 1
+                && ChatSuggestionConfig.alternativeLineLimit == 2, "a long reply wraps to a second line")
         let field = try Self.source("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
-        #expect(Self.count("hasTabMailSession && inputText.isEmpty && !isDictating", in: field) == 1,
-                "the alt line shows only on an empty, signed-in field, never while dictating")
+        #expect(Self.count("alt: ", in: field) == 0 && Self.count("putAlternative", in: field) == 0,
+                "the field draws no line of its own: it stays one line")
 
         let compose = try Self.source("TabMail/Views/Compose/ComposeView.swift")
         #expect(Self.count("if outcome == .written { await postMessageDataDidChange(reply.id) }", in: compose) == 1,
@@ -1648,8 +1666,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count(".accessibilityHidden(dictation.isActive) .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
         #expect(Self.count(".onTapGesture { dictation.finish() } .showChatAction(showChat, isExpanded: isExpanded)", in: pill) == 1)
         // A field built without the action offers none (the panel open, the tutorial).
-        #expect(ChatReplyField(alternative: nil).showChat == nil)
-        #expect(ChatReplyField(alternative: nil, showChat: {}).showChat != nil)
+        #expect(ChatReplyField().showChat == nil)
+        #expect(ChatReplyField(showChat: {}).showChat != nil)
         // The reply field and the panel's input are two text fields, each with its own focus value,
         // and the panel opening moves a typed-in field's keyboard to the panel's input (mock v15
         // H2; on screen: `ChatSwipeUITests`, the drags that open the panel from the focused field).
@@ -1815,7 +1833,7 @@ struct ChatReplyFieldTests {
     func recipientsWiring() throws {
         let chat = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
         // The field itself; the suggestion's rule takes them too (`shownSuggestion`, pinned above).
-        #expect(Self.count("alternative: ChatReplyField.alternative(shown: shown), onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
+        #expect(Self.count("alternativeTap: alternativeTap, dictationChanged: { fieldDictating = $0 }, onlyTo: replyTarget.only,", in: chat) == 1, "the field knows the people chosen")
         // Both reply cards open through the one helper, read as the card opens: Reply All exactly
         // when the reply goes to everyone, and the recipients with it.
         #expect(Self.count("agentCompose = req", in: chat) == 1,

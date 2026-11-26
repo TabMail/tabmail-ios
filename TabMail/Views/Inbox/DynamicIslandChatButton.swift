@@ -791,6 +791,16 @@ struct DynamicIslandChat: View {
             guard let key = wordsKey else { return }
             await ChatFieldWords.shared.load(key)
         }
+        // A tap on the line under the AI Suggestion, in the chat: its reply goes in the field.
+        // Here, not on the field's bar, so the tap lands whether or not the panel is open.
+        .onChange(of: replyField?.alternativeTap) { _, tap in
+            if let tap { putAlternative(tap.reply) }
+        }
+        // A dictation into the field starting or ending, told to the chat: it hides that line
+        // while dictated words are coming.
+        .onChange(of: isDictating, initial: true) { _, dictating in
+            replyField?.dictationChanged?(dictating)
+        }
         .onChange(of: shownMessages.last?.actionConfirmation != nil) { _, hasCard in
             guard hasCard, replyField != nil, !isExpanded else { return }
             fieldSending = false
@@ -990,7 +1000,9 @@ struct DynamicIslandChat: View {
         Binding(get: { inputText }, set: { fieldFill.apply(.put($0)) })
     }
 
-    /// The "alt: " line's reply, put in the field for the user to send or edit; never sent here.
+    /// The reply of the line under the AI Suggestion (`ChatAlternativeLink`, tapped in the chat and
+    /// carried here by `ChatReplyField.alternativeTap`), put in the field for the user to send or
+    /// edit, the cursor at its end; never sent here.
     func putAlternative(_ alternative: String) {
         fieldFill.apply(.put(alternative))
         inputSelection = .init(insertionPoint: inputText.endIndex)
