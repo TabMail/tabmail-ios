@@ -729,7 +729,7 @@ struct DatabaseMigrationTests {
     /// column that left the CREATE text alone still fails) and `indexShape` (which
     /// reads `PRAGMA index_list`, the only place the implicit primary-key
     /// autoindex is visible at all).
-    private static func schemaDump(_ db: DatabaseQueue) throws -> [String] {
+    static func schemaDump(_ db: DatabaseQueue) throws -> [String] {
         let objects: [String] = try db.read { conn in
             try Row.fetchAll(conn, sql: """
                 SELECT type, name, tbl_name, COALESCE(sql, '∅') AS sql
@@ -757,7 +757,7 @@ struct DatabaseMigrationTests {
     /// GRDB's applied-migrations ledger, read straight out of GRDB's own table
     /// rather than through `DatabaseMigrator` — the point is what is RECORDED,
     /// not what the migrator computes.
-    private static func appliedLedger(_ db: DatabaseQueue) throws -> [String] {
+    static func appliedLedger(_ db: DatabaseQueue) throws -> [String] {
         try db.read {
             try String.fetchAll($0, sql: "SELECT identifier FROM grdb_migrations ORDER BY identifier")
         }
@@ -1738,5 +1738,93 @@ struct FolderIsFollowedMigrationTests {
         let decoded = try db.read { try Folder.fetchAll($0) }
         let decodedFollowed = decoded.map(\.isFollowed)
         #expect(decodedFollowed == [false, false], "the model reads every existing row as unfollowed")
+    }
+
+    /// v112 is registered after v104, but every released install already ran the migrations
+    /// registered behind it (v1.11.6: v113 to v116; v1.11.7: v113 to v117). On those devices
+    /// v112 runs AFTER them, an order no fresh install and no stepped upgrade takes. The
+    /// released state is rebuilt from a database at the current version: the columns the
+    /// release did not have are dropped and their migrations' ledger rows deleted. The app's
+    /// own entry point (`AppDatabase.runMigrations`, as at launch) must then run what is
+    /// missing without an error and reach a fresh install's schema. Never `migrate(_:upTo:)`
+    /// here: GRDB stops the process when that target is behind an applied migration.
+    @Test("v112 runs cleanly after the released v113 to v117, and the schema equals a fresh install's",
+          arguments: ReleasedMigrationState.allCases)
+    func v112RunsCleanlyAfterTheReleasedV113ToV117(_ released: ReleasedMigrationState) throws {
+        let fresh = try TestDatabase.make()
+        let freshDump = try DatabaseMigrationTests.schemaDump(fresh)
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db, id: "acc1", email: "one@example.com")
+        try TestDatabase.insertFolder(db)
+        try TestDatabase.insertFolder(db, name: "Archive", path: "Archive", role: .archive)
+
+        let missing = released.notYetApplied
+        try db.write { conn in
+            for step in missing {
+                try conn.execute(sql: "ALTER TABLE \"\(step.table)\" DROP COLUMN \"\(step.column)\"")
+                try conn.execute(sql: "DELETE FROM grdb_migrations WHERE identifier = ?", arguments: [step.migration])
+            }
+        }
+
+        var registration = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &registration)
+        let migrator = registration
+        let registered = migrator.migrations
+        // Non-vacuity: the database really is at the released schema.
+        let ledgerBefore = try DatabaseMigrationTests.appliedLedger(db)
+        let expectedBefore = registered.filter { id in !missing.contains { $0.migration == id } }.sorted()
+        #expect(ledgerBefore == expectedBefore)
+        let folderColumnsBefore = try db.read { try $0.columns(in: "folder").map(\.name) }
+        #expect(!folderColumnsBefore.contains("isFollowed"))
+        let completeBefore = try db.read { try migrator.hasCompletedMigrations($0) }
+        #expect(!completeBefore, "the splash gate must see v112 as pending work")
+
+        try AppDatabase.runMigrations(on: db)
+
+        let ledgerAfter = try DatabaseMigrationTests.appliedLedger(db)
+        #expect(ledgerAfter == registered.sorted())
+        let completeAfter = try db.read { try migrator.hasCompletedMigrations($0) }
+        #expect(completeAfter)
+        // The CREATE text of a table this test dropped a column from is SQLite's rewrite, a
+        // setup artifact (on a device the column was never there); that table's column and
+        // index shape, which the dump also holds, still pins every column's type, NOT NULL,
+        // default and position. Everything else is compared whole.
+        let rebuilt = Set(missing.map(\.table))
+        let comparable: ([String]) -> [String] = { dump in
+            dump.filter { line in !rebuilt.contains { line.hasPrefix("table|\($0)|\($0)|") } }
+        }
+        let releasedDump = try DatabaseMigrationTests.schemaDump(db)
+        let releasedShape = comparable(releasedDump)
+        let freshShape = comparable(freshDump)
+        #expect(!freshShape.isEmpty)
+        #expect(releasedShape == freshShape)
+        let folders = try db.read { try Folder.fetchAll($0) }
+        let followed = folders.map(\.isFollowed)
+        #expect(followed == [false, false], "both existing folders decode, unfollowed")
+        let accounts = try db.read { try Account.fetchCount($0) }
+        #expect(accounts == 1)
+    }
+}
+
+/// A released app's schema, for `FolderIsFollowedMigrationTests`: the migrations registered
+/// after v112 that the release did NOT have yet, each with the column it adds. v112 itself is
+/// in neither release.
+enum ReleasedMigrationState: String, CaseIterable, Sendable {
+    case v1_11_7
+    case v1_11_6
+
+    struct Step: Sendable {
+        let migration: String
+        let table: String
+        let column: String
+    }
+
+    var notYetApplied: [Step] {
+        let v112 = Step(migration: "v112_addFolderIsFollowed", table: "folder", column: "isFollowed")
+        let v117 = Step(migration: "v117_addOutboxOriginalChangesAtQueue", table: "outboxMessage", column: "originalChangesAtQueue")
+        switch self {
+        case .v1_11_7: return [v112]
+        case .v1_11_6: return [v112, v117]
+        }
     }
 }
