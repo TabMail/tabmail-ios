@@ -62,6 +62,9 @@ struct ChatThreadView: View {
     /// The header of a thread another screen hosts (`ChatThreadOpened`): that screen's own toolbar
     /// item shows it, and this view keeps its people and takes its tap. Nil: this view's own item.
     let hostedHeader: ChatThreadHeader?
+    /// The hosting screen's read of this thread on the row that replaced its opened email
+    /// (`ChatNewThreadView.followSend`): this view takes it in place (`adoptReopened`).
+    let reopened: ChatThreadOpened?
 
     @State private var context = ChatThreadContext()
     /// Emails that were unread when they first showed here; marked read as they show.
@@ -176,16 +179,19 @@ struct ChatThreadView: View {
             expectedObservedUidValidity: expectedObservedUidValidity))
         self.highlightsOpenedMessage = highlightsOpenedMessage
         self.hostedHeader = nil
+        self.reopened = nil
     }
 
     /// A thread read before it shows (`ChatThreadOpened`): its first frame has the email and the
     /// user's own emails on the user's side, and the screen hosting it shows its header from the
-    /// same frame. Its own load and context reads go on as for any open.
-    init(opened: ChatThreadOpened) {
+    /// same frame. Its own load and context reads go on as for any open. `reopened`: the same
+    /// thread read again on the row that replaced the opened email, which this view takes in place.
+    init(opened: ChatThreadOpened, reopened: ChatThreadOpened? = nil) {
         self._viewModel = State(initialValue: opened.viewModel)
         self._context = State(initialValue: opened.context)
         self.highlightsOpenedMessage = false
         self.hostedHeader = opened.header
+        self.reopened = reopened
     }
 
     // MARK: - Members
@@ -223,6 +229,12 @@ struct ChatThreadView: View {
     /// message lands, or its body does (attachments, invite).
     private var memberKey: [String] {
         members.map { "\($0.id)|\($0.summaryTextMessage != nil)|\($0.bodyComplete)" }
+    }
+
+    /// The hosting screen's read of this thread on the row that replaced its opened email, by its
+    /// view model: a new read is taken in place (`adoptReopened`).
+    private var reopenedKey: ObjectIdentifier? {
+        reopened.map { ObjectIdentifier($0.viewModel) }
     }
 
     /// The Message-IDs of the chat's emails, normalized.
@@ -281,6 +293,7 @@ struct ChatThreadView: View {
         }
         .onChange(of: viewModel.threadCopies.map(\.id)) { _, _ in noteCopies() }
         .onChange(of: memberKey) { _, _ in noteMembers() }
+        .onChange(of: reopenedKey) { _, _ in adoptReopened() }
         .task(id: messageIds) {
             // One observation per open chat of its outbox replies, keyed by its Message-IDs.
             do {
@@ -774,6 +787,20 @@ struct ChatThreadView: View {
         for copy in viewModel.threadCopies where seenIds.insert(copy.id).inserted {
             viewModel.markReadIfNeeded(copy)
         }
+    }
+
+    /// The hosting screen read this thread again on the row that replaced the opened email: the
+    /// server's copy of the user's own sent email, which a sync puts in place of the send's
+    /// optimistic copy under another id (`ChatNewThreadView.followSend`). Its view model and context
+    /// take the place of this view's, in place: whatever is open over the thread stays open, and
+    /// the field keeps its words, since the chat's key is the thread's (`ChatThreadKey`). A Send
+    /// from the field then writes to the row that is there, not to the one that has gone.
+    private func adoptReopened() {
+        guard let reopened, reopened.viewModel !== viewModel else { return }
+        viewModel.isViewVisible = false
+        reopened.viewModel.isViewVisible = isOnScreen
+        viewModel = reopened.viewModel
+        context = reopened.context
     }
 
     /// Records each email the first time it shows, then marks it read. Its unread state at

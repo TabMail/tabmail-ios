@@ -19,7 +19,8 @@ import Testing
 ///  6. The Unread line goes above the first email that was unread at open, once.
 ///  7. An email that left out someone already in the chat (on an earlier email) carries who it went
 ///     to ("replied only to"), the user as "you" whichever address they used; an email to everyone,
-///     or to everyone and someone new, carries nothing, and nobody who joined later counts.
+///     or to everyone and someone new, carries nothing, and nobody who joined later counts. A
+///     one-to-one chat carries it on no bubble: it shows plain bubbles, with no name line.
 @Suite("Chat thread")
 struct ChatThreadTests {
     private static let me = "me@example.com"
@@ -346,6 +347,33 @@ struct ChatThreadTests {
         #expect(longer.items.count == 3)
         guard longer.items.count == 3 else { return }
         #expect(longer.items[2].repliedOnlyTo?.people.map(\.name) == ["David Kim"])
+    }
+
+    @Test("A one-to-one chat carries no \"replied only to\", even after an email to someone it no longer shows")
+    @MainActor
+    func oneToOneCarriesNoOnly() {
+        // The user wrote to two addresses; only Sam answered, to the user alone, and the user
+        // answered Sam alone. The header shows Sam only.
+        let first = Self.header("1", from: "Me", fromAddress: Self.me, to: "sam@example.com, jo@example.com", minutesAgo: 30)
+        let answer = Self.header("2", from: "Sam Lee", fromAddress: "sam@example.com", to: Self.me, minutesAgo: 20)
+        let mine = Self.header("3", from: "Me", fromAddress: Self.me, to: Self.sam, minutesAgo: 10)
+
+        let chat = Self.thread([first, answer, mine], reply: ["sam@example.com"])
+        #expect(!chat.isGroup)
+        #expect(chat.replyPeople.map(\.name) == ["Sam Lee"])
+        #expect(chat.items.map(\.repliedOnlyTo) == [nil, nil, nil] as [ChatThread.OnlyTo?],
+                "no name line and no note over any bubble")
+        guard chat.items.count == 3 else { Issue.record("three bubbles"); return }
+        #expect(ChatBubbleView.accessibilityText(item: chat.items[1], words: "Got it") == "Sam Lee said: Got it")
+        #expect(ChatBubbleView.accessibilityText(item: chat.items[2], words: "Great") == "You said: Great")
+
+        // Control: once Jo writes too, the chat is a group and the same emails carry who they went to.
+        let joWrites = Self.header("4", from: "Jo Park", fromAddress: "jo@example.com", to: Self.me, minutesAgo: 5)
+        let group = Self.thread([first, answer, mine, joWrites], reply: ["jo@example.com"])
+        #expect(group.isGroup)
+        guard group.items.count == 4 else { Issue.record("four bubbles"); return }
+        #expect(group.items[1].repliedOnlyTo == ChatThread.OnlyTo(includesYou: true, people: []))
+        #expect(group.items[2].repliedOnlyTo?.people.map(\.name) == ["Sam Lee"])
     }
 
     @Test("The user is one person, whichever of their addresses an email used")
