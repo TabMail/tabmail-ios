@@ -18,7 +18,7 @@ import UIKit
 ///     email; under the empty field the "e.g." line shows a change from the config set.
 ///  3. Words for the agent name the newest email and say they came from its reply field; for a
 ///     no-reply sender they say not to write a reply.
-///  4. While the agent writes a reply the line above the field says so.
+///  4. While the field's Send writes its email, the line under the user's bubble says so.
 ///  5. Only a sent compose card empties the field, and the field never starts dictation by itself
 ///     (the Sending bubble is read from the outbox: `ChatSendingBubbleTests`).
 ///  6. With recipients changed (Reply to), no AI Suggestion shows (it was written for everyone),
@@ -890,6 +890,31 @@ struct ChatReplyFieldTests {
                 "the user's own message is never the AI Suggestion's bubble")
     }
 
+    /// 2026-11-26: the bubble pulsed at once, from whatever phase the clock was in, down to the
+    /// working dots' 0.3, so going up read as a blink.
+    @Test("The user's bubble pulses softly: still at full for a wait after it goes up, then from full, with no jump, down to a dim opacity softer than the working dots' and back")
+    func fieldMessagePulse() {
+        let delay = ChatSuggestionConfig.fieldMessagePulseDelay
+        let period = ChatSuggestionConfig.fieldMessagePulsePeriod
+        let dim = ChatSuggestionConfig.fieldMessageDimOpacity
+        #expect(delay > 0, "a wait before the pulse")
+        #expect(dim > ChatSuggestionConfig.dotDimOpacity && dim < 1, "softer than the working bubble's dots")
+        let waiting = [0, delay / 2, delay].map { ChatFieldMessageBubble.pulseOpacity(sinceShown: $0) }
+        #expect(waiting == [1, 1, 1], "still at full until the wait is over: \(waiting)")
+        let starting = ChatFieldMessageBubble.pulseOpacity(sinceShown: delay + 0.01)
+        let dimmest = ChatFieldMessageBubble.pulseOpacity(sinceShown: delay + period / 2)
+        let full = ChatFieldMessageBubble.pulseOpacity(sinceShown: delay + period)
+        #expect(abs(starting - 1) < 0.01, "the pulse starts from full: \(starting)")
+        #expect(abs(dimmest - dim) < 0.0001, "the dim opacity at half the period: \(dimmest)")
+        #expect(abs(full - 1) < 0.0001, "full again at the period: \(full)")
+        let frames = stride(from: 0.0, through: delay + 3 * period, by: ChatSuggestionConfig.dotFrameInterval)
+            .map { ChatFieldMessageBubble.pulseOpacity(sinceShown: $0) }
+        let inRange = frames.allSatisfy { $0 >= dim - 0.0001 && $0 <= 1 }
+        #expect(inRange, "between the dim opacity and full")
+        let largestStep = zip(frames, frames.dropFirst()).map { abs($1 - $0) }.max() ?? 1
+        #expect(largestStep < 0.05, "no jump from one frame to the next: \(largestStep)")
+    }
+
     @Test("The ghost tapped open stays while its card is up, and turns into the sent reply's bubble once the card has closed")
     func heldGhostWiring() throws {
         let text = try Self.source("TabMail/Views/Chat/ChatThreadView.swift")
@@ -1665,33 +1690,35 @@ struct ChatReplyFieldTests {
         #expect(Self.count("reduceMotion: false", in: chat) == 0 && Self.count("reduceMotion: true", in: chat) == 0)
     }
 
-    @Test("The agent's status on a Send shows above the field, outside its glass, on both chat screens")
-    func statusLineAboveTheField() throws {
+    /// 2026-11-26: "Writing your email" goes where "Sent" goes, with the bubble. Before, it was a
+    /// centred line above the field, which the field handed to its screen.
+    @Test("While the field's Send writes its email, \"Writing your email\" is the line under the user's bubble, right-aligned where \"Sent\" goes, on both chat screens; no status line above the field")
+    func writingLineUnderTheBubble() throws {
         let field = try Self.code("TabMail/Views/Inbox/DynamicIslandChat+ReplyField.swift")
-        // The field draws no status of its own: it hands the line to the screen.
         #expect(Self.count("Text(workingStatus", in: field) == 0, "no status inside the field's glass")
         #expect(Self.count("private func liveReplyFieldBar(_ field: ChatReplyField) -> some View { ChatFieldBarRow {", in: field) == 1,
                 "the field's bar is its one row")
-        #expect(Self.count(".preference(key: ChatFieldStatusKey.self, value: sentWorking ? (workingStatus.isEmpty ? \"Thinking...\" : workingStatus) : nil) .modifier(ChatFieldDrag.Swell(model: field.drag, sign: 1))", in: field) == 1)
-        // Each screen shows it in the stack above the field, so its bar, and the chat, move up for it.
+        #expect(Self.count(".preference(", in: field) == 0, "the field hands its screen no status line")
+        // The line in the look of "Sent" (`ChatBubbleView`), under the bubble, at its right edge.
+        let bubble = try Self.code("TabMail/Views/Chat/ChatBubbleView.swift")
+        let start = try #require(bubble.range(of: "struct ChatFieldMessageBubble: View {"))
+        let end = try #require(bubble[start.upperBound...].range(of: "struct ChatSuggestionWorkingBubble: View {"))
+        let messageBubble = String(bubble[start.upperBound..<end.lowerBound])
+        #expect(Self.count("var body: some View { VStack(alignment: .trailing, spacing: 4) { TimelineView(", in: messageBubble) == 1)
+        #expect(Self.count("if let status { Text(status) .font(.caption2) .foregroundStyle(Theme.textSecondary) } }", in: messageBubble) == 1)
+        #expect(Self.count("Text(\"Sent\") .font(.caption2) .foregroundStyle(Theme.textSecondary)", in: bubble) == 1, "control: the look of \"Sent\"")
         for path in ["TabMail/Views/Chat/ChatThreadView.swift", "TabMail/Views/Chat/ChatNewThreadView.swift"] {
             let screen = try Self.code(path)
-            #expect(Self.count("if let fieldStatus { ChatFieldStatusLine(text: fieldStatus) .transition(.opacity) } DynamicIslandChat(", in: screen) == 1, "\(path): the line right above the field")
-            #expect(Self.count(".onPreferenceChange(ChatFieldStatusKey.self) { status in withAnimation(", in: screen) == 1, "\(path)")
-            #expect(Self.count("fieldStatus = status }", in: screen) == 1, "\(path)")
+            #expect(Self.count("ChatFieldStatus", in: screen) == 0 && Self.count("fieldStatus", in: screen) == 0,
+                    "\(path): no status line above the field")
+            #expect(Self.count("ChatOutgoingRows(", in: screen) == 1, "\(path): the user's bubble shows through the chat's outgoing rows")
         }
-    }
-
-    @Test("Only one status reaches the screen: the first field's")
-    func statusKeyKeepsTheFirst() {
-        var value: String? = nil
-        ChatFieldStatusKey.reduce(value: &value) { "Thinking..." }
-        #expect(value == "Thinking...")
-        ChatFieldStatusKey.reduce(value: &value) { "Searching email" }
-        #expect(value == "Thinking...")
-        ChatFieldStatusKey.reduce(value: &value) { nil }
-        #expect(value == "Thinking...")
-        #expect(ChatFieldStatusKey.defaultValue == nil)
+        // Both chats show the user's bubble through the one set of rows (`ChatOutgoingRows`).
+        let rows = try Self.code("TabMail/Views/Chat/ChatOutgoingRows.swift")
+        #expect(Self.count("ChatFieldMessageBubble(text: message.text, pulses: message.pulses, status: ChatReplyField.writingStatus)", in: rows) == 1,
+                "the line under the user's bubble while its email is written")
+        #expect(Self.count("ChatFieldMessageBubble(text: held.text, pulses: false)", in: rows) == 1,
+                "none under it while it is held behind its card")
     }
 
     @Test("The open panel closes like a sheet: past the close distance, on the let-go only")

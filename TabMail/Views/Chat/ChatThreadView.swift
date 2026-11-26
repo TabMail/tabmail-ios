@@ -87,8 +87,6 @@ struct ChatThreadView: View {
     /// remainder of that is the same height, `pillHeightMoved`), so the chat does not move under
     /// either.
     @State private var pillHeight = ChatViewLayout.pillStartHeight
-    /// What the agent is doing about a Send from the field, shown above it (`ChatFieldStatusKey`).
-    @State private var fieldStatus: String?
     /// A drag up on the collapsed field (`ChatFieldDrag`, `ChatFieldPan`): reset however the drag
     /// ends, a cancelled one included, with the pill's spring, so the swell always springs back
     /// (`fieldDragEnded`). Its progress is read only in modifiers (`ChatFieldDrag.Model`), never
@@ -1119,10 +1117,6 @@ struct ChatThreadView: View {
                     .foregroundStyle(Theme.textSecondary)
                     .frame(maxWidth: .infinity)
             }
-            if let fieldStatus {
-                ChatFieldStatusLine(text: fieldStatus)
-                    .transition(.opacity)
-            }
             DynamicIslandChat(
                 message: newest,
                 isExpanded: $chatExpanded,
@@ -1145,11 +1139,6 @@ struct ChatThreadView: View {
                 onAgentCompose: openAgentCompose,
                 composeFromAccountId: viewModel.message?.accountId,
                 composeHostCovered: isAnyPresentation)
-            // The agent's status on a Send shows above the field (`ChatFieldStatusLine`); the stack
-            // grows by it, so the bar and the chat above move up with the pill's spring.
-            .onPreferenceChange(ChatFieldStatusKey.self) { status in
-                withAnimation(Self.pillSpring) { fieldStatus = status }
-            }
             // Debug UI tests only: the glass's top, swell included (`ChatFieldDragMarker`).
             .modifier(ChatFieldDragMarker.Glass(model: fieldDrag))
             // The swell is not the field's room: its glass grows upward, and the same swell is taken

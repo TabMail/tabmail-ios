@@ -50,8 +50,10 @@ struct ChatOutgoingRows<Last: View>: View {
             .transition(.opacity)
         } else if let message = fieldMessage {
             // The field's Send: the user's own message, up at once in the AI Suggestion's place,
-            // pulsing while its email is written.
-            ChatFieldMessageBubble(text: message.text, pulses: message.pulses)
+            // pulsing while its email is written, with "Writing your email" under it where "Sent"
+            // goes.
+            ChatFieldMessageBubble(text: message.text, pulses: message.pulses,
+                                   status: ChatReplyField.writingStatus)
                 .transition(.opacity)
         } else {
             last()

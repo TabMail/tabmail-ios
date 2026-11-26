@@ -248,27 +248,39 @@ struct ChatSuggestionBubble: View {
 }
 
 /// The user's own message from the closed field (`ChatFieldMessage`): their words, verbatim, in
-/// their own blue bubble where the reply lands once sent. It pulses, as the working bubble's dots
-/// do, while the email that says them is written (the line above the field says what is
-/// happening); still once it is written and while its compose card is up. Nothing to tap.
+/// their own blue bubble where the reply lands once sent. While the field's Send runs, the line
+/// under it, where "Sent" goes on a sent email, says what is happening ("Writing your email",
+/// `status`). It pulses softly while the email that says them is written, after a short wait
+/// (`pulseOpacity`); still once it is written and while its compose card is up. Nothing to tap.
 struct ChatFieldMessageBubble: View {
     let text: String
     var pulses = false
+    /// The line under the bubble; nil for none (held behind its card).
+    var status: String?
+    /// When the bubble went up: the pulse's wait runs from here.
+    @State private var shownAt = Date.now
 
     var body: some View {
-        // Paused, the timeline draws once and the bubble is at full opacity.
-        TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval, paused: !pulses)) { context in
-            Text(text)
-                .font(.body)
-                .foregroundStyle(Color.white)
-                .multilineTextAlignment(.leading)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(
-                    RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
-                        .fill(Theme.accent)
-                )
-                .opacity(pulses ? ChatSuggestionWorkingBubble.dotOpacity(at: context.date.timeIntervalSinceReferenceDate) : 1)
+        VStack(alignment: .trailing, spacing: 4) {
+            // Paused, the timeline draws once and the bubble is at full opacity.
+            TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval, paused: !pulses)) { context in
+                Text(text)
+                    .font(.body)
+                    .foregroundStyle(Color.white)
+                    .multilineTextAlignment(.leading)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .background(
+                        RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                            .fill(Theme.accent)
+                    )
+                    .opacity(pulses ? Self.pulseOpacity(sinceShown: context.date.timeIntervalSince(shownAt)) : 1)
+            }
+            if let status {
+                Text(status)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textSecondary)
+            }
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(pulses ? "You said: \(text), writing your email" : "You said: \(text)")
@@ -278,6 +290,16 @@ struct ChatFieldMessageBubble: View {
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
         .padding(.horizontal)
+    }
+
+    /// The bubble's opacity `elapsed` seconds after it went up: full through
+    /// `ChatSuggestionConfig.fieldMessagePulseDelay`, then from full, smoothly, down to
+    /// `fieldMessageDimOpacity` at half of each `fieldMessagePulsePeriod` and back up.
+    static func pulseOpacity(sinceShown elapsed: Double) -> Double {
+        let pulsing = elapsed - ChatSuggestionConfig.fieldMessagePulseDelay
+        guard pulsing > 0 else { return 1 }
+        let depth = (1 - cos(2 * Double.pi * pulsing / ChatSuggestionConfig.fieldMessagePulsePeriod)) / 2
+        return 1 - (1 - ChatSuggestionConfig.fieldMessageDimOpacity) * depth
     }
 
     /// The bubble, as tests find it: while its email is written, and once it is.

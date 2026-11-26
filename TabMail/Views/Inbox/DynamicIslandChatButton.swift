@@ -1799,8 +1799,9 @@ struct DynamicIslandChat: View {
         }
     }
 
-    /// The closed field's compose run, for a reply and a new email alike: "Writing your email"
-    /// above the field while `compose` writes, with nothing sent to the agent and no chat turn
+    /// The closed field's compose run, for a reply and a new email alike: "Writing your email" as
+    /// the pill's working status while `compose` writes (the host shows the same line under the
+    /// user's bubble, `ChatFieldMessageBubble`), with nothing sent to the agent and no chat turn
     /// added; once written, the host's bubble stays up to be read before the card opens
     /// (`ToolInvocation.fieldWritten`). `ended` gets what it wrote, or nil when Stop cancelled it
     /// (Stop has already cleaned up the pill).
