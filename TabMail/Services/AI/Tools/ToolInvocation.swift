@@ -20,10 +20,15 @@ struct ToolInvocation: Sendable {
     let uiSink: (any AgentUISink)?
     /// Invoking session key, for logging/correlation only.
     let sessionKey: String?
+    /// The account of the email open where the user asked: set by an email screen's chat, nil
+    /// in the inbox and for non-interactive callers. A new email the assistant writes is sent
+    /// from it (`EmailComposeTool.sendingAccount`).
+    let openEmailAccountId: String?
 
-    init(uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil) {
+    init(uiSink: (any AgentUISink)? = nil, sessionKey: String? = nil, openEmailAccountId: String? = nil) {
         self.uiSink = uiSink
         self.sessionKey = sessionKey
+        self.openEmailAccountId = openEmailAccountId
     }
 
     /// The no-UI invocation used by every non-interactive completion caller and

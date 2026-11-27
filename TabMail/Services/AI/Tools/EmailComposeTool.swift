@@ -19,6 +19,12 @@ struct EmailComposeTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// The real entry point: `invocation` carries the account of the email open where the user
+    /// asked (an email screen's chat), which the new email is sent from.
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse recipients
         let to = Self.parseStringArray(arguments["to"]) ?? Self.parseStringArray(arguments["recipients"]) ?? []
         let cc = Self.parseStringArray(arguments["cc"]) ?? []
@@ -56,7 +62,7 @@ struct EmailComposeTool: AgentTool, Sendable {
 
         // The account the new email is sent from, read once: the AI signs the body as this
         // account, and the compose card opens with it, so the two cannot differ.
-        let account = await Self.sendingAccount(db: ctx.db)
+        let account = await Self.sendingAccount(openEmailAccountId: invocation.openEmailAccountId, db: ctx.db)
 
         // When a compose instruction is present, run it through the backend LLM
         // to generate the actual email content — matching TB's runComposeEdit() flow.
@@ -106,17 +112,24 @@ struct EmailComposeTool: AgentTool, Sendable {
     /// the tool calls made inside its own `withValue` scope.
     @TaskLocal static var inlineEditOverride: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)?
 
-    /// The account a new email the assistant writes is sent from: the primary account.
+    /// The account a new email the assistant writes is sent from: the account of the email open
+    /// where the user asked (`openEmailAccountId`, an email screen's chat), else the primary account.
     /// Demo boundary (ADR-IOS-038): in demo, compose MUST use the demo account — during
     /// debug-menu coexistence the real primary is ALSO isPrimary, so an unscoped lookup could
     /// pick (and send via) the real account. Normal mode excludes the demo row symmetrically.
-    static func sendingAccount(db: any DatabaseReader & Sendable) async -> Account? {
+    static func sendingAccount(openEmailAccountId: String?, db: any DatabaseReader & Sendable) async -> Account? {
         let demoActive = DemoModeStore.isDemoActive
         return try? await db.read { db in
             if demoActive {
                 return try Account
                     .filter(Column("id") == DemoSeed.demoAccountId && Column("isActive") == true)
                     .fetchOne(db)
+            }
+            if let openEmailAccountId, let openEmailAccount = try Account
+                .filter(Column("id") == openEmailAccountId && Column("isActive") == true)
+                .filter(Column("id") != DemoSeed.demoAccountId)
+                .fetchOne(db) {
+                return openEmailAccount
             }
             if let primary = try Account
                 .filter(Column("isActive") == true && Column("isPrimary") == true)

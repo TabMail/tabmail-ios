@@ -23,4 +23,6 @@
 - **Tests:** `TabMailTests/Tools/FSMToolDeliveryTests.swift` — owned routing (card reaches only the invoking sink, not another session's), nil-sink fast-fail without suspension, accept/decline resume, and `SessionUISink` level-triggered append.
 - **Files:** `TabMail/Services/AI/Tools/ToolInvocation.swift` (new: `ToolInvocation`, `AgentUISink`, `SessionUISink`); `ToolRegistry.swift`, `AgentToolRouter.swift`, `BackendClient.swift`, `AIService.swift`, `AIChat.swift`, `DynamicIslandChatButton.swift`, and the 12 confirmation tools.
 
+**Amendment (2026-11-27, tabmail-ios #1521):** `ToolInvocation` also carries `openEmailAccountId`, the account of the email open where the user asked (an email screen's chat; nil in the inbox and for `.noninteractive`). It is per-call, like the sink, so it lives here and not in `ToolContext`. The chat view builds every session invocation in one place (`toolInvocation`). `email_compose` sends a new email from that account (ADR-IOS-030, #1521 amendment).
+
 ---

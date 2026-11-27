@@ -1291,8 +1291,9 @@ the tool queues (the card itself is not presented).
     account's name and address, and the request's parent email is the work account's.
   - The reply's edit, sent through a real `AIService` request, reaches the backend with the work
     account's name as `user_name`.
-  - A new email, with either account as the primary, carries the primary account on its compose
-    request, and the edit context has that same account's name and address. Without a writing
+  - A new email asked in the inbox (no open email), with either account as the primary, carries
+    the primary account on its compose request, and the edit context has that same account's name
+    and address. Without a writing
     request, the request still carries the account. A primary change while the edit runs leaves
     the request on the account the body was signed as.
   - Demo boundary: with the demo row and a real primary both primary, a new email is the demo
@@ -1300,6 +1301,15 @@ the tool queues (the card itself is not presented).
     an inactive one), it is the active real account (not the demo row, not an inactive account).
     The rows a lookup filter must skip are inserted before the expected account, so a lookup
     without that filter picks the wrong one.
+  - Asked on an email's screen (run through a `ToolRegistry` with a `ToolInvocation` that names
+    the open email's account, as a chat turn runs it): a new email is the open email's account,
+    with the other account as the primary, for either account. In demo it is still the demo
+    account when the open email is a real account's; out of demo an email of the demo row gives
+    the real primary. An open email whose account is not active gives the primary.
+- `AssistantChatOpenEmailAccountWiringTests`: a source fence over the app target, comments and
+  strings masked. Exactly one `ToolInvocation` is built with a chat session's `SessionUISink`
+  (the chat view's `toolInvocation`, used by every chat turn), and it passes
+  `openEmailAccountId: message?.accountId`.
 - `AssistantComposeCardAccountWiringTests`: a source fence over every app-target
   `composeViewForAgentRequest` (exactly two: `InboxView`, `MessageDetailView`), comments masked.
   The `.compose` case passes `account: req.account` and no other account argument; the `.reply`

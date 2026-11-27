@@ -74,8 +74,10 @@ ComposeView contains `.alert`, `.popover`, `.photosPicker`, `.fileImporter`, and
   - a new email whose card the email screen presented, because it opened the card with the open email's account (the observer race above decides which view presents).
 - *Decision:* `runComposeEdit` takes the sending account (`sender:`) and does no account lookup of its own.
   - A reply or forward passes the email's own account: the reply tool takes it from its existing account list, the forward tool reads it by primary key. The card sends from `replyTo`'s account, the same one.
-  - A new email: the tool reads the account once (`EmailComposeTool.sendingAccount`: the primary account, the demo account in demo, ADR-IOS-038), signs with it, and carries it on `ComposeRequest.account`. Both views open a new email's card with `req.account`, so the account no longer depends on which view wins the race, and the inbox no longer reads its own primary account (which had no demo filter) for this card.
+  - A new email: the tool reads the account once (`EmailComposeTool.sendingAccount`), signs with it, and carries it on `ComposeRequest.account`. Asked on an email's screen, it is that email's account (if active); in the inbox, the primary account; in demo, the demo account either way (ADR-IOS-038). Both views open a new email's card with `req.account`, so the account no longer depends on which view wins the race, and neither view reads an account of its own for this card (the inbox's primary had no demo filter; the email screen's was a synchronous read on the main thread).
+  - The email screen's chat tells the tool which email is open: `ToolInvocation.openEmailAccountId` (ADR-IOS-053's per-call value), set from the chat view's `message` by its one `toolInvocation` builder, nil in the inbox and for non-interactive callers. The tool reads that account by primary key inside its one read, before the primary lookup.
+  - Owner's choice (panel, 2026-11-27): from the open email's account on its screen, from the primary account in the inbox, rather than always the primary account.
 - *Accepted limitation:* if the user changes From in the card after the body was written, the sign-off keeps the first account's name. The text is on screen and editable.
-- *Tests:* `ComposeEditSenderAccountTests`, `AssistantComposeCardAccountWiringTests`.
+- *Tests:* `ComposeEditSenderAccountTests`, `AssistantChatOpenEmailAccountWiringTests`, `AssistantComposeCardAccountWiringTests`.
 
 ---

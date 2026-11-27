@@ -14,8 +14,9 @@ private let workAccountId = "acc-work"
 /// Invariant: when the assistant writes an email, the AI signs the body as the account the email
 /// is sent from. A reply or forward is sent from the email's own account, so the body is signed
 /// with that account's name even when it is not the primary account. A new email is sent from
-/// the primary account (the demo account in demo), and its compose card opens with exactly the
-/// account the body was signed as.
+/// the account of the email open where the user asked (an email screen's chat), and from the
+/// primary account in the inbox (the demo account in demo, either way); its compose card opens
+/// with exactly the account the body was signed as.
 ///
 /// The backend call is replaced per task through `EmailComposeTool.inlineEditOverride`, which
 /// receives the exact `ComposeEditContext` the tool built for `performInlineEdit`; one test sends
@@ -343,6 +344,101 @@ struct ComposeEditSenderAccountTests {
             guard captured.contexts.count == 1 else { return }
             #expect(captured.contexts[0].senderName == Self.work.name)
             #expect(captured.card?.account?.id == Self.work.id)
+        }
+    }
+
+    /// Runs `email_compose` the way a chat turn does: through a tool registry, with `invocation`.
+    private func composeThroughRegistry(_ ctx: ToolContext, invocation: ToolInvocation) async -> String {
+        let registry = ToolRegistry()
+        await registry.register(EmailComposeTool(context: ctx))
+        return await registry.execute(
+            name: "email_compose",
+            arguments: [
+                "to": .array([.string(Self.correspondent)]),
+                "request": .string("Ask about moving the offsite to Friday"),
+            ],
+            invocation: invocation
+        ).output
+    }
+
+    /// Asked on an email's screen, a new email is sent from, and signed as, that email's
+    /// account, whichever account is primary.
+    @Test("email_compose: asked on an email's screen, the new email is the open email's account, not the primary's", arguments: [homeAccountId, workAccountId])
+    func newEmailOnAnEmailsScreenIsTheOpenEmailsAccount(openId: String) async throws {
+        try await withDemoMode(false) {
+            let otherId = openId == Self.home.id ? Self.work.id : Self.home.id
+            let (ctx, _, _, router) = try makeContext(primaryId: otherId)
+            let open = openId == Self.home.id ? Self.home : Self.work
+
+            let captured = try await captureEditAndRequest(router: router) {
+                await self.composeThroughRegistry(ctx, invocation: ToolInvocation(openEmailAccountId: openId))
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == open.name)
+            #expect(captured.contexts[0].senderEmail == open.email)
+            #expect(captured.card?.account?.id == open.id)
+        }
+    }
+
+    /// Demo boundary (ADR-IOS-038) on an email's screen: in demo the new email is the demo
+    /// account's even when the open email is a real account's; out of demo an email of the demo
+    /// row never sends from it, and the new email is the real primary's.
+    @Test("email_compose: on an email's screen the new email keeps the demo boundary", arguments: [true, false])
+    func newEmailOnAnEmailsScreenKeepsTheDemoBoundary(demoActive: Bool) async throws {
+        try await withDemoMode(demoActive) {
+            let (ctx, _, _, router) = try makeContext(primaryId: Self.home.id, withDemoRow: true)
+            let openId = demoActive ? Self.work.id : Self.demo.id
+            let expected = demoActive ? Self.demo : Self.home
+
+            let captured = try await captureEditAndRequest(router: router) {
+                await self.composeThroughRegistry(ctx, invocation: ToolInvocation(openEmailAccountId: openId))
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == expected.name)
+            #expect(captured.card?.account?.id == expected.id)
+        }
+    }
+
+    /// An email whose account is no longer active does not send from that account: the new
+    /// email is the primary's, as in the inbox.
+    @Test("email_compose: on the screen of an email whose account is not active, the new email is the primary's")
+    func newEmailOnAnInactiveAccountsEmailIsThePrimarys() async throws {
+        try await withDemoMode(false) {
+            let (ctx, _, _, router) = try makeContext(primaryId: Self.home.id, inactive: [Self.work.id])
+
+            let captured = try await captureEditAndRequest(router: router) {
+                await self.composeThroughRegistry(ctx, invocation: ToolInvocation(openEmailAccountId: workAccountId))
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == Self.home.name)
+            #expect(captured.card?.account?.id == Self.home.id)
+        }
+    }
+}
+
+/// The chat gives its tools the account of the email it is on: every tool invocation bound to a
+/// chat session (`SessionUISink`) is built in one place, which passes the open email's account
+/// (nil in the inbox, where the chat has no email).
+@Suite("Assistant chat passes the open email's account to its tools")
+struct AssistantChatOpenEmailAccountWiringTests {
+
+    @Test("Every chat-session tool invocation carries the open email's account")
+    func everyChatInvocationCarriesTheOpenEmailsAccount() throws {
+        // Each chat-session construction's arguments, comments and string contents masked
+        // and whitespace collapsed.
+        let constructions = try DiagnosticPrintGateTests.appTargetSources().flatMap { file -> [String] in
+            DiagnosticPrintGateTests.codeOnly(file.source)
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                .components(separatedBy: "ToolInvocation(uiSink: SessionUISink(")
+                .dropFirst()
+                .map { String($0.prefix(120)) }
+        }
+        #expect(constructions.count == 1, "expected one chat-session invocation builder, found \(constructions.count)")
+        for construction in constructions {
+            #expect(construction.contains("openEmailAccountId: message?.accountId)"))
         }
     }
 }
