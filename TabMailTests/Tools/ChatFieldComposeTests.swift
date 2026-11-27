@@ -385,13 +385,15 @@ struct ChatFieldComposeTests {
         let to: [String]
         let cc: [String]
         let isReplyAll: Bool
+        /// The subject the card opens with: the one the answer wrote.
+        var subject = "Re: Offsite"
         var testDescription: String { name }
     }
 
     nonisolated static let ownOnly: [OwnOnly] = [
-        OwnOnly(name: "the words add someone else to To", onlyTo: nil,
-                answer: answer(addTo: [["name": "Bob", "email": "bob@example.com"]]),
-                to: ["bob@example.com"], cc: [], isReplyAll: true),
+        OwnOnly(name: "the words add someone else to To, under a subject they wrote", onlyTo: nil,
+                answer: answer(subject: "Plans for Friday", addTo: [["name": "Bob", "email": "bob@example.com"]]),
+                to: ["bob@example.com"], cc: [], isReplyAll: true, subject: "Plans for Friday"),
         OwnOnly(name: "the words add someone else to Cc", onlyTo: nil,
                 answer: answer(addCc: [["name": "Bob", "email": "bob@example.com"]]),
                 to: [], cc: ["bob@example.com"], isReplyAll: true),
@@ -426,6 +428,7 @@ struct ChatFieldComposeTests {
         let cc = RecipientEntry(card.cc).addresses.map { $0.lowercased() }
         #expect(to == expected.to && cc == expected.cc && card.bcc.isEmpty, "To \(to), Cc \(cc), Bcc \(card.bcc)")
         #expect(card.isReplyAll == expected.isReplyAll)
+        #expect(card.subject == expected.subject)
         card.onOutcome(.cancelled)
         _ = await task.value
     }

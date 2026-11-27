@@ -334,6 +334,8 @@ struct EmailReplyToolTests {
         let to: [String]
         let cc: [String]
         let bcc: [String]
+        /// The To entries that name no sendable address, as written.
+        var toNamed: [String] = []
         var testDescription: String { name }
     }
 
@@ -344,28 +346,37 @@ struct EmailReplyToolTests {
                       to: [], cc: ["bob@example.com"], bcc: []),
         OwnOnlyChange(name: "someone else added to Bcc", arguments: ["add_bcc": .array([.string("bob@example.com")])],
                       to: [], cc: [], bcc: ["bob@example.com"]),
+        // A name with no address is someone else too: the user names them on the card, which then
+        // holds them alone.
+        OwnOnlyChange(name: "someone else added by name only", arguments: ["add_recipients": .array([.string("Bob Smith")])],
+                      to: [], cc: [], bcc: [], toNamed: ["Bob Smith"]),
         // Controls: with nobody else added, the user's own addresses are the reply's audience.
         OwnOnlyChange(name: "no change", arguments: [:],
-                      to: ["a@example.com", "b@example.com"], cc: [], bcc: []),
+                      to: ["a@example.com", "b@example.com"], cc: ["c@example.com"], bcc: []),
         OwnOnlyChange(name: "one of the user's own addresses added",
                       arguments: ["add_recipients": .array([.string("A@example.com")])],
-                      to: ["a@example.com", "b@example.com"], cc: [], bcc: []),
+                      to: ["a@example.com", "b@example.com"], cc: ["c@example.com"], bcc: []),
     ]
 
-    /// The user forwards an email from their account A to their account B and, on the copy B
-    /// received, asks for a reply. Its Reply All holds nobody, so the reply goes to A, then B
-    /// (`ChatThread.replyAllAudience`). Once the change adds someone else, the card opens to them
-    /// alone: the person added is never shown the user's other addresses.
+    /// The user forwards an email from their account A to their account B, copying their account C,
+    /// and, on the copy B received, asks for a reply. Its Reply All holds nobody, so the reply goes to
+    /// A, then B, with C in Cc (`ChatThread.replyAllAudience`). Once the change adds someone else, the
+    /// card opens to them alone: the person added is never shown the user's other addresses. B's
+    /// account address is stored with capitals, as an account can be, and is still one of the user's.
     @Test("An own-only email's reply card keeps the user's addresses only while nobody else is added",
           arguments: ownOnlyChanges)
     func ownOnlyFallbackWithAChange(_ change: OwnOnlyChange) async throws {
         let (ctx, db, translator, router) = try makeContext()
         try TestDatabase.insertAccount(db, id: "acc1", email: "a@example.com")
-        try TestDatabase.insertAccount(db, id: "acc2", email: "b@example.com")
+        try TestDatabase.insertAccount(db, id: "acc2", email: "B@Example.com")
+        try TestDatabase.insertAccount(db, id: "acc3", email: "c@example.com")
         try TestDatabase.insertFolder(db, accountId: "acc2")
         let header = try TestDatabase.insertMessageHeader(
             db, messageId: "msgOwn", subject: "Notes", from: "a@example.com", fromAddress: "a@example.com",
             to: "b@example.com", folderId: "acc2:INBOX", accountId: "acc2")
+        try await db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cc = 'c@example.com' WHERE id = ?", arguments: [header.id])
+        }
         await translator.seed(header.id, as: 30)
 
         let tool = EmailReplyTool(context: ctx)
@@ -382,7 +393,9 @@ struct EmailReplyToolTests {
         let to = RecipientEntry(req.to).addresses.map { $0.lowercased() }
         let cc = RecipientEntry(req.cc).addresses.map { $0.lowercased() }
         let bcc = RecipientEntry(req.bcc).addresses.map { $0.lowercased() }
+        let toNamed = RecipientEntry(req.to).leftovers
         #expect(to == change.to && cc == change.cc && bcc == change.bcc, "To \(to), Cc \(cc), Bcc \(bcc)")
+        #expect(toNamed == change.toNamed, "To entries with no address: \(toNamed)")
         #expect(req.isReplyAll, "a Reply All, as before the own-only audience")
         req.onOutcome(.cancelled)
         _ = try await task.value

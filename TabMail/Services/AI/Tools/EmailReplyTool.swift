@@ -115,9 +115,9 @@ struct EmailReplyTool: AgentTool, Sendable {
 
         // THE draft of this reply, derived once and used for both the model's context and the card:
         // the AI Suggestion's own envelope (`ChatReplyCompose.suggestionEnvelope`, the ghost's card's
-        // builder) with this call's recipient changes applied by the card's own operation
-        // (`ChatReplyCompose.applying`, which also leaves an own-only email's addresses out once
-        // someone else is added). Its kind follows the final audience (`ChatReplyCompose.with`).
+        // builder) with this call's recipient changes applied by the one step the field's Send
+        // shares (`ChatReplyCompose.applying`, which also leaves an own-only email's addresses out
+        // once someone else is added). Its kind follows the final audience (`ChatReplyCompose.with`).
         let suggestionEnvelope = ChatReplyCompose.suggestionEnvelope(for: header, accounts: accounts)
         let start = suggestionEnvelope.applying(
             to: Self.delta(adds: addTo, removes: removeTo), cc: Self.delta(adds: addCc, removes: removeCc),

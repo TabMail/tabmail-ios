@@ -465,11 +465,12 @@ struct ChatReplyCompose: Equatable {
     /// (`with(recipients:subject:)`): the one step with which the agent's reply tool
     /// (`EmailReplyTool.reply`) and the field's Send (`ChatFieldCompose.reply`) apply a change.
     /// An own-only email's audience (`ChatThread.replyAllAudience`: the user's own addresses, when
-    /// its Reply All holds nobody else) stands only while nobody else is on the reply: a change that
-    /// adds an address that is not one of the user's (`accounts`) applies to the email's Reply All
-    /// without them, which is nobody, so the person added is never shown the user's other
-    /// addresses. An address of the user's that the change itself adds stays. A plain reply's
-    /// people (chosen in Reply to, `onlyTo`) stay as chosen.
+    /// its Reply All holds nobody else) stays through a change only while the change adds nobody
+    /// else: a change that adds anyone who is not one of the user's addresses (`accounts`), an entry
+    /// that names no sendable address included (someone the user still has to name), applies to the
+    /// email's Reply All without them, which is nobody, so the person added is never shown the
+    /// user's other addresses. An address of the user's that the change itself adds stays. A plain
+    /// reply's people (chosen in Reply to, `onlyTo`) stay as chosen.
     func applying(
         to: RecipientDelta?, cc: RecipientDelta?, bcc: RecipientDelta?, subject: String, accounts: [Account]
     ) -> ChatReplyCompose {
@@ -478,7 +479,8 @@ struct ChatReplyCompose: Equatable {
         let ownOnly = isReplyAll && audience.leftovers.isEmpty && !audience.addresses.isEmpty
             && audience.addresses.allSatisfy { own.contains($0.lowercased()) }
         let addsSomeoneElse = [to, cc, bcc].contains { delta in
-            delta?.adds.addresses.contains { !own.contains($0.lowercased()) } ?? false
+            guard let adds = delta?.adds else { return false }
+            return !adds.leftovers.isEmpty || adds.addresses.contains { !own.contains($0.lowercased()) }
         }
         let start = ownOnly && addsSomeoneElse
             ? ChatReplyCompose(isReplyAll: isReplyAll, to: [], cc: [], bcc: self.bcc, subject: self.subject)
