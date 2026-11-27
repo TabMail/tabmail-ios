@@ -180,7 +180,8 @@ occupied) posts nothing: the row there is not the moved row, so a view holding t
 a gone row until reopened (`IOS-BODY-004`). A placeholder's collision arms do post: the row already
 at the new id is the server's copy of that email, and the inbox list then drops the moved snapshot
 rather than show the copy twice. The list drops a moved snapshot whenever its new id is held after
-the post (by a row no move names, or by a row an earlier move of the same post renamed), and it
+the post (by a row no move names, or by another moved row of the same post, earlier in the list,
+that took that id), and it
 writes the list only when a row is renamed or dropped.
 
 Accepted limitation (rare timing race, ios#1581): posts and hand-overs follow commit order for one

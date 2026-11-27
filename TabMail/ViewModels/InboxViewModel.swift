@@ -359,9 +359,9 @@ final class InboxViewModel {
     /// is already looking at until the normal reload reconciles it.
     ///
     /// A move onto an id the list holds after this post (a row no move names,
-    /// such as a placeholder's server copy that was stored first, or a row an
-    /// earlier move of this post renamed) drops the moved snapshot: the list
-    /// never holds one id twice.
+    /// such as a placeholder's server copy that was stored first, or another
+    /// moved row of this post, earlier in the list, that took that id) drops
+    /// the moved snapshot: the list never holds one id twice.
     func applyHeaderRekeys(_ moves: MailPointerMoves) {
         guard !moves.isEmpty else { return }
         var changed = false
