@@ -91,7 +91,8 @@ struct OutlookChangeReadingTests {
             let request = ChangeRequest(
                 folders: folders.map {
                     ChangeFolder(id: $0.id, path: $0.path, role: $0.role, cursor: $0.changeCursor,
-                                 isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate)
+                                 isSynced: synced.contains($0.id), heldSince: $0.oldestSyncedDate,
+                                 olderMailComplete: $0.backfillComplete)
                 },
                 scope: scope, recheck: recheck, context: context,
                 localRows: SyncEngineCatchUpRowReader(pool: AppDatabase.syncPool))
@@ -161,6 +162,12 @@ struct OutlookChangeReadingTests {
         func setHeldSince(_ date: Date?, of path: String) throws {
             try pool.write { db in
                 try db.execute(sql: "UPDATE folder SET oldestSyncedDate = ? WHERE id = ?", arguments: [date, folderId(path)])
+            }
+        }
+
+        func setWalkComplete(_ complete: Bool, of path: String) throws {
+            try pool.write { db in
+                try db.execute(sql: "UPDATE folder SET backfillComplete = ? WHERE id = ?", arguments: [complete, folderId(path)])
             }
         }
 
@@ -334,12 +341,16 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    @Test("Baseline: an unknown message below the held range gets no fetch; one within it is fetched and inserted")
-    func baselineFetchesOnlyWithinTheHeldRange() async throws {
+    /// Whether the folder's older-mail walk has completed does not widen a held
+    /// range: mail older than it stays the backfill's (#1363's guard).
+    @Test("Baseline: an unknown message below the held range gets no fetch; one within it is fetched and inserted; the same once the folder's older-mail walk has completed",
+          arguments: [false, true])
+    func baselineFetchesOnlyWithinTheHeldRange(walkComplete: Bool) async throws {
         try await Self.withWorld(
             seeds: [Self.seed("old", in: Self.archive, daysAgo: 60), Self.seed("recent", in: Self.archive, daysAgo: 5)],
             heldSince: Self.daysAgo(30)
         ) { w in
+            try w.setWalkComplete(walkComplete, of: w.archive)
             try await w.baselineAll()
             #expect(w.batchedIds() == ["recent"])
             #expect(try w.row("recent", in: w.archive) != nil)
@@ -347,7 +358,56 @@ struct OutlookChangeReadingTests {
         }
     }
 
-    @Test("A baseline with no held range inserts nothing and fetches nothing")
+    /// A folder whose older-mail walk completed while it was empty holds no
+    /// held range, yet holds the whole folder: its first read fetches and
+    /// inserts every message it lacks, whatever the message's date (#1363).
+    @Test("A baseline with no held range, in a folder whose older-mail walk has completed, fetches and inserts every message the folder lacks, whatever its date")
+    func baselineWithNoHeldRangeAfterTheWalkTakesEveryMessage() async throws {
+        try await Self.withWorld(
+            seeds: [Self.seed("landed", in: Self.archive, daysAgo: 1), Self.seed("moved-in", in: Self.archive, daysAgo: 400)],
+            heldSince: nil
+        ) { w in
+            try w.setWalkComplete(true, of: w.archive)
+            try await w.baselineAll()
+            let fetched = Set(w.batchedIds())
+            let rows = try w.rowIds(in: w.archive)
+            #expect(fetched == ["landed", "moved-in"], "the first read fetches every message the folder lacks: \(fetched)")
+            #expect(rows == ["landed", "moved-in"], "and inserts them: \(rows)")
+        }
+    }
+
+    /// The reader's rule (`ExchangeProvider.needsHeader`) case by case: a
+    /// tracking round fetches every new message; a baseline fetches one within
+    /// the held range; with no range, every one once the folder's older-mail
+    /// walk has completed and none before; a completed walk never widens a range.
+    @Test("The reader fetches a message the folder lacks: tracking, every one; a baseline, within the held range only; with no range, every one once the walk has completed and none before")
+    func needsHeaderRule() {
+        let heldSince = Self.daysAgo(30)
+        func record(_ days: Double) -> GraphDeltaMessage {
+            GraphDeltaMessage(id: "n-\(days)", removed: nil, receivedDateTime: Self.daysAgo(days).iso8601String(),
+                              isRead: nil, flag: nil, categories: nil)
+        }
+        let recent = record(5)
+        let old = record(60)
+        let noRangeWalked = ExchangeProvider.needsHeader(old, phase: .baseline, heldSince: nil, olderMailComplete: true)
+        let noRangeWalkedRecent = ExchangeProvider.needsHeader(recent, phase: .baseline, heldSince: nil, olderMailComplete: true)
+        let noRangeUnwalked = ExchangeProvider.needsHeader(recent, phase: .baseline, heldSince: nil, olderMailComplete: false)
+        let belowRangeWalked = ExchangeProvider.needsHeader(old, phase: .baseline, heldSince: heldSince, olderMailComplete: true)
+        let belowRangeUnwalked = ExchangeProvider.needsHeader(old, phase: .baseline, heldSince: heldSince, olderMailComplete: false)
+        let withinRange = ExchangeProvider.needsHeader(recent, phase: .baseline, heldSince: heldSince, olderMailComplete: false)
+        let tracking = ExchangeProvider.needsHeader(old, phase: .tracking, heldSince: heldSince, olderMailComplete: false)
+        let undated = ExchangeProvider.needsHeader(
+            GraphDeltaMessage(id: "u", removed: nil, receivedDateTime: nil, isRead: true, flag: nil, categories: nil),
+            phase: .baseline, heldSince: nil, olderMailComplete: true)
+        #expect(noRangeWalked && noRangeWalkedRecent, "no range, walk completed: every message")
+        #expect(!noRangeUnwalked, "no range, walk not completed: none")
+        #expect(!belowRangeWalked && !belowRangeUnwalked, "below a range: none, whether or not the walk completed")
+        #expect(withinRange, "within the range")
+        #expect(tracking, "tracking: every new message")
+        #expect(!undated, "an update record (no received date) is never fetched")
+    }
+
+    @Test("A baseline with no held range, before the folders' older-mail walks have completed, inserts nothing and fetches nothing")
     func baselineWithNoHeldRangeInsertsNothing() async throws {
         try await Self.withWorld(seeds: [Self.seed("i-1", in: Self.inbox), Self.seed("a-1", in: Self.archive)], heldSince: nil) { w in
             try await w.baselineAll()
