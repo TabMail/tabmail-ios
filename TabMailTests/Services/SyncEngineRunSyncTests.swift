@@ -1658,6 +1658,54 @@ struct RunSyncDedupReclaimFtsRoutingTests {
         #expect(labelsByRow == ["\(canonicalId) \(label.id)"])
     }
 
+    /// The placeholder dedup's collision leg: the server's copy already occupies
+    /// its id, so the placeholder is deleted and nothing is inserted. The label
+    /// the user put on the placeholder goes to the copy, as on the insert leg.
+    @Test("A collided placeholder dedup keeps the placeholder's user labels on the copy")
+    func draftDedupCollisionKeepsTheUserLabels() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "draft-collided-labels@example.com"
+        let placeholderId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "Drafts", messageId: "draft-local-1")
+        let copyId = MessageIdentity.headerId(accountId: "racc", folderPath: "Drafts", messageId: "42")
+        let label = UserLabel(accountId: "racc", providerLabelId: "keep", name: "Keep", isSystem: false)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "d@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "racc").insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "draft-local-1", folderPath: "Drafts",
+                folderId: "racc:Drafts", rfc822: rfc, isInInbox: false)
+            // The row at the copy's id is filed under another folder, so the
+            // listing's existence check misses it and the dedup's own read finds
+            // it (the collision leg's reachable shape, as in
+            // `draftDedupCollisionRoutesTheOldIdToStaleIds`).
+            _ = try Self.insertHeader(
+                db, messageId: "42", folderPath: "Drafts", folderId: "racc:INBOX",
+                rfc822: "someone-else@example.com", isInInbox: false)
+            try label.insert(db)
+            try MessageUserLabel(messageId: placeholderId, userLabelId: label.id).insert(db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Drafts")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+        _ = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        let placeholderLeft = try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) }
+        #expect(placeholderLeft == nil, "precondition: the collision leg deleted the placeholder")
+        let labelsByRow = try await pool.read { db in
+            try MessageUserLabel.fetchAll(db).map { "\($0.messageId) \($0.userLabelId)" }
+        }
+        #expect(labelsByRow == ["\(copyId) \(label.id)"])
+    }
+
     /// A Gmail row an optimistic move left keyed by its old folder is re-keyed
     /// to its canonical key when its folder is listed. That re-key is reported
     /// for views and chats with no provider authority (a hidden or fading row
