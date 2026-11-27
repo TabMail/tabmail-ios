@@ -6,9 +6,10 @@ import SwiftUI
 import UIKit
 
 /// The one-time database upgrade's screen (ADR-IOS-121), full screen: first the
-/// notice (what it does, Upgrade now and Later), then, after Upgrade now, a spinner
-/// with the screen kept awake (`keepScreenAwake`, as Fast Sync), then the result.
-/// State and actions are `DatabaseUpgrade`'s.
+/// notice (what it does, how long it can take, Upgrade now and Later), then, after
+/// Upgrade now, one progress bar for both databases with the minutes left
+/// (`DatabaseUpgradeProgress`), with the screen kept awake (`keepScreenAwake`, as Fast
+/// Sync), then the result. State and actions are `DatabaseUpgrade`'s.
 struct DatabaseUpgradeView: View {
     @Bindable var upgrade: DatabaseUpgrade
 
@@ -16,7 +17,6 @@ struct DatabaseUpgradeView: View {
 
     static let noticeTitle = "Database update"
     static let noticeWhat = "For the best experience, TabMail needs to update your database."
-    static let noticeTime = "It can take up to 10 minutes. Keep TabMail open while it runs."
     static let upgradeNowTitle = "Update now"
     static let laterTitle = "Later"
     static let upgradingTitle = "Updating your database."
@@ -26,6 +26,26 @@ struct DatabaseUpgradeView: View {
     static let failedTitle = "The update could not finish"
     static let failedMessage = "Nothing was lost. You can try again later from the banner in your inbox."
     static let powerMessage = "Plug in your phone first: the battery is low."
+    static let lessThanAMinuteRemaining = "Less than a minute remaining"
+    static let almostDone = "Almost done"
+
+    /// The notice's time: `minutes` from `DatabaseUpgrade.noticeMinutes`.
+    static func noticeTime(minutes: Int) -> String {
+        "It can take up to \(minutesText(minutes)). Keep TabMail open while it runs."
+    }
+
+    /// What the running screen says under the bar.
+    static func remainingText(_ remaining: DatabaseUpgradeProgress.Remaining) -> String {
+        switch remaining {
+        case .minutes(let minutes): "About \(minutesText(minutes)) remaining"
+        case .lessThanAMinute: lessThanAMinuteRemaining
+        case .almostDone: almostDone
+        }
+    }
+
+    private static func minutesText(_ minutes: Int) -> String {
+        minutes == 1 ? "1 minute" : "\(minutes) minutes"
+    }
 
     /// The space free right now, not what iPhone Storage shows as available (which
     /// counts space iOS could purge): the upgrade writes its copy at once.
@@ -76,7 +96,7 @@ struct DatabaseUpgradeView: View {
             Text(Self.noticeWhat)
                 .multilineTextAlignment(.center)
                 .foregroundStyle(Palette.textColor)
-            Text(Self.noticeTime)
+            Text(Self.noticeTime(minutes: upgrade.noticeMinutes ?? SyncConfig.databaseUpgradeNoticeFallbackMinutes))
                 .multilineTextAlignment(.center)
                 .foregroundStyle(Palette.textMuted)
             if upgrade.showsSpaceMessage {
@@ -98,16 +118,11 @@ struct DatabaseUpgradeView: View {
         }
     }
 
+    /// Recomputed every `SyncConfig.databaseUpgradeProgressRefreshSeconds`, and at once
+    /// when a database finishes (`DatabaseUpgrade.progress` is observed).
     private var upgrading: some View {
-        VStack(spacing: 16) {
-            ProgressView()
-                .controlSize(.large)
-            Text(Self.upgradingTitle)
-                .font(.headline)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(Palette.textColor)
-            Text(Self.upgradingHint)
-                .foregroundStyle(Palette.textMuted)
+        TimelineView(.periodic(from: .now, by: SyncConfig.databaseUpgradeProgressRefreshSeconds)) { _ in
+            DatabaseUpgradeRunningContent(progress: upgrade.progress?.progress(at: .now))
         }
     }
 
@@ -140,6 +155,33 @@ struct DatabaseUpgradeView: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+        }
+    }
+}
+
+/// The running screen's content: the title, the bar and the minutes left. Before the
+/// run has read the databases' data (`progress` nil) the bar is empty and no time shows.
+struct DatabaseUpgradeRunningContent: View {
+    let progress: DatabaseUpgradeProgress?
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text(DatabaseUpgradeView.upgradingTitle)
+                .font(.headline)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Palette.textColor)
+            ProgressView(value: progress?.fraction ?? 0)
+                .progressViewStyle(.linear)
+                .accessibilityLabel(Text(DatabaseUpgradeView.upgradingTitle))
+            if let progress {
+                Text(DatabaseUpgradeView.remainingText(progress.remaining))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(Palette.textColor)
+                    .monospacedDigit()
+            }
+            Text(DatabaseUpgradeView.upgradingHint)
+                .multilineTextAlignment(.center)
+                .foregroundStyle(Palette.textMuted)
         }
     }
 }

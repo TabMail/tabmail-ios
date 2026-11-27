@@ -20,14 +20,16 @@ import UIKit
 ///   render: the search database's state read opens the search index, which the
 ///   app opens only after the first paint (`TabMailApp.deferredSearchIndexInitIfNeeded`).
 /// - The notice (`DatabaseUpgradeView`) says what the upgrade does and how long it
-///   takes. Upgrade now is off while the device has too little space free right now
+///   can take (`noticeMinutes`, from the data still to upgrade). Upgrade now is off
+///   while the device has too little space free right now
 ///   (`bytesToFree`; space iOS could purge does not count) or the battery is low and
 ///   not charging (`needsPower`).
 /// - It shows by itself once (`checkAfterLaunch`), at that quiet moment; after that
 ///   only from the banner. Later closes it; the banner stays.
-/// - Upgrade now runs `run`: upgrade mode (the full-screen spinner over the app, and
-///   the light pause), then the rewrite, email database first, with the screen kept
-///   awake. At the end a sync runs at once and the banner goes.
+/// - Upgrade now runs `run`: upgrade mode (the full-screen progress screen over the
+///   app, and the light pause), then the rewrite, email database first, with the
+///   screen kept awake. The screen's bar and minutes left come from `progress`
+///   (`DatabaseUpgradeProgress`). At the end a sync runs at once and the banner goes.
 @MainActor
 @Observable
 final class DatabaseUpgrade {
@@ -39,10 +41,14 @@ final class DatabaseUpgrade {
         let state: DatabaseVacuum.SpaceState?
     }
 
+    /// Told each database's step as soon as it ends (`SyncEngine.runDatabaseUpgrade`).
+    typealias StepFinished = @Sendable (SyncEngine.UpgradeStep) async -> Void
+
     /// The scheduler whose polling the upgrade pauses and turns back on.
     private let scheduler: SyncScheduler
-    /// The rewrite: the app's two databases (`upgradeTheAppsDatabases`).
-    private let upgradeDatabases: @Sendable () async -> [SyncEngine.UpgradeStep]
+    /// The rewrite: the app's two databases (`upgradeTheAppsDatabases`), telling its
+    /// argument each database's step as it ends.
+    private let upgradeDatabases: @Sendable (StepFinished) async -> [SyncEngine.UpgradeStep]
     /// Both databases' states (`readTheAppsStates`).
     private let readStates: @Sendable () async -> [DatabaseState]
     /// The battery's level and state (`theDevicesBattery`).
@@ -51,7 +57,7 @@ final class DatabaseUpgrade {
     /// The app's upgrade; a test passes its own scheduler, rewrite, states and battery.
     init(
         scheduler: SyncScheduler = .shared,
-        upgradeDatabases: @escaping @Sendable () async -> [SyncEngine.UpgradeStep] = DatabaseUpgrade.upgradeTheAppsDatabases,
+        upgradeDatabases: @escaping @Sendable (StepFinished) async -> [SyncEngine.UpgradeStep] = DatabaseUpgrade.upgradeTheAppsDatabases,
         readStates: @escaping @Sendable () async -> [DatabaseState] = DatabaseUpgrade.readTheAppsStates,
         readBattery: @escaping @MainActor () -> (level: Float, state: UIDevice.BatteryState) = DatabaseUpgrade.theDevicesBattery
     ) {
@@ -65,7 +71,7 @@ final class DatabaseUpgrade {
     enum Screen: Equatable {
         /// The notice: what the upgrade does, Upgrade now and Later.
         case notice
-        /// The rewrite runs (spinner, screen kept awake).
+        /// The rewrite runs (progress bar, screen kept awake).
         case upgrading
         /// Both databases are upgraded.
         case done
@@ -92,6 +98,15 @@ final class DatabaseUpgrade {
     /// The rewrite stopped because the databases were suspended (the app's
     /// background time ran out); it starts again when the app is active.
     private(set) var continuesOnReturn = false
+    /// The notice's "It can take up to N minutes" (`DatabaseUpgradeProgress.noticeMinutes`)
+    /// for the data of the databases still on NONE; nil when a database's mode and pages
+    /// cannot be read, and the notice says `SyncConfig.databaseUpgradeNoticeFallbackMinutes`.
+    private(set) var noticeMinutes: Int?
+    /// The running upgrade's progress (the running screen's bar): the data of the
+    /// databases it rewrites, read once at its start, and when each finished. Nil from
+    /// the start until that read, for a run whose read found a database unreadable,
+    /// and after a suspension stopped the run.
+    private(set) var progress: DatabaseUpgradeProgress.Run?
 
     /// Set once the notice has shown by itself (`checkAfterLaunch`).
     static let noticeOfferedKey = "DatabaseUpgrade.noticeOffered"
@@ -145,8 +160,20 @@ final class DatabaseUpgrade {
             guard let available = SyncEngine.deviceAvailableBytes(forVolumeOf: entry.path) else { return nil }
             return SyncEngine.bytesToFreeForUpgrade(liveBytes: entry.liveBytes, availableBytes: available)
         }.max() ?? 0
+        noticeMinutes = states.contains { $0.state == nil }
+            ? nil
+            : DatabaseUpgradeProgress.noticeMinutes(dataBytes: Self.dataToUpgrade(states).reduce(0, +))
         let battery = readBattery()
         needsPower = Self.needsPower(level: battery.level, state: battery.state)
+    }
+
+    /// The data (pages less empty pages) of each database still on NONE, in the order
+    /// the upgrade rewrites them.
+    private static func dataToUpgrade(_ states: [DatabaseState]) -> [Int64] {
+        states.compactMap { entry in
+            guard let state = entry.state, state.autoVacuum == DatabaseVacuum.noneMode else { return nil }
+            return state.liveBytes
+        }
     }
 
     /// The device's battery level and state, as `UIDevice` reports them.
@@ -181,7 +208,7 @@ final class DatabaseUpgrade {
         await run()
     }
 
-    /// The upgrade in upgrade mode: the full-screen spinner keeps
+    /// The upgrade in upgrade mode: the full-screen progress screen keeps
     /// the user out of the app, and the light pause quiets the database, so the
     /// rewrite runs faster and its final TRUNCATE can empty the WAL (which then holds
     /// a second copy of the database). The pause is the two stops the app already
@@ -214,17 +241,32 @@ final class DatabaseUpgrade {
     /// When the databases are suspended mid-rewrite (the app left, its background
     /// time ran out), the rewrite rolls back while it builds its copy, and the
     /// upgrade starts again when the app is active (`appBecameActive`).
+    ///
+    /// The running screen's bar (`progress`, #1583): once paused, the run reads the
+    /// databases' states once more (the same header read as the notice's; no table) for
+    /// the data of those still on NONE, and starts its clock; each database the rewrite
+    /// upgrades records its finish (`databaseFinished`). A database whose state cannot be
+    /// read leaves the run with no bar (`progress` nil: an empty bar, no minutes): the
+    /// finishes are matched to the data by position, and the rewrite still runs that
+    /// database. A run the suspension stops drops its bar; started again, it reads the
+    /// states again, and its bar covers what is left.
     private func run() async {
         screen = .upgrading
         continuesOnReturn = false
         ranOutOfSpace = false
+        progress = nil
         scheduler.stopPolling()
         defer { if DatabaseSuspension.isAppActive { scheduler.startForegroundPolling() } }
         await SyncScheduler.cancelAllInFlightQueues(inboxOnly: false)
-        let steps = await upgradeDatabases()
+        let states = await readStates()
+        progress = states.contains { $0.state == nil }
+            ? nil
+            : DatabaseUpgradeProgress.Run(dataBytes: Self.dataToUpgrade(states), start: .now)
+        let steps = await upgradeDatabases { step in await self.databaseFinished(step) }
         BackgroundSyncLogger.logDebug("[DatabaseUpgrade] ended: \(steps)")
         if steps.contains(where: { if case .stopped = $0 { true } else { false } }) {
             continuesOnReturn = true
+            progress = nil
             return
         }
         await refreshConditions()
@@ -236,6 +278,14 @@ final class DatabaseUpgrade {
         } else {
             screen = .done
         }
+    }
+
+    /// A database's step ended (`SyncEngine.runDatabaseUpgrade`): an upgraded one fills
+    /// its share of the bar. A database the run found upgraded already is not in its
+    /// data (read on NONE only), and any other step ends the run.
+    private func databaseFinished(_ step: SyncEngine.UpgradeStep) {
+        guard case .upgraded = step else { return }
+        progress?.finish(at: .now)
     }
 
     /// The inbox is shown (RootView's `.task`): once the launch is ready and
@@ -272,10 +322,10 @@ final class DatabaseUpgrade {
     }
 
     /// The rewrite of the app's two databases, with the app's free-space reading
-    /// and suspension check.
-    nonisolated static func upgradeTheAppsDatabases() async -> [SyncEngine.UpgradeStep] {
+    /// and suspension check, telling `finished` each database's step as it ends.
+    nonisolated static func upgradeTheAppsDatabases(finished: StepFinished) async -> [SyncEngine.UpgradeStep] {
         let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.dbPool)
-        return await SyncEngine.runDatabaseUpgrade(targets: targets)
+        return await SyncEngine.runDatabaseUpgrade(targets: targets, finished: finished)
     }
 
     /// The app's two databases' paths and states, read off the main thread: the

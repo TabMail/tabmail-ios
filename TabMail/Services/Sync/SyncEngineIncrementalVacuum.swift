@@ -318,15 +318,19 @@ extension SyncEngine {
     /// `shouldRun` is asked before each target and again on the writer, just before
     /// each `VACUUM`. The TRUNCATE after a switch always follows it: the WAL then
     /// holds the whole rewritten database, and only a checkpoint empties it.
+    /// `finished` is told each target's step as soon as it ends (the upgrade screen's
+    /// progress, #1583), before the next target starts.
     nonisolated static func runDatabaseUpgrade(
         targets: [SpaceReturnTarget],
         availableBytes: @Sendable (String) -> Int64? = { deviceAvailableBytes(forVolumeOf: $0) },
-        shouldRun: @escaping @Sendable () -> Bool = { SyncEngine.upgradeMayRun() }
+        shouldRun: @escaping @Sendable () -> Bool = { SyncEngine.upgradeMayRun() },
+        finished: @Sendable (UpgradeStep) async -> Void = { _ in }
     ) async -> [UpgradeStep] {
         var steps: [UpgradeStep] = []
         for target in targets {
             let step = await upgradeOne(target, availableBytes: availableBytes, shouldRun: shouldRun)
             steps.append(step)
+            await finished(step)
             switch step {
             case .upgraded, .alreadyUpgraded: continue
             case .needsSpace, .ranOutOfSpace, .stopped, .failed: return steps
