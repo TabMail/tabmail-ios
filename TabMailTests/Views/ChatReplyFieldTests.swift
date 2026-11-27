@@ -998,8 +998,8 @@ struct ChatReplyFieldTests {
     @Test("A new email's chat shows its send through the thread's own rows, and ends its hold by the thread's rule")
     func newEmailSharesTheOutgoingRows() throws {
         let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
-        #expect(Self.count("ChatOutgoingRows(unsentReplies: cardSend?.reply.map { [$0] } ?? [], heldGhost: heldMessage, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .newEmailChat) { EmptyView() }", in: view) == 1,
-                "the card's send, the held message and the field's message, in the thread's rows")
+        #expect(Self.count("ChatOutgoingRows(unsentReplies: sends.replies(showing: []), heldGhost: heldMessage, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .newEmailChat) { EmptyView() }", in: view) == 1,
+                "the card's send (its bubble, `ChatSendBubbles`), the held message and the field's message, in the thread's rows")
         for bubble in ["ChatUnsentReplyBubble(", "ChatFieldMessageBubble(", ".matchedGeometryEffect("] {
             #expect(Self.count(bubble, in: view) == 0, "\(bubble): no copy of the rows' bubbles")
         }

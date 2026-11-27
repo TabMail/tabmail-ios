@@ -484,9 +484,11 @@ struct ChatSendingBubbleTests {
         #expect(count(text) == 1 && count("Sending") == 1, "control: the reply's Sending bubble shows its summary: \(labels().prefix(20))")
 
         // The optimistic Sent copy as the send writes it: in Sent, under the row's Message-ID, answering
-        // the chat's email, with the summary made at Send.
+        // the chat's email, to the reply's recipient (so the chat reads it "You said: ..."), with the
+        // summary made at Send.
         var copy = Self.header("copy-\(order.rawValue)", folder: "Sent", from: fixture.account.emailAddress,
                                inReplyTo: fixture.parent.rfc822MessageId)
+        copy.to = "sender@example.com"
         copy.rfc822MessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId))
         copy.date = Date()
         copy.summaryBlurb = "A plan."
@@ -607,7 +609,13 @@ struct ChatSendingBubbleTests {
         copy.rfc822MessageId = sentId
         let ownCopy = copy
         try await pool.write { db in try ownCopy.insert(db) }
-        #expect(try await shown()[sent.id] != nil, "its copy is in the database, not yet one of the chat's emails: the row still shows")
+        let afterCopy = try await shown()
+        if afterCopy[sent.id] == nil {
+            // What the outbox row is when the read leaves it out.
+            let row = try await pool.read { db in try OutboxMessage.fetchOne(db, key: sent.id) }
+            print("[whichRowsShow] sent row after its copy: exists=\(row != nil) sentAt=\(row?.sentAt != nil) status=\(row.map { "\($0.outboxStatus)" } ?? "nil") sentMessageId=\(row?.sentMessageId ?? "nil") parent=\(row.flatMap { AccountManager.queuedParentRfc822MessageId(of: $0) } ?? "nil") chat=\(chat.sorted()) shown=\(afterCopy.keys.sorted()) sent=\(sent.id)")
+        }
+        #expect(afterCopy[sent.id] != nil, "its copy is in the database, not yet one of the chat's emails: the row still shows")
         #expect(try await shown(chat.union([sentId]))[sent.id] == nil, "once the copy is one of the chat's emails, the bubble ends")
     }
 
