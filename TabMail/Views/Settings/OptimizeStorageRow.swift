@@ -8,12 +8,12 @@ import SwiftUI
 /// can drop to, a line under it, and the tap. State and actions are `StorageOptimizer`'s.
 ///
 /// The title stays on one line, and the size and the lines are grey, as other values in
-/// Settings are. Every line under the title starts where the title's text does. Up to the
-/// default text size the size sits on the title's line; at the larger standard sizes it does
-/// not fit there on a 375-pt phone, so it goes under the title as the lines do. At the
-/// accessibility sizes a list wraps a label's text under its icon and `LabeledContent` puts its
-/// value under its title, so the size and the lines go under the title from the row's leading
-/// edge, as the rows around it do.
+/// Settings are. The size goes under the title, never beside it: beside it, it wraps on a
+/// narrow row (a 375-pt phone from xxLarge up, or a phone that Display Zoom lays out 320 pt
+/// wide, already at the default text size). Below the accessibility sizes the size and the
+/// lines start where the title's text does. At the accessibility sizes a list wraps a label's
+/// text under its icon and `LabeledContent` puts its value under its title, so the size and
+/// the lines go under the title from the row's leading edge, as the rows around it do.
 struct OptimizeStorageRow: View {
     let row: StorageOptimizer.Row
     /// Formats a size as "Email Index Used" shows it.
@@ -43,11 +43,6 @@ struct OptimizeStorageRow: View {
 
     private static let icon = "internaldrive"
 
-    /// The largest text size at which the size sits beside the title. At xLarge the title and a
-    /// wide size ("Can drop to 4.85 GB") leave only a few points of a 375-pt phone's row, and at
-    /// xxLarge they need more than the row.
-    private static let largestSideBySideSize: DynamicTypeSize = .large
-
     var body: some View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 4) {
@@ -58,23 +53,15 @@ struct OptimizeStorageRow: View {
                         lineText(line)
                     }
                 } else {
-                    if dynamicTypeSize > Self.largestSideBySideSize {
-                        titleLabel
-                        underTitle(trailing)
-                    } else {
-                        HStack {
-                            titleLabel
-                                .layoutPriority(1)
-                            Spacer()
-                            trailing
-                        }
-                    }
+                    titleLabel
+                    underTitle(trailing)
                     if let line = Self.line(for: row) {
                         underTitle(lineText(line))
                     }
                 }
             }
             .multilineTextAlignment(.leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
