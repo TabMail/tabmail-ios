@@ -7,13 +7,14 @@ import SwiftUI
 /// Settings > Email Index's Optimize Storage row (#1448): the size "Email Index Used"
 /// can drop to, a line under it, and the tap. State and actions are `StorageOptimizer`'s.
 ///
-/// The title stays on one line, and the size and the lines are grey, as other values in
-/// Settings are. The size goes under the title, never beside it: beside it, it wraps on a
-/// narrow row (a 375-pt phone from xxLarge up, or a phone that Display Zoom lays out 320 pt
-/// wide, already at the default text size). Below the accessibility sizes the size and the
-/// lines start where the title's text does. At the accessibility sizes a list wraps a label's
-/// text under its icon and `LabeledContent` puts its value under its title, so the size and
-/// the lines go under the title from the row's leading edge, as the rows around it do.
+/// The size and the lines are grey, as other values in Settings are. The size goes under the
+/// title, never beside it: beside it, it wraps on a narrow row (a 375-pt phone from xxLarge
+/// up, or a phone that Display Zoom lays out 320 pt wide, already at the default text size).
+/// Below the accessibility sizes the title stays on one line, and the size and the lines start
+/// where the title's text does. At the accessibility sizes a list wraps a label's text under
+/// its icon and `LabeledContent` puts its value under its title, so the size and the lines go
+/// under the title from the row's leading edge, as the rows around it do, and the title may
+/// wrap, as theirs do: held to one line it is cut short ("Optim…" at AX5 on a 320-pt row).
 struct OptimizeStorageRow: View {
     let row: StorageOptimizer.Row
     /// Formats a size as "Email Index Used" shows it.
@@ -70,7 +71,7 @@ struct OptimizeStorageRow: View {
 
     private var titleLabel: some View {
         Label(Self.title, systemImage: Self.icon)
-            .lineLimit(1)
+            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
     }
 
     private func lineText(_ line: String) -> some View {
