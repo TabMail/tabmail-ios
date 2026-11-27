@@ -1278,6 +1278,23 @@ host's zone, and compares the write on the fake with the card.
   `this_and_following` delete with no cut or no zone is retired as failed with nothing sent. An event
   that does not repeat, given any `delete_scope`, is deleted as it is (the scope dropped).
 
+## Assistant-written emails — signed as the account they are sent from
+
+`TabMailTests/Tools/ComposeEditSenderAccountTests.swift` pins #1521. Each case has two active
+accounts and captures the edit request through `EmailComposeTool.inlineEditOverride`.
+
+- `ComposeEditSenderAccountTests`:
+  - A reply and a forward of an email in the account that is not the primary are signed with that
+    account's name and address, and the card sends from that account (red-first: before the fix
+    both were signed as the primary account).
+  - A new email, with either account as the primary, carries the primary account on its compose
+    request, and the body is signed with that same account. Without a writing request, the request
+    still carries the account.
+- `AssistantComposeCardAccountWiringTests`: both views that present an assistant compose request
+  (`InboxView`, `MessageDetailView`) open a new email's card with the request's account and no
+  account of their own (red-first: before the fix they used the primary account and the open
+  email's account).
+
 ## CalDAV organizer — every event with guests names its organizer
 
 `TabMailTests/Providers/CalDAVOrganizerTests.swift` pins ADR-IOS-109 (#711): every CalDAV PUT runs

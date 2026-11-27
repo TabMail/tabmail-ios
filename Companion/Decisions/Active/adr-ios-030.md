@@ -67,4 +67,15 @@ ComposeView contains `.alert`, `.popover`, `.photosPicker`, `.fileImporter`, and
 
 **PARTIALLY SUPERSEDED (routing) by ADR-IOS-053:** the InboxView/MessageDetailView `pendingCompose` observer race noted in the Consequences is slated to be fixed (Phase 2) by re-homing compose routing to the owned `AgentUISink`. The cover-serialization FIFO (`composeQueue`/`presentationCount`/`awaitingAppear`) is retained — it solves the distinct "SwiftUI can't stack two fullScreenCovers" constraint, which owned routing does not address.
 
+**Amendment (2026-11-27, tabmail-ios #1521): the request carries the account it is signed as.**
+
+- *Problem:* the AI-written body was signed by `EmailComposeTool.runComposeEdit` with the primary account's name and address. The email went out from another account in two cases:
+  - a reply or forward, which is sent from the email's own account;
+  - a new email whose card the email screen presented, because it opened the card with the open email's account (the observer race above decides which view presents).
+- *Decision:* `runComposeEdit` takes the sending account (`sender:`) and does no account lookup of its own.
+  - A reply or forward passes the email's own account: the reply tool takes it from its existing account list, the forward tool reads it by primary key. The card sends from `replyTo`'s account, the same one.
+  - A new email: the tool reads the account once (`EmailComposeTool.sendingAccount`: the primary account, the demo account in demo, ADR-IOS-038), signs with it, and carries it on `ComposeRequest.account`. Both views open a new email's card with `req.account`, so the account no longer depends on which view wins the race, and the inbox no longer reads its own primary account (which had no demo filter) for this card.
+- *Accepted limitation:* if the user changes From in the card after the body was written, the sign-off keeps the first account's name. The text is on screen and editable.
+- *Tests:* `ComposeEditSenderAccountTests`, `AssistantComposeCardAccountWiringTests`.
+
 ---

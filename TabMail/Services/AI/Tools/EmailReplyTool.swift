@@ -97,6 +97,7 @@ struct EmailReplyTool: AgentTool, Sendable {
                           let html = messageBody.htmlContent, !html.isEmpty else { return nil }
                     return EmailFilter.htmlToPlainText(html)
                 }
+                // The reply is sent from the replied email's account, so the AI signs as it.
                 let result = try await EmailComposeTool.runComposeEdit(
                     to: to,
                     cc: cc,
@@ -106,7 +107,7 @@ struct EmailReplyTool: AgentTool, Sendable {
                     mode: "edit_reply",
                     relatedHeader: header,
                     relatedBodyText: relatedBodyText,
-                    db: ctx.db
+                    sender: accounts.first(where: { $0.id == header.accountId })
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody

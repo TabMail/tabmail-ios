@@ -54,6 +54,10 @@ struct EmailComposeTool: AgentTool, Sendable {
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] Opening compose: to=\(to) cc=\(cc) subject=\(subject ?? "(none)") bodyLen=\(body?.count ?? 0) requestLen=\(composeRequest?.count ?? 0)") }
 
+        // The account the new email is sent from, read once: the AI signs the body as this
+        // account, and the compose card opens with it, so the two cannot differ.
+        let account = await Self.sendingAccount(db: ctx.db)
+
         // When a compose instruction is present, run it through the backend LLM
         // to generate the actual email content — matching TB's runComposeEdit() flow.
         var generatedSubject = subject
@@ -67,7 +71,7 @@ struct EmailComposeTool: AgentTool, Sendable {
                     body: body,
                     request: composeRequest,
                     mode: "edit_new",
-                    db: ctx.db
+                    sender: account
                 )
                 generatedSubject = result.subject ?? generatedSubject
                 generatedBody = result.body ?? generatedBody
@@ -82,6 +86,7 @@ struct EmailComposeTool: AgentTool, Sendable {
             AgentToolRouter.ComposeRequest(
                 mode: .compose,
                 replyTo: nil,
+                account: account,
                 to: to,
                 cc: cc,
                 bcc: bcc,
@@ -101,29 +106,13 @@ struct EmailComposeTool: AgentTool, Sendable {
     /// the tool calls made inside its own `withValue` scope.
     @TaskLocal static var inlineEditOverride: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)?
 
-    /// Shared compose edit flow matching TB's `runComposeEdit()`.
-    /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
-    /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
-    /// and email_forward (mode "edit_forward") tools for full TB parity.
-    static func runComposeEdit(
-        to: [String],
-        cc: [String],
-        subject: String?,
-        body: String?,
-        request: String,
-        mode: String,
-        relatedHeader: MessageHeader? = nil,
-        relatedBodyText: String? = nil,
-        db: (any DatabaseReader & Sendable)? = nil
-    ) async throws -> InlineEditResult {
-        let dbReader = db ?? AppDatabase.rawPool
-        // Get sender info from primary account (matching TB's user identity
-        // resolution). Demo boundary (ADR-IOS-038): in demo, compose MUST use
-        // the demo account — during debug-menu coexistence the real primary is
-        // ALSO isPrimary, so an unscoped lookup could pick (and send via) the
-        // real account. Normal mode excludes the demo row symmetrically.
+    /// The account a new email the assistant writes is sent from: the primary account.
+    /// Demo boundary (ADR-IOS-038): in demo, compose MUST use the demo account — during
+    /// debug-menu coexistence the real primary is ALSO isPrimary, so an unscoped lookup could
+    /// pick (and send via) the real account. Normal mode excludes the demo row symmetrically.
+    static func sendingAccount(db: any DatabaseReader & Sendable) async -> Account? {
         let demoActive = DemoModeStore.isDemoActive
-        let account: Account? = try? await dbReader.read { db in
+        return try? await db.read { db in
             if demoActive {
                 return try Account
                     .filter(Column("id") == DemoSeed.demoAccountId && Column("isActive") == true)
@@ -140,7 +129,25 @@ struct EmailComposeTool: AgentTool, Sendable {
                 .filter(Column("id") != DemoSeed.demoAccountId)
                 .fetchOne(db)
         }
+    }
 
+    /// Shared compose edit flow matching TB's `runComposeEdit()`.
+    /// Resolves prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
+    /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
+    /// and email_forward (mode "edit_forward") tools for full TB parity.
+    /// `sender` is the account the email is sent from (a reply or forward: the email's own
+    /// account; a new email: `sendingAccount`); the AI signs the body with its name and address.
+    static func runComposeEdit(
+        to: [String],
+        cc: [String],
+        subject: String?,
+        body: String?,
+        request: String,
+        mode: String,
+        relatedHeader: MessageHeader? = nil,
+        relatedBodyText: String? = nil,
+        sender account: Account?
+    ) async throws -> InlineEditResult {
         // Get composition prompt and KB text (MainActor-isolated)
         let (kbText, compositionPrompt) = await MainActor.run {
             (PromptStore.shared.kbText(), PromptStore.shared.compositionMarkdown())

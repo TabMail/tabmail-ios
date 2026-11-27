@@ -31,7 +31,7 @@ order	status	source_lines	sha256	path	title
 29	superseded	714-736	d006507fe46ef463b048ebaa1dbb8e25c85b66d5e2929846379a1ee6fa15eec3	Companion/Decisions/Superseded/adr-ios-026b.md	ADR-IOS-026B: PendingOperation Uses Stable IDs (rfc822MessageId)
 30	active	737-808	39ffb5fa7b0dbfb184de1b7cf345f9d2a43aa6a53b498857d86673818a06c7aa	Companion/Decisions/Active/adr-ios-028.md	ADR-IOS-028: Background Execution Budget — Lightweight Refresh, Heavy Processing
 31	active	809-839	82a8eb0f517ca86870b1d9053e3c3c1585bbdef43c1b7478fc3b0333125ebc8b	Companion/Decisions/Active/adr-ios-029.md	ADR-IOS-029: Database Index Management — Purpose-Built Indexes, Drop What's Superseded
-32	active	840-909	c7e424dcb162991e5b7e01f82a63139092945499273bb4a9c4006f28830a3509	Companion/Decisions/Active/adr-ios-030.md	ADR-IOS-030: Agent Compose Tool FIFO Queue
+32	active	840-909	f94a9943ea9b937a2aa9ea2afa2134be4d357c58b7719888635b6848f3a626da	Companion/Decisions/Active/adr-ios-030.md	ADR-IOS-030: Agent Compose Tool FIFO Queue
 33	active	910-966	c71d2038878deee1eb31f3918b87f6cac6e6a126be3f155a47261ccab87350f6	Companion/Decisions/Active/adr-ios-031.md	ADR-IOS-031: Background Tasks Touching GRDB MUST Use `.medium` Priority (Never `.low` / `.utility` / `.background`)
 34	active	967-1015	4314c1304c8cf9eafb76900c0c96d9fb2bc0aab7f29a47db86c4de71ed77a8ee	Companion/Decisions/Active/adr-ios-032.md	ADR-IOS-032: Memory Search Reuses iOS Swift Hybrid FTS Stack (No Rust FFI)
 35	active	1016-1063	67f3ca058ff9204c02fe0e1c20d418c2c502c70b958232b9ddc7f116adddb141	Companion/Decisions/Active/adr-ios-034.md	ADR-IOS-034: Memory Index Moves to Per-Turn Granularity (Supersedes v2 Session-Document Model)
