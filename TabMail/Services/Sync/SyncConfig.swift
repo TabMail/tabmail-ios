@@ -601,10 +601,17 @@ enum SyncConfig {
     /// `incremental_vacuum` with 0 or less gives every empty page back in one write.
     static let incrementalVacuumStepPages = 2048
     /// Free space the device needs for a database's one-time upgrade to INCREMENTAL,
-    /// as a multiple of the database's size (`SyncEngine.bytesToFreeForUpgrade`): the
-    /// `VACUUM` builds a full copy in a temporary file, then writes every page of it
-    /// through the WAL (measured: a 1.1 GB database left a 965 MB WAL).
-    static let incrementalVacuumSwitchFreeSpaceMultiple: Double = 2
+    /// as a multiple of the database's pages less its empty pages
+    /// (`DatabaseVacuum.SpaceState.liveBytes`, `SyncEngine.bytesNeededForUpgrade`): the
+    /// `VACUUM` copies only the pages that hold data into a temporary file, then
+    /// writes every page of that copy through the WAL, each with a 24-byte frame
+    /// header (4,120 bytes for a 4 KB page), so about 2.006 times. The rest covers the
+    /// pointer-map pages the INCREMENTAL copy adds (about one page in 820), the WAL
+    /// index's growth (8 bytes a frame) and the WAL's header, about 2.010 in all, and a
+    /// copy laid out a little differently (#1545).
+    /// Measured on a Mac: a 1.1 GB database with about 10% of its rows deleted left a
+    /// 965 MB WAL (memory 162: about 2x the compacted size in all).
+    static let incrementalVacuumSwitchFreeSpaceMultiple: Double = 2.05
     /// How long the upgrade waits, at a time, for a planner statistics refresh that
     /// was already running when it started, a maintenance pass's `ANALYZE`
     /// (`SyncEngine.runDatabaseUpgrade`): it holds the latch the email database's

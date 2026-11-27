@@ -4,7 +4,7 @@
 > **Current note (2026-11-25, #1450): empty pages go back to the file system (ADR-IOS-121).** Both
 > databases now use `auto_vacuum = INCREMENTAL`: a new install from its first page, an existing install
 > after a one-time upgrade the user starts from a notice and an inbox banner (one `VACUUM` per database,
-> when the device has twice the database's size free). On an upgraded database, after its prune, the job gives the empty pages back in short `incremental_vacuum`
+> when the device has about twice the database's data free: its pages less its empty pages, times 2.05, amended 2026-11-26, #1449). On an upgraded database, after its prune, the job gives the empty pages back in short `incremental_vacuum`
 > steps that stop when the app comes to the foreground. In the note below, "auto_vacuum is NONE" now
 > describes a database that has not switched yet, and "returning the empty pages to the file system ... is
 > separate work" is this work. The measure is unchanged: a delete still moves its pages to the freelist

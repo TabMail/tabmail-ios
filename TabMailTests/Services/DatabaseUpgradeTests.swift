@@ -53,15 +53,18 @@ struct DatabaseUpgradeTests {
         private let heldReads = Mutex<(started: Int, until: Int)>((0, 0))
         /// Each database's size: tiny, so the device always has room, or huge, so it never does.
         let databaseBytes: Int64
+        /// How much of each database's size is empty pages.
+        let emptyBytes: Int64
 
         /// `userLeaves`: the user leaves the app during the first rewrite.
         /// `emailStartsUpgraded`: only the search database is left to upgrade.
         init(
-            answers: [[SyncEngine.UpgradeStep]], databaseBytes: Int64 = 4_096, userLeaves: Bool = false,
-            emailStartsUpgraded: Bool = false
+            answers: [[SyncEngine.UpgradeStep]], databaseBytes: Int64 = 4_096, emptyBytes: Int64 = 0,
+            userLeaves: Bool = false, emailStartsUpgraded: Bool = false
         ) {
             self.answers = Mutex(answers)
             self.databaseBytes = databaseBytes
+            self.emptyBytes = emptyBytes
             self.leaves = Mutex(userLeaves)
             self.emailStartsUpgraded = emailStartsUpgraded
         }
@@ -109,7 +112,7 @@ struct DatabaseUpgradeTests {
                     path: path,
                     state: DatabaseVacuum.SpaceState(
                         autoVacuum: isUpgraded ? DatabaseVacuum.incrementalMode : DatabaseVacuum.noneMode,
-                        pageCount: databaseBytes / 4_096, freePages: 0, pageSize: 4_096))
+                        pageCount: databaseBytes / 4_096, freePages: emptyBytes / 4_096, pageSize: 4_096))
             }
         }
 
@@ -320,6 +323,27 @@ struct DatabaseUpgradeTests {
         #expect(works.all.isEmpty, "nothing was stopped or started: \(works.all)")
         #expect(scheduler.foregroundPollingIsOn, "polling stays on")
         #expect(upgrade.screen == .notice)
+    }
+
+    @Test("Upgrade now starts on a device with room for the databases' data although not for twice their files: their empty pages are not counted")
+    func emptyPagesDoNotCountAgainstTheRoom() async throws {
+        let works = Works()
+        let scheduler = try await makeScheduler(works)
+        defer { tearDown(scheduler) }
+        let databaseBytes: Int64 = 1 << 60
+        let databases = FakeDatabases(
+            answers: [[.upgraded("email"), .upgraded("search")]], databaseBytes: databaseBytes, emptyBytes: databaseBytes - 4_096)
+        let upgrade = await makeUpgrade(scheduler, databases)
+        let bytesToFreeBefore = upgrade.bytesToFree
+        let bytesNeededBefore = upgrade.bytesNeeded
+
+        await upgrade.upgradeNow()
+
+        #expect(bytesNeededBefore == SyncEngine.bytesNeededForUpgrade(liveBytes: 4_096), "the notice asks for what the check needs, the data's, not the file's: \(bytesNeededBefore)")
+        #expect(bytesToFreeBefore == 0, "the device has room for one page of data: \(bytesToFreeBefore)")
+        #expect(databases.pollingSeenByRewrites == [false], "the rewrite ran: \(databases.pollingSeenByRewrites)")
+        await expectEverythingBackOn(scheduler, works)
+        #expect(upgrade.screen == .done)
     }
 
     @Test("Upgrade now refused for a low battery not charging: nothing is paused and no rewrite runs")

@@ -126,9 +126,13 @@ enum ThreadUtils {
 
         let placeholders = L.map { _ in "?" }.joined(separator: ",")
 
-        // (2) + (4) Reverse + lateral via inReplyTo.
+        // (2) + (4) Reverse + lateral via inReplyTo. Named index: where the
+        // stored mail has no In-Reply-To (Outlook stores none), ANALYZE counts
+        // all its rows under one value and the planner would read the whole
+        // table instead (#1563). The index is migration-built (v13), never
+        // deferred or dropped, so every caller has it.
         if let found = try String.fetchOne(db, sql: """
-            SELECT computedThreadId FROM messageHeader
+            SELECT computedThreadId FROM messageHeader INDEXED BY messageHeader_inReplyTo
             WHERE inReplyTo IN (\(placeholders))
               AND id != ?
               AND computedThreadId != ''

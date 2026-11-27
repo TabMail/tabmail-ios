@@ -42,7 +42,8 @@ enum ThreadDetection {
     /// - `messageReference WHERE referencedRfc822Id IN L` covers (3) + (5).
     ///
     /// All three use existing indexes (`messageHeader_rfc822MessageId`,
-    /// `messageHeader_inReplyTo`, `messageReference_referencedRfc822Id`).
+    /// `messageHeader_inReplyTo`, `messageReference_referencedRfc822Id`); the
+    /// `inReplyTo` lookup names its index (`INDEXED BY`), see below.
     ///
     /// Messages whose `folderId` points at a Trash or Spam folder are excluded —
     /// deleted replies and junk should not reappear in thread bubbles. Applied as a
@@ -104,13 +105,20 @@ enum ThreadDetection {
                 // (2) + (4) Reverse + lateral via inReplyTo: messages whose inReplyTo is in L.
                 // - in L because of my rfc822 → classic direct children (reverse).
                 // - in L because of one of my ancestors → classic siblings (lateral).
-                let inReplyToMatches = try MessageHeader
-                    .filter(L.contains(Column("inReplyTo"))
-                            && !seenIds.contains(Column("id"))
-                            && !excludedFolderIds.contains(Column("folderId")))
-                    .order(Column("date").desc)
-                    .limit(SyncConfig.threadQueryLimit)
-                    .fetchAll(db)
+                // Named index: where the stored mail has no In-Reply-To (Outlook stores
+                // none), ANALYZE counts all its rows under one value and the planner
+                // walked the date index over the whole table instead (#1563). The index
+                // is migration-built (v13), never deferred or dropped.
+                let seen = Array(seenIds)
+                let excluded = Array(excludedFolderIds)
+                let inReplyToMatches = try MessageHeader.fetchAll(db, sql: """
+                    SELECT * FROM messageHeader INDEXED BY messageHeader_inReplyTo
+                    WHERE inReplyTo IN (\(Self.placeholders(L.count)))
+                      AND id NOT IN (\(Self.placeholders(seen.count)))
+                      AND folderId NOT IN (\(Self.placeholders(excluded.count)))
+                    ORDER BY date DESC
+                    LIMIT ?
+                    """, arguments: StatementArguments(L + seen + excluded) + [SyncConfig.threadQueryLimit])
 
                 // (3) + (5) Reverse + lateral via References: messages whose References
                 // header contains any entry of L. The messageReference junction table is
@@ -235,6 +243,11 @@ enum ThreadDetection {
                 .limit(SyncConfig.threadQueryLimit)
                 .fetchAll(db)
         }
+    }
+
+    /// `count` comma-separated `?` placeholders for a SQL `IN` list.
+    private static func placeholders(_ count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ",")
     }
 
 }
