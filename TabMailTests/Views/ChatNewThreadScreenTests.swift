@@ -720,10 +720,10 @@ struct ChatNewThreadScreenTests {
                     let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
                     let copy = Self.sentFolderHeader("screen-sent-copy-filed", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
                     let rowId = row.id
-                    func bubbleShows() -> Bool {
+                    @MainActor func bubbleShows() -> Bool {
                         HostedAccessibility.identifiers(in: screen.view).contains(ChatUnsentReplyBubble.bubbleId)
                     }
-                    func sendingShows() -> Bool {
+                    @MainActor func sendingShows() -> Bool {
                         HostedAccessibility.labels(in: screen.view).contains { $0.contains("Sending") }
                     }
                     let frames = OwnWordsFrames(view: screen.view)
