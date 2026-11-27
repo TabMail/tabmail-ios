@@ -98,6 +98,7 @@ struct DatabaseUpgradeView: View {
                 .foregroundStyle(.orange)
             Text(Self.noticeTitle)
                 .font(.title2.weight(.semibold))
+                .multilineTextAlignment(.center)
                 .foregroundStyle(Palette.textColor)
             Text(Self.noticeWhat)
                 .multilineTextAlignment(.center)
