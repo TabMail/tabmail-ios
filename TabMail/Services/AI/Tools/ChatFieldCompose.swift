@@ -81,7 +81,7 @@ struct ChatFieldCompose: Sendable {
     /// (`ComposeTextMode.thread`). It goes to whom the field's reply goes as it was sent: everyone on
     /// that email (the AI Suggestion's envelope, `ChatReplyCompose.suggestionEnvelope`), or only the
     /// people chosen in Reply to (`ChatReplyCompose.onlyTo`); a change the words clearly ask for
-    /// applies by the card's own operation (`Recipients.applying`). The card saves to a draft of its
+    /// applies by the one step the reply tool shares (`ChatReplyCompose.applying`). The card saves to a draft of its
     /// own, as every chat card does, never over a reply draft already saved for this email.
     ///
     /// The row the field showed is bound to the email it showed: a UIDVALIDITY reset can seat another
@@ -117,7 +117,7 @@ struct ChatFieldCompose: Sendable {
         guard let written = await write(words, mode: mode, subject: start.subject, context: context) else {
             return .failed("the reply could not be written; nothing was done")
         }
-        let envelope = Self.envelope(start, after: written.result)
+        let envelope = Self.envelope(start, after: written.result, accounts: shown.accounts)
         await held(invocation)
         let outcome = await ctx.router.enqueueComposeAndAwaitOutcome(fieldWordsKey: invocation.fieldWordsKey) { onOutcome, state in
             AgentToolRouter.ComposeRequest(
@@ -132,17 +132,17 @@ struct ChatFieldCompose: Sendable {
         return .card(outcome)
     }
 
-    /// The draft `start` after the email written: its recipient changes applied by the card's own
-    /// operation, and a subject it wrote in place of the start's (none, the model's blank subject,
-    /// keeps the start's). With no recipient change the envelope keeps its kind as it is.
-    static func envelope(_ start: ChatReplyCompose, after result: InlineEditResult) -> ChatReplyCompose {
+    /// The draft `start` after the email written: its recipient changes applied by the one step the
+    /// reply tool shares (`ChatReplyCompose.applying`, with the user's `accounts`), and a subject it wrote in
+    /// place of the start's (none, the model's blank subject, keeps the start's). With no recipient
+    /// change the envelope keeps its kind as it is.
+    static func envelope(_ start: ChatReplyCompose, after result: InlineEditResult, accounts: [Account]) -> ChatReplyCompose {
         let subject = result.subject ?? start.subject
         guard result.toDelta != nil || result.ccDelta != nil || result.bccDelta != nil else {
             return start.with(subject: subject)
         }
-        return start.with(
-            recipients: start.recipients.applying(to: result.toDelta, cc: result.ccDelta, bcc: result.bccDelta),
-            subject: subject)
+        return start.applying(
+            to: result.toDelta, cc: result.ccDelta, bcc: result.bccDelta, subject: subject, accounts: accounts)
     }
 
     // MARK: - A new email's chat
