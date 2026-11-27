@@ -17,6 +17,9 @@ struct TLSOverrideDebugFenceTests {
         "setIMAPUseTLSOverrideForTesting", "imapUseTLSOverrideBox",
         "setCalDAVSessionOverrideForTesting", "calDAVSessionOverrideBox",
         "failNextSaveForTesting", "failNextSaveKeyForTesting",
+        // The plain-TCP transport the IMAP override selects: release builds
+        // always use an encrypted connection (`MailTransportPolicy`).
+        "MailTransportSecurity.plainText",
     ]
 
     private static var appSourceRoot: URL {

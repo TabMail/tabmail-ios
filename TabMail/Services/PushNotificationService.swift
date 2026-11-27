@@ -1022,6 +1022,7 @@ actor PushNotificationService {
                     port: account.imapPort ?? 993,
                     username: account.imapUsername ?? account.emailAddress,
                     password: password,
+                    security: MailTransportPolicy.pushSubscriptionSecurity,
                     authToken: authToken
                 )
                 guard await currentSubscribeAccount(account, userId: session.userId, sessionGeneration: sessionGeneration) else { return false }

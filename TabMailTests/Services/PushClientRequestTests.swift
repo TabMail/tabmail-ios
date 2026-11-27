@@ -100,7 +100,7 @@ struct PushClientRequestTests {
             try await client.subscribeIMAP(context: IMAPSubscribeContext(userId: "user-a", deviceId: "device-a",
                 accountEmail: "mail@example.test", deviceToken: "token-new", apnsSandbox: false, nseCapable: true),
                 host: "imap.example.test", port: 993, username: "synthetic", password: "synthetic-password",
-                authToken: "synthetic-worker-token")
+                security: MailTransportPolicy.pushSubscriptionSecurity, authToken: "synthetic-worker-token")
             succeeded = true
         } catch { #expect(code != 200) }
         #expect(succeeded == (code == 200))

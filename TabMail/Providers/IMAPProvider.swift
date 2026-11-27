@@ -53,9 +53,23 @@ struct UIDExistenceResult: Sendable {
 enum IMAPTransportSecurityError: Error, Equatable, CustomStringConvertible, LocalizedError {
     /// The server would not negotiate the minimum TLS version TabMail requires.
     case tlsFloorNotMet(host: String)
+    /// The server did not offer STARTTLS on a port where TabMail requires it
+    /// (`MailTransportPolicy`). `encryptedPort` is the implicit-TLS port the
+    /// sentence suggests instead (993 for incoming mail, 465 for sending).
+    case noEncryptedConnection(host: String, port: Int, encryptedPort: Int)
 
     var description: String {
         switch self {
+        case .noEncryptedConnection(let host, let port, let encryptedPort):
+            // ⚠️ Keep the words "connection" and "timeout" out of this sentence:
+            // `isTransientSendError` and `SyncEngine.isConnectionError` read the
+            // rendered text, and either word would make a refusal that can never
+            // succeed look like a passing network problem.
+            return """
+                \(host) does not offer encryption on port \(port). TabMail always encrypts your \
+                mail and password and will not send them unencrypted. Try port \(encryptedPort), \
+                or ask your mail provider to turn on STARTTLS.
+                """
         case .tlsFloorNotMet(let host):
             // ⚠️ The version named here is SwiftMail's `MailTLSMinimumVersion`
             // default (`.tlsv12`), which is the floor TabMail's `IMAPServer` /
@@ -102,23 +116,47 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `SyncEngine.isConnectionError` uses for NIO's error families.
     static let tlsProtocolVersionAlert = "TLSV1_ALERT_PROTOCOL_VERSION"
 
+    /// SwiftMail's refusals when a connection that requires STARTTLS
+    /// (`MailTransportPolicy`) finds the server not offering it, before anything
+    /// else is sent: IMAP `IMAPError.connectionFailed("Server did not advertise
+    /// STARTTLS on port N")` (`IMAPConnection.applyPostGreetingTLSPolicy`) and
+    /// SMTP `SMTPError.tlsFailed("STARTTLS required but not advertised by
+    /// server")` (`SMTPServer.applyPostEHLOTLSPolicy`). Matched in the rendered
+    /// description, like the floor token; the end-to-end tests against servers
+    /// that offer no STARTTLS pin both against the pinned library.
+    static let startTLSNotOfferedSignatures = [
+        "did not advertise STARTTLS",
+        "STARTTLS required but not advertised",
+    ]
+
     /// Return an actionable transport-security error when — and ONLY when — the
-    /// failure was the server refusing the TLS version floor. Everything else is
-    /// returned UNCHANGED.
+    /// failure was the server refusing the TLS version floor, or the server not
+    /// offering STARTTLS where TabMail requires it. Everything else is returned
+    /// UNCHANGED.
     ///
     /// Fail-to-generic is the safe direction and it is chosen on purpose. A shape
     /// this function does not recognise stays whatever it already was, so it keeps
     /// its existing transient/retryable classification and the user's send keeps
     /// retrying. Recognising too much is the dangerous direction: it would label a
     /// recoverable failure permanent and stop a send that would have gone through.
+    ///
+    /// `port` is the port that was refused and `encryptedPort` the implicit-TLS
+    /// port of the same service, both for the no-STARTTLS sentence.
     nonisolated static func mapTransportSecurityFailure(
         _ error: Error,
-        host: String
+        host: String,
+        port: Int,
+        encryptedPort: Int
     ) -> Error {
-        guard String(describing: error).contains(tlsProtocolVersionAlert) else {
-            return error
+        let rendered = String(describing: error)
+        if rendered.contains(tlsProtocolVersionAlert) {
+            return IMAPTransportSecurityError.tlsFloorNotMet(host: host)
         }
-        return IMAPTransportSecurityError.tlsFloorNotMet(host: host)
+        if startTLSNotOfferedSignatures.contains(where: { rendered.contains($0) }) {
+            return IMAPTransportSecurityError.noEncryptedConnection(
+                host: host, port: port, encryptedPort: encryptedPort)
+        }
+        return error
     }
 
     private let host: String
@@ -128,9 +166,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     private let senderEmail: String
     private let smtpHost: String
     private let smtpPort: Int
-    /// Test-only TLS override. `nil` in production — SwiftMail infers TLS from
-    /// the port (993 → implicit TLS, 143 → plain). Tests set `false` to point
-    /// IMAPProvider at an in-process plain-TCP fake on an ephemeral port.
+    /// Test-only TLS override, read only in DEBUG builds (`imapTransportSecurity`).
+    /// `nil` in production, where the transport always comes from
+    /// `MailTransportPolicy`. Tests set `false` to point IMAPProvider at an
+    /// in-process plain-TCP fake on an ephemeral port.
     private let useTLS: Bool?
     /// Reports what a login the server answered says about the account's
     /// sign-in. Injected by the account layer; `nil` reports nothing. Stored in a
@@ -999,12 +1038,27 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
     #endif
 
-    /// The SMTP session one send uses.
+    /// The SMTP session one send uses: always an encrypted connection
+    /// (`MailTransportPolicy`), with no plain-text mode even in DEBUG.
     private nonisolated func makeSMTPSession() -> any SMTPSubmissionSession {
         #if DEBUG
         if let factory = smtpSessionTestFactory.withLock({ $0 }) { return factory() }
         #endif
-        return SMTPServer(host: smtpHost, port: smtpPort)
+        return SMTPServer(
+            host: smtpHost,
+            port: smtpPort,
+            transportSecurity: MailTransportPolicy.smtpSecurity(port: smtpPort)
+        )
+    }
+
+    /// The transport of every IMAP connection this provider opens: always an
+    /// encrypted connection (`MailTransportPolicy`). Only a DEBUG build honours
+    /// the test override that reaches the plain-TCP `FakeIMAPServer`.
+    private nonisolated var imapTransportSecurity: MailTransportSecurity {
+        #if DEBUG
+        if useTLS == false { return MailTransportSecurity.plainText }
+        #endif
+        return MailTransportPolicy.imapSecurity(port: port)
     }
 
     /// Test seam: install `serverCreatedTestHook`.
@@ -1082,7 +1136,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let server = IMAPServer(
             host: host,
             port: port,
-            useTLS: useTLS,
+            transportSecurity: imapTransportSecurity,
             responseBufferLimit: IMAPFetchMapping.responseBufferLimit
         )
         if let passGeneration {
@@ -1110,8 +1164,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if openingTornDown(passGeneration) { throw ProviderError.notConnected }
             // IOS-TLS-002: a server below the TLS floor otherwise arrives at the
             // UI as "The operation couldn't be completed. (NIOSSL.NIOSSLError
-            // error 0.)" — permanent, actionable, and named nowhere.
-            throw Self.mapTransportSecurityFailure(error, host: host)
+            // error 0.)" — permanent, actionable, and named nowhere. A server
+            // that offers no STARTTLS would read as a passing network failure.
+            throw Self.mapTransportSecurityFailure(
+                error, host: host, port: port,
+                encryptedPort: MailTransportPolicy.imapImplicitTLSPort)
         }
         // Checked right before the LOGIN is written, after every wait that comes
         // before it: a teardown (`markDirty`, `disconnect`) during any of them
@@ -6401,8 +6458,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // FOREVER: `isTransientSendError` reads `.tlsFailed`/connection
                 // shapes as transient, so a message addressed to a server that can
                 // never accept it was retried indefinitely and the user was never
-                // given the Retry/Discard agency Outbox Rules 7/9 promise.
-                throw Self.mapTransportSecurityFailure(error, host: self.smtpHost)
+                // given the Retry/Discard agency Outbox Rules 7/9 promise. The same
+                // holds for a server that offers no STARTTLS (`.tlsFailed`).
+                throw Self.mapTransportSecurityFailure(
+                    error, host: self.smtpHost, port: self.smtpPort,
+                    encryptedPort: MailTransportPolicy.smtpImplicitTLSPort)
             }
             // Connect, greeting and TLS were awaited: an account removed
             // meanwhile neither authenticates nor submits.

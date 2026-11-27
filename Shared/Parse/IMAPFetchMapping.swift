@@ -24,7 +24,7 @@ enum IMAPFetchMapping {
     ///
     /// Single source of truth for both IMAP entry points — main-app
     /// `IMAPProvider` and the NSE's one-shot `NSEIMAPConnection` pass this to
-    /// `IMAPServer(host:port:useTLS:responseBufferLimit:)` so the two behave
+    /// `IMAPServer(host:port:transportSecurity:responseBufferLimit:)` so the two behave
     /// identically. History: this was a fork-local deviation (a hardcoded
     /// `bufferLimit: 4 * 1024 * 1024` in the SwiftMail fork). Upstream PR #179
     /// made the limit a constructor parameter, so the fork is now a pure

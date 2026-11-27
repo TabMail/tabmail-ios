@@ -149,7 +149,7 @@ struct NSECredentialEntryTests {
             UserDefaults.standard.removePersistentDomain(forName: suiteName)
         }
         defaults.set("{\"user@example.com\":\"\(accountId)\"}", forKey: SharedNSEData.accountMapKey)
-        let config: [String: Any] = [accountId: ["host": scenario == .iCloudActive ? "imap.mail.me.com" : "imap.example.com", "port": 993, "username": "user@example.com", "useTLS": true]]
+        let config: [String: Any] = [accountId: ["host": scenario == .iCloudActive ? "imap.mail.me.com" : "imap.example.com", "port": 993, "username": "user@example.com"]]
         defaults.set(String(data: try JSONSerialization.data(withJSONObject: config), encoding: .utf8), forKey: SharedNSEData.imapAccountsKey)
         defaults.set(true, forKey: SharedNSEData.imapPushEnabledKey)
         defaults.set(true, forKey: "nse.reconnectEnabled")

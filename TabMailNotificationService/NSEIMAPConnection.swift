@@ -41,16 +41,17 @@ enum NSEIMAPConnection {
         accountId: String,
         host: String,
         port: Int,
-        useTLS: Bool?,
         username: String,
         password: String,
         rfc822MessageId: String,
         folderPath: String = "INBOX"
     ) async -> (metadata: NSEMessageMetadata, body: RenderedBody)? {
+        // Always an encrypted connection, chosen from the port exactly as the
+        // app's `IMAPProvider` chooses it.
         let server = IMAPServer(
             host: host,
             port: port,
-            useTLS: useTLS,
+            transportSecurity: MailTransportPolicy.imapSecurity(port: port),
             responseBufferLimit: IMAPFetchMapping.responseBufferLimit
         )
 
