@@ -255,7 +255,7 @@ struct BccRecipientsTests {
           arguments: ["undisclosed-recipients:;", "  "])
     func queuedRecipientNamingNobodyIsFatal(recipient: String) {
         do {
-            let mailboxes = try IMAPProvider.sendableRecipients([recipient])
+            let mailboxes = try OutgoingRecipients.sendableRecipients([recipient])
             Issue.record("accepted as \(mailboxes)")
         } catch {
             #expect(AccountManager.isFatalSendError(error), "\(error)")

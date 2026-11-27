@@ -194,3 +194,59 @@ change, the field's included, goes through `Recipients.replace(with:showCc:)`, s
 a copy of the wiring. `AgentAutoSaveRecipientsTests` asserts the header names exactly the
 addresses and that Reply All on the saved draft offers neither an invented nor a Bcc address;
 `RecipientEntryTests` covers a separator typed after a closed comment.
+
+**Amendment (2026-11-27, #1031): Send and drafts carry each chip's display name.** A field keeps its
+addresses (`tokens`) and their names (`displayNames`) apart, and Send and a draft save took the
+addresses alone, so every provider wrote `sam@example.com` where the chip showed Sam Lee (the
+Thunderbird add-on writes `name <email>`). Both now take `RecipientField.namedTokens`: each address
+under the name its chip shows, written by `RecipientEntry.text` so it reads back as the same mailbox
+(`"Sam Lee" <sam@example.com>`), or bare when it has none. Rejected entries and input text are stored
+as before. IMAP and Gmail already read each recipient with SwiftMail's parser and write the name
+(RFC 2047-encoded when it is not ASCII); Outlook's Graph payload now reads each recipient the same way
+(`ExchangeProvider.graphRecipients`, through `draftRecipients`) and sends
+`emailAddress.name` beside the address, so a recipient holding a list also goes as each mailbox there.
+The two readers every provider uses, `sendableRecipients` (the send boundary check named above) and
+`draftRecipients`, moved unchanged from `IMAPProvider` to the provider-neutral `OutgoingRecipients`
+(`TabMail/Helpers/OutgoingRecipients.swift`), so no provider calls another provider's code for them.
+A reply to a sender with no name no longer takes the address as the name (`RecipientEntry.reply`):
+sync lists such a sender under its address, compared both as stored and as read (a quoted local
+part such as `"bob"@example.com` reads as `bob@example.com`). The Undo Send toast and the Outbox row still show
+addresses (`RecipientEntry.shownAddresses`, through `ComposeDraftGuards.undoSendSummary` and
+`OutboxRow.recipientLine`).
+
+Reading a draft copy back keeps the names too, or a draft reopened or adopted loses them and its next
+save sends none. Outlook: a draft read (`readMessage(forDraft:)`) writes each recipient as
+`"Name" <address>` (`ExchangeProvider.draftRecipientText`); a name equal to its address (Graph gives
+one to a recipient saved without a name) is left out. A synced message's header still keeps the bare
+addresses. Gmail: `GmailParse.rawHeader` unfolds a value (RFC 5322 §2.2.3, `GmailParse.unfolded`)
+before it is stored or read, because compose splits recipients at line breaks and a fold inside one
+long name would split it in two; this also applies to the To, Cc, Bcc and Reply-To a sync stores,
+where a fold carries no meaning. IMAP already read a draft's recipients unfolded, with their names.
+
+Known limits: a long name is written as SwiftMail's address folding writes it, which never splits one
+word and never folds between a name and its `<address>`, so the whole physical header line holding a
+long encoded name and its address can pass the 76-character line of RFC 2047, and one holding a name
+of nearly 1,000 plain characters the 998-octet line (ios#1597, P5). An IMAP draft adopted from another
+device takes its names from the server's ENVELOPE, which some servers normalize (repeated spaces
+collapsed; ios#1603, P5). A Gmail sender name holding an escaped quote keeps its backslashes in a
+reply (ios#1606, P5).
+
+Tests: `SendRecipientNamesTests` (the three ways a field gets a name, Send, the Outbox model a queued
+send is encoded to and read back from, the draft round trip, the toast and the Outbox row, the Outlook
+draft read and every other Outlook read keeping addresses only, Outlook's reading of a stored list,
+group and unreadable text, the IMAP draft copy read from a named ENVELOPE, a reply to a sender with no
+name, and each provider's wire: the `Email` the app's own SMTP send hands its submission session
+(every address once in the recipient list SwiftMail sends RCPT TO from) and that message built with
+`constructContent` (the names in To and Cc, no Bcc), the IMAP draft, its replacement under a renamed
+recipient (a new UID, the old one gone) and the Sent copy, Gmail send, draft create and update with
+and without a file, Outlook send, draft create and update, with names holding quotes, a backslash,
+angle brackets, an address, a line break and a long non-ASCII name), `GmailFoldedRecipientReadTests`
+(a folded Bcc and Reply-To stored as one line by sync and by a push, and a reply to that Reply-To
+going to each name whole), `OutboxStrandedClaimTests` (a queued send's stored row keeps the names, and
+the drain and a Retry send them), `AgentAutoSaveRecipientsTests` (the agent's first and later
+autosaves store the named fields), `ExchangeAttachmentSendTests` (Outlook's draft, upload and send
+route for files carries each address and name, one without a name too), `DraftOpenReloadTests` (an
+adopted Outlook draft keeps its To, Cc and Bcc names and its first save sends them; a reopened Outlook
+draft and a reopened Gmail draft keep each name, Gmail's folded inside its phrase too),
+`GmailParseTests` (a folded name reads back whole), `ComposeRecipientWiringTests` (the toast and the
+Outbox row show addresses).

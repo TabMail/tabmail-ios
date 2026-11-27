@@ -827,7 +827,7 @@ actor GmailProvider: EmailProvider {
     /// the send is stamped, and keys the optimistic Sent row by it.
     @discardableResult
     func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
-        _ = try IMAPProvider.sendableRecipients(draft.to + draft.cc + draft.bcc)
+        _ = try OutgoingRecipients.sendableRecipients(draft.to + draft.cc + draft.bcc)
         let body = buildSendBody(draft: draft)
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let response = try await request(path: "/messages/send", method: "POST", body: jsonData)

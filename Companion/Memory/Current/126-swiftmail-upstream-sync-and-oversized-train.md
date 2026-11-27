@@ -137,9 +137,12 @@ Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, 
   - To/Cc/Bcc stored one entry per mailbox, groups flattened, invalid entries kept visible
     (`IMAPFetchMapping.addressField`); `isValidEmailAddress` requires `AddressListEntry` to read a
     `.mailbox`, so invalid entries are never offered for reply-all.
-  - Send normalises recipients through SwiftMail's parser (`IMAPProvider.sendableRecipients`);
-    unparseable text throws `SMTPError.invalidEmailAddress` (fatal send error), no fallback. Drafts
-    keep recipients as typed.
+  - Send normalises recipients through SwiftMail's parser (`IMAPProvider.sendableRecipients`; since
+    2026-11-27 `OutgoingRecipients.sendableRecipients`, #1031); on IMAP and Gmail unparseable text
+    throws `SMTPError.invalidEmailAddress` (fatal send error), no fallback. Graph's writer
+    (`ExchangeProvider.graphRecipients`) reads each stored recipient with the same parser but, as
+    before, passes text that names no mailbox on as the `address`, for Graph to refuse. Drafts keep
+    recipients as typed.
 - **C1 note above is superseded**: SwiftMail now decodes encoded display names itself, so the
   `RFC5322Parse.decodeRFC2047` calls in `EmlParsing.parse` were deleted (owner decision D).
 - **BCC was dropped on send** (pre-existing, found during this sync): `IMAPProvider.buildEmail` never

@@ -371,15 +371,17 @@ enum ComposeDraftGuards {
 
     /// PORT — `v2final:ComposeDraftGuards.committedRecipients`.
     ///
-    /// The recipients a draft PERSISTS for one field: its addresses, then each
+    /// The recipients a draft PERSISTS for one field: its addresses, each under
+    /// its display name (`namedTokens`, #1031), then each
     /// rejected entry as written, one element each, then any text still in its
     /// input line (only the whitespace around it trimmed), so close / save never
     /// drop or change what the user typed. Reopening the draft reads each element
     /// on its own (`fieldState`), so a rejected entry returns as a rejected chip,
-    /// never joined to another or read as a recipient (ADR-IOS-092).
+    /// never joined to another or read as a recipient (ADR-IOS-092), and each
+    /// address returns under its name.
     static func committedRecipients(_ field: RecipientField) -> [String] {
         let typed = field.input.trimmingCharacters(in: .whitespacesAndNewlines)
-        return field.tokens + field.rejected + (typed.isEmpty ? [] : [typed])
+        return field.namedTokens + field.rejected + (typed.isEmpty ? [] : [typed])
     }
 
     /// Whether a character ends one entry of an input line.
@@ -572,8 +574,23 @@ enum ComposeDraftGuards {
         case refused(String)
     }
 
+    /// The Undo Send toast's recipient line for what Send sent: the first two To
+    /// addresses and how many more, or the first Cc address when To is empty. It
+    /// names the addresses, as it did before Send carried the display names (#1031).
+    static func undoSendSummary(to: [String], cc: [String]) -> String {
+        let shownTo = RecipientEntry.shownAddresses(to)
+        let shownCc = RecipientEntry.shownAddresses(cc)
+        if shownTo.isEmpty {
+            return shownCc.isEmpty ? "" : "Cc: \(shownCc.first ?? "")"
+        }
+        let head = shownTo.prefix(2).joined(separator: ", ")
+        let tail = shownTo.count > 2 ? " +\(shownTo.count - 2)" : ""
+        return "To: \(head)\(tail)"
+    }
+
     /// What Send sends, given fields whose input lines are already committed
-    /// (`pendingCommitted`): each field's addresses, or a refusal naming the first
+    /// (`pendingCommitted`): each field's addresses under their display names
+    /// (`namedTokens`, #1031), or a refusal naming the first
     /// field that still holds a rejected entry or input text, or, when the fields hold more
     /// than the recipient cap (reply-all prefill can exceed it), the cap.
     static func sendRecipients(to: RecipientField, cc: RecipientField, bcc: RecipientField) -> SendRecipients {
@@ -586,7 +603,7 @@ enum ComposeDraftGuards {
         if to.tokens.count + cc.tokens.count + bcc.tokens.count > SyncConfig.outboxMaxRecipients {
             return .refused("Too many recipients. Limit is \(SyncConfig.outboxMaxRecipients) total across To, Cc, and Bcc.")
         }
-        return .send(to: to.tokens, cc: cc.tokens, bcc: bcc.tokens)
+        return .send(to: to.namedTokens, cc: cc.namedTokens, bcc: bcc.namedTokens)
     }
 
     /// PORT — `v2final:ComposeDraftGuards.runCheckedLocalDeleteThenDismiss` (R5).
@@ -3878,14 +3895,7 @@ struct ComposeView: View {
         }
         // Present the Gmail-style undo-send toast. Shown at RootView scope, so
         // it persists after this compose view dismisses.
-        let toSummary: String
-        if snapshot.to.isEmpty {
-            toSummary = snapshot.cc.isEmpty ? "" : "Cc: \(snapshot.cc.first ?? "")"
-        } else {
-            let head = snapshot.to.prefix(2).joined(separator: ", ")
-            let tail = snapshot.to.count > 2 ? " +\(snapshot.to.count - 2)" : ""
-            toSummary = "To: \(head)\(tail)"
-        }
+        let toSummary = ComposeDraftGuards.undoSendSummary(to: snapshot.to, cc: snapshot.cc)
         // `holdUntil` travels with the id: it is anchored at persist START, so by
         // the time this line runs the whole persist latency has already elapsed
         // against it. Bounding the Undo affordance by anything else — including
