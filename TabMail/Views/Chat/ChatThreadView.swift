@@ -269,6 +269,12 @@ struct ChatThreadView: View {
     // MARK: - Body
 
     var body: some View {
+        presentations(on: container)
+    }
+
+    /// The chat with its lifecycle modifiers. Its sheets and covers go on after them, in
+    /// `presentations(on:)`: one chain was more than the compiler type-checks in reasonable time.
+    private var container: some View {
         // Lifecycle modifiers hang on this stable container, never on the branches the load
         // itself flips (ADR-IOS-054).
         ZStack {
@@ -432,6 +438,11 @@ struct ChatThreadView: View {
             guard didInitialScroll, isOnScreen else { return }
             askForSummaries()
         }
+    }
+
+    /// The chat's sheets and covers, on `content` (the body's `container`) after its lifecycle modifiers.
+    private func presentations(on content: some View) -> some View {
+        content
         .sheet(item: $cardMessage) { msg in
             // Today's detail of that email, from the bottom; swipe down to return.
             NavigationStack {
