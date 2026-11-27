@@ -72,9 +72,7 @@ struct ChangeFolder: Sendable, Equatable {
     /// ids the device holds the folder in, whatever rows it holds now. A reader
     /// with numeric ids takes the start of the held range from this, never from
     /// the rows: a removal moves the lowest row, and a message restored on the
-    /// server later must still come back. A reader with dated records (Outlook)
-    /// reads it when `heldSince` is nil: a completed walk then holds the whole
-    /// folder, so its first read fetches every message it lacks (#1363).
+    /// server later must still come back.
     var olderMailComplete: Bool
     /// The older-mail walk's position: it walks down from the top, so every id
     /// above this one has been downloaded. Nil = the walk has not started (or
