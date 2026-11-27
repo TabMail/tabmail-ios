@@ -22,7 +22,8 @@ import Testing
 ///  4. Nothing written opens nothing: a failed request, an answer with no email, or a row that is
 ///     no longer the email shown (a UIDVALIDITY reset), which is never even asked about.
 ///  5. The card goes to whom the field's reply goes: the suggestion's envelope, or only the people
-///     chosen in Reply to, with the changes the answer gives; it saves to a draft of its own.
+///     chosen in Reply to, with the changes the answer gives; it saves to a draft of its own. An
+///     own-only email's addresses stay on it only while the answer adds nobody else.
 @Suite("The closed field's words are the user's own message")
 @MainActor
 struct ChatFieldComposeTests {
@@ -374,6 +375,59 @@ struct ChatFieldComposeTests {
         let call = try #require(asked.all.first)
         #expect(call.context.toRecipients.isEmpty && call.context.ccRecipients == ["pat@example.com"])
         #expect(card?.to == [] && card?.cc == ["pat@example.com"])
+    }
+
+    /// One answer on the field's reply to an own-only email, and the card it opens.
+    struct OwnOnly: Sendable, CustomTestStringConvertible {
+        let name: String
+        let onlyTo: [String]?
+        let answer: InlineEditResult
+        let to: [String]
+        let cc: [String]
+        let isReplyAll: Bool
+        var testDescription: String { name }
+    }
+
+    nonisolated static let ownOnly: [OwnOnly] = [
+        OwnOnly(name: "the words add someone else to To", onlyTo: nil,
+                answer: answer(addTo: [["name": "Bob", "email": "bob@example.com"]]),
+                to: ["bob@example.com"], cc: [], isReplyAll: true),
+        OwnOnly(name: "the words add someone else to Cc", onlyTo: nil,
+                answer: answer(addCc: [["name": "Bob", "email": "bob@example.com"]]),
+                to: [], cc: ["bob@example.com"], isReplyAll: true),
+        // Controls: with nobody else added, the user's own addresses are the reply's audience; and
+        // the people the user chose in Reply to stay as chosen when someone is added.
+        OwnOnly(name: "no change", onlyTo: nil, answer: answer(),
+                to: ["b@example.com", "test@example.com"], cc: [], isReplyAll: true),
+        OwnOnly(name: "chosen in Reply to, then someone else added", onlyTo: ["b@example.com"],
+                answer: answer(addTo: [["name": "Bob", "email": "bob@example.com"]]),
+                to: ["b@example.com", "bob@example.com"], cc: [], isReplyAll: false),
+    ]
+
+    /// The user forwards an email from their other account (b@) to this one and writes in the field
+    /// on the copy this account received. Its Reply All holds nobody, so the field's reply goes to
+    /// b@, then this account (`ChatThread.replyAllAudience`). Once the words add someone else, the
+    /// card opens to them alone: the person added is never shown the user's other addresses.
+    @Test("An own-only email's field reply keeps the user's addresses only while nobody else is added",
+          arguments: ownOnly)
+    func ownOnlyFallbackWithTheWordsChange(_ expected: OwnOnly) async throws {
+        let fixture = try await fixture()
+        try TestDatabase.insertAccount(fixture.db, id: "acc2", email: "b@example.com")
+        try await fixture.db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET \"from\" = 'b@example.com', fromAddress = 'b@example.com', \"to\" = 'test@example.com' WHERE id = ?",
+                           arguments: [fixture.header.id])
+        }
+        let email = try await row(fixture.db, fixture.header.id)
+        let compose = compose(fixture, asked: Asked(), answer: expected.answer)
+        let invocation = invocation(email, onlyTo: expected.onlyTo)
+        let task = Task { @MainActor in await compose.reply(Self.words, invocation: invocation) }
+        let card = try #require(await waitForCard(fixture.router))
+        let to = RecipientEntry(card.to).addresses.map { $0.lowercased() }
+        let cc = RecipientEntry(card.cc).addresses.map { $0.lowercased() }
+        #expect(to == expected.to && cc == expected.cc && card.bcc.isEmpty, "To \(to), Cc \(cc), Bcc \(card.bcc)")
+        #expect(card.isReplyAll == expected.isReplyAll)
+        card.onOutcome(.cancelled)
+        _ = await task.value
     }
 
     // MARK: - A new email's chat

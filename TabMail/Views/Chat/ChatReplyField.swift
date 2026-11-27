@@ -460,6 +460,32 @@ struct ChatReplyCompose: Equatable {
         ChatReplyCompose(isReplyAll: isReplyAll, to: to, cc: cc, bcc: bcc, subject: subject)
     }
 
+    /// The envelope with a recipient change applied by the card's own operation
+    /// (`Recipients.applying`) and `subject`, its kind following the final audience
+    /// (`with(recipients:subject:)`): the one step with which the agent's reply tool
+    /// (`EmailReplyTool.reply`) and the field's Send (`ChatFieldCompose.reply`) apply a change.
+    /// An own-only email's audience (`ChatThread.replyAllAudience`: the user's own addresses, when
+    /// its Reply All holds nobody else) stands only while nobody else is on the reply: a change that
+    /// adds an address that is not one of the user's (`accounts`) applies to the email's Reply All
+    /// without them, which is nobody, so the person added is never shown the user's other
+    /// addresses. An address of the user's that the change itself adds stays. A plain reply's
+    /// people (chosen in Reply to, `onlyTo`) stay as chosen.
+    func applying(
+        to: RecipientDelta?, cc: RecipientDelta?, bcc: RecipientDelta?, subject: String, accounts: [Account]
+    ) -> ChatReplyCompose {
+        let own = Set(accounts.map { $0.emailAddress.lowercased() })
+        let audience = RecipientEntry(self.to + self.cc)
+        let ownOnly = isReplyAll && audience.leftovers.isEmpty && !audience.addresses.isEmpty
+            && audience.addresses.allSatisfy { own.contains($0.lowercased()) }
+        let addsSomeoneElse = [to, cc, bcc].contains { delta in
+            delta?.adds.addresses.contains { !own.contains($0.lowercased()) } ?? false
+        }
+        let start = ownOnly && addsSomeoneElse
+            ? ChatReplyCompose(isReplyAll: isReplyAll, to: [], cc: [], bcc: self.bcc, subject: self.subject)
+            : self
+        return start.with(recipients: start.recipients.applying(to: to, cc: cc, bcc: bcc), subject: subject)
+    }
+
     /// Whether a draft with `recipients` and `subject`, from `accountId`, is this envelope: the same
     /// subject, exactly, and in each role the same addresses and the same entries that name no
     /// sendable address (a Reply-To's `undisclosed-recipients:;`), each read as its text, in any

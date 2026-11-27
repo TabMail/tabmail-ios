@@ -939,7 +939,17 @@ same AI result, kept as long as the email itself is shown.
    agent's reply tool (`EmailReplyTool.reply`) builds its card's envelope with the same
    `ChatReplyCompose.suggestionEnvelope`, on every screen, so its card for an email that went only to
    the user's own addresses now opens with those addresses in To where it opened with none. The To
-   shows on the card before Send and only the user's own mailboxes are involved, so it is kept.
+   shows on the card before Send, and it stands only while only the user's own mailboxes are on the
+   reply: a recipient change that adds an address that is not one of the user's (the reply tool's
+   `add_recipients`, `add_cc` or `add_bcc`, or a change the field's words ask for) applies to the
+   email's Reply All without them, which is nobody, so the card opens to the people added alone and
+   never shows the user's other addresses to them, as it did before this fallback. It stays a Reply
+   All. An address of the user's that the change itself adds stays, and people the user chose in
+   Reply to stay as chosen. One step applies a change for both the reply tool and the field's Send
+   (`ChatReplyCompose.applying`, tabmail-ios #1627). (Reworded 2026-11-27; it read "The To shows on
+   the card before Send and only the user's own mailboxes are involved, so it is kept.", which stops
+   holding once someone else is added.) Tests: `EmailReplyToolTests.ownOnlyFallbackWithAChange`,
+   `ChatFieldComposeTests.ownOnlyFallbackWithTheWordsChange`.
    (`ComposeView.suggestionEditTarget` reads the envelope too, but such an email has no AI
    Suggestion: the AI Reply skips self-sent mail.) A copy one of the user's accounts sent to another,
    opened where it was received (a forward from A, received at B), went from B to B alone: the
