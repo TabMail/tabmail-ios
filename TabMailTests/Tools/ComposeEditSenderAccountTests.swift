@@ -208,10 +208,12 @@ struct ComposeEditSenderAccountTests {
         }
     }
 
-    /// The name reaches the backend: the reply tool's edit goes through a real `AIService`
-    /// request, whose `user_name` is the name the AI signs with.
-    @Test("email_reply: the backend request signs as the work account's name, not the primary's")
-    func replyRequestCarriesTheRepliedAccountsName() async throws {
+    /// The name reaches the backend: each writing tool's edit goes through a real `AIService`
+    /// request, whose `user_name` is the name the AI signs with. The work account is not the
+    /// primary; the reply and forward are of its email, and the new email is asked on its screen.
+    @Test("email_reply, email_forward, email_compose: the backend request signs as the work account's name, not the primary's",
+          arguments: ["email_reply", "email_forward", "email_compose"])
+    func writingRequestCarriesTheSendingAccountsName(toolName: String) async throws {
         let restoreAISetting = AITestSetting.save()
         defer { restoreAISetting() }
         AITestSetting.set(aiOff: false)
@@ -224,20 +226,26 @@ struct ComposeEditSenderAccountTests {
             }
             let service = AIService(backendClient: BackendClient(llmSession: backend.session))
             let (ctx, db, translator, router) = try makeContext(primaryId: Self.home.id)
-            let header = try insertWorkEmail(db, messageId: "rep-wire")
+            let header = try insertWorkEmail(db, messageId: "wire-\(toolName)")
             await translator.seed(header.id, as: 23)
+            let registry = ToolRegistry()
+            await registry.register(EmailReplyTool(context: ctx))
+            await registry.register(EmailForwardTool(context: ctx))
+            await registry.register(EmailComposeTool(context: ctx))
+            let arguments: [String: JSONValue] = toolName == "email_compose"
+                ? ["to": .array([.string(Self.correspondent)]), "request": .string("Say Friday works")]
+                : ["unique_id": .int(23), "to": .array([.string("pat@example.com")]), "request": .string("Say Friday works")]
 
-            let tool = EmailReplyTool(context: ctx)
             _ = try await captureEditAndRequest(router: router, edit: { context, instruction in
                 try await service.performInlineEdit(
                     currentSubject: "", currentBody: "", context: context,
                     instruction: instruction, chatHistory: []
                 )
             }) {
-                try await tool.execute(arguments: [
-                    "unique_id": .int(23),
-                    "request": .string("Say Friday works"),
-                ])
+                await registry.execute(
+                    name: toolName, arguments: arguments,
+                    invocation: ToolInvocation(openEmailAccountId: workAccountId)
+                ).output
             }
 
             let calls = backend.recordedCalls()
@@ -400,8 +408,8 @@ struct ComposeEditSenderAccountTests {
         }
     }
 
-    /// Demo boundary (ADR-IOS-038): in demo with no demo account, the new email has no account
-    /// at all; it never goes from a real account.
+    /// Demo boundary (ADR-IOS-038): in demo with no demo account, a new email is never signed as,
+    /// or opened with, a real account.
     @Test("email_compose: in demo without the demo account the new email never takes a real account")
     func newEmailInDemoWithoutTheDemoAccountTakesNoRealAccount() async throws {
         try await withDemoMode(true) {
@@ -413,11 +421,15 @@ struct ComposeEditSenderAccountTests {
                     "request": .string("Ask about moving the offsite to Friday"),
                 ])
             }
-            #expect(captured.contexts.count == 1)
-            guard captured.contexts.count == 1 else { return }
-            #expect(captured.contexts[0].senderName.isEmpty)
-            #expect(captured.contexts[0].senderEmail.isEmpty)
-            #expect(captured.card?.account == nil)
+            let realNames: Set<String> = [Self.home.name, Self.work.name]
+            let realEmails: Set<String> = [Self.home.email, Self.work.email]
+            let realIds: Set<String> = [Self.home.id, Self.work.id]
+            for context in captured.contexts {
+                #expect(!realNames.contains(context.senderName))
+                #expect(!realEmails.contains(context.senderEmail))
+            }
+            let cardAccountId = captured.card?.account?.id ?? ""
+            #expect(!realIds.contains(cardAccountId))
         }
     }
 
@@ -595,6 +607,35 @@ struct AssistantChatOpenEmailAccountWiringTests {
             searchFrom = index
         }
         return lists
+    }
+
+    /// The open email comes from the email screen: its chat pill is built with the email the chat
+    /// is about (the highlighted one in a conversation, else the screen's email), and the inbox's
+    /// and the compose editor's pills with none. `message` is the chat's first initializer
+    /// argument, so a construction passes it exactly when its arguments start with it.
+    @Test("The email screen's chat is given its email; the inbox's and the compose editor's none")
+    func theEmailScreensChatIsGivenItsEmail() throws {
+        var constructions: [String: [String]] = [:]
+        for file in try DiagnosticPrintGateTests.appTargetSources() {
+            let code = DiagnosticPrintGateTests.codeOnly(file.source)
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let lists = Self.argumentLists(of: "DynamicIslandChat(", in: code)
+            guard !lists.isEmpty else { continue }
+            let name = (file.relativePath as NSString).lastPathComponent
+            constructions[name, default: []] += lists.map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        #expect(Set(constructions.keys) == ["MessageDetailView.swift", "InboxView.swift", "ComposeView.swift"],
+                "chat pill hosts: \(constructions.keys.sorted())")
+        let detail = constructions["MessageDetailView.swift"] ?? []
+        #expect(detail.count == 1)
+        for arguments in detail {
+            #expect(arguments.hasPrefix("message: chatContextMessage ?? message,"))
+        }
+        for host in ["InboxView.swift", "ComposeView.swift"] {
+            for arguments in constructions[host] ?? [] {
+                #expect(!arguments.hasPrefix("message:"), "\(host) gives its chat an email")
+            }
+        }
     }
 
     /// The chat's turns use that invocation: a fresh turn, a resumed turn and a compose edit each
