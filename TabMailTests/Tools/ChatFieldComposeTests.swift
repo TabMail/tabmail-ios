@@ -323,6 +323,9 @@ struct ChatFieldComposeTests {
         // No subject from the model (blank): the card keeps the draft's "Re:" subject.
         Envelope(name: "no subject", answer: answer(subject: ""), subject: "Re: Offsite",
                  to: ["sender@example.com", "recipient@example.com"], cc: [], isReplyAll: true),
+        // A subject written with no recipient change: the card takes it, its people and kind as they are.
+        Envelope(name: "subject only", answer: answer(subject: "Plans for Friday"), subject: "Plans for Friday",
+                 to: ["sender@example.com", "recipient@example.com"], cc: [], isReplyAll: true),
         Envelope(name: "added", answer: answer(addCc: [["name": "Pat", "email": "pat@example.com"]]), subject: "Re: Offsite",
                  to: ["sender@example.com", "recipient@example.com"], cc: ["pat@example.com"], isReplyAll: true),
         // Narrowed to one person: a plain reply, so the send records a reply on the original.

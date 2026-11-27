@@ -350,6 +350,12 @@ struct EmailReplyToolTests {
         // holds them alone.
         OwnOnlyChange(name: "someone else added by name only", arguments: ["add_recipients": .array([.string("Bob Smith")])],
                       to: [], cc: [], bcc: [], toNamed: ["Bob Smith"]),
+        OwnOnlyChange(name: "someone else added by name only, beside one of the user's own addresses",
+                      arguments: ["add_recipients": .array([.string("A@example.com"), .string("Bob Smith")])],
+                      to: ["a@example.com"], cc: [], bcc: [], toNamed: ["Bob Smith"]),
+        OwnOnlyChange(name: "To cleared and someone else added by name only",
+                      arguments: ["remove_recipients": .array([.string("*")]), "add_recipients": .array([.string("Bob Smith")])],
+                      to: [], cc: [], bcc: [], toNamed: ["Bob Smith"]),
         // Controls: with nobody else added, the user's own addresses are the reply's audience.
         OwnOnlyChange(name: "no change", arguments: [:],
                       to: ["a@example.com", "b@example.com"], cc: ["c@example.com"], bcc: []),

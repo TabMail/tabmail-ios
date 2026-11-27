@@ -1759,7 +1759,7 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
       case, so leaving that entry out narrows the audience too. An own-only email's audience is the
       one start a change can drop (decision 11, amended 2026-11-27): a change that adds someone else
       applies to that email's empty Reply All, so the card stays a Reply All without the user's own
-      addresses (`ChatReplyCompose.applying`).
+      addresses, other than any the change itself adds (`ChatReplyCompose.applying`).
       The reply tool derives one start envelope (`ChatReplyCompose.suggestionEnvelope` with the call's
       recipient changes, or `onlyTo` for people chosen in the field) and uses it for both the model's
       context and the card; the subject is the edit's when it writes one, else the start's.
