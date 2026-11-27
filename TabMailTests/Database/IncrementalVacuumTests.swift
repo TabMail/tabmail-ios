@@ -1352,13 +1352,14 @@ struct IncrementalVacuumTests {
             ],
             availableBytes: { _ in 0 }, shouldRun: { true },
             finished: { step in toldShort.add("\(step)") })
+        let shortSteps = short.map { "\($0)" }
 
         #expect(steps == [.upgraded("email"), .upgraded("search")], "\(steps)")
         #expect(told.all == [
             "\(SyncEngine.UpgradeStep.upgraded("email")): email 1, search 0",
             "\(SyncEngine.UpgradeStep.upgraded("search")): email 1, search 1",
         ], "each step told once, after its own switch and before the next: \(told.all)")
-        #expect(toldShort.all == short.map { "\($0)" }, "every step told, in order, the one that ends the upgrade included: \(toldShort.all)")
+        #expect(toldShort.all == shortSteps, "every step told, in order, the one that ends the upgrade included: \(toldShort.all)")
         #expect(short.count == 2, "precondition: one step for each database: \(short)")
     }
 

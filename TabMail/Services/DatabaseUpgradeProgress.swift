@@ -73,9 +73,7 @@ struct DatabaseUpgradeProgress: Equatable, Sendable {
     static func at(
         elapsedSeconds: Double,
         dataBytes: [Int64],
-        finishedAfterSeconds: [Double],
-        secondsPerGB: Double = SyncConfig.databaseUpgradeSecondsPerGB,
-        holdFraction: Double = SyncConfig.databaseUpgradeProgressHoldFraction
+        finishedAfterSeconds: [Double]
     ) -> DatabaseUpgradeProgress {
         let finished = min(finishedAfterSeconds.count, dataBytes.count)
         guard finished < dataBytes.count else { return DatabaseUpgradeProgress(fraction: 1, remaining: .almostDone) }
@@ -88,12 +86,12 @@ struct DatabaseUpgradeProgress: Equatable, Sendable {
         let lastFinish = finished > 0 ? finishedAfterSeconds[finished - 1] : 0
         let rate = finished > 0 && finishedBytes > 0
             ? lastFinish / finishedBytes
-            : secondsPerGB / SyncConfig.databaseUpgradeBytesPerGB
+            : SyncConfig.databaseUpgradeSecondsPerGB / SyncConfig.databaseUpgradeBytesPerGB
 
         let inCurrent = max(0, elapsedSeconds - lastFinish)
         let expected = bytes[finished] * rate
         let fill = expected > 0 ? min(1, inCurrent / expected) : 1
-        let fraction = shares[..<finished].reduce(0, +) + shares[finished] * holdFraction * fill
+        let fraction = shares[..<finished].reduce(0, +) + shares[finished] * SyncConfig.databaseUpgradeProgressHoldFraction * fill
 
         let left = max(0, expected - inCurrent) + bytes[(finished + 1)...].reduce(0, +) * rate
         let remaining: Remaining

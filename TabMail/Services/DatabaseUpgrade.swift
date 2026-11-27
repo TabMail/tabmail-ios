@@ -104,7 +104,8 @@ final class DatabaseUpgrade {
     private(set) var noticeMinutes: Int?
     /// The running upgrade's progress (the running screen's bar): the data of the
     /// databases it rewrites, read once at its start, and when each finished. Nil from
-    /// the start until that read.
+    /// the start until that read, for a run whose read found a database unreadable,
+    /// and after a suspension stopped the run.
     private(set) var progress: DatabaseUpgradeProgress.Run?
 
     /// Set once the notice has shown by itself (`checkAfterLaunch`).
@@ -244,8 +245,11 @@ final class DatabaseUpgrade {
     /// The running screen's bar (`progress`, #1583): once paused, the run reads the
     /// databases' states once more (the same header read as the notice's; no table) for
     /// the data of those still on NONE, and starts its clock; each database the rewrite
-    /// upgrades records its finish (`databaseFinished`). A run started again after a
-    /// suspension reads them again: its bar covers what is left.
+    /// upgrades records its finish (`databaseFinished`). A database whose state cannot be
+    /// read leaves the run with no bar (`progress` nil: an empty bar, no minutes): the
+    /// finishes are matched to the data by position, and the rewrite still runs that
+    /// database. A run the suspension stops drops its bar; started again, it reads the
+    /// states again, and its bar covers what is left.
     private func run() async {
         screen = .upgrading
         continuesOnReturn = false
@@ -255,11 +259,14 @@ final class DatabaseUpgrade {
         defer { if DatabaseSuspension.isAppActive { scheduler.startForegroundPolling() } }
         await SyncScheduler.cancelAllInFlightQueues(inboxOnly: false)
         let states = await readStates()
-        progress = DatabaseUpgradeProgress.Run(dataBytes: Self.dataToUpgrade(states), start: .now)
+        progress = states.contains { $0.state == nil }
+            ? nil
+            : DatabaseUpgradeProgress.Run(dataBytes: Self.dataToUpgrade(states), start: .now)
         let steps = await upgradeDatabases { step in await self.databaseFinished(step) }
         BackgroundSyncLogger.logDebug("[DatabaseUpgrade] ended: \(steps)")
         if steps.contains(where: { if case .stopped = $0 { true } else { false } }) {
             continuesOnReturn = true
+            progress = nil
             return
         }
         await refreshConditions()

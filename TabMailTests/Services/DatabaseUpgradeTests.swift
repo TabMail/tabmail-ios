@@ -44,7 +44,8 @@ struct DatabaseUpgradeTests {
     /// The two databases' mode as the fake rewrite leaves it, the rewrite's answers in
     /// turn, and what each rewrite saw of the scheduler.
     final class FakeDatabases: Sendable {
-        private let upgraded = Mutex(false)
+        /// The databases ("email", "search") a rewrite has upgraded or found upgraded.
+        private let upgraded = Mutex<Set<String>>([])
         private let emailStartsUpgraded: Bool
         private let answers: Mutex<[[SyncEngine.UpgradeStep]]>
         private let pollingDuringRewrite = Mutex<[Bool]>([])
@@ -55,21 +56,21 @@ struct DatabaseUpgradeTests {
         let databaseBytes: Int64
         /// How much of each database's size is empty pages.
         let emptyBytes: Int64
-        /// The search database's mode and pages cannot be read.
-        private let searchUnreadable: Bool
+        /// The databases ("email", "search") whose mode and pages cannot be read.
+        private let unreadable: Set<String>
 
         /// `userLeaves`: the user leaves the app during the first rewrite.
         /// `emailStartsUpgraded`: only the search database is left to upgrade.
         init(
             answers: [[SyncEngine.UpgradeStep]], databaseBytes: Int64 = 4_096, emptyBytes: Int64 = 0,
-            userLeaves: Bool = false, emailStartsUpgraded: Bool = false, searchUnreadable: Bool = false
+            userLeaves: Bool = false, emailStartsUpgraded: Bool = false, unreadable: Set<String> = []
         ) {
             self.answers = Mutex(answers)
             self.databaseBytes = databaseBytes
             self.emptyBytes = emptyBytes
             self.leaves = Mutex(userLeaves)
             self.emailStartsUpgraded = emailStartsUpgraded
-            self.searchUnreadable = searchUnreadable
+            self.unreadable = unreadable
         }
 
         /// Each database's data, as the upgrade counts it: its pages less its empty pages.
@@ -77,8 +78,8 @@ struct DatabaseUpgradeTests {
 
         /// The fake rewrite: records whether polling was on, lets the user leave the
         /// app when told, gives its next answer, telling `finished` each of its steps in
-        /// turn, and upgrades both databases when every step of that answer upgraded its
-        /// database or found it upgraded.
+        /// turn, and leaves each database a step upgraded or found upgraded on
+        /// `auto_vacuum = INCREMENTAL`.
         func rewrite(_ scheduler: SyncScheduler, finished: DatabaseUpgrade.StepFinished) async -> [SyncEngine.UpgradeStep] {
             let pollingOn = await MainActor.run { scheduler.foregroundPollingIsOn }
             pollingDuringRewrite.withLock { $0.append(pollingOn) }
@@ -87,16 +88,13 @@ struct DatabaseUpgradeTests {
             }
             let answer = answers.withLock { $0.isEmpty ? [] : $0.removeFirst() }
             for step in answer {
-                await finished(step)
-            }
-            let allUpgraded = !answer.isEmpty && answer.allSatisfy {
-                switch $0 {
-                case .upgraded, .alreadyUpgraded: true
-                default: false
+                switch step {
+                case .upgraded(let name), .alreadyUpgraded(let name):
+                    upgraded.withLock { _ = $0.insert(name) }
+                default:
+                    break
                 }
-            }
-            if allUpgraded {
-                upgraded.withLock { $0 = true }
+                await finished(step)
             }
             return answer
         }
@@ -115,12 +113,16 @@ struct DatabaseUpgradeTests {
             while held, heldReads.withLock({ $0.started < $0.until }) {
                 try? await Task.sleep(for: .milliseconds(5))
             }
-            let all = upgraded.withLock { $0 }
+            let done = upgraded.withLock { $0 }
             let path = FileManager.default.temporaryDirectory.path
-            return [(all || emailStartsUpgraded, false), (all, searchUnreadable)].map { isUpgraded, unreadable in
+            let databases = [
+                (done.contains("email") || emailStartsUpgraded, unreadable.contains("email")),
+                (done.contains("search"), unreadable.contains("search")),
+            ]
+            return databases.map { isUpgraded, isUnreadable in
                 DatabaseUpgrade.DatabaseState(
                     path: path,
-                    state: unreadable ? nil : DatabaseVacuum.SpaceState(
+                    state: isUnreadable ? nil : DatabaseVacuum.SpaceState(
                         autoVacuum: isUpgraded ? DatabaseVacuum.incrementalMode : DatabaseVacuum.noneMode,
                         pageCount: databaseBytes / 4_096, freePages: emptyBytes / 4_096, pageSize: 4_096))
             }
@@ -425,7 +427,7 @@ struct DatabaseUpgradeTests {
         let emptyBytes: Int64 = 600_000_000
         let both = FakeDatabases(answers: [], databaseBytes: databaseBytes, emptyBytes: emptyBytes)
         let searchOnly = FakeDatabases(answers: [], databaseBytes: databaseBytes, emptyBytes: emptyBytes, emailStartsUpgraded: true)
-        let unreadable = FakeDatabases(answers: [], databaseBytes: databaseBytes, emptyBytes: emptyBytes, searchUnreadable: true)
+        let unreadable = FakeDatabases(answers: [], databaseBytes: databaseBytes, emptyBytes: emptyBytes, unreadable: ["search"])
 
         let bothMinutes = await makeUpgrade(scheduler, both).noticeMinutes
         let searchOnlyMinutes = await makeUpgrade(scheduler, searchOnly).noticeMinutes
@@ -465,6 +467,78 @@ struct DatabaseUpgradeTests {
         #expect(searchOnlyRun.dataBytes == [searchOnly.liveBytes], "only the database still on NONE: \(searchOnlyRun.dataBytes)")
         #expect(searchOnlyRun.finishedAfter.count == 1, "the database found upgraded records no finish: \(searchOnlyRun.finishedAfter)")
         #expect(searchOnlyUpgrade.screen == .done)
+    }
+
+    @Test("Only an upgraded database fills its share of the bar: one that failed or found too little space records no finish, so the bar is not full")
+    func onlyAnUpgradedDatabaseRecordsAFinish() async throws {
+        let works = Works()
+        let scheduler = try await makeScheduler(works)
+        defer { tearDown(scheduler) }
+        let failed = FakeDatabases(answers: [[.upgraded("email"), .failed("search")]])
+        let shortOfSpace = FakeDatabases(answers: [[.upgraded("email"), .needsSpace("search", bytesToFree: 1)]])
+        let failedUpgrade = await makeUpgrade(scheduler, failed)
+        let shortOfSpaceUpgrade = await makeUpgrade(scheduler, shortOfSpace)
+
+        await failedUpgrade.upgradeNow()
+        await settle()
+        await shortOfSpaceUpgrade.upgradeNow()
+
+        let failedRun = try #require(failedUpgrade.progress, "the run recorded its progress")
+        let shortOfSpaceRun = try #require(shortOfSpaceUpgrade.progress, "the run recorded its progress")
+        let failedBar = failedRun.progress(at: ContinuousClock.now)
+        let shortOfSpaceBar = shortOfSpaceRun.progress(at: ContinuousClock.now)
+        #expect(failedRun.finishedAfter.count == 1, "only the email database's finish: \(failedRun.finishedAfter)")
+        #expect(failedBar.fraction < 1, "the bar is not full: \(failedBar)")
+        #expect(failedUpgrade.screen == .failed)
+        #expect(shortOfSpaceRun.finishedAfter.count == 1, "only the email database's finish: \(shortOfSpaceRun.finishedAfter)")
+        #expect(shortOfSpaceBar.fraction < 1, "the bar is not full: \(shortOfSpaceBar)")
+        #expect(shortOfSpaceUpgrade.screen == .notice)
+    }
+
+    @Test("A database unreadable at the run's start: the run has no bar, so the email database's finish is never counted as the search database's and the bar never shows the search database done before it is")
+    func anUnreadableDatabaseLeavesTheRunWithoutABar() async throws {
+        let works = Works()
+        let scheduler = try await makeScheduler(works)
+        defer { tearDown(scheduler) }
+        // The search step fails, so the bar after the run is the bar as it stood once the
+        // email database had finished and the search database was being rewritten.
+        let databases = FakeDatabases(answers: [[.upgraded("email"), .failed("search")]], unreadable: ["email"])
+        let upgrade = await makeUpgrade(scheduler, databases)
+        let canStart = upgrade.canStart && upgrade.needsUpgrade
+
+        await upgrade.upgradeNow()
+
+        let bar = upgrade.progress?.progress(at: ContinuousClock.now)
+        let fraction = bar?.fraction ?? 0
+        #expect(canStart, "precondition: the search database still needs the upgrade and the device has room")
+        #expect(databases.pollingSeenByRewrites == [false], "the rewrite ran: \(databases.pollingSeenByRewrites)")
+        #expect(fraction < 1, "the bar does not show the search database done: \(String(describing: bar))")
+        #expect(upgrade.progress == nil, "no bar for the run: \(String(describing: upgrade.progress))")
+        #expect(upgrade.screen == .failed)
+    }
+
+    @Test("A run the suspension stops drops its bar; the run started again on the return reads the databases again, and its bar covers only what is left")
+    func aStoppedRunDropsItsBarAndTheNextCoversWhatIsLeft() async throws {
+        let works = Works()
+        let scheduler = try await makeScheduler(works)
+        defer { tearDown(scheduler) }
+        let databases = FakeDatabases(
+            answers: [[.upgraded("email"), .stopped("search")], [.alreadyUpgraded("email"), .upgraded("search")]], userLeaves: true)
+        let upgrade = await makeUpgrade(scheduler, databases)
+
+        await upgrade.upgradeNow()
+        let barAfterStop = upgrade.progress
+        let continues = upgrade.continuesOnReturn
+        await returnToTheApp(scheduler, upgrade, works)
+
+        let resumed = try #require(upgrade.progress, "the run started again recorded its progress")
+        #expect(continues, "precondition: the upgrade continues on the app's return")
+        #expect(barAfterStop == nil, "the stopped run's bar is dropped: \(String(describing: barAfterStop))")
+        #expect(resumed.dataBytes == [databases.liveBytes], "only the search database is left: \(resumed.dataBytes)")
+        #expect(resumed.finishedAfter.count == 1, "the search database's finish; the email database, found upgraded, records none: \(resumed.finishedAfter)")
+        #expect(databases.pollingSeenByRewrites == [false, false], "both rewrites ran with polling off: \(databases.pollingSeenByRewrites)")
+        await expectEverythingBackOn(scheduler, works, starts: 2)
+        #expect(upgrade.screen == .done)
     }
 
     @Test("A return with no stopped upgrade starts nothing")

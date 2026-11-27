@@ -125,12 +125,21 @@ rewrite to the user's next opening of the app, with every save, search and AI to
        before the next starts, and `DatabaseUpgrade` records the time of each `.upgraded` step. A
        database found upgraded already is not in the run's data (the snapshot holds NONE databases
        only). Nothing the upgrade does to the databases changed.
-     - **A run started again after a suspension** (decision 3, "Leaving mid-upgrade") reads the data
-       again: its bar covers what is left, starting empty. The app was in the background in between,
-       so the user sees only the new run's bar.
+     - **The finishes are matched to the data by position:** the n-th `.upgraded` step fills the n-th
+       share. The snapshot holds the NONE databases in the loop's order and the loop rewrites only
+       those, so the two line up, except when a database's state cannot be read at the run's start:
+       then the run has no bar (`progress` nil: an empty bar and no minutes), and the rewrite still
+       runs that database. This replaced keying finishes by database name, which would need a name in
+       `DatabaseUpgrade.DatabaseState` and in the targets for this one case.
+     - **A run started again after a suspension** (decision 3, "Leaving mid-upgrade"): the stopped run
+       drops its bar, and the new run reads the data again: its bar covers what is left, starting
+       empty. The app was in the background in between, so the user sees only the new run's bar.
      - Pinned by `DatabaseUpgradeProgressTests` (the bar never goes back, the share jump, the
        re-estimate, the hold and "Almost done", full at the end, the rounding, the notice's N),
-       `DatabaseUpgradeTests.theNoticeMinutesComeFromTheData` and `theRunRecordsItsProgress`,
+       `DatabaseUpgradeViewTests` (the notice's and the running screen's words, the fallback),
+       `DatabaseUpgradeTests.theNoticeMinutesComeFromTheData`, `theRunRecordsItsProgress`,
+       `onlyAnUpgradedDatabaseRecordsAFinish`, `anUnreadableDatabaseLeavesTheRunWithoutABar` and
+       `aStoppedRunDropsItsBarAndTheNextCoversWhatIsLeft`,
        `IncrementalVacuumTests.eachStepIsToldAsItEnds`, and the order in
        `theUpgradeRunsOnlyInUpgradeMode` (the data are read after the pause, just before the rewrite).
    - **The rewrite** (`SyncEngine.runDatabaseUpgrade`): the email database first, then the search
