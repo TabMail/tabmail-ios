@@ -61,7 +61,7 @@ struct ChatSendingBubbleTests {
         let parent: MessageHeader
     }
 
-    private static func header(_ id: String, folder: String, from: String, inReplyTo: String? = nil) -> MessageHeader {
+    nonisolated private static func header(_ id: String, folder: String, from: String, inReplyTo: String? = nil) -> MessageHeader {
         var header = MessageHeader(
             messageId: id, subject: "Lunch plans", from: from, fromAddress: from, to: "someone@example.com",
             date: Date().addingTimeInterval(-600), snippet: "Note \(id)",
