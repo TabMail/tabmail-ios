@@ -13,12 +13,17 @@ private let workAccountId = "acc-work"
 
 /// Invariant: when the assistant writes an email, the AI signs the body as the account the email
 /// is sent from. A reply or forward is sent from the email's own account, so the body is signed
-/// with that account's name and address even when it is not the primary account. A new email's
-/// compose card opens with exactly the account the body was signed as.
+/// with that account's name even when it is not the primary account. A new email is sent from
+/// the primary account (the demo account in demo), and its compose card opens with exactly the
+/// account the body was signed as.
 ///
 /// The backend call is replaced per task through `EmailComposeTool.inlineEditOverride`, which
-/// receives the exact `ComposeEditContext` the tool built for `performInlineEdit`.
-@Suite("Compose edit signs as the sending account")
+/// receives the exact `ComposeEditContext` the tool built for `performInlineEdit`; one test sends
+/// that context through a real `AIService` request to read the name the backend receives.
+///
+/// `.processGlobalState`: the tools read the process-wide demo mode, which each test pins, and
+/// the request test reads the App Group AI opt-out flag, which it pins off and restores.
+@Suite("Compose edit signs as the sending account", .serialized, .processGlobalState)
 @MainActor
 struct ComposeEditSenderAccountTests {
 
@@ -29,29 +34,60 @@ struct ComposeEditSenderAccountTests {
 
     private static let home = (id: homeAccountId, email: "home@example.com", name: "Home Name")
     private static let work = (id: workAccountId, email: "work@example.com", name: "Work Name")
+    private static let demo = (id: DemoSeed.demoAccountId, email: "demo@example.com", name: "Demo Name")
     private static let correspondent = "sam@example.com"
+    /// The address the work account's email was sent to: a team alias, not the account's own
+    /// address, so the account the email arrived in is known only from the email's account.
+    private static let workAlias = "team@example.com"
 
-    /// A database with two active accounts, `primaryId` the primary one, and an Inbox for each.
-    private func makeContext(primaryId: String) throws -> (ToolContext, DatabaseQueue, MockChatIdTranslator, AgentToolRouter) {
+    /// A database with the home and work accounts and an Inbox for each. `primaryId` is the
+    /// primary account (nil: none is), `inactive` the accounts that are not active, and
+    /// `withDemoRow` adds the demo account as the app seeds it (active and primary).
+    private func makeContext(
+        primaryId: String?,
+        inactive: Set<String> = [],
+        withDemoRow: Bool = false
+    ) throws -> (ToolContext, DatabaseQueue, MockChatIdTranslator, AgentToolRouter) {
         let db = try TestDatabase.make()
         for seed in [Self.home, Self.work] {
             var account = Account(emailAddress: seed.email, displayName: seed.name, provider: .gmail)
             account.id = seed.id
             account.isPrimary = seed.id == primaryId
+            account.isActive = !inactive.contains(seed.id)
             try db.write { try account.insert($0) }
             try TestDatabase.insertFolder(db, accountId: seed.id)
+        }
+        if withDemoRow {
+            var account = Account(emailAddress: Self.demo.email, displayName: Self.demo.name, provider: .imap)
+            account.id = Self.demo.id
+            account.isActive = true
+            account.isPrimary = true
+            try db.write { try account.insert($0) }
         }
         let translator = MockChatIdTranslator()
         let router = AgentToolRouter()
         return (ToolContext(db: db, translator: translator, router: router), db, translator, router)
     }
 
-    /// An email from Sam to the work account, in the work account's Inbox.
+    /// Runs `body` with demo mode set to `active`, and puts the previous mode back after.
+    private func withDemoMode(_ active: Bool, _ body: () async throws -> Void) async throws {
+        let prior = DemoModeStore.shared.isActive
+        DemoModeStore.shared.isActive = active
+        do {
+            try await body()
+        } catch {
+            DemoModeStore.shared.isActive = prior
+            throw error
+        }
+        DemoModeStore.shared.isActive = prior
+    }
+
+    /// An email from Sam to the work account's team alias, in the work account's Inbox.
     private func insertWorkEmail(_ db: DatabaseQueue, messageId: String) throws -> MessageHeader {
         try TestDatabase.insertMessageHeader(
             db, messageId: messageId, subject: "Offsite",
             from: Self.correspondent, fromAddress: Self.correspondent,
-            to: Self.work.email,
+            to: Self.workAlias,
             folderId: "\(Self.work.id):INBOX", accountId: Self.work.id
         )
     }
@@ -72,17 +108,24 @@ struct ComposeEditSenderAccountTests {
         let replyToAccountId: String?
     }
 
+    nonisolated private static func cannedEdit() -> InlineEditResult {
+        InlineEditResult(response: nil, subject: "Subject", body: "Body", toDelta: nil, ccDelta: nil, bccDelta: nil, raw: "")
+    }
+
     /// Runs `tool` with the backend edit call captured, closes the compose card it opens, and
-    /// returns every edit context the tool built and what the card was opened with.
+    /// returns every edit context the tool built and what the card was opened with. `edit`
+    /// answers the edit call (default: a fixed result).
     private func captureEditAndRequest(
         router: AgentToolRouter,
+        edit: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)? = nil,
         run: @escaping @MainActor () async throws -> String
     ) async throws -> (contexts: [ComposeEditContext], card: Card?) {
         var enqueued: Card?
         let box = ContextBox()
-        let override: @Sendable (ComposeEditContext, String) async throws -> InlineEditResult = { ctx, _ in
+        let override: @Sendable (ComposeEditContext, String) async throws -> InlineEditResult = { ctx, instruction in
             await box.append(ctx)
-            return InlineEditResult(response: nil, subject: "Subject", body: "Body", toDelta: nil, ccDelta: nil, bccDelta: nil, raw: "")
+            if let edit { return try await edit(ctx, instruction) }
+            return Self.cannedEdit()
         }
         try await EmailComposeTool.$inlineEditOverride.withValue(override) {
             let task = Task { @MainActor () -> String in try await run() }
@@ -99,85 +142,203 @@ struct ComposeEditSenderAccountTests {
         return (await box.contexts, enqueued)
     }
 
-    @Test("email_reply: a reply to the work account's email is signed as the work account, not the primary")
-    func replySignsAsTheRepliedEmailsAccount() async throws {
-        let (ctx, db, translator, router) = try makeContext(primaryId: Self.home.id)
-        let header = try insertWorkEmail(db, messageId: "rep-work")
-        await translator.seed(header.id, as: 21)
+    @Test("email_reply: a reply to the work account's email is signed as the work account, primary or not", arguments: [homeAccountId, workAccountId])
+    func replySignsAsTheRepliedEmailsAccount(primaryId: String) async throws {
+        try await withDemoMode(false) {
+            let (ctx, db, translator, router) = try makeContext(primaryId: primaryId)
+            let header = try insertWorkEmail(db, messageId: "rep-work")
+            await translator.seed(header.id, as: 21)
 
-        let tool = EmailReplyTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
-                "unique_id": .int(21),
-                "request": .string("Say Friday works"),
-            ])
+            let tool = EmailReplyTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "unique_id": .int(21),
+                    "request": .string("Say Friday works"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].mode == "edit_reply")
+            #expect(captured.contexts[0].senderName == Self.work.name)
+            #expect(captured.contexts[0].senderEmail == Self.work.email)
+            // The card sends from the replied email's account.
+            #expect(captured.card?.replyToAccountId == Self.work.id)
         }
-        #expect(captured.contexts.count == 1)
-        guard captured.contexts.count == 1 else { return }
-        #expect(captured.contexts[0].mode == "edit_reply")
-        #expect(captured.contexts[0].senderName == Self.work.name)
-        #expect(captured.contexts[0].senderEmail == Self.work.email)
-        // The card sends from the replied email's account.
-        #expect(captured.card?.replyToAccountId == Self.work.id)
     }
 
-    @Test("email_forward: a forward of the work account's email is signed as the work account, not the primary")
-    func forwardSignsAsTheForwardedEmailsAccount() async throws {
-        let (ctx, db, translator, router) = try makeContext(primaryId: Self.home.id)
-        let header = try insertWorkEmail(db, messageId: "fwd-work")
-        await translator.seed(header.id, as: 22)
+    @Test("email_forward: a forward of the work account's email is signed as the work account, primary or not", arguments: [homeAccountId, workAccountId])
+    func forwardSignsAsTheForwardedEmailsAccount(primaryId: String) async throws {
+        try await withDemoMode(false) {
+            let (ctx, db, translator, router) = try makeContext(primaryId: primaryId)
+            let header = try insertWorkEmail(db, messageId: "fwd-work")
+            await translator.seed(header.id, as: 22)
 
-        let tool = EmailForwardTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
-                "unique_id": .int(22),
-                "to": .array([.string("pat@example.com")]),
-                "request": .string("Let them know Friday works"),
-            ])
+            let tool = EmailForwardTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "unique_id": .int(22),
+                    "to": .array([.string("pat@example.com")]),
+                    "request": .string("Let them know Friday works"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].mode == "edit_forward")
+            #expect(captured.contexts[0].senderName == Self.work.name)
+            #expect(captured.contexts[0].senderEmail == Self.work.email)
+            // The card sends from the forwarded email's account.
+            #expect(captured.card?.replyToAccountId == Self.work.id)
         }
-        #expect(captured.contexts.count == 1)
-        guard captured.contexts.count == 1 else { return }
-        #expect(captured.contexts[0].mode == "edit_forward")
-        #expect(captured.contexts[0].senderName == Self.work.name)
-        #expect(captured.contexts[0].senderEmail == Self.work.email)
-        // The card sends from the forwarded email's account.
-        #expect(captured.card?.replyToAccountId == Self.work.id)
+    }
+
+    /// The name reaches the backend: the reply tool's edit goes through a real `AIService`
+    /// request, whose `user_name` is the name the AI signs with.
+    @Test("email_reply: the backend request signs as the work account's name, not the primary's")
+    func replyRequestCarriesTheRepliedAccountsName() async throws {
+        let restoreAISetting = AITestSetting.save()
+        defer { restoreAISetting() }
+        AITestSetting.set(aiOff: false)
+        try await withDemoMode(false) {
+            let backend = FakeHTTP.Scenario()
+            backend.register(path: "/completions/chat", method: "POST") { _ in
+                let final = (try? JSONSerialization.data(withJSONObject: ["assistant": "Subject: Offsite\nBody: Friday works."])) ?? Data()
+                let stream = "event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n"
+                return .bytes(Data(stream.utf8), contentType: "text/event-stream")
+            }
+            let service = AIService(backendClient: BackendClient(llmSession: backend.session))
+            let (ctx, db, translator, router) = try makeContext(primaryId: Self.home.id)
+            let header = try insertWorkEmail(db, messageId: "rep-wire")
+            await translator.seed(header.id, as: 23)
+
+            let tool = EmailReplyTool(context: ctx)
+            _ = try await captureEditAndRequest(router: router, edit: { context, instruction in
+                try await service.performInlineEdit(
+                    currentSubject: "", currentBody: "", context: context,
+                    instruction: instruction, chatHistory: []
+                )
+            }) {
+                try await tool.execute(arguments: [
+                    "unique_id": .int(23),
+                    "request": .string("Say Friday works"),
+                ])
+            }
+
+            let calls = backend.recordedCalls()
+            #expect(calls.count == 1)
+            guard calls.count == 1 else { return }
+            let json = calls[0].body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+            let vars = (json["messages"] as? [[String: Any]])?.first ?? [:]
+            let userName = vars["user_name"] as? String
+            #expect(userName == Self.work.name)
+        }
     }
 
     @Test("email_compose: the new email's card opens with the account the body is signed as", arguments: [homeAccountId, workAccountId])
     func newEmailOpensWithTheAccountItIsSignedAs(primaryId: String) async throws {
-        let (ctx, _, _, router) = try makeContext(primaryId: primaryId)
-        let primary = primaryId == Self.home.id ? Self.home : Self.work
+        try await withDemoMode(false) {
+            let (ctx, _, _, router) = try makeContext(primaryId: primaryId)
+            let primary = primaryId == Self.home.id ? Self.home : Self.work
 
-        let tool = EmailComposeTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
-                "to": .array([.string(Self.correspondent)]),
-                "request": .string("Ask about moving the offsite to Friday"),
-            ])
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "request": .string("Ask about moving the offsite to Friday"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            let account = captured.card?.account
+            #expect(account?.id == primary.id)
+            #expect(captured.contexts[0].senderName == primary.name)
+            #expect(captured.contexts[0].senderEmail == primary.email)
+            #expect(captured.contexts[0].senderName == account?.displayName)
+            #expect(captured.contexts[0].senderEmail == account?.emailAddress)
         }
-        #expect(captured.contexts.count == 1)
-        guard captured.contexts.count == 1 else { return }
-        let account = captured.card?.account
-        #expect(account?.id == primary.id)
-        #expect(captured.contexts[0].senderName == primary.name)
-        #expect(captured.contexts[0].senderEmail == primary.email)
-        #expect(captured.contexts[0].senderName == account?.displayName)
-        #expect(captured.contexts[0].senderEmail == account?.emailAddress)
     }
 
     @Test("email_compose: with no writing request the card still opens with the sending account")
     func newEmailWithoutRequestCarriesTheSendingAccount() async throws {
-        let (ctx, _, _, router) = try makeContext(primaryId: Self.work.id)
-        let tool = EmailComposeTool(context: ctx)
-        let captured = try await captureEditAndRequest(router: router) {
-            try await tool.execute(arguments: [
-                "to": .array([.string(Self.correspondent)]),
-                "body": .string("See you Friday."),
-            ])
+        try await withDemoMode(false) {
+            let (ctx, _, _, router) = try makeContext(primaryId: Self.work.id)
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "body": .string("See you Friday."),
+                ])
+            }
+            #expect(captured.contexts.isEmpty)
+            #expect(captured.card?.account?.id == Self.work.id)
         }
-        #expect(captured.contexts.isEmpty)
-        #expect(captured.card?.account?.id == Self.work.id)
+    }
+
+    /// The account is read once: a primary account change while the AI is writing does not
+    /// move the card away from the account the body was signed as.
+    @Test("email_compose: a primary change during the edit keeps the card on the account the body is signed as")
+    func newEmailKeepsItsAccountWhenThePrimaryChangesDuringTheEdit() async throws {
+        try await withDemoMode(false) {
+            let (ctx, db, _, router) = try makeContext(primaryId: Self.home.id)
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router, edit: { _, _ in
+                try await db.write { db in
+                    try db.execute(sql: "UPDATE account SET isPrimary = (id = ?)", arguments: [workAccountId])
+                }
+                return Self.cannedEdit()
+            }) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "request": .string("Ask about moving the offsite to Friday"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == Self.home.name)
+            #expect(captured.card?.account?.id == Self.home.id)
+        }
+    }
+
+    /// Demo boundary (ADR-IOS-038): the demo account and a real primary are both primary while
+    /// they coexist. In demo the new email is signed as, and opens with, the demo account; out
+    /// of demo, the real primary.
+    @Test("email_compose: in demo the new email is the demo account's, out of demo the real primary's", arguments: [true, false])
+    func newEmailFollowsTheDemoBoundary(demoActive: Bool) async throws {
+        try await withDemoMode(demoActive) {
+            let (ctx, _, _, router) = try makeContext(primaryId: Self.home.id, withDemoRow: true)
+            let expected = demoActive ? Self.demo : Self.home
+
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "request": .string("Ask about moving the offsite to Friday"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == expected.name)
+            #expect(captured.card?.account?.id == expected.id)
+        }
+    }
+
+    /// With no real primary account, the new email uses an active real account: never the
+    /// demo row (which is primary) and never an account that is not active.
+    @Test("email_compose: with no real primary the new email uses the active real account")
+    func newEmailWithoutPrimaryUsesTheActiveRealAccount() async throws {
+        try await withDemoMode(false) {
+            let (ctx, _, _, router) = try makeContext(primaryId: nil, inactive: [Self.work.id], withDemoRow: true)
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "request": .string("Ask about moving the offsite to Friday"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == Self.home.name)
+            #expect(captured.card?.account?.id == Self.home.id)
+        }
     }
 }
 

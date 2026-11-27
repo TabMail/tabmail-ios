@@ -136,7 +136,8 @@ struct EmailComposeTool: AgentTool, Sendable {
     /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
     /// and email_forward (mode "edit_forward") tools for full TB parity.
     /// `sender` is the account the email is sent from (a reply or forward: the email's own
-    /// account; a new email: `sendingAccount`); the AI signs the body with its name and address.
+    /// account; a new email: `sendingAccount`); the AI signs the body with its display name,
+    /// which the edit request sends as `user_name`.
     static func runComposeEdit(
         to: [String],
         cc: [String],

@@ -1280,20 +1280,27 @@ host's zone, and compares the write on the fake with the card.
 
 ## Assistant-written emails — signed as the account they are sent from
 
-`TabMailTests/Tools/ComposeEditSenderAccountTests.swift` pins #1521. Each case has two active
-accounts and captures the edit request through `EmailComposeTool.inlineEditOverride`.
+`TabMailTests/Tools/ComposeEditSenderAccountTests.swift` pins #1521. Each case has a home and a
+work account and captures the edit context the tool builds through
+`EmailComposeTool.inlineEditOverride`; the assertions read that context and the compose request
+the tool queues (the card itself is not presented).
 
-- `ComposeEditSenderAccountTests`:
-  - A reply and a forward of an email in the account that is not the primary are signed with that
-    account's name and address, and the card sends from that account (red-first: before the fix
-    both were signed as the primary account).
+- `ComposeEditSenderAccountTests` (`.processGlobalState`, demo mode pinned per case):
+  - A reply and a forward of an email in the work account (sent to a team alias, not the
+    account's address), with either account as the primary, build an edit context with the work
+    account's name and address, and the request's parent email is the work account's.
+  - The reply's edit, sent through a real `AIService` request, reaches the backend with the work
+    account's name as `user_name`.
   - A new email, with either account as the primary, carries the primary account on its compose
-    request, and the body is signed with that same account. Without a writing request, the request
-    still carries the account.
-- `AssistantComposeCardAccountWiringTests`: both views that present an assistant compose request
-  (`InboxView`, `MessageDetailView`) open a new email's card with the request's account and no
-  account of their own (red-first: before the fix they used the primary account and the open
-  email's account).
+    request, and the edit context has that same account's name and address. Without a writing
+    request, the request still carries the account. A primary change while the edit runs leaves
+    the request on the account the body was signed as.
+  - Demo boundary: with the demo row and a real primary both primary, a new email is the demo
+    account's in demo and the real primary's out of demo. With no real primary, it is the active
+    real account (not the demo row, not an inactive account).
+- `AssistantComposeCardAccountWiringTests`: a source fence that the `.compose` case of
+  `composeViewForAgentRequest` in both presenting views (`InboxView`, `MessageDetailView`) passes
+  `account: req.account` and no other account argument.
 
 ## CalDAV organizer — every event with guests names its organizer
 

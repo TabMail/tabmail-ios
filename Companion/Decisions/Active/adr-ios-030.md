@@ -69,7 +69,7 @@ ComposeView contains `.alert`, `.popover`, `.photosPicker`, `.fileImporter`, and
 
 **Amendment (2026-11-27, tabmail-ios #1521): the request carries the account it is signed as.**
 
-- *Problem:* the AI-written body was signed by `EmailComposeTool.runComposeEdit` with the primary account's name and address. The email went out from another account in two cases:
+- *Problem:* the AI-written body was signed by `EmailComposeTool.runComposeEdit` with the primary account's name (the edit request's `user_name`). The email went out from another account in two cases:
   - a reply or forward, which is sent from the email's own account;
   - a new email whose card the email screen presented, because it opened the card with the open email's account (the observer race above decides which view presents).
 - *Decision:* `runComposeEdit` takes the sending account (`sender:`) and does no account lookup of its own.
