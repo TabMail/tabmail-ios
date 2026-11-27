@@ -245,7 +245,10 @@ it, unread and changing no result.
   to the Sent folders), run for every batch of stored headers.
 
 None of them sought the index once `ANALYZE` had run on a mailbox with no In-Reply-To stored. The
-Microsoft Graph sync stores none, so an Outlook-only database is that mailbox.
+Microsoft Graph sync stores none, so an Outlook-only database is that mailbox. *(Amended 2026-11-27,
+#1559: the Graph sync now stores In-Reply-To for mail it reads with the extended-property expand; Outlook
+mail stored before that release, by an Inbox baseline or from search still has none, so such a mailbox
+still exists and the forced index stays right.)*
 - **Why the planner chose it.** `ANALYZE` counts NULL as one value. With every `inReplyTo` NULL, the
   index's `sqlite_stat1` row reads `N N`: every row shares one value. The planner then prices a seek
   as N row lookups and prefers another plan.

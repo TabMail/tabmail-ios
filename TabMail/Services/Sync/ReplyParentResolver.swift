@@ -67,8 +67,8 @@ enum ReplyParentResolver {
 
         // Normalize defensively. Every provider already hands In-Reply-To over
         // bare (IMAP's `IMAPProvider.mapMessageInfo` through `normalizeMessageId`,
-        // Gmail and RFC 822 parsing through `extractFirstMessageId`; Graph gives
-        // none), and `normalizeMessageId` is idempotent, so this costs nothing
+        // Gmail, RFC 822 and Graph's extended property through
+        // `extractFirstMessageId`), and `normalizeMessageId` is idempotent, so this costs nothing
         // when the value was already normalized.
         var replied = Set<String>()
         var forwarded = Set<String>()
@@ -244,7 +244,9 @@ enum ReplyParentResolver {
     /// normalized (Gmail and RFC 822 parsing through
     /// `EmailFilter.extractFirstMessageId`; IMAP's envelope mapping and the
     /// extension's `IMAPFetchMapping` through `EmailFilter.normalizeMessageId`;
-    /// the optimistic Sent copy; Graph stores none), so the bare form is the only
+    /// the optimistic Sent copy; Graph through `GraphParse.parseMessage`, which
+    /// reads the expanded In-Reply-To with `EmailFilter.extractFirstMessageId`),
+    /// so the bare form is the only
     /// one matched, as `markInsertedParentsOfStoredReplies` matches it.
     static func hasStoredReply(
         toRfc822MessageId rfc822MessageId: String?,

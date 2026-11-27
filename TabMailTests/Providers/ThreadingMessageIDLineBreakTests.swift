@@ -45,8 +45,8 @@ struct ThreadingMessageIDLineBreakTests {
         let storedHeaders = stored.additionalHeaders ?? [:]
         let graphProperties = (exchange.buildGraphSendPayload(draft: draft, sending: false)["singleValueExtendedProperties"]
             as? [[String: String]]) ?? []
-        let graphNames = [ExchangeProvider.graphInReplyToProperty: "In-Reply-To",
-                          ExchangeProvider.graphReferencesProperty: "References"]
+        let graphNames = [GraphAPI.inReplyToPropertyId: "In-Reply-To",
+                          GraphAPI.referencesPropertyId: "References"]
         let graphHeaders = graphProperties.map { ["name": graphNames[$0["id"] ?? ""] ?? ($0["id"] ?? ""), "value": $0["value"] ?? ""] }
         func graph(_ name: String) -> [String] { graphHeaders.filter { $0["name"] == name }.compactMap { $0["value"] } }
 

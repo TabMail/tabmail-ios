@@ -30,10 +30,14 @@ Apple Mail or Outlook does therefore depends on headers nobody has measured:
 
 An Outlook (Microsoft Graph) account's sync reads no `In-Reply-To` at all (`GraphParse.parseMessage`
 sets it nil), so on that account no Sent copy marks anything, whichever app sent it.
+*(Amended 2026-11-27, #1559: an Outlook account's sync now reads `In-Reply-To` (extended property
+`String 0x1042`), so its Sent copies follow the three cases above as on Gmail and IMAP, and an
+Outlook account is no longer immune to the third.)*
 
 ## When it happens
 
-Whenever a user forwards from Apple Mail or Outlook with an IMAP or Gmail account TabMail also syncs.
+Whenever a user forwards from Apple Mail or Outlook with an IMAP or Gmail account TabMail also syncs
+(since #1559, 2026-11-27, with an Outlook account too).
 Which of the three cases it is, is what a measurement would show; only the third gives a wrong mark.
 
 ## Recoverability

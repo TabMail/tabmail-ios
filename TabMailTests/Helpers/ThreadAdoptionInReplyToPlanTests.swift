@@ -9,7 +9,8 @@ import Testing
 
 /// #1563: every stored email runs the thread lookup (`ThreadUtils.findAdoptableThreadId`), and
 /// its In-Reply-To probe must seek `messageHeader_inReplyTo` whatever the planner statistics
-/// say. On a mailbox with no In-Reply-To stored (Outlook's sync stores none) the app's ANALYZE
+/// say. On a mailbox with no In-Reply-To stored (Outlook mail stored before #1559, by an Inbox
+/// baseline or from search) the app's ANALYZE
 /// records every row under one value, and the probe without its index name planned
 /// `SCAN messageHeader`: the whole table read for every email stored.
 @Suite("Thread lookup: the In-Reply-To probe seeks its index under any statistics")

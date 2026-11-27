@@ -41,6 +41,9 @@ leaves it out, so the revert goes ahead unless a reply is stored beside it. If t
 removal comes before the reply's copy syncs, `ReplyParentResolver` marks the original and clears the tag when
 it does. Graph stores no In-Reply-To, so on Outlook neither step finds the reply; there a reply from
 another client reaches the original only through the server's last-verb properties (memory 151).
+*(Amended 2026-11-27, #1559: Outlook's sync now reads In-Reply-To, so both steps find the reply on
+Outlook too; `SendReplyMarksTests.outlookWebReplyWhileTheSendWaited` and
+`OutlookChangeReadingTests.sentReplyMarksItsParentReplied`.)*
 
 **Accepted, as in 1.11.6:** a forward sent from another client while TabMail's forward waits leaves the
 original with no forwarded mark when TabMail's is removed unsent. No other client's forward is visible

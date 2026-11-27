@@ -264,12 +264,13 @@ extension OutlookChangeReadingTests {
         }
     }
 
-    @Test("A batch item's URL carries the last-verb expand with its spaces encoded")
+    @Test("A batch item's URL carries the last-verb and threading-id expand with its spaces encoded")
     func batchItemURLEncodesSpaces() {
-        let url = GraphAPI.batchItemURL(path: "/messages/m-1", query: GraphAPI.metadataSelection.withLastVerb.queryParameter)
+        let url = GraphAPI.batchItemURL(path: "/messages/m-1", query: GraphAPI.metadataSelection.withExtendedProperties.queryParameter)
         #expect(!url.contains(" "))
         #expect(url.hasPrefix("/me/messages/m-1?$select="))
-        #expect(url.hasSuffix("&$expand=singleValueExtendedProperties($filter=id%20eq%20'Integer%200x1081')"))
+        #expect(url.hasSuffix("&$expand=singleValueExtendedProperties($filter=id%20eq%20'Integer%200x1081'"
+            + "%20or%20id%20eq%20'String%200x1042'%20or%20id%20eq%20'String%200x1039')"))
     }
 
     @Test("The last verb is read only with a request that may expand it, never on a message delta")

@@ -599,12 +599,32 @@ does not read the verb. The arrow is never written to the server (Mail.Send and 
 out of scope).
 *Amended 2026-11-15 (#915):* the app now writes the verb on the original after a confirmed send
 (memory 151); the reader sees that echo as a mark already set locally, so it changes nothing.
+*Amended 2026-11-27 (#1559):* the same expand also names the threading ids `String 0x1042` (In-Reply-To)
+and `String 0x1039` (References), joined with `or` (observed, not documented: Microsoft documents the
+filter with one id, and the `or` form was measured on 2026-11-27; a refusal would answer every expanded
+read with 400, a loud failure, never a silent loss); the names became
+`GraphMessageSelection.expandsExtendedProperties` / `withExtendedProperties` and
+`GraphAPI.extendedPropertiesExpandParameter`, and the notification extension's `messageMetadata` expands
+too, as do the older-mail and catch-up reads (`fetchSingleBackfill`). `GraphParse.parseMessage` reads
+both ids. `readLastVerbs` also copies them onto the record's header, which only the apply's insert reads,
+so a new message threads under the one it answers, and the change reader never moves a stored row's chain,
+thread or reference rows (`fullRecord`). A full listing's merge of a stored row (its ordinary
+existing-row arm, when the incoming Message-ID normalizes) writes the server's References onto it, as on
+every provider, and keeps its thread, In-Reply-To and reference rows; a stored Sent or Drafts row takes the
+earlier metadata-skip arm and keeps its References too. No new
+request. Residuals (a by-id read the allowance or budget cut, or that failed: 5xx, 429, a failed batch,
+an unusable answer; an Inbox baseline; search) in IOS-THREAD-002 case 4.
+Since the Sent copies now carry In-Reply-To, the Sent-copy marks (`ReplyParentResolver`) and the revert's
+`hasStoredReply` work on Outlook as on Gmail and IMAP, and so does the accepted wrong-arrow class of
+IOS-OUTBOX-008 (another app's forward with In-Reply-To and no `Fwd:`/`Fw:` subject).
 
-Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`).
+Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`); threading ids:
+`OutlookReplyThreadingTests.swift`.
 
 Keywords: last verb, PidTagLastVerbExecuted, 0x1081, replied, answered, forwarded, reply arrow,
 singleValueExtendedProperties, $expand, expandsLastVerb, readLastVerbs, batchItemURL,
-double encoding, ReplyDetect, #890.
+double encoding, ReplyDetect, #890, expandsExtendedProperties, extendedPropertiesExpandParameter,
+0x1042, 0x1039, In-Reply-To, References, threading ids, #1559.
 
 ### Amendment 2026-11-16: Gmail resumes its history read (#491)
 

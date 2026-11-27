@@ -11,7 +11,8 @@ import Testing
 /// every email opened) and of the parent-side reply discovery
 /// (`ReplyParentResolver.markInsertedParentsOfStoredReplies`, run on every batch of stored headers)
 /// must seek `messageHeader_inReplyTo` whatever the planner statistics say. On a mailbox with no
-/// In-Reply-To stored (Outlook's sync stores none) the app's ANALYZE records every row under one
+/// In-Reply-To stored (Outlook mail stored before #1559, by an Inbox baseline or from search) the
+/// app's ANALYZE records every row under one
 /// value. Without the index name the thread view then walked the date index over the whole table,
 /// and the reply discovery read every row of each Sent folder.
 ///

@@ -96,14 +96,29 @@ enum GraphParse {
         }
         #endif
 
+        // In-Reply-To and References come as extended properties, present only
+        // when the request expanded them (`GraphAPI.extendedPropertiesExpandParameter`)
+        // and the message has them; otherwise the row threads by conversationId
+        // alone. Parsed as GmailParse parses the headers.
+        let properties = json["singleValueExtendedProperties"] as? [[String: Any]] ?? []
+        func property(_ propertyId: String) -> String? {
+            properties.first {
+                ($0["id"] as? String)?.caseInsensitiveCompare(propertyId) == .orderedSame
+            }?["value"] as? String
+        }
+        let inReplyTo = property(GraphAPI.inReplyToPropertyId).flatMap { EmailFilter.extractFirstMessageId($0) }
+        let references: [String] = {
+            guard let raw = property(GraphAPI.referencesPropertyId) else { return [] }
+            return raw.components(separatedBy: .whitespacesAndNewlines)
+                .compactMap { EmailFilter.extractFirstMessageId($0) }
+        }()
+
         return MessageMetadata(
             providerMessageId: id,
             threadId: threadId,
             rfc822MessageId: rfc822,
-            // Graph uses conversationId for threading; In-Reply-To / References require
-            // a separate internetMessageHeaders fetch — too expensive for the default path.
-            inReplyTo: nil,
-            references: [],
+            inReplyTo: inReplyTo,
+            references: references,
             from: from ?? EmailAddress(name: "", email: ""),
             to: to, cc: cc, bcc: bcc,
             replyTo: replyToArr.first,

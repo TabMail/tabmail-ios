@@ -25,8 +25,8 @@ struct ExchangeSendPayloadTests {
     /// Exchange writes that header from.
     private func header(_ name: String, in payload: [String: Any]) -> String? {
         let property = switch name {
-        case "In-Reply-To": ExchangeProvider.graphInReplyToProperty
-        case "References": ExchangeProvider.graphReferencesProperty
+        case "In-Reply-To": GraphAPI.inReplyToPropertyId
+        case "References": GraphAPI.referencesPropertyId
         default: name
         }
         let properties = payload["singleValueExtendedProperties"] as? [[String: String]] ?? []
@@ -56,8 +56,8 @@ struct ExchangeSendPayloadTests {
 
     @Test("Threading goes as PidTagInReplyToId and PidTagInternetReferences")
     func threadingPropertyIds() {
-        #expect(ExchangeProvider.graphInReplyToProperty == "String 0x1042")
-        #expect(ExchangeProvider.graphReferencesProperty == "String 0x1039")
+        #expect(GraphAPI.inReplyToPropertyId == "String 0x1042")
+        #expect(GraphAPI.referencesPropertyId == "String 0x1039")
     }
 
     @Test("Reply emits bracketed In-Reply-To + full References chain")
