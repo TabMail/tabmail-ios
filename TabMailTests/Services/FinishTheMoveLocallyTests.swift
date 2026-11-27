@@ -1001,6 +1001,114 @@ struct FinishTheMoveLocallyTests {
         await finish(f)
     }
 
+    /// **THE PROPERTY: from the moment the dropping write commits, before the
+    /// outside-stores lane runs the in-memory retirement, the pill is already
+    /// retired where it is stored, and a reopen heal that would re-point it by
+    /// Message-ID is refused.** Until the lane runs, the stored stand-in is the
+    /// only thing that stops that heal, and the only thing a relaunch reads.
+    @Test("Before the lane runs, a dropped row's pill is retired in storage and a heal is refused")
+    @MainActor
+    func aDroppedRowsPillIsRetiredInStorageBeforeTheLaneRuns() async throws {
+        let target = "pill-held@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [Self.message(uid: 4, id: target)],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-pill-held")
+        await ChatIdTranslator.shared.clearAll()
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 88, rfc: target)
+        let numericId = await ChatIdTranslator.shared.toNumericId(seeded.id)
+        let retiredId = ChatIdTranslator.retiredRealId(numericId: numericId, realId: seeded.id)
+        let release = MailPointerMoves.holdOutsideStoresForTesting()
+        defer { release() }
+
+        await AccountManager.shared.move([seeded], to: "Archive")
+        try await drainToQuiescence(f)
+        // NON-VACUITY: the row is gone and the lane has not retired the pill in
+        // memory yet, so this is the window between the commit and the lane.
+        let remnantKept = try rows(f).contains { $0.id == seeded.id }
+        #expect(!remnantKept, "the remnant row was not dropped")
+        let inMemory = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(inMemory == seeded.id, "the lane was not held: the in-memory retirement already ran")
+
+        let stored = try await AppDatabase.dbPool.read { db in
+            try String.fetchOne(db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [numericId])
+        }
+        #expect(stored == retiredId, "the dropping write left the stored mapping live: \(String(describing: stored))")
+        // A reopen heal re-points the pill to the same-id message in Archive.
+        let sameId = MessageIdentity.headerId(accountId: f.accountId, folderPath: "Archive", messageId: "4")
+        let moved = await ChatIdTranslator.shared.remapRealId(from: seeded.id, to: sameId)
+        #expect(moved == 0, "the heal re-pointed the dropped row's pill by Message-ID")
+        let healed = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(healed == retiredId, "the pill names \(String(describing: healed)) after the heal")
+        let retired = await ChatIdTranslator.shared.isRetiredPill(numericId)
+        #expect(retired, "the pill is not reported as retired")
+
+        release()
+        await MailPointerMoves.outsideStoresSettledForTesting()
+        let settled = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(settled == retiredId, "the lane's retirement left the pill naming \(String(describing: settled))")
+        await ChatIdTranslator.shared.clearAll()
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: every pilled row one move drops ends retired, not only
+    /// the first.**
+    @Test("A move that drops two pilled rows retires both pills")
+    @MainActor
+    func aMoveThatDropsTwoPilledRowsRetiresBoth() async throws {
+        let targets = ["pill-pair-a@example.com", "pill-pair-b@example.com"]
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: targets[0]), Self.message(uid: 89, id: targets[1])],
+            "Archive": [],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88, 89])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88, 89])
+        for target in targets { server.expectMutation(rfc822MessageId: target) }
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-pill-pair")
+        await ChatIdTranslator.shared.clearAll()
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let first = try seedHeader(f, uid: 88, rfc: targets[0])
+        let second = try seedHeader(f, uid: 89, rfc: targets[1])
+        let firstNumeric = await ChatIdTranslator.shared.toNumericId(first.id)
+        let secondNumeric = await ChatIdTranslator.shared.toNumericId(second.id)
+
+        await AccountManager.shared.move([first, second], to: "Archive")
+        try await drainToQuiescence(f)
+        await MailPointerMoves.outsideStoresSettledForTesting()
+        // NON-VACUITY: one MOVE carried both rows, and both were dropped.
+        let moves = server.recordedCommands().filter { $0.uppercased().contains("UID MOVE") }
+        #expect(moves.count == 1, "the two rows did not move in one operation: \(moves)")
+        let kept = try rows(f).filter { $0.id == first.id || $0.id == second.id }.map(\.id)
+        #expect(kept.isEmpty, "rows kept: \(kept)")
+
+        for (numericId, realId) in [(firstNumeric, first.id), (secondNumeric, second.id)] {
+            let named = await ChatIdTranslator.shared.toRealId(numericId)
+            #expect(named == ChatIdTranslator.retiredRealId(numericId: numericId, realId: realId),
+                    "the pill of \(realId) names \(String(describing: named))")
+            let retired = await ChatIdTranslator.shared.isRetiredPill(numericId)
+            #expect(retired, "the pill of \(realId) is not reported as retired")
+        }
+        await ChatIdTranslator.shared.clearAll()
+        try? await provider.disconnect()
+        await finish(f)
+    }
+
     // MARK: - G1 — a pairing that cannot be trusted is not an address
 
     /// **THE PROPERTY: no local row ever adopts an address from a `COPYUID`
