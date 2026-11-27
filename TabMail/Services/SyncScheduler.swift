@@ -954,6 +954,10 @@ final class SyncScheduler {
     ///   wind-down, run right after cancelling the in-flight sync Task so
     ///   actor-owned queue Tasks (the AI heartbeat in particular) stop drumming
     ///   on the App Group SQLite before iOS suspends.
+    /// - `DatabaseUpgrade.run` — the one-time database upgrade's light pause,
+    ///   with `stopPolling`, before its `VACUUM`s (ADR-IOS-121); its exit's
+    ///   `startForegroundPolling`, run while the app is active, refills the
+    ///   queues (in the background, the return to the app does).
     ///
     /// Not a caller, despite the near-identical name: `ActiveAIQueue.executeJob`'s
     /// per-job bgTask expiration handler calls `ActiveAIQueue.shared.cancelAllInFlight()`
@@ -1671,6 +1675,21 @@ final class SyncScheduler {
         // cancellation winds it down at a shard boundary (each shard is one
         // transaction). No deadline — BGProcessing has minutes of budget.
         await SearchIndex.shared.rebuildStaleTokenizerShards()
+
+        // Last: give the databases' empty pages back to the device (ADR-IOS-121),
+        // after the cleanup above (`syncStartup`'s WAL maintenance prunes and
+        // evicts) has freed them, in short steps. Only a database the user has
+        // upgraded to INCREMENTAL (`DatabaseUpgrade`) gets steps; this never runs
+        // the upgrade's `VACUUM`. It stops between steps when the app comes forward or the job ends
+        // (`DatabaseSuspension`), so it runs detached like the maintenance pass, at
+        // `.medium`, the floor for GRDB work (ADR-IOS-031); its writes still queue at
+        // the background tier (`AppDatabase.backgroundPool`).
+        if !Task.isCancelled {
+            await Task.detached(priority: .medium) {
+                let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.backgroundPool)
+                await SyncEngine.runOvernightSpaceReturn(targets: targets)
+            }.value
+        }
     }
 
     private func backgroundProcessingHasWork() async -> Bool {

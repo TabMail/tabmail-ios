@@ -9,6 +9,7 @@ import Testing
 /// the listing's own transaction (plus synthetic seeds, through the same
 /// writer); and every on-demand listing (folder open, after a send, after a
 /// move, epoch-rebuild step 6) goes through `syncFolderMessages` → `listFolder`.
+/// The follow mark (#1109), column-scoped like the counters, has one writer too.
 /// Reads the working tree at run time.
 @Suite("Listing route fence: one classifier, no other door")
 struct ListingRouteFenceTests {
@@ -80,6 +81,70 @@ struct ListingRouteFenceTests {
             let assigned = Self.hits("Column(\(column)).set(", in: sources)
             #expect(assigned.keys.allSatisfy { $0 == Self.engineFile }, "\(column) assigned outside the owners: \(assigned)")
         }
+    }
+
+    /// The follow mark (`Folder.isFollowed`, #1109) is column-scoped like the
+    /// counters: one writer, `SyncEngine.markFollowed`, which only ever sets it.
+    /// No other code names the column or its constant to write it, no production code sets the
+    /// record's field, and no whole record writes it (the encode fence in
+    /// `FolderRoleTests`).
+    @Test("The follow mark: one writer, which only sets it")
+    func followMarkHasOneWriter() throws {
+        let sources = try Self.productionSources()
+        let followFile = "TabMail/Services/Sync/SyncEngineFollowedFolders.swift"
+        #expect(Self.hits("markFollowed(", in: sources) == [followFile: 2],
+                "the writer's definition and its one call, in followFolders")
+        #expect(Self.hits("Column(Folder.followedColumn).set(", in: sources) == [followFile: 1],
+                "the column is set by markFollowed alone")
+        // Every use of the column constant, however it is written to (a raw SQL
+        // write that interpolates it would not spell the column's name): its
+        // declaration, the read of the folders not followed yet, and the one set.
+        let constantUses = Self.hits("followedColumn", in: sources)
+        #expect(constantUses == ["TabMail/Models/Folder.swift": 1, followFile: 2],
+                "a new use of the column constant is reviewed against the one writer: \(constantUses)")
+        #expect(Self.hits("\"isFollowed\"", in: sources) == ["TabMail/Models/Folder.swift": 1, "TabMail/Services/AppDatabase.swift": 1],
+                "the column's name appears only as its constant and in its migration")
+        // Every mention of the field or column, however it is spelled (a Swift
+        // assignment, SQL `SET isFollowed = 0`, `isFollowed=1`): its declaration,
+        // its column constant, its migration and the one read, in `isSyncable`.
+        // A new mention is reviewed against the one writer.
+        let mentions = Self.hits("isFollowed", in: sources)
+        #expect(mentions == [
+            "TabMail/Models/Folder.swift": 2,
+            "TabMail/Services/AppDatabase.swift": 1,
+            Self.engineFile: 1,
+        ], "no production code sets the record's mark or writes the column by name: \(mentions)")
+        let follow = try #require(sources.first { $0.path == followFile }?.text)
+        #expect(!follow.contains("set(to: false)"), "the mark is never cleared")
+        // A message open in the app is a folder access: the production init of
+        // the detail view model turns it on; only its test init leaves it off.
+        let detailAccess = Self.hits("self.accessesFolder = true", in: sources)
+        #expect(detailAccess == ["TabMail/ViewModels/MessageDetailViewModel.swift": 1],
+                "the app's message open accesses its folder: \(detailAccess)")
+    }
+
+    /// The turn line's places (ADR-IOS-104, #1360): only the new-mail
+    /// follow-up (`followUpPass`) and the folder view's listing
+    /// (`AccountManager.syncFolders`) wait ahead of the catch-up slices, and
+    /// only the catch-up slice (`runCatchUpRun`) waits as one. Every other
+    /// single-folder listing keeps arrival order, so a caller that passes
+    /// either place is reviewed against that decision. RED if, say, the
+    /// listing after a send or an open email's listing passed
+    /// `.aheadOfBackgroundChunks`.
+    @Test("Only the follow-up and the folder view's listing wait ahead of the catch-up slices, and only a slice waits as one")
+    func turnPlacesHaveTheirOwnCallers() throws {
+        let sources = try Self.productionSources()
+        let ahead = Self.hits(".aheadOfBackgroundChunks", in: sources)
+        #expect(ahead == [
+            "TabMail/Services/Sync/SyncEngine.swift": 1,
+            "TabMail/Services/Account/AccountManagerFetch.swift": 1,
+            "TabMail/Services/Sync/SyncEngineOneSyncAtATime.swift": 1,
+        ], "followUpPass, syncFolders and the line's own insert only: \(ahead)")
+        let chunk = Self.hits(".backgroundChunk", in: sources)
+        #expect(chunk == [
+            "TabMail/Services/Sync/SyncEngineCatchUp.swift": 1,
+            "TabMail/Services/Sync/SyncEngineOneSyncAtATime.swift": 1,
+        ], "runCatchUpRun's slice and the line's own mark only: \(chunk)")
     }
 
     @Test("Every on-demand listing goes through syncFolderMessages (folder open, after a send, after a move, epoch-rebuild step 6)")

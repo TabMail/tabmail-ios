@@ -36,14 +36,31 @@ struct IMAPCatchUpState: Codable, Equatable, Sendable {
     var skippedLoads: Bool?
     /// `lapseCount` as it stood when the last COMPLETED listing started.
     var listedLapseCount: Int?
+    /// The folder's stored counters when the last COMPLETED listing started
+    /// (`Listing.firstCounters`, #1109): on a server with no mod-sequences, an
+    /// access lists the folder again when they have moved since. Nil: no listing
+    /// completed with them recorded.
+    var completionCounters: Counters?
 
     /// A lapse came after the last completed listing started.
     var lapsedSinceLastListing: Bool { (lapseCount ?? 0) > (listedLapseCount ?? 0) }
+
+    /// A folder's counters as its last window listing stored them
+    /// (`Folder.totalCount`, `Folder.lastKnownUidNext`, #1109).
+    struct Counters: Codable, Equatable, Sendable {
+        var exists: Int
+        var uidNext: Int?
+    }
 
     struct Listing: Codable, Equatable, Sendable {
         /// HIGHESTMODSEQ taken when this listing started, before its first range.
         /// Becomes `completionStamp` when the listing completes.
         var firstStamp: Int?
+        /// The folder's stored counters when this listing started (#1109).
+        /// Become `completionCounters` when the listing completes. Taken before the
+        /// first range, as `firstStamp` is: a change during the listing moves the
+        /// counters past them, so the next access lists the folder again.
+        var firstCounters: Counters?
         /// The next listing range starts here (or at the range's lower bound, if
         /// that is higher): a range is cut on UIDs, never on local rows (#1062).
         /// *Superseded:* "The next listing range starts at the first local UID `>=` this."
@@ -183,9 +200,28 @@ extension IMAPProvider {
     ///   (`CatchUpLapse.read`), the new listing's start count when `state` is
     ///   absent (a floor-only state, another epoch), so a mark made on such a
     ///   state is settled by the first listing that starts after it (#1062).
+    /// - `counters`: the folder's stored counters now (`Folder.totalCount`,
+    ///   `Folder.lastKnownUidNext`), a new listing's `firstCounters` (#1109).
+    /// - `accessed`: a user action just landed in the folder
+    ///   (`CatchUpContext.accessedFolderIds`, #1109). An untracked folder is
+    ///   listed at that access when its counters differ from those its last
+    ///   completed listing started from, with or without MODSEQ: a server with
+    ///   CONDSTORE alone need not move HIGHESTMODSEQ on an expunge, so equal
+    ///   MODSEQ never vetoes a moved count. With no MODSEQ pair to compare (a
+    ///   server or session without CONDSTORE, or a last completed listing that
+    ///   started with no MODSEQ) there is no cheap check for a flag change, so
+    ///   it is also listed when that listing completed longer ago than
+    ///   `SyncConfig.catchUpAccessCheckAgeSeconds`. A tracked folder's changes
+    ///   come through its change read.
+    /// - `otherFolder`: the folder is outside the syncable set
+    ///   (`CatchUpContext.otherFolderIds`, #1110). Its regular change read
+    ///   (`SyncEngine.readOtherFolders`) cannot fit a deletion check in a slice,
+    ///   so its untracked full check comes weekly
+    ///   (`SyncConfig.catchUpOtherFolderFullCheckIntervalSeconds`), not daily.
     nonisolated static func catchUpPlan(
         state: IMAPCatchUpState?, freshModSeq: Int?, now: Date, isTracked: Bool = false,
-        rawLapseCount: Int? = nil
+        rawLapseCount: Int? = nil, counters: IMAPCatchUpState.Counters? = nil, accessed: Bool = false,
+        otherFolder: Bool = false
     ) -> CatchUpPlan {
         let modSeqChanged: Bool = {
             guard !isTracked, let stamp = state?.completionStamp, let freshModSeq else { return false }
@@ -194,12 +230,20 @@ extension IMAPProvider {
         let fullCheckDue = isTracked
             ? (state?.lastCompletedAt == nil || state?.lapsedSinceLastListing == true)
             : CatchUpSchedule.fullCheckDue(
-                lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpFullCheckIntervalSeconds)
+                lastCompletedAt: state?.lastCompletedAt, now: now,
+                interval: otherFolder
+                    ? SyncConfig.catchUpOtherFolderFullCheckIntervalSeconds : SyncConfig.catchUpFullCheckIntervalSeconds)
                 || state?.lapsedSinceLastListing == true
+        let modSeqComparable = freshModSeq != nil && state?.completionStamp != nil
+        let accessCheckDue = accessed && !isTracked
+            && (state?.completionCounters != counters
+                || (!modSeqComparable && CatchUpSchedule.fullCheckDue(
+                    lastCompletedAt: state?.lastCompletedAt, now: now, interval: SyncConfig.catchUpAccessCheckAgeSeconds)))
         if let listing = state?.listing { return .list(listing) }
-        if modSeqChanged || fullCheckDue {
+        if modSeqChanged || fullCheckDue || accessCheckDue {
             return .list(IMAPCatchUpState.Listing(
-                firstStamp: freshModSeq, nextUid: 1, lapseCountAtStart: state?.lapseCount ?? rawLapseCount))
+                firstStamp: freshModSeq, firstCounters: counters, nextUid: 1,
+                lapseCountAtStart: state?.lapseCount ?? rawLapseCount))
         }
         return .none
     }
@@ -219,7 +263,7 @@ extension IMAPProvider {
         // (a completion is a try). A folder whose requests keep failing
         // therefore goes behind the others. The sort is stable on the caller's order
         // for ties.
-        let ordered = CatchUpSchedule.leastRecentlyAttemptedFirst(folders) {
+        let ordered = CatchUpSchedule.leastRecentlyAttemptedFirst(folders, later: context.otherFolderIds) {
             IMAPCatchUpState.decode($0.catchUpState)?.lastAttemptAt
         }
 
@@ -265,7 +309,10 @@ extension IMAPProvider {
             state: state, freshModSeq: freshModSeq,
             now: context.clock(),
             isTracked: isTracked,
-            rawLapseCount: CatchUpLapse.read(folder.catchUpState))
+            rawLapseCount: CatchUpLapse.read(folder.catchUpState),
+            counters: IMAPCatchUpState.Counters(exists: folder.totalCount, uidNext: folder.lastKnownUidNext),
+            accessed: context.accessedFolderIds.contains(folder.id),
+            otherFolder: context.otherFolderIds.contains(folder.id))
         guard case .list(var listing) = plan else { return nil }
 
         var result = CatchUpFolderResult(folderId: folder.id, epoch: epoch)
@@ -841,6 +888,7 @@ extension IMAPProvider {
         newState.lastAttemptAt = context.clock()
         if completed {
             newState.completionStamp = listing.firstStamp
+            newState.completionCounters = listing.firstCounters
             newState.lastCompletedAt = context.clock()
             newState.listedLapseCount = listing.lapseCountAtStart
             newState.listing = nil

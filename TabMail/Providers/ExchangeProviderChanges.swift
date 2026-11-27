@@ -22,7 +22,8 @@ import Foundation
 ///   the folder does not hold, whose record carries `receivedDateTime` (a new or
 ///   moved-in message), gets its headers fetched (`fetchMessageDetails`, in
 ///   `$batch`es) when the folder is tracking, or during its baseline when the
-///   message is within the folder's held range (`ChangeFolder.heldSince`). The
+///   message is within the folder's held range (`ChangeFolder.heldSince`; with
+///   no range, the whole folder once its older-mail walk has completed). The
 ///   folder's bookmark never passes a page until every such header is in, read
 ///   as gone, or reported unreadable (`rereadLater`); a page cut short is read
 ///   again on the next pass, which fetches only what is still missing.
@@ -51,6 +52,13 @@ import Foundation
 /// given up after `SyncConfig.changeReadRequestTimeoutSeconds`, and one read
 /// sends at most `SyncConfig.graphChangeReadRequestsPerSecond` times its read
 /// budget, a `$batch` charged its width before it is sent.
+///
+/// **Other-folder runs** (scope `.otherFolders`, #1110): each slice reads the
+/// run's folders, every one a delta as above, with no folder list and no re-read
+/// list; a folder the slice can send nothing for is `.notRun`, and a baseline
+/// read that passed no page (the slice's time, or a held page, ended it) is
+/// `.baselining` with `FolderChanges.readCut`, so the run does not read the same
+/// page again in every slice (#1358).
 ///
 /// **Folder list** (scope `.all`): the mail-folder delta is a change signal. A
 /// record for a folder already stored updates its name and counts
@@ -91,6 +99,10 @@ extension ExchangeProvider {
         var results: [String: FolderChanges] = [:]
         var verbIdsByFolder: [(folder: ChangeFolder, ids: [String])] = []
         for folder in Self.foldersToRead(request) {
+            // A slice of an other-folder run reports a folder it can send nothing
+            // for `.notRun`, so the run reads it in a later slice (#1110); a pass
+            // reports such a folder from its stored phase.
+            if request.scope == .otherFolders, !allowance.canSend(1) { break }
             let read = try await readFolder(folder, request: request, allowance: &allowance)
             results[folder.id] = read.changes
             if !read.verbIds.isEmpty { verbIdsByFolder.append((folder, read.verbIds)) }
@@ -128,15 +140,20 @@ extension ExchangeProvider {
     }
 
     /// The folders this read covers, in order: those already tracking before
-    /// those in their baseline, the Inbox first in each. Scope `.all` reads every
-    /// folder the full sync syncs; `.inboxOnly` reads the Inbox only.
+    /// those in their baseline, the Inbox first in each, else in the request's
+    /// order. Scope `.all` reads every folder the full sync syncs; `.inboxOnly`
+    /// reads the Inbox only; `.otherFolders` reads the run's folders (#1110) in
+    /// the request's order, which the engine sets (those read longest ago first),
+    /// so a folder still in its baseline is never kept behind tracked ones run
+    /// after run.
     nonisolated static func foldersToRead(_ request: ChangeRequest) -> [ChangeFolder] {
         let eligible = request.folders.filter { folder in
             switch request.scope {
-            case .all: return folder.isSynced
+            case .all, .otherFolders: return folder.isSynced
             case .inboxOnly: return folder.role == .inbox
             }
         }
+        if request.scope == .otherFolders { return eligible }
         return eligible.enumerated().sorted { lhs, rhs in
             let l = (Self.isBaselinePhase(lhs.element) ? 1 : 0, lhs.element.role == .inbox ? 0 : 1, lhs.offset)
             let r = (Self.isBaselinePhase(rhs.element) ? 1 : 0, rhs.element.role == .inbox ? 0 : 1, rhs.offset)
@@ -178,6 +195,7 @@ extension ExchangeProvider {
 
         var ending = FolderReadEnding.cut
         var restartedBaseline = false
+        var pagePassed = false
         pages: while true {
             guard allowance.canSend(1) else { ending = .cut; break }
             let link = state.next
@@ -227,7 +245,7 @@ extension ExchangeProvider {
                 if held.contains(record.id) || state.select == .header {
                     collected.add(Self.changeRecord(record, header: page.headers[record.id]))
                     if state.phase == .tracking { verbIds.insert(record.id) }
-                } else if Self.needsHeader(record, phase: state.phase, heldSince: folder.heldSince) {
+                } else if Self.needsHeader(record, phase: state.phase, heldSince: folder.heldSince, olderMailComplete: folder.olderMailComplete) {
                     missing.append(record.id)
                 }
             }
@@ -297,6 +315,7 @@ extension ExchangeProvider {
             }
             state.next = next
             state.failingSince = nil
+            pagePassed = true
             if page.deltaLink != nil {
                 if state.phase == .baseline {
                     state.phase = .tracking
@@ -316,8 +335,15 @@ extension ExchangeProvider {
                              collected: &collected, changes: &changes)
         }
 
-        let finished = Self.finish(
+        var finished = Self.finish(
             changes, collected: collected, state: state, stored: stored, ending: ending, now: context.clock())
+        // A run's baseline read that passed no page did not move the folder,
+        // whatever held rows it applies: the run counts it as cut, not as a
+        // baseline under way, so a slow link cannot keep the run on this page
+        // in every slice (#1358).
+        if request.scope == .otherFolders, !pagePassed, case .baselining = finished.status {
+            finished.readCut = true
+        }
         // Only records that travel with the result need their verb.
         let carried = Set(finished.records.map(\.messageId))
         return (finished, verbOrder.filter { carried.contains($0) })
@@ -489,14 +515,17 @@ extension ExchangeProvider {
     /// A message the folder does not hold needs its headers fetched when its
     /// record carries `receivedDateTime` (a new or moved-in message; an update
     /// carries only what changed) and, during the baseline, that date is within
-    /// the folder's held range. Below the range, or with no range yet, the apply
-    /// would insert nothing, so nothing is fetched.
-    nonisolated static func needsHeader(_ record: GraphDeltaMessage, phase: OutlookFolderCursor.Phase, heldSince: Date?) -> Bool {
+    /// the folder's held range. Below the range the apply would insert nothing,
+    /// so nothing is fetched. With no range yet, the whole folder is in range
+    /// once its older-mail walk has completed (`olderMailComplete`: the walk
+    /// found it empty, so it holds no date; IMAP's rule, "every UID once the walk
+    /// has completed"); before that, nothing is fetched (#1363).
+    nonisolated static func needsHeader(_ record: GraphDeltaMessage, phase: OutlookFolderCursor.Phase, heldSince: Date?, olderMailComplete: Bool) -> Bool {
         guard let raw = record.receivedDateTime, let date = Date.fromISO8601(raw) else { return false }
         switch phase {
         case .tracking: return true
         case .baseline:
-            guard let heldSince else { return false }
+            guard let heldSince else { return olderMailComplete }
             return date >= heldSince
         }
     }

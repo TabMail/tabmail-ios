@@ -72,6 +72,9 @@ final class AppDatabase: Sendable {
         // ~1-2s PASSIVE checkpoint, seen as the merge "tic" lagging the paint by 1-2s.
         // Now checkpoints land only on `.background`, keeping the foreground path fast.
         config.prepareDatabase { db in
+            // First, before GRDB sets up WAL mode: a new file starts on
+            // `auto_vacuum = INCREMENTAL` (ADR-IOS-121). Writer only, new file only.
+            try DatabaseVacuum.setIncrementalOnNewFile(db)
             try db.execute(sql: "PRAGMA wal_autocheckpoint = 0")
             // synchronous=NORMAL: WAL commits no longer fsync (only checkpoints do),
             // removing the per-commit fsync that stalled `merge.phase1` ~5s on cold-disk
@@ -2552,6 +2555,10 @@ final class AppDatabase: Sendable {
             //   measured ~11 s for a 2 GB body table on a Mac — 2–4× worse on
             //   device — needs ≈3× the table free at peak, and leaves the file at
             //   ≈2× until a `VACUUM` the app never runs outside `AppDataWiper`.
+            //   (Since ADR-IOS-121 a one-time upgrade the user starts runs one
+            //   `VACUUM` per database to switch it to INCREMENTAL, and the
+            //   background processing job then gives empty pages back in short
+            //   steps; that does not change this migration's choice.)
             //   That permanent growth feeds `StorageEstimator.totalSizeMB()` →
             //   `isOverBudget()` (the check before #1437) → `SyncEngine.runPruneIfOverBudget`, which deletes
             //   `MessageHeader` ROWS oldest-first: a schema-only migration causing
@@ -4467,6 +4474,23 @@ final class AppDatabase: Sendable {
             }
         }
 
+        // #1109: a folder a user action landed in is followed: it joins the
+        // syncable set (`SyncEngine.isSyncable`) for good, so it gets change
+        // reads, the catch-up and the epoch re-drive as a favourite does. One
+        // writer (`SyncEngine.markFollowed`), never cleared. Every existing
+        // folder starts unfollowed: a default only, no data conversion. No
+        // existing column can carry the mark, and it needs no index (it is read
+        // only with an account's folder rows): ADR-IOS-111, amendment 2026-11-22.
+        // The number: v105 to v111 are taken by unmerged work, and GRDB runs an
+        // unapplied migration in registration order wherever it sits.
+        migrator.registerTimedMigration(
+            "v112_addFolderIsFollowed", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "folder") { t in
+                t.add(column: "isFollowed", .boolean).notNull().defaults(to: false)
+            }
+        }
+
         // #1374 (ADR-IOS-029): the AI cache purge reads the expired entries,
         // `messageAICache WHERE updatedAt < ?`, after every AI queue drain and in
         // maintenance. No index led with `updatedAt`, so its count and every batch
@@ -4655,6 +4679,24 @@ final class AppDatabase: Sendable {
                     WHERE rowid = NEW.rowid;
                 END
                 """)
+        }
+
+        // #1490: Send marks the original at once again (its replied or forwarded
+        // mark, and a Reply tag changed to none), and a send that leaves the
+        // Outbox unsent undoes exactly what its queuing changed. The row records
+        // those changes (`OutboxMessage.QueuedOriginalChanges`) because nothing
+        // else on disk keeps the original's state from before the send: the queue
+        // write overwrites the original's row, and no other outbox column can
+        // carry it (ADR-IOS-019 amendment, #1490). Written with the row, read
+        // with it, gone with it. NULL for every existing row: such a send changed
+        // nothing when it was queued and behaves as before. No index: it is read
+        // only from a row already fetched by its primary key.
+        migrator.registerTimedMigration(
+            "v117_addOutboxOriginalChangesAtQueue", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "outboxMessage") { t in
+                t.add(column: "originalChangesAtQueue", .integer)
+            }
         }
     }
 

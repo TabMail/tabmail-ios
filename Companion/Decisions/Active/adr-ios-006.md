@@ -1,6 +1,18 @@
 
 ## ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 
+> **Current note (2026-11-25, #1450): empty pages go back to the file system (ADR-IOS-121).** Both
+> databases now use `auto_vacuum = INCREMENTAL`: a new install from its first page, an existing install
+> after a one-time upgrade the user starts from a notice and an inbox banner (one `VACUUM` per database,
+> when the device has about twice the database's data free: its pages less its empty pages, times 2.05, amended 2026-11-26, #1449). On an upgraded database, after its prune, the job gives the empty pages back in short `incremental_vacuum`
+> steps that stop when the app comes to the foreground; the Optimize Storage tap in Settings runs the same
+> steps at once while the app is open (#1448, ADR-IOS-121 decision 5). In the note below, "auto_vacuum is NONE" now
+> describes a database that has not switched yet, and "returning the empty pages to the file system ... is
+> separate work" is this work. The measure is unchanged: a delete still moves its pages to the freelist
+> and the measure counts pages less empty pages. A switch changes no data; a step lowers the pages and the
+> empty pages by the same count, plus the pointer-map pages it no longer needs (about one page in 800),
+> which the measure loses.
+>
 > **Current note (2026-11-24, #1437): what the limit counts, and where the prune starts and stops.**
 > The space the Email Index Limit counts is the space Settings reports (`StorageEstimator.totalSizeMB`,
 > a walk of Application Support) with the email and search databases counted by the data they hold, not

@@ -737,6 +737,27 @@ enum MessageHeaderRekey {
                 result.removedOldHeaderIds.append(oldId)
                 continue
             }
+            // A reply or forward still in the Outbox names its original by header
+            // id (#1479). The completion's server mark and an unsent removal's
+            // revert read the original by that key, so it follows the original to
+            // the address the server just proved, in this transaction, as queued
+            // operations do (`readdressQueuedOperations`). Not the collision arm
+            // above: the row already at the new id is not the row Send marked,
+            // and its numbering is unproven. Of `apply`'s other callers, only
+            // `canonicalizeLocalRows` carries it too, on the provider's own id: a
+            // Gmail move is not re-keyed here (its address does not change on a
+            // move), and the destination's listing re-keys it there (#1500).
+            // Sync's UID remap and the body backfill's re-key
+            // (`BackfillBodyQueue.rekeyRemappedHeader`) do not carry it: both
+            // re-key on Message-ID evidence, and the Message-ID never chooses a
+            // message to change (ADR-IOS-068 D4). So after an IMAP or Graph move
+            // without proven destination evidence, once sync re-keys the row the
+            // send finds no original. Neither does one moved in another client,
+            // which sync stores as a new row (`IOS-OUTBOX-012`).
+            // outboxMessage holds only unsent, failed and unfinalized sends.
+            try db.execute(
+                sql: "UPDATE outboxMessage SET originalMessageHeaderId = ? WHERE originalMessageHeaderId = ?",
+                arguments: [newId, oldId])
             result.applied.append(HeaderRekeyRecord(
                 oldHeaderId: oldId, newHeaderId: newId,
                 newProviderMessageId: newMessageId,

@@ -88,6 +88,12 @@ final class DatabaseSuspension {
     /// See ADR-IOS-046. `nonisolated` (a Sendable Mutex) so off-main maintenance reads
     /// it without a main-actor hop.
     nonisolated static var isAppActive: Bool { appActive.withLock { $0 } }
+    #if DEBUG
+    /// What leaving and returning to the screen set here, without the quiesce
+    /// window or the resume that follow them. Tests that use it hold the
+    /// process-global test lock and set it back to `true`.
+    nonisolated static func setAppActiveForTesting(_ active: Bool) { appActive.withLock { $0 = active } }
+    #endif
 
     /// Idempotently mirror GRDB's suspend/resume notifications into `isSuspended`.
     /// Installed from `start()` (production) and lazily by tests. The two observers

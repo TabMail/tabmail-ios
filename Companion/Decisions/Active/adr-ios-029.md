@@ -11,6 +11,8 @@
 >
 > **The latch and what re-arms it.** The marker is the SQLite `schema_version` in force when the last `ANALYZE` completed, persisted in `UserDefaults` (the `StartupMigrations` precedent, durable across app kill / crash / reboot). SQLite bumps `schema_version` on every DDL statement, so any migration that creates, drops or alters a table or an index re-arms the refresh automatically — there is no hand-maintained counter to forget. ⚠️ **What does NOT re-arm it:** ordinary row traffic, however far the counts move. A per-poll `ANALYZE` would be a far worse defect than the one this fixes.
 >
+> **Current note (2026-11-25, #1450): the `VACUUM` that switches the email database to INCREMENTAL carries the marker (ADR-IOS-121 decision 6).** A `VACUUM` adds one to `schema_version` and copies `sqlite_stat1` unchanged, so without a carry it would make the statistics look stale and re-arm a whole `ANALYZE` for statistics that did not change. `SyncEngine.switchEmailDatabaseToIncremental` reads `schema_version`, switches and reads it again in one write on the writer connection, under the refresh's single-flight latch (`plannerStatisticsRefreshInFlight`, so no `ANALYZE` stores its marker in between); a marker equal to the first value is set to the second, and a marker already stale stays stale. While an `ANALYZE` holds the latch the switch does not start; the upgrade the user started waits for it. The nightly `incremental_vacuum` steps change no `schema_version` (measured) and carry nothing.
+>
 > ⚠️ **NEGATIVE CASE 1 — do NOT read this as "statistics do not matter".** Measured on a synthetic 120k-row / 3-account / 8-folder database: with an empty `sqlite_stat1` the drain's per-member header lookup in `AccountManagerQueue` plans as `SEARCH messageHeader USING INDEX messageHeader_accountId (accountId=?)` — an account-wide scan — and after `ANALYZE` as a `MULTI-INDEX OR` over `messageHeader_messageId_accountId` + `messageHeader_rfc822MessageId_date`, two seeks. Deleting the `ANALYZE` outright would have been a regression.
 >
 > **Reproduced at profile H (500k headers / 3.4 GB) on the AFTER state — i.e. the whole `v68…v83` chain with no `ANALYZE` in any body — so this is the plan a real upgraded device now holds until the first background pass.** `EXPLAIN QUERY PLAN` on the query GRDB actually emits for that lookup (`WHERE (messageId = ? OR rfc822MessageId = ?) AND accountId = ? LIMIT 1`), with a real account id: **before** — `SEARCH messageHeader USING INDEX messageHeader_accountId_messageId (accountId=?)`, seeking on the account alone, i.e. a 100k-row account-wide walk; **after** the bare background `ANALYZE` — `MULTI-INDEX OR` over `messageHeader_accountId_messageId (accountId=? AND messageId=?)` and `messageHeader_rfc822MessageId_date (rfc822MessageId=?)`, two seeks, 0.079 ms/lookup. `sqlite_stat1` went from **0 rows to 36**. ⚠️ **The probe must use a value that EXISTS**: a first attempt with a literal account id present in no row reported the same plan on both sides, which reads as "statistics change nothing" and is an artefact of the probe, not a fact about the planner. **v83's own index is unaffected either way** — the unread sweep plans as `SEARCH messageHeader USING COVERING INDEX messageHeader_unreadSweep (folderId=?)` before and after, which is the measured basis for the claim that the `ANALYZE` bought `v83` itself nothing.
@@ -229,3 +231,63 @@ evict reads its candidates from the header. As of 2026-11-24 no released or Test
 deferred step with it in the list (it was added after build 392, the newest TestFlight build then),
 so no user's database holds it, and nothing drops it; a development database that built it keeps
 it, unread and changing no result.
+
+---
+
+## Amendment 2026-11-27 (#1563): the three In-Reply-To lookups name `messageHeader_inReplyTo`
+
+**What happened.** Three reads look rows up by `inReplyTo IN (…)`:
+- the thread lookup's reply probe (`ThreadUtils.findAdoptableThreadId`, `LIMIT 1`), run for every
+  stored email;
+- the thread view's related-email search (`ThreadDetection.findRelatedMessages`,
+  `ORDER BY date DESC LIMIT 100`), run for every email opened;
+- the parent-side reply discovery (`ReplyParentResolver.markInsertedParentsOfStoredReplies`, joined
+  to the Sent folders), run for every batch of stored headers.
+
+None of them sought the index once `ANALYZE` had run on a mailbox with no In-Reply-To stored. The
+Microsoft Graph sync stores none, so an Outlook-only database is that mailbox.
+- **Why the planner chose it.** `ANALYZE` counts NULL as one value. With every `inReplyTo` NULL, the
+  index's `sqlite_stat1` row reads `N N`: every row shares one value. The planner then prices a seek
+  as N row lookups and prefers another plan.
+- **What it cost.** Measured on the database proof of #1555 (105,000 headers, its seed's In-Reply-To
+  all NULL, after `ANALYZE`). A lookup usually matches nothing, so each plan read its whole range:
+  - the thread lookup planned `SCAN messageHeader`: about 605,000 pages per 50 emails stored;
+  - the related-email search planned `SCAN messageHeader USING INDEX messageHeader_date`: every
+    header (104,999 scan steps, about 85,000 pages, about 2 s cold) for one email opened;
+  - the reply discovery planned `SCAN f`, then `SEARCH r USING INDEX
+    messageHeader_folderId_providerDate (folderId=?)`: every row of each Sent folder (about 68,000
+    steps, 28 ms) per chunk of up to 100 stored Message-IDs.
+
+**The fix: name the index on those three statements.** The results are unchanged: the name only fixes
+the plan.
+- The thread lookup and the reply discovery name it in their SQL: `FROM messageHeader INDEXED BY
+  messageHeader_inReplyTo`, and `FROM messageHeader r INDEXED BY messageHeader_inReplyTo JOIN folder f`.
+  The reply discovery then seeks each match's folder by its primary key.
+- The related-email search was a query-interface request, which cannot name an index. That one
+  request is now raw SQL with the same filters, order and limit.
+- **Why it is safe.** `INDEXED BY` throws when its index is missing.
+  - `messageHeader_inReplyTo` is migration-built (`v13_addMessageHeaderInReplyTo`). It is not in
+    `SyncEngine.deferredIndexes`, no migration drops it, and no migration after v13 rebuilds
+    `messageHeader`.
+  - Every caller runs after v13. The thread lookup: the insert paths, and the two migration callers
+    (`v47_lateralThreadRepair` and `v54_mergeFragmentedThreads` through `runFragmentMergeToFixpoint`).
+    The related-email search: the message detail view. The reply discovery: the sync insert paths
+    (`fetchOlderMessages`, `insertBackfillBatchGuardable`, `runSyncMessages`, `insertChangeRecord`).
+  - The notification extension and `Shared` call none of them.
+- **Precedent.** `ReplyParentResolver.hasStoredReply` names the same index, and
+  `ReplyParentResolver.parentLookupSQL` names `messageHeader_rfc822MessageId`.
+- **Registry.** The related-email search and reply discovery rows move from `SIM` to `SEEK`. Their
+  literals are completed at run time (an `IN` list), so the plan fence skips them and the tests
+  below carry the plan.
+
+**Pinned by** three tests, each in two statistics states: none, and the app's `ANALYZE` over a
+mailbox with no In-Reply-To stored.
+- `ThreadAdoptionInReplyToPlanTests.probeSeeksItsIndex` (the thread lookup),
+  `InReplyToLookupPlanTests.threadViewLookupSeeksItsIndex` (the related-email search) and
+  `InReplyToLookupPlanTests.replyDiscoveryLookupSeeksItsIndex` (the reply discovery).
+- Each captures the statement production runs (a statement trace) and requires it to seek
+  `messageHeader_inReplyTo`. The reply discovery's check covers both loops of its join.
+- Under the second state each also checks the positive control: without the name, the same statement
+  plans the read measured above (the reply discovery's through any index that leads with `folderId`).
+- Each then checks the answer: a stored reply is still found.
+- Each is red without the name.

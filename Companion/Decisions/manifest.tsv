@@ -5,7 +5,7 @@ order	status	source_lines	sha256	path	title
 3	active	65-83	f1be2d5a693d08ecfea4cb2cfbd46c59eab2aeadd776a8f1c26f79edb330c212	Companion/Decisions/Active/adr-ios-003.md	ADR-IOS-003: Pending Operation Queue for Crash Recovery
 4	superseded	84-95	283add9ea8b6cc7d5834ec47dbf9bfad372bc31a905865391c78dfacd4f9a151	Companion/Decisions/Superseded/adr-ios-004.md	ADR-IOS-004: ~~First Compute Wins for Cross-Instance Action Tags~~ (SUPERSEDED by ADR-IOS-036)
 5	active	96-118	f3a8b7e6875183871d5ce93adde0f3031854f8acb72507f7c69340cbf5e50c4a	Companion/Decisions/Active/adr-ios-005.md	ADR-IOS-005: Progressive Background Backfill
-6	active	119-147	16dd7c20260933d794f1d883ab00a11f007c7b03243aefac43e7a148f351214a	Companion/Decisions/Active/adr-ios-006.md	ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
+6	active	119-147	737eb9f13ea59696cbed0bba59e8a5303001e56fa01f79c7667a8409be775ee4	Companion/Decisions/Active/adr-ios-006.md	ADR-IOS-006: Storage-Budget Retention with Progressive Crawling
 7	active	148-177	0d0d50f26cda9aa429610e2337e0abd66e7ea0ddc6cf1ecbd341c9541a53955a	Companion/Decisions/Active/adr-ios-007.md	ADR-IOS-007: Hybrid FTS5 + Vector Search (Local)
 8	active	178-207	38e3f3dee78e9efaa60a5683a9b3f0e72785d4164506c0b76d983b52e16e5ccc	Companion/Decisions/Active/adr-ios-008.md	ADR-IOS-008: AI Processing Must Replicate TB Addon Architecture
 9	active	208-233	7213e0f9e642b70bdfbc7756381a0cad4e3cc3230f7ac6315c73c1f3b2630763	Companion/Decisions/Active/adr-ios-009.md	ADR-IOS-009: Two-Tier Delta + Full Sync
@@ -18,7 +18,7 @@ order	status	source_lines	sha256	path	title
 16	superseded	356-363	12f1337bd443e4268cec0eaacd0e3054055f14f28ca6763931b18d52d319d548	Companion/Decisions/Superseded/adr-ios-016.md	ADR-IOS-016: ~~PersistenceGateway — Coalesced SwiftData Saves~~ (SUPERSEDED)
 17	superseded	364-371	7a09874ecb49e8a5318c4ab3df8265bfa870a03d6bb90f643cda599bf015889d	Companion/Decisions/Superseded/adr-ios-017.md	ADR-IOS-017: ~~Remove Folder→MessageHeader @Relationship~~ (SUPERSEDED)
 18	active	372-411	2853caac827ae5898d6d9fc22153bb51a22d7e6d946d39f23accbe353155c88b	Companion/Decisions/Active/adr-ios-018.md	ADR-IOS-018: Persistent Offline Action Queue
-19	active	412-451	5a59f9c7b3de5b7d6cc50446f4ed5f9983137ebf4d5b7612fecbfbcb8f525784	Companion/Decisions/Active/adr-ios-019.md	ADR-IOS-019: Outbox — Persistent Offline Send Queue
+19	active	412-451	91d34f26286a81d2b82feeda0ac5c88b44de84fc7017fe6dc38db47c45cc4733	Companion/Decisions/Active/adr-ios-019.md	ADR-IOS-019: Outbox — Persistent Offline Send Queue
 20	active	452-478	36c6e0d2bccb56809d0175a0584e11e65f3145a405908bd476a170e0fa6b52ff	Companion/Decisions/Active/adr-ios-020.md	ADR-IOS-020: Swift 6 BGTask Handler Isolation Pattern
 21	active	479-503	f9a2619228cb18fd157582e142a606a096be5766a65d4c81b0db809b3e2f897c	Companion/Decisions/Active/adr-ios-021.md	ADR-IOS-021: Backfill Power Optimization
 22	active	504-528	b247ba5f425d4d0191693de14393ff20af59da0a0ce96c56cbc7420cf9b4ad91	Companion/Decisions/Active/adr-ios-022.md	ADR-IOS-022: Agent Chat with Persistent History

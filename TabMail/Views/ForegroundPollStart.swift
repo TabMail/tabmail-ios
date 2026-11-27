@@ -1,9 +1,11 @@
 import SwiftUI
 
 /// Starts foreground polling for the screen: the one place the app's screens call
-/// `SyncScheduler.startForegroundPolling` (Settings' database reset is the only
-/// other caller). That call runs a return's stage 1, starts the 300 s poll timer
-/// and starts IMAP IDLE (sync timing promises 4, 5 and 6).
+/// `SyncScheduler.startForegroundPolling` (Settings' database reset, and the end
+/// of the one-time database upgrade while the app is active, `DatabaseUpgrade`,
+/// are the only other callers; an upgrade that ends in the background leaves the
+/// start to this view's return). That call runs a return's stage 1, starts the
+/// 300 s poll timer and starts IMAP IDLE (sync timing promises 4, 5 and 6).
 ///
 /// One condition: the scene is active, at least one account exists, and the app
 /// is not in screenshot mode. It is read when the view mounts and again whenever

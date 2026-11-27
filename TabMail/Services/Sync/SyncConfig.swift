@@ -592,6 +592,65 @@ enum SyncConfig {
     /// (the embedding queue) from over-checkpointing while still bounding the WAL. SQLite
     /// autocheckpoint is disabled (see `AppDatabase.makePool`).
     static let walCheckpointMinIntervalSeconds: TimeInterval = 1.5
+    /// Pages one step of the overnight space return gives back
+    /// (`SyncEngine.runOvernightSpaceReturn`, `DatabaseVacuum.giveBackEmptyPages`,
+    /// ADR-IOS-121): 8 MB at the 4 KB page size. Each step is one write that holds
+    /// the database's writer. Measured on a Mac, 190 MB empty in a 960 MB database:
+    /// 1,024 pages 51 ms a step (median), 2,048 pages 35 ms (one step of 520 ms),
+    /// 4,096 pages 71 ms, 8,192 pages 168 ms. At least 1: SQLite's
+    /// `incremental_vacuum` with 0 or less gives every empty page back in one write.
+    static let incrementalVacuumStepPages = 2048
+    /// Free space the device needs for a database's one-time upgrade to INCREMENTAL,
+    /// as a multiple of the database's pages less its empty pages
+    /// (`DatabaseVacuum.SpaceState.liveBytes`, `SyncEngine.bytesNeededForUpgrade`): the
+    /// `VACUUM` copies only the pages that hold data into a temporary file, then
+    /// writes every page of that copy through the WAL, each with a 24-byte frame
+    /// header (4,120 bytes for a 4 KB page), so about 2.006 times. The rest covers the
+    /// pointer-map pages the INCREMENTAL copy adds (about one page in 820), the WAL
+    /// index's growth (8 bytes a frame) and the WAL's header, about 2.010 in all, and a
+    /// copy laid out a little differently (#1545).
+    /// Measured on a Mac: a 1.1 GB database with about 10% of its rows deleted left a
+    /// 965 MB WAL (memory 162: about 2x the compacted size in all).
+    static let incrementalVacuumSwitchFreeSpaceMultiple: Double = 2.05
+    /// How long the upgrade waits, at a time, for a planner statistics refresh that
+    /// was already running when it started, a maintenance pass's `ANALYZE`
+    /// (`SyncEngine.runDatabaseUpgrade`): it holds the latch the email database's
+    /// switch takes.
+    static let databaseUpgradeStatisticsWaitMilliseconds = 250
+    /// Battery level under which the upgrade notice asks the user to plug the phone
+    /// in first, when it is not charging (`DatabaseUpgrade`): below it a long rewrite
+    /// risks running the battery out.
+    static let databaseUpgradeMinimumBatteryLevel: Float = 0.2
+    /// How long after the inbox has painted the upgrade's state read (its banner) and
+    /// its notice, shown by itself once, wait (`DatabaseUpgrade.checkAfterLaunch`):
+    /// not during startup.
+    static let databaseUpgradeNoticeQuietDelaySeconds: Double = 3
+    /// The upgrade's time for a gigabyte of a database's data (its pages less its empty
+    /// pages, `DatabaseVacuum.SpaceState.liveBytes`): the `VACUUM` and the TRUNCATE
+    /// after it (`DatabaseUpgradeProgress`, #1583). Measured on an iPhone: 1.00 GB of
+    /// email data in 37.6 s and 3.80 GB of search data in 134.8 s, 36 s a gigabyte over
+    /// both (memory 162).
+    static let databaseUpgradeSecondsPerGB: Double = 40
+    /// Bytes in the gigabyte of `databaseUpgradeSecondsPerGB` (decimal, as measured).
+    static let databaseUpgradeBytesPerGB: Double = 1_000_000_000
+    /// The notice's "It can take up to N minutes" is the estimate at
+    /// `databaseUpgradeSecondsPerGB` times this (`DatabaseUpgradeProgress.noticeMinutes`):
+    /// room for a slower phone. The running screen's minutes use the estimate alone.
+    static let databaseUpgradeNoticeTimeMargin: Double = 3
+    /// The fewest minutes the notice says.
+    static let databaseUpgradeNoticeMinimumMinutes = 1
+    /// The minutes the notice says when a database's size cannot be read.
+    static let databaseUpgradeNoticeFallbackMinutes = 10
+    /// Past its estimate, a database's part of the running screen's bar stops at this
+    /// fraction of its share until the database finishes (`DatabaseUpgradeProgress`).
+    static let databaseUpgradeProgressHoldFraction: Double = 0.95
+    /// How often the running screen recomputes its bar and the minutes left.
+    static let databaseUpgradeProgressRefreshSeconds: Double = 1
+    /// Settings shows its Optimize Storage row (`StorageOptimizer`, #1448) only while
+    /// the email and search databases' empty pages come to at least this much: below it
+    /// a tap would give back too little to see in "Email Index Used", and the
+    /// background job gives it back anyway.
+    static let optimizeStorageMinimumGainBytes: Int64 = 50 * 1024 * 1024
     /// Entries of `bodyAssetPendingDelete` per batch of the pending-delete worker
     /// (`BodyAssetMaintenance.processPendingDeletes`): one manifest read, one
     /// main-database read and one main-database write per batch (#1376).
@@ -872,6 +931,49 @@ enum SyncConfig {
     /// its cursor is valid, so a Gmail folder is listed only the first time and
     /// after a lapse of the cursor (`GmailProvider.catchUpPlan`).
     static let catchUpFullCheckIntervalSeconds: TimeInterval = 86_400
+    /// The same full listing for a folder outside the syncable set (#1110: no
+    /// main role, not a favourite, no user action landed in it), whose changes
+    /// an other-folder run reads (seconds: a week). It matters only where no
+    /// change bookmark covers the folder (an IMAP server without change
+    /// tracking): there it is what removes a message deleted deep in the folder,
+    /// and applies a read mark changed on old mail, without opening the folder.
+    static let catchUpOtherFolderFullCheckIntervalSeconds: TimeInterval = 604_800
+    /// On a server with no mod-sequences, a folder a user action lands in is
+    /// listed again at that access when its counters (EXISTS, UIDNEXT) differ
+    /// from those its last completed listing started from, or when that listing
+    /// completed longer ago than this (seconds, #1109). Flag changes move no
+    /// counter, so this age is how stale a read or flag mark below the newest
+    /// listing can be when the user comes back to the folder.
+    static let catchUpAccessCheckAgeSeconds: TimeInterval = 3_600
+    /// How long the catch-up run a user action starts for the folders it landed
+    /// in may work (seconds, #1109): slices run, paced like every other catch-up
+    /// slice of the account, until the folders make no progress or the slices'
+    /// time inside the account's turn adds up to this (`CatchUpRun.workSeconds`:
+    /// the wait for the turn and the pacing wait between slices do not count).
+    /// What a large folder still needs then is the backfill worker's, which
+    /// checks every followed folder.
+    static let accessCatchUpRunSeconds: TimeInterval = 120
+    /// How long one other-folder run may work (seconds, #1110): the run a
+    /// clock-due foreground pass starts to read the changes of the folders
+    /// outside the syncable set. Its slices run, paced like every other catch-up
+    /// slice of the account, until every such folder has been read once, a slice
+    /// reads nothing new, or the slices' time inside the account's turn adds up
+    /// to this (`CatchUpRun.workSeconds`: waits do not count). A folder not
+    /// reached is read first by the next run.
+    static let otherFolderRunSeconds: TimeInterval = 120
+    /// The share of an other-folder slice's time its change read may use
+    /// (#1110); the rest is left for the listings of the changed folders no
+    /// bookmark covers (servers without change tracking), which start only
+    /// before the slice's end. Without it a read of many folders on a slow link
+    /// spends the whole slice on one STATUS per folder, no listing ever starts,
+    /// and the same folders are read again at every run. A reader whose read is
+    /// all its work (a bookmark, an Outlook delta) gets the same time per run in
+    /// more, shorter slices: a run's working time counts slice time only. The
+    /// share bounds when a folder after the first may start: the read's first
+    /// folder is read in the slice's whole time, so a slow session check before
+    /// it never leaves a slice with no folder read
+    /// (`SyncEngine.otherFolderReadContext`).
+    static let otherFolderReadShare: Double = 0.5
     /// About how many messages one IMAP listing range holds (`UID FETCH lo:hi
     /// (UID FLAGS)`, then one membership `UID SEARCH` of the same range). The
     /// first range's width in UIDs is sized from the folder's EXISTS and UIDNEXT

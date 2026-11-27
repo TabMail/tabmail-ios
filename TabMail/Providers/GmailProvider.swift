@@ -820,11 +820,30 @@ actor GmailProvider: EmailProvider {
     /// fatal, as an IMAP send does; a draft keeps whatever the user typed. A
     /// recipient naming several mailboxes (a send queued by an earlier version)
     /// is written as each of them (`IMAPProvider.recipientsFieldBody`).
-    func send(draft: DraftMessage) async throws {
+    ///
+    /// Gmail answers with the sent message's `id` and `threadId`, which name
+    /// its copy in Sent. Gmail gives that copy a Message-ID of its own
+    /// (`buildRFC822`), so the Outbox reads the copy's header by this id once
+    /// the send is stamped, and keys the optimistic Sent row by it.
+    @discardableResult
+    func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
         _ = try IMAPProvider.sendableRecipients(draft.to + draft.cc + draft.bcc)
         let body = buildSendBody(draft: draft)
         let jsonData = try JSONSerialization.data(withJSONObject: body)
-        let _ = try await request(path: "/messages/send", method: "POST", body: jsonData)
+        let response = try await request(path: "/messages/send", method: "POST", body: jsonData)
+        return Self.sentCopyIdentity(fromSendResponse: response)
+    }
+
+    /// The Sent copy named by a `users.messages.send` answer (a `Message`
+    /// resource). `nil` when the answer names no id: the send went out, and the
+    /// Outbox's placeholder row is replaced or dropped by sync as before.
+    nonisolated static func sentCopyIdentity(fromSendResponse data: Data) -> SentCopyIdentity? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = json["id"] as? String, !id.isEmpty else {
+            return nil
+        }
+        let threadId = (json["threadId"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return SentCopyIdentity(providerMessageId: id, threadId: threadId)
     }
 
     /// Build the `users.messages.send` request body, which is also the `message`
@@ -2479,9 +2498,11 @@ actor GmailProvider: EmailProvider {
 
     nonisolated func buildRFC822(draft: DraftMessage) -> String {
         var lines: [String] = []
-        // Include Message-ID so Gmail preserves our rfc822MessageId. Without this,
-        // Gmail assigns its own, breaking rfc822MessageId-based UID remap detection
-        // when the sync replaces our optimistic header with the real server header.
+        // Gmail does not keep this Message-ID on a send: the message it stores
+        // gets one of its own (measured 2026-11-25 on a Workspace account). The
+        // Sent copy is matched by the id `users.messages.send` returns (`send`)
+        // instead. Drafts are built here too; whether Gmail keeps a draft's
+        // Message-ID was not measured.
         if let messageId = draft.messageId, !messageId.isEmpty {
             let bracketed = messageId.hasPrefix("<") ? messageId : "<\(messageId)>"
             lines.append("Message-ID: \(bracketed)")

@@ -71,11 +71,11 @@ enum StorageEstimator {
     }
 
     /// One database's pages, in bytes: all of them, and the empty ones on its
-    /// freelist. A delete moves the pages it frees to the freelist and never shrinks
-    /// the file (auto_vacuum is off, and the app runs VACUUM only after "Delete All
-    /// Email Index Data"), so the file's size cannot show what a delete freed, and
-    /// the empty pages show it as soon as the delete commits. Read from the database
-    /// header, no table. nil if SQLite returns no row.
+    /// freelist. A delete moves the pages it frees to the freelist and does not
+    /// shrink the file (empty pages go back to the file system only in the overnight
+    /// job's steps and the Optimize Storage tap's, on a database the user has upgraded, ADR-IOS-121), so the file's size cannot show what a delete freed,
+    /// and the empty pages show it as soon as the delete commits. Read from the
+    /// database header, no table. nil if SQLite returns no row.
     struct PageTotals: Equatable, Sendable {
         let allBytes: Int64
         let emptyBytes: Int64

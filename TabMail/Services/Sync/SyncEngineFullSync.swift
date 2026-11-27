@@ -67,6 +67,19 @@ extension SyncEngine {
         }
     }
 
+    #if DEBUG
+    /// The folder's count of full syncs since its last deep pass, read without
+    /// counting one (`fullSyncIsDeepPass` counts one). Nil: none counted.
+    nonisolated static func fullSyncSkipStreakForTesting(folderId: String) -> Int? {
+        fullSyncSkipStreak.withLock { $0[folderId] }
+    }
+
+    /// Sets the folder's count back (nil removes it), for a test that ends.
+    nonisolated static func setFullSyncSkipStreakForTesting(folderId: String, _ value: Int?) {
+        fullSyncSkipStreak.withLock { $0[folderId] = value }
+    }
+    #endif
+
     /// Full-sync fetch-skip decision. Skip re-fetching a folder ONLY when CONDSTORE proves
     /// nothing changed since our last sync: HIGHESTMODSEQ is present on BOTH sides and
     /// equal. NEVER skip the inbox (always fully synced), a deep pass, or a folder
@@ -321,9 +334,11 @@ extension SyncEngine {
              try Account.fetchOne(db, key: account.id)?.lastHistoryId != nil)
         }
 
-        // Sync messages for main roles + favorited folders, prioritized:
-        // inbox first, then favorites, then secondary roles, then custom.
-        // Custom non-favorited folders sync on-demand when the user navigates to them.
+        // Sync messages for the syncable folders (main roles, favourites and
+        // followed folders, `SyncEngine.isSyncable`), prioritized: inbox first,
+        // then favorites, then secondary roles, then followed folders. A custom
+        // folder no user action has landed in syncs on demand when the user
+        // navigates to it, which also follows it (#1109).
         let syncableFolders = syncableFoldersInOrder(folders)
 
         BackgroundSyncLogger.logDebug("[FullSync] \(account.emailAddress) syncing \(syncableFolders.count) folders: \(syncableFolders.map(\.name).joined(separator: ", "))")
@@ -564,15 +579,15 @@ extension SyncEngine {
     }
 
     /// The folders the full sync syncs, the backfill worker's catch-up lists,
-    /// and a per-folder change reader reads (`ChangeFolder.isSynced`): main roles
-    /// and favourites, inbox first, then favourites, then secondary roles. Custom
-    /// non-favourite folders sync on demand when the user navigates to them.
+    /// and a per-folder change reader reads (`ChangeFolder.isSynced`): main roles,
+    /// favourites and followed folders, inbox first, then favourites, then
+    /// secondary roles, then followed folders. Any other folder is listed on
+    /// demand, and the first user action that lands in it makes it followed
+    /// (#1109, `SyncEngine.folderAccessed`).
     nonisolated func syncableFoldersInOrder(_ folders: [Folder]) -> [Folder] {
         let primary = self.primaryRoles
         let secondary = self.secondaryRoles
-        return folders.filter { folder in
-            Self.isSyncable(role: folder.role, isFavorite: folder.isFavorite)
-        }.sorted { a, b in
+        return folders.filter(Self.isSyncable).sorted { a, b in
             func priority(_ f: Folder) -> Int {
                 if primary.contains(f.role) { return 0 }
                 if f.isFavorite { return 1 }
@@ -584,11 +599,15 @@ extension SyncEngine {
     }
 
     /// Whether a folder is in the syncable set (`syncableFoldersInOrder`): a main
-    /// role or a favourite. These are also the only folders the catch-up checks
+    /// role, a favourite, or a folder a user action landed in (`Folder.isFollowed`,
+    /// #1109). Every other folder's changes are read by an other-folder run
+    /// (#1110), and the catch-up checks it after the syncable ones.
+    /// *Superseded (#1110):* "These are also the only folders the catch-up checks
     /// (`runCatchUpRun` takes `syncableFolderIds`), so only for them does arming
-    /// the catch-up repair anything.
-    nonisolated static func isSyncable(role: FolderRole, isFavorite: Bool) -> Bool {
-        syncedPrimaryRoles.contains(role) || syncedSecondaryRoles.contains(role) || isFavorite
+    /// the catch-up repair anything."
+    nonisolated static func isSyncable(_ folder: Folder) -> Bool {
+        syncedPrimaryRoles.contains(folder.role) || syncedSecondaryRoles.contains(folder.role)
+            || folder.isFavorite || folder.isFollowed
     }
 
     // MARK: - Message Sync
@@ -600,7 +619,11 @@ extension SyncEngine {
     /// when the folder's armed turnover reaction ran instead, or when the
     /// account was removed or the folder deleted before the sync turn was
     /// acquired (nothing is listed). Throws only
-    /// `CancellationError`.
+    /// `CancellationError`. `place` is where it waits in the account's turn
+    /// line: at the back, except the folder view's listing (opening a folder,
+    /// pulling to refresh it: `AccountManager.syncFolders`), which waits ahead
+    /// of the catch-up slices already waiting
+    /// (`SyncTurnPlace.aheadOfBackgroundChunks`, #1360).
     #if DEBUG
     /// Test harness only: awaited by a standalone listing after its turn-holder
     /// checks and current-folder lookup, before it reads anything else. Nil in
@@ -609,12 +632,14 @@ extension SyncEngine {
     #endif
 
     @discardableResult
-    func syncFolderMessages(folder: Folder, provider: any EmailProvider) async throws -> ListingOutcome? {
+    func syncFolderMessages(
+        folder: Folder, provider: any EmailProvider, place: SyncTurnPlace = .arrivalOrder
+    ) async throws -> ListingOutcome? {
         // T4.S6 re-drive — the THIRD owner, and the ONLY one that reaches a custom
-        // non-favourite folder. `fullSync` (after its listing, in the pass's own
-        // task) and `imapDeltaSync` both branch into the reaction for a quarantined
-        // folder, but both iterate
-        // `syncableFolders` (primary ∪ secondary ∪ favourite), so a quarantined
+        // folder that is neither a favourite nor followed. `fullSync` (after its
+        // listing, in the pass's own task) and `imapDeltaSync` both branch into the
+        // reaction for a quarantined folder, but both iterate
+        // `syncableFolders` (primary ∪ secondary ∪ favourite ∪ followed, #1109), so a quarantined
         // custom folder previously had NO re-drive at all: `runSyncMessages`'s
         // in-transaction quarantine term correctly SKIPS the merge pass and
         // `isFolderWalkComplete` refuses the crawl, which together left the folder
@@ -649,7 +674,7 @@ extension SyncEngine {
         // captured IMAP provider would log in again with its retained password.
         // So the turn's holder re-checks the terminal removal fence and the
         // folder's current row, and lists nothing when either is gone.
-        let outcome: ListingOutcome? = await oneSyncAtATime(accountId: folder.accountId) {
+        let outcome: ListingOutcome? = await oneSyncAtATime(accountId: folder.accountId, place: place) {
             guard !AccountManager.shared.isRuntimeRemoved(folder.accountId) else {
                 BackgroundSyncLogger.logDebug("[Sync] \(folder.name): account removed while waiting for the sync turn; listing skipped")
                 return nil
@@ -685,10 +710,18 @@ extension SyncEngine {
     /// whose listings return no counters (a date-window provider's) has no such
     /// counters to skip on and no count check to clear the debt, so it owes none. It counts against a pass's full-sync stamp only for
     /// the pass that ran it (`pass`); an on-demand listing (nil) belongs to no
-    /// pass and never withholds a scheduled pass's stamp.
-    func listFolder(_ folder: Folder, provider: any EmailProvider, limit: Int, pass: UUID? = nil) async -> ListingOutcome {
-        let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool)
-        if case .unproven = outcome {
+    /// pass and never withholds a scheduled pass's stamp. `bound`: an
+    /// other-folder run's listing (#1110, `ListingRequestBound`).
+    func listFolder(
+        _ folder: Folder, provider: any EmailProvider, limit: Int, pass: UUID? = nil, bound: ListingRequestBound? = nil
+    ) async -> ListingOutcome {
+        let outcome = await Self.runListing(for: folder, provider: provider, limit: limit, dbPool: dbPool, bound: bound)
+        // The other-folder run's listing (`bound`, #1110) owes nothing when it
+        // proves nothing: only a proven listing writes the folder's counters, so
+        // they still show it changed and a later run lists it again. The deep
+        // pass and the due mark are the passes' (a full sync never lists an
+        // other folder, and the run ignores a due mark).
+        if case .unproven = outcome, bound == nil {
             if let pass { unprovenListingPasses.insert(pass) }
             Self.oweDeepListing(folderId: folder.id)
             do {
@@ -1054,6 +1087,24 @@ extension SyncEngine {
                 removedIds.append(oldId)
                 return (try MessageHeader.fetchOne(db, key: canonicalId), removedIds, nil, true)
             }
+            // A reply or forward still in the Outbox names its original by header
+            // id (#1479), and its completion and an unsent removal's revert read
+            // the original by that key. This re-key is proven by the provider's
+            // own id (the row owns the address this listing reported,
+            // `providerAddressOwnershipProven`), never by Message-ID evidence, so
+            // the send follows its original here, in this write, as it does
+            // through a landed move (`MessageHeaderRekey.finishMove`). An original
+            // archived on Gmail keeps its Inbox-shaped key until this listing
+            // re-keys it, and a reply then discarded unsent must still find it to
+            // take Send's mark back (#1500). Not carried by the skip above: the row
+            // keeps its key there, so the send still finds it. The UID remap and
+            // the body backfill's re-key, on Message-ID evidence, never carry it
+            // (ADR-IOS-068 D4, `IOS-OUTBOX-012`).
+            // outboxMessage holds only unsent, failed and unfinalized sends, and
+            // this arm runs only when a row is re-keyed, never on the fast path.
+            try db.execute(
+                sql: "UPDATE outboxMessage SET originalMessageHeaderId = ? WHERE originalMessageHeaderId = ?",
+                arguments: [canonicalId, oldId])
             survivor = migrated
             ftsRekey = (oldId: oldId, newId: canonicalId)
             if DebugModeManager.isLoggingEnabled() {
@@ -1324,11 +1375,16 @@ extension SyncEngine {
     /// DB write transaction. No MainActor state accessed.
     /// PRIVATE: only the one classifier (`runListing`) calls it, so no route can
     /// publish a listing's rows or counters without its `ListingOutcome`.
+    /// `bound`: the request bound of a listing in an other-folder run's slice
+    /// (#1110, `ListingRequestBound`): the epoch check's FETCH and the listing's
+    /// own read each start only while the slice has time and get its request
+    /// limit. A cut or timed-out read throws, before anything is written.
     private nonisolated static func runSyncMessages(
         for folder: Folder,
         provider: any EmailProvider,
         limit: Int,
-        dbPool: PrioritizedDatabase
+        dbPool: PrioritizedDatabase,
+        bound: ListingRequestBound? = nil
     ) async throws -> SyncMessagesResult {
         // T1.2b — SELECT-sourced epoch capture, BOUND to this pass's own fetch.
         // `fetchMessagesWithObservedEpoch` SELECTs the folder
@@ -1383,10 +1439,18 @@ extension SyncEngine {
         // this listing waited) is not read from the server at all.
         let verification = await Self.verifyAndBootstrapPrePopulatedFolderEpoch(
             folderId: folder.id, folderPath: folder.path, accountId: folder.accountId,
-            provider: provider, dbPool: dbPool)
+            provider: provider, dbPool: dbPool, bound: bound)
         if verification == .folderGone { throw FolderGoneBeforeListing() }
-        let fetched = try await provider.fetchMessagesWithObservedEpoch(
-            folder: folder.path, limit: limit, offset: 0)
+        let path = folder.path
+        let read: @Sendable () async throws -> (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage) = {
+            try await provider.fetchMessagesWithObservedEpoch(folder: path, limit: limit, offset: 0)
+        }
+        let fetched: (messages: [MessageHeaderInfo], observedEpoch: UInt32?, coverage: FetchCoverage)
+        if let bound {
+            fetched = try await bound.request(read)
+        } else {
+            fetched = try await read()
+        }
         let messages = fetched.messages
         // COVERAGE — what the SERVER said about the window, bound to this fetch and
         // computed before any client-side narrowing. Every "did we see the whole
@@ -2704,10 +2768,11 @@ extension SyncEngine {
     /// The one classifier of a folder listing. Never throws: a cancelled pass
     /// reads as unproven here and the caller checks cancellation itself.
     nonisolated static func runListing(
-        for folder: Folder, provider: any EmailProvider, limit: Int, dbPool: PrioritizedDatabase
+        for folder: Folder, provider: any EmailProvider, limit: Int, dbPool: PrioritizedDatabase,
+        bound: ListingRequestBound? = nil
     ) async -> ListingOutcome {
         do {
-            let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool)
+            let result = try await runSyncMessages(for: folder, provider: provider, limit: limit, dbPool: dbPool, bound: bound)
             if result.proven { return .proven(result) }
             return result.notListable ? .notListable(result) : .unproven(result, connectionLost: false, error: nil)
         } catch is FolderGoneBeforeListing {

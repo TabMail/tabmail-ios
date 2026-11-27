@@ -33,6 +33,21 @@ actor SyncEngine {
     /// `SyncConfig.catchUpSliceIntervalSeconds`. In memory only; a relaunch starts afresh.
     var catchUpSliceWindowEnds: [String: Date] = [:]
 
+    /// Per account: the catch-up run user actions started (#1109,
+    /// `SyncEngine.startAccessCatchUp`), one at a time, and the folders the
+    /// actions landed in that it has not taken yet. In memory only: the folders
+    /// are followed, so the backfill worker's catch-up checks them anyway.
+    var accessCatchUpTasks: [String: Task<Void, Never>] = [:]
+    var accessCatchUpPending: [String: Set<String>] = [:]
+
+    /// Per account: the other-folder run a clock-due foreground pass started
+    /// (#1110, `SyncEngine.startOtherFolderRun`), at most one at a time, and when
+    /// each other folder's read last finished or failed, so the next run reads
+    /// the folders read longest ago first. In memory only: a relaunch reads
+    /// every other folder in stored order at its first run.
+    var otherFolderRunTasks: [String: Task<Void, Never>] = [:]
+    var otherFolderAttemptedAt: [String: [String: Date]] = [:]
+
     #if DEBUG
     /// Test-only seam (`setCatchUpSliceStartHookForTesting`): called with the
     /// folders each catch-up slice asks, as it starts, and awaited, so a test
@@ -43,6 +58,12 @@ actor SyncEngine {
     /// anything is applied, and awaited, so a test can hold a slice that has
     /// read the server inside its turn. Nil outside tests.
     var catchUpAfterReadHookForTesting: (@Sendable ([String]) async -> Void)?
+    /// Test-only seam (`setAccessCatchUpClockForTesting`): the clock access
+    /// catch-up runs are measured on. Nil outside tests: the real clock.
+    var accessCatchUpClockForTesting: (@Sendable () -> Date)?
+    /// Test-only seam (`setOtherFolderRunClockForTesting`): the clock other-folder
+    /// runs are measured on. Nil outside tests: the real clock.
+    var otherFolderRunClockForTesting: (@Sendable () -> Date)?
     #endif
 
     /// Generation counter per account — prevents stale task defer from clearing
@@ -70,9 +91,23 @@ actor SyncEngine {
     var deletionReconcileInFlight: Set<String> = []
 
     /// The accounts with a sync pass running, and for each the passes waiting
-    /// their turn, oldest first (`oneSyncAtATime`).
+    /// their turn, in turn order (`oneSyncAtATime`): oldest first, except a
+    /// follow-up or the folder view's listing (`.aheadOfBackgroundChunks`),
+    /// which stands ahead of the catch-up slices waiting (#1360).
     var syncPassRunning: Set<String> = []
     var syncPassWaiters: [String: [SyncTurnWaiter]] = [:]
+    #if DEBUG
+    /// Test harness only: how many waiters went in ahead of a waiting catch-up
+    /// slice (`waitForSyncTurn`), so a fuzz can check that its seeds reordered
+    /// the line at all (#1360).
+    var syncTurnOvertakesForTesting = 0
+    #endif
+    /// For each account whose turn is held, where the pass holding it was
+    /// started (`caller:line`), so a pass that waited names in the debug log
+    /// what it waited behind (`[SyncTurnWait]`). Read by nothing else. A label
+    /// is stored only with debug logging on; with it off, `recordSyncTurnHolder`
+    /// drops any label left from a time it was on.
+    var syncTurnHolders: [String: String] = [:]
     var syncTurnWaiterSerial: UInt64 = 0
     /// Waiters the test harness released after an overrun (`syncTurnWaitWatch`).
     var overrunSyncTurnWaiters: Set<UInt64> = []
@@ -394,6 +429,16 @@ actor SyncEngine {
             indexTask.cancel()
             await indexTask.value // wait for cancellation to propagate
         }
+        accessCatchUpPending.removeValue(forKey: accountId)
+        if let accessTask = accessCatchUpTasks.removeValue(forKey: accountId) {
+            accessTask.cancel()
+            await accessTask.value
+        }
+        if let otherFolderTask = otherFolderRunTasks.removeValue(forKey: accountId) {
+            otherFolderTask.cancel()
+            await otherFolderTask.value
+        }
+        otherFolderAttemptedAt.removeValue(forKey: accountId)
     }
 
     // MARK: - Background Maintenance
@@ -778,7 +823,9 @@ actor SyncEngine {
     /// SyncEngineOneSyncAtATime.swift). Unlike a trigger it waits in line for the
     /// account's turn, so it starts as soon as the work holding the turn ends,
     /// even when that work takes the turn again at once (a catch-up's next
-    /// slice). It runs stage 2 only if the flag is still set when it gets the
+    /// slice). It joins the line ahead of every catch-up slice waiting
+    /// (`SyncTurnPlace.aheadOfBackgroundChunks`, #1360), so other readers'
+    /// slices queued before it never read first. It runs stage 2 only if the flag is still set when it gets the
     /// turn, and returns nil, doing nothing, when a stage 2 that ran in between
     /// served it: two asks for one flag run one stage 2. `mayStart` is the
     /// scheduler's follow-up gate (`SyncScheduler.followUpMayStart`: foreground
@@ -797,7 +844,7 @@ actor SyncEngine {
     ) async throws -> Bool? {
         guard let queue = workQueues[accountId] else { return nil }
         let provider = queue.provider
-        return try await oneSyncAtATime(accountId: accountId) {
+        return try await oneSyncAtATime(accountId: accountId, place: .aheadOfBackgroundChunks) {
             guard self.syncFollowUpWanted.contains(accountId) else {
                 BackgroundSyncLogger.logDebug("[SyncFollowUp] \(accountId.prefix(8)): served by an earlier stage 2")
                 return nil
@@ -919,7 +966,10 @@ actor SyncEngine {
         //    the read, so it does not hold back the rest of the account.
         let timeSinceFullSync = account.lastFullSyncAt.map { Date().timeIntervalSince($0) } ?? .infinity
         let listingNeeded = changePass?.needsListing ?? false
-        let fullSyncDue = timeSinceFullSync >= fullSyncInterval || listingNeeded
+        // Due by the 15-minute clock, not only by a listing the read needs: such
+        // a pass also starts the other-folder run when it ends (#1110).
+        let clockDue = timeSinceFullSync >= fullSyncInterval
+        let fullSyncDue = clockDue || listingNeeded
         if fullSyncDue {
             BackgroundSyncLogger.logDebug("[Sync] Full sync due for \(account.emailAddress) (last: \(timeSinceFullSync.isFinite ? "\(Int(timeSinceFullSync))s" : "never"), new bookmark: \(listingNeeded))...")
             let plan = FullSyncPlan(deadline: deadline)
@@ -991,7 +1041,10 @@ actor SyncEngine {
             throw error
         }
 
-        // 3. Background work — runs after every sync (delta or full)
+        // 3. Background work — runs after every sync (delta or full). A pass whose
+        //    full sync was due by the clock also starts the change reads of the
+        //    folders outside the syncable set (#1110), in the catch-up's slices.
+        if clockDue { startOtherFolderRun(account: account) }
         BackgroundSyncLogger.logDebug("[Sync] \(account.emailAddress) calling startBackfill")
         startBackfill(account: account)
         bulkIndexIfNeeded(account: account)

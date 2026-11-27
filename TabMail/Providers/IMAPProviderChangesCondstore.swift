@@ -16,7 +16,8 @@ import SwiftMail
 // a candidate, removed only when a FETCH and a confirming SEARCH on the same
 // selection both leave it out (`rereadIds`). Older held rows are the catch-up's,
 // armed with the check. A check that does not fit the budget is resumed on later
-// passes (its progress rides in the bookmark, `pendingCheck`), and every pass
+// passes (its progress rides in the bookmark, `pendingCheck`); a slice of an
+// other-folder run takes one step of it at most (`runRemovalCheck`, #1110); every pass
 // that does not finish lists the folder (`UntrackedObservation.mustList`) with the
 // bookmark unchanged. A finished check commits the new bookmark of the pass that
 // STARTED it, so every change after that checkpoint is read again.
@@ -147,6 +148,18 @@ extension IMAPProvider {
             }
         }
         guard try await fetchArrivals(toFetch, server: server, context: context, into: &changes) else {
+            // A slice of an other-folder run whose check step finished but
+            // whose arrivals cannot start keeps the finished check and what it
+            // proved, under the old reading position (the cut): the next read
+            // takes no step, fetches the arrivals and commits the check's
+            // bookmark. A pass reads the folder again next pass.
+            if let check, request.scope == .otherFolders {
+                var bookmark = cursor.cleared
+                bookmark.pendingCheck = check
+                return cutFolder(
+                    folder, changes: proven, bookmark: bookmark, arm: created,
+                    observation: observation, selection: selection)
+            }
             return FolderChanges(folderId: folder.id, status: .notRun)
         }
         changes.records += proven.records
@@ -205,25 +218,42 @@ extension IMAPProvider {
     /// candidates' proof, then whole chunks of the window, newest first. Proven
     /// removals and fetched records go into `changes`; `heldRowsProof` covers the
     /// rows searched. True when the window is done.
+    ///
+    /// A pass takes every step whose requests fit its budget whole. A slice of
+    /// an other-folder run (`.otherFolders`, #1110) takes at most ONE step (the
+    /// proof, or one chunk's SEARCH), started only while the slice has time and
+    /// with each request waiting at most `SyncConfig.catchUpRequestTimeoutSeconds`,
+    /// as a request of the older-mail check: its share of the slice is shorter
+    /// than any step's price, so the priced gate would never let the check move.
+    /// The progress rides in the bookmark (the cut), and later slices and runs
+    /// take the next steps until the window is done.
     private func runRemovalCheck(
         _ progress: inout IMAPRemovalCheckProgress, folder: ChangeFolder, server: IMAPServer,
         request: ChangeRequest, into changes: inout FolderChanges
     ) async throws -> Bool {
         let context = request.context
-        let step = SyncConfig.changeReadRequestTimeoutSeconds
+        let oneStep = request.scope == .otherFolders
+        let step = oneStep ? SyncConfig.catchUpRequestTimeoutSeconds : SyncConfig.changeReadRequestTimeoutSeconds
         let top = Int(progress.nextBelow) - 1
         var searched = Set<Int>()
+        var stepTaken = false
+        // Whether the next step, sending `requests` requests, may start.
+        func mayStart(requests: Double) -> Bool {
+            oneStep ? !stepTaken && context.hasBudget() : context.secondsLeft >= requests * step
+        }
         while true {
             if !progress.unproven.isEmpty {
-                guard context.secondsLeft >= 2 * step else { return false }
-                let answer = try await rereadIds(progress.unproven, server: server, context: context)
+                guard mayStart(requests: 2) else { return false }
+                stepTaken = true
+                let answer = try await rereadIds(progress.unproven, server: server, context: context, requestTimeout: step)
                 changes.records += answer.records
                 changes.removals += answer.removals
                 changes.rereadLater += answer.unreadable
                 progress.unproven = []
             }
             guard progress.remaining > 0 else { return true }
-            guard context.secondsLeft >= 3 * step else { return false }
+            guard mayStart(requests: 3) else { return false }
+            stepTaken = true
             let rows = try await request.localRows?.rows(
                 folderId: folder.id, numericIdsBelow: Int(progress.nextBelow),
                 limit: min(SyncConfig.deletionReconcileChunkSize, progress.remaining)) ?? []

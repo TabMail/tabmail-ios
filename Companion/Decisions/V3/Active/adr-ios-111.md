@@ -163,7 +163,9 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      nullable TEXT, NULL = no bookmark yet). The engine writes back `FolderChanges.cursor` in that
      folder's transaction.
    - `ChangeFolder.isSynced`: the folder is in the full sync's syncable set
-     (`SyncEngine.syncableFoldersInOrder`); a per-folder reader reads only these.
+     (`SyncEngine.syncableFoldersInOrder`); a per-folder reader reads only these. *Amended 2026-11-22
+     (#1109):* the set also holds every followed folder (`Folder.isFollowed`, a folder a user action
+     landed in); see the amendment of that date at the end.
    - `ChangeFolder.heldSince`: the start of the folder's held range (`Folder.oldestSyncedDate`), a hint
      only; the apply checks the range again inside the transaction.
    - `ChangeRequest.localRows`: the existing `CatchUpLocalRowReader` (ids and two flags, never content;
@@ -181,6 +183,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
    updates a stored row, and inserts only a message dated within the folder's held range, checked inside
    the transaction; a folder with no held range (after a reset) inserts nothing. A later round's record
    inserts at any age: a message moved in by another client appears whatever its date (#722, #536).
+   *Amended 2026-11-26 (#1363):* a folder with no held range whose older-mail walk has completed (the walk
+   found it empty) holds the whole folder and inserts at any age; see the amendment of that date at the end.
 4. **The read budget ends before the caller's deadline** (`SyncEngine.changeReadEnd`): the smaller of
    `SyncConfig.changeReadBudgetSeconds` and the caller's deadline less one request's timeout
    (`changeReadRequestTimeoutSeconds`) and the apply margin (`changeReadApplyMarginSeconds`). No request
@@ -201,7 +205,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      (`GraphAPI.stateSelection`: `id,isRead,flag,receivedDateTime,categories`). A change to a message the
      phone holds applies from that record; a message the folder does not hold whose record carries
      `receivedDateTime` (a new or moved-in message) gets its headers fetched, when the folder is tracking,
-     or during its baseline when the message is within the held range.
+     or during its baseline when the message is within the held range (with no range, every such message
+     once the folder's older-mail walk has completed; amended 2026-11-26, #1363).
    - **Why not ids only.** A delta chain keeps the `$select` it was started with (Graph encodes it in the
      next and delta links), and later rounds carry only selected fields. With `$select=id` every read or
      flag change would cost one GET per message, or might not be reported at all; a change key says only
@@ -447,7 +452,8 @@ answer in that folder, for a message of any age:
 3. **A list is cut only where the catch-up will find the rest** (added same day, review round 4;
    *amended 2026-11-15, #903: a stored id is never cut, see the amendment below*). Over
    `SyncConfig.changeRecheckLimit`, a folder the catch-up checks (`SyncEngine.isSyncable`: a main role
-   or a favourite, the same set `syncableFoldersInOrder` gives the full sync and the catch-up run)
+   or a favourite, the same set `syncableFoldersInOrder` gives the full sync and the catch-up run;
+   *amended 2026-11-22, #1109: or a followed folder*)
    keeps its first ids and its catch-up is armed, as decision 3 says. A folder the catch-up never
    checks keeps every id: arming its catch-up is a no-op there (`markCatchUpLapse` updates only a
    non-NULL state, and the catch-up run never takes that folder), so a dropped id would stay wrong for
@@ -1317,3 +1323,447 @@ before it now runs after it).
 
 Keywords: redriveArmedTurnovers, changeReadEnd, runUidValidityResetReaction, uidValidityResetPendingAt, write
 barrier exhausted, turnover re-drive, change read starved, #1287, #974, #1277.
+
+### Amendment 2026-11-22 (#1109): a folder a user action lands in is followed
+
+**Context.** The syncable set (`SyncEngine.isSyncable`: main roles and favourites) decided which folders
+get the full sync's listing, the change read (`ChangeFolder.isSynced`), the catch-up and the UIDVALIDITY
+re-drive. Every other folder was listed only when opened, and only its newest messages (the window
+listing). A delete, move, or read or flag change made elsewhere below those, or a message the device
+never loaded, then stayed wrong for good in a folder the user works in but never starred: an IMAP
+custom folder, an Outlook folder that is not a favourite. Memory 114 records the same predicate's effect
+on the re-drive.
+
+**Decision.**
+1. **The mark.** `Folder.isFollowed` (`v112_addFolderIsFollowed`, `BOOLEAN NOT NULL DEFAULT 0`, no index).
+   A followed folder is in the syncable set (`SyncEngine.isSyncable(_:)`), ordered after the secondary
+   roles (`syncableFoldersInOrder`: Inbox, favourites, secondary roles, followed folders). It therefore
+   gets everything a favourite gets, with no new provider code: the full sync's listing, the change read,
+   the catch-up run (`syncableFolderIds`), the UIDVALIDITY re-drive (the same loop) and the re-read
+   list's overflow cut (rule 3 of the #876 amendment). This amends decision 1 of the 2026-11-12 Outlook
+   amendment (`ChangeFolder.isSynced`) and ADR-IOS-107 decision 1 (the catch-up's folders).
+   - One writer, `SyncEngine.markFollowed(folderIds:db:)`: a column-scoped UPDATE of the named folders not
+     followed yet. It only sets the mark; nothing clears it (no expiry). The column is left out of
+     `Folder.encode(to:)` (`Folder.followedColumn`), as the listing counters are, so a whole-record write
+     from an older read never clears it. Fences: `ListingRouteFenceTests.followMarkHasOneWriter`, the
+     `FolderRoleTests` encode fence.
+   - It is the user's choice, not sync state: both Settings resets keep it, as they keep `isFavorite`
+     (`SettingsSyncStateResetTests`). A renamed or re-created IMAP folder is a new row and starts
+     unfollowed.
+2. **The access points** (`SyncEngine.folderAccessed`: the mark, then an access catch-up run):
+   - opening a folder or pulling to refresh it (`AccountManager.syncFolders`): the mark is written first,
+     before the connect and the listings, so an open while offline, or a listing that fails, still follows
+     the folder. `followFolders` reads first and opens a write only when some folder is not followed yet:
+     a mark is never cleared, so the usual pull (a folder already followed) never waits for the database's
+     one writer before its first read (apart from the merge of a notification extension's staged rows,
+     which every async read of the sync pool waits for). *(Amended in review 2026-11-23: it first opened a write on every
+     pull.)* The run starts after the change read, so a folder the reader has just baselined may be
+     listed. When that read finds the account busy (it sets the account's follow-up flag and reads
+     nothing, #1289), the run starts all the same and waits for the turn; it may take the turn before
+     the follow-up stage 2, and an Outlook folder the follow-up has yet to baseline is then not listed by
+     this run (decision 5) but by the ordinary catch-up once it is baselined. *(Amended 2026-11-26,
+     #1360, ADR-IOS-104: the run's slices wait as catch-up slices, behind the follow-up once that is in
+     line; the run takes the turn before the follow-up only when the turn frees before the follow-up
+     has joined.)*;
+   - a drained move, archive or delete: its source and its destination (`AccountOperationExecutor.finishDrain`,
+     `DrainContext.foldersAccessed`);
+   - opening a message, from a folder, a search result, or a chat or AI answer alike
+     (`MessageDetailViewModel.loadBody`): started when the body load ends, whichever way it ends, on a
+     detached task, so the open never waits for it and the folder's catch-up requests never queue ahead
+     of the message's body request on a provider's shared request slots (Graph's per-mailbox
+     `HTTPConcurrencyGate`). A body still queued ends the load by handing it to the body poll, so the
+     access starts then (a limit below). The view model's production init turns the access on
+     (`accessesFolder`, fenced in `ListingRouteFenceTests`); its test init leaves it off unless a test
+     asks, because the access writes through the shared engine and database, not a test's own pool.
+   The trigger is not `syncFolderMessages`, the place the issue first proposed: that route also serves
+   the post-send Sent listing and step 6 of the epoch rebuild, which are not user actions in the folder.
+3. **The access catch-up run** (`SyncEngine.startAccessCatchUp`): one per account, on its own task (an
+   unstructured task, as the older-mail worker's), never awaited by the caller; folders that
+   arrive while it runs are taken by its next run. Each run is `runCatchUpRun` with
+   `CatchUpRun.accessedFolderIds`: it asks only those folders (the syncable ones among them, so a folder
+   whose mark did not land is not asked), under the account's turn and slice pacing like every slice,
+   until they make no progress or their slices have spent `SyncConfig.accessCatchUpRunSeconds` (120 s)
+   of working time (`CatchUpRun.workSeconds`), each slice's counted from when its provider work starts,
+   once the account's provider work queue gives it a slot: the wait for the turn, the wait for the slot
+   and the pacing wait between slices are not counted, because waiting is not working time. The run ends
+   with the slice that spends its time. What a large folder still needs
+   then is the backfill worker's, whose catch-up checks every followed folder. *(Amended in review
+   2026-11-23: the run first had a deadline 120 s from when it took its folders, so a run whose first
+   slice waited behind a long pass, as after a pull that found its account busy, could spend it all
+   waiting and ask nothing.)* *(Amended in review 2026-11-23, second time. Superseded: "spent ... (120 s)
+   inside the account's turn (`CatchUpRun.workSeconds`): the wait for the turn and the pacing wait
+   between slices are not counted". A slice's clock then started at its turn, so its wait for a slot of
+   the provider work queue, inside the turn, counted as working time, and a slice that waited its whole
+   slice reached the provider with no time left; and a run whose last slice spent its time took another
+   turn, and could wait for another pacing window, before it found its time spent. Every catch-up slice,
+   the backfill's included, now starts its clock at its slot: ADR-IOS-107, amendment 2026-11-23 (#1109).)*
+   `CatchUpContext.accessedFolderIds` tells the provider which folders an action reached (provider-neutral).
+   `SyncEngine.remove(accountId:)` drops the folders waiting for a run and cancels the running one, so a
+   disconnect that keeps the account's credentials (a re-authentication, re-adding an account) does not
+   wait for its slot or its pacing window. A run still in line for the account's turn ends once the passes
+   ahead of it have handed the turn over (waiting for the turn ignores cancellation by design); on a
+   re-authentication their provider was just disconnected, so the wait is short.
+4. **IMAP access check** (`IMAPProvider.catchUpPlan`, `counters:`, `accessed:`). An untracked folder with no
+   mod-sequences has no cheap check, so the daily full check alone would leave an accessed folder stale for
+   up to a day. An accessed, untracked folder is listed when its stored counters (`totalCount`, the
+   listing's EXISTS, and `lastKnownUidNext`) differ from those its last completed listing started from
+   (`IMAPCatchUpState.completionCounters`, taken from `Listing.firstCounters` before the first range, as
+   `firstStamp` is; inside the opaque state, no column), with or without MODSEQ: a server with CONDSTORE
+   alone need not move HIGHESTMODSEQ on an expunge, so an equal MODSEQ never vetoes a moved count. With no
+   MODSEQ pair to compare (no fresh MODSEQ from the server or session, or a last completed listing that
+   started with none, so no `completionStamp`) it is also listed when that listing completed longer ago
+   than `SyncConfig.catchUpAccessCheckAgeSeconds` (1 h: a flag change moves no counter). With a pair, the
+   MODSEQ check already lists a folder whose flags changed, and a tracked folder's changes come through
+   its change read. *(Amended in review the same day: the first form vetoed moved counters when a pair
+   existed.)*
+5. **Outlook keeps its catch-up gate**: a followed folder is synced, so its change read baselines it first,
+   and only then does the catch-up list it. Gmail's change read already covers every label; a followed
+   label gains the catch-up.
+6. **Unchanged:** sync by UID, never by date; the reconcile is a scan and runs on any network, battery level
+   and power mode (header and body loads wait as before, ADR-IOS-107 amendment 2026-11-19); removals go
+   through the one removal core; no mail content is stored; nothing provider-specific above the boundary.
+
+**Why a new column, and why no index.** Every existing field was checked first:
+1. `changeState` is sync progress. The UIDVALIDITY reaction sets it NULL (`AccountManagerUidValidityReset`)
+   and the full sync's re-drive loops over the syncable set (`SyncEngineFullSync`), so a mark kept there
+   would take the folder out of the syncable set inside its own epoch reaction: it would lose its full
+   sync listing, change read and catch-up, and after an abort only the change pass's re-drive
+   (`redriveArmedTurnovers`, every armed folder) would still reach it (Memory 114). Both Settings resets
+   clear it (`resetSyncStateTxn`), and `FolderChangeState.encoded` stores NULL for a state with nothing in
+   it. Keeping the mark there would mean carving it out of the epoch reaction and both resets.
+2. `catchUpState` and `changeCursor` are provider-opaque JSON the engine cannot read above the boundary,
+   and both are provider progress with their own lifetimes: an epoch change, the exit rule and both
+   resets drop them, and a lapse rewrites the catch-up state (it adds the lapse it owes); nil already
+   means "first listing" and "baseline needed".
+3. `isFavorite` is the user's visible favourites list: setting it would add folders to the sidebar.
+4. A per-folder "last synced" time does not exist; `Account.lastSyncedAt` is account-wide.
+5. The listing counters and the walk's columns (`totalCount`, `lastKnownUidNext`, `lastKnownHighestModSeq`,
+   `backfillComplete`, `backfillUidCursor`) are written by paths that are not user actions (the post-send
+   Sent listing, step 6 of the epoch rebuild, the walk over every folder) and invalidated by a reset.
+No index: the mark is read only with an account's folder rows (`syncableFoldersInOrder` filters the rows
+read by `accountId`, tens per account); no query selects by the mark alone.
+
+**Consequences.** A folder the user has acted in is kept current like a favourite, at the cost of its change
+read and catch-up from then on. The set only grows; a folder the user stops using stays followed.
+Limits (each recovers through the ordinary schedule, because the folder is followed from then on, except
+the #1268 label sets and the #1276 cost, as their bullets say):
+- An access that comes inside an open slice window waits for it (at most `catchUpSliceIntervalSeconds`).
+- A visit shorter than the folder view's start delay before its sync is not an access: no sync starts,
+  so the folder is not marked. This is on purpose: the mark is never cleared, so a folder tapped by
+  mistake and left at once is not followed for good.
+- An access with no change evidence waits for the ordinary schedule: on Outlook a first access by a
+  drained action or a message open waits until the change read baselines the folder (decision 5); on IMAP
+  with no mod-sequences, a flag change made elsewhere below the newest listing within an hour of the last
+  completed listing waits for the next access after that hour, or the daily check; a message open, and
+  the source of a drained move, archive or delete (which the drain does not list), compare the counters
+  the folder's last listing stored, so a change made elsewhere since then waits for the folder's next
+  open (whose listing refreshes them), the next access after the hour, or the daily check; a tracked folder's changes wait for its next change
+  read; a listing that throws ends that run.
+- A pull whose connect, listing or change read throws starts no access run, nor does one whose account
+  is gone by then: the folders are already followed, so the backfill worker's catch-up reconciles them.
+- A message whose body is still queued (the poll path: a background body queue, cancelled reads, an
+  address the provider is blocking) starts its access when the load hands over to the poll, so the poll's
+  next read (every 2 s) can wait behind at most one catch-up request on the folder's connection or
+  request slot. The direct body load, the common open, is first.
+- Rare timing windows where one action's mark is missed (an app kill between a drained action's commit
+  and its mark, which also spans the post-drain listings; a retirement replay committed while offline,
+  whose drain stops at the connectivity check before the mark; a message load cancelled during its first
+  read): the next action in the folder marks it (#1263). The same issue holds a window where an
+  account is removed and registered again under the same id while its old engine state is torn down:
+  the teardown can cancel the new registration's access run; the marks stay, and the ordinary catch-up
+  reconciles the folders.
+- Following widens two existing limits to followed folders: a Gmail label's re-read overflow cut in a
+  syncable label drops the retry for a label set the catch-up never replaces, so a cut message's user
+  labels stay stale until a later change to that message is read; the ordinary schedule does not
+  recover them (#1268). Outlook reads tracking folders before baselines every pass, in a fixed order,
+  so once the tracking folders fill a pass's request allowance every baseline waits: a new followed
+  folder's, and a main folder's re-baseline after a refused change token (the Inbox is first only
+  within its phase), whose catch-up stays gated meanwhile; in a background pass the later tracking
+  folders, secondary roles included, are not read either. A foreground pass recovers them for
+  realistic folder counts (#1269).
+- On IMAP without CONDSTORE no folder holds a change bookmark, so every folder is untracked, and an
+  access whose counters moved lists the whole folder again: an arrival raises UIDNEXT, and the user's
+  own archive out of the Inbox lowers EXISTS and raises the Archive's counters. While a user triages,
+  the Inbox and the Archive are listed far more often than the daily check did (paced by the slice
+  window). Cost only, nothing shown is wrong; skipping counters that show only arrivals is #1276.
+- Pre-existing, not changed here: an IMAP folder the reader can no longer track keeps its bookmark on
+  purpose, so the catch-up plan counts it as tracked and it gets neither the daily nor the access check
+  (#1264).
+
+Tests: `FollowedFolderTests` (`FollowedFolderMarkTests`: the mark, the order, the access plan: moved
+counters list with or without a MODSEQ pair, the age rule only without one, including a missing fresh
+MODSEQ; a state stored before the counters existed decodes with none and its next access lists the
+folder; `FollowedFolderIMAPTests`: the wire oracle for opening the folder, a move into it, taking a
+message out of it by a move, an archive or a delete (each following the folder and the destination, the
+message held once in the destination on both sides), and opening one of its messages, on a server with
+no mod-sequences and on a QRESYNC server, each against the scenario's expected server and device state,
+the action's own `UID MOVE` the only change sent to the server, each run asking only the accessed
+folders and a quiet re-open listing nothing, the message's body requested before any catch-up slice, a
+second access during a run taken by the next run (and never asked alone, with a pause between the
+handovers), an open while offline that still follows the folder, following a followed folder while
+another write holds the database's writer (no wait), a pull whose change read finds the
+account busy (its access run waits behind the running pass, asks nothing meanwhile, then reconciles the
+folder with all of its time although its clock moved on twice that time while it waited), and a completion that keeps the
+counters its listing started from across slices; `FollowedFolderOutlookTests`: through the production change read, the gated access sends no
+request for the folder and writes no listing, then the baseline, then the listing),
+`ReleaseBoundaryRecheckTests.applyOverflowInAFollowedFolderArmsTheCatchUp` (the first ids are kept),
+`FolderIsFollowedMigrationTests`, `ListingRouteFenceTests.followMarkHasOneWriter` (every production
+mention of the mark and of its column constant, and the detail view model's production init turning the
+access on), `GmailCatchUpTests.removingTheAccountEndsItsAccessRun` (removing the account ends a run waiting
+for its slot at once, sends nothing, and drops the folders waiting for the next run).
+
+Keywords: isFollowed, followed folder, follow mark, markFollowed, followedColumn, folderAccessed,
+followFolders, startAccessCatchUp, access catch-up run, accessedFolderIds, accessCatchUpRunSeconds,
+catchUpAccessCheckAgeSeconds, completionCounters, firstCounters, Counters, syncable set, isSyncable,
+custom non-favourite folder, sync on demand, v112_addFolderIsFollowed, accessesFolder, body poll, #1109,
+#1263, #1264, #1268, #1269, #1276.
+
+### Amendment 2026-11-23 (#1110): the folders outside the syncable set have their changes read every 15 minutes
+
+**Context.** The passes read the changes of the syncable set only (`SyncEngine.isSyncable`: main roles,
+favourites and, since #1109, followed folders). Every other folder (an IMAP custom folder or an Outlook
+folder the user has not opened or acted in) was read only when opened: mail a server rule filed there, and
+changes made there elsewhere, did not reach the device until then. Gmail was already covered: every
+pass's history read reports every label.
+
+**Decision.**
+1. **The run.** A foreground pass whose full sync was due by its 15-minute clock (`lastFullSyncAt` against
+   `fullSyncInterval`; not a pass whose full sync ran only because its change read needed a listing), and
+   whose full sync ran without an error, starts the account's other-folder run when it ends
+   (`SyncEngine.startOtherFolderRun`, `SyncEngineOtherFolders.swift`), beside the older-mail worker. A full
+   sync whose listing proved nothing leaves the clock due, so the next clock-due pass may start the next run.
+   At most one run per account: a start while one runs starts none. A run under way when the app leaves the
+   screen goes on in the app's later wakes, as the older-mail check and the access runs of #1109 do: no
+   lifecycle check of its own (decided 2026-11-23). *Superseded (2026-11-23):* "The run is the foreground's
+   only (`CatchUpRun.inForeground`, the lifecycle flag `DatabaseSuspension.isAppActive`): a pass that ends
+   after the app has left starts none, and each slice asks again at its turn and at its slot, so a run whose
+   app leaves ends there and reads nothing more". The run has no timer, scheduler, queue,
+   gate or turn of its own (tabmail-ios rule `sync-work-rides-the-existing-pipe.md`): it is the catch-up
+   runner (`runCatchUpRun` with `CatchUpRun.readsOtherFolders`), so each slice takes the account's turn
+   (ADR-IOS-104), waits for the pacing window outside it, takes a `.headerFetch` slot of the provider work
+   queue and works at most one slice (`catchUpSliceSeconds`), then hands the turn on. A trigger that comes
+   during a slice sets the account's follow-up flag (#1289), and the stage 2 it asks for waits at most that
+   slice. The poll, IDLE, push, pull and return passes are unchanged, and nothing is added to
+   `syncStartup`: a clock-due pass does one in-memory check and starts one task when it ends.
+2. **What a slice reads.** The other folders (`isSyncable` false, a non-empty path) not yet done in the
+   run, those whose read finished, moved (a baseline that moved and is not done) or failed longest ago
+   first, never-read ones first of all (`otherFolderReadOrder`, an in-memory record per engine,
+   `otherFolderAttemptedAt`, which keeps only the account's folders that still exist, so a deleted folder's
+   time neither stays nor passes to a folder made later at its id). *Superseded (2026-11-23):* "finished or
+   failed": a long baseline first in the order kept its never-read place and took every slice's read share
+   before a folder never reached, run after run. The slice reads them
+   through the provider's change reader with the new scope `ChangeScope.otherFolders` (every folder of the
+   request is read: `ChangeFolder.isSynced` true), for at most half the slice (`otherFolderReadShare`), its
+   first folder excepted: that folder's read may start while the slice itself still has time
+   (`ChangeContext.firstFolderDeadline`, `ChangeRequest.forFirstFolder`; decided 2026-11-24), so a slow
+   session check (the NOOP before the reads) never leaves a slice with no folder read, and no request
+   starts after the slice's end. *Superseded (2026-11-24):* the first folder too only within the read
+   share: on a slow link the NOOP used up the share, every folder came back not run, and every later run
+   did the same. The slice applies the answer with the passes' one generic apply (`applyChangeSet`). Readers read the request's
+   folders in its order and report a folder they did not reach as `.notRun`, which stays pending. A folder
+   whose read was started and cut by the slice's time is kept apart from one not reached (#1358): the IMAP
+   reader, which always sends a run's folder its STATUS (or SELECT) first, reports it `.notRun` with
+   `FolderChanges.readCut`; the Outlook reader reports `.baselining` with `readCut` for a run's baseline read
+   that passed no page (its time ran out inside the page, or the page's header batch failed), so the held
+   rows of a page read again are applied but not counted as the folder moving; the engine also counts as cut
+   an Outlook baseline that neither moved nor failed and an untracked folder whose listing could not start.
+   A cut folder stays pending while the slice moved
+   or failed another folder (the next slice reads it first); a slice that did nothing else counts it as
+   tried (`inFlightFolderIds`: left out of the rest of the run, behind the others in the next run's order),
+   so the run goes on to the next folders. Before this, on a slow link a changed first folder's STATUS could
+   use the whole read share every run: no slice moved, the run ended, and the folders after it were never
+   read while the link stayed slow.
+   - IMAP with QRESYNC or CONDSTORE: each folder's own bookmark (`Folder.changeCursor`). A first read stores
+     it (`.baselineReady`) and arms the folder's catch-up check (decision 5). On a server with CONDSTORE and
+     no QRESYNC, the bookmark's removal check (`runRemovalCheck`) takes at most ONE step in a slice (the
+     proof of its open candidates, or one chunk's SEARCH), started only while the slice has time, each
+     request at most `SyncConfig.catchUpRequestTimeoutSeconds`, as a request of the older-mail check; its
+     progress rides in the bookmark, so later slices and runs take the next steps until the window is done
+     (decided 2026-11-23). A pass still takes every step its budget pays for whole. Before, a run priced
+     each step at the passes' request limit, above its read share, so the check never moved in a run. A
+     check finished in a slice whose arrivals cannot start in it (no time left) stays in the bookmark's
+     progress (`pendingCheck`) with its proven removals, so a later slice reads the arrivals instead of
+     taking the check again; a pass is unchanged.
+   - IMAP with no change tracking: each folder's STATUS. A folder whose counters moved is listed
+     (`refreshUntrackedFolder`, `otherFolderSlice:`) only while the slice has time to start a listing
+     (`.listingNotStarted` otherwise: a later slice of the run lists it). The listing (the 50-message window
+     a pass lists) is bounded as a request of the older-mail check is (`ListingRequestBound`, decided
+     2026-11-23): a request is one provider call (the epoch check's sample, the listing's window read),
+     bounded as a whole, as in `IMAPProvider.catchUpFolder`. The call starts only while the slice has time,
+     and the listing waits for it at most `SyncConfig.catchUpRequestTimeoutSeconds`, a limit that covers
+     everything inside the call: the connection checkout, a cold session's connect and login, SELECT, and
+     the FETCH. So a command of a call that started in time may start after the slice's end, and a slice
+     holds the turn at most to its end plus one such call, as an older-mail slice does (decided 2026-11-23:
+     per call, not per command). *Superseded (2026-11-23):* "each of its requests (the epoch check's FETCH,
+     the listing's read) starts only while the slice has time", which read as a check before every command.
+     A window read the slice's end leaves unstarted (after the epoch check) is a listing not started
+     (`.listingNotStarted`); a call the request limit cuts proves nothing (`.unproven`). Either way the
+     listing writes nothing, the folder's counters stay as they were, the run's listing owes no deep listing
+     and sets no due mark (only a pass's unproven listing does: a full sync never lists an other folder, and
+     the run ignores a due mark), and a later slice or run lists the folder. *Superseded (2026-11-23):* "A
+     listing cut or given up writes nothing: it is unproven" (a cut or unproven run listing owed a deep
+     listing and set a due mark, as a pass's does). *Superseded (2026-11-23):*
+     "A listing once started runs to completion, so a slice can end later than its time by that listing"
+     (the listing's connection, SELECT and FETCH had no bound of their own). The listing runs no deletion check:
+     its walk can take longer than a slice, and the weekly whole-folder check (decision 5) removes what it
+     would. A due mark (`FolderChangeState.listingDue`) alone lists nothing in a run and is left as it is.
+     *Superseded (2026-11-23):* "the listing's deletion check is bounded by the slice"; "a check cut by a
+     slice's end leaves one, and honouring it would list the folder in every run".
+   - Outlook: the per-folder Graph delta of the run's folders in the request's order (a pass reads tracked
+     folders first; a run does not, so a folder in its baseline is never kept behind tracked ones run after
+     run), with no folder-list read; a first read baselines, across slices if it must. It stops when the
+     request allowance is spent (`.notRun`).
+   - Gmail: nothing is sent (every folder `.notRun`).
+3. **What a run never writes.** The folder list, the account's bookmark (the slice keeps it, `.keep`),
+   `lastSyncedAt` and `lastFullSyncAt`; and it never turns a folder's coverage (`FolderChangeState.tracking`)
+   on, since the full sync does not list these folders. A refused or dropped bookmark of an other folder
+   (`dropChangeBookmark(listedByFullSync: false)`, and the first bookmark's due listing) does not make the
+   account's full sync due; it arms the catch-up check as always. That includes a bookmark dropped because a
+   read took the folder's re-read list over `changeRecheckLimit`.
+4. **The end rule.** A run ends at the first of: every other folder read once in it (a folder whose baseline
+   a slice's end cut stays pending while the slice moved another); a slice that reads nothing new and leaves
+   no new folder out (a slice whose only work was a folder its time cut leaves that folder out, decision 2,
+   so a cut first folder never ends the run; a reader that reads nothing, Gmail's, still ends it at once); its
+   working time spent (`SyncConfig.otherFolderRunSeconds`, 120 s, slice time only: the waits for the turn,
+   the slot and the pacing window do not count, as for the access run of #1109); the account removed
+   (`remove(accountId:)` cancels and awaits it). A folder the run did not finish is read first by the next.
+   *Superseded (2026-11-23):* "the app no longer in the foreground at a slice's turn or slot".
+5. **The catch-up checks every folder** (`catchUpFolderIds`): the syncable ones first, then the others
+   (`CatchUpContext.otherFolderIds`, `CatchUpSchedule.leastRecentlyAttemptedFirst(later:)`), so the other
+   folders' first checks never hold back a due check of the syncable set. An IMAP other folder with no
+   change tracking gets its whole-folder check weekly (`SyncConfig.catchUpOtherFolderFullCheckIntervalSeconds`)
+   instead of daily, because its run cannot fit a deletion check in a slice; a first check and a lapse are
+   not held back. First checks run on any network, as every scan does (#1063). This amends ADR-IOS-107
+   decision 1. *Superseded:* "the syncable folders, then every other folder owed a check after a move
+   retired without proof".
+6. **Unchanged:** the syncable set, the passes and their triggers, the sync timing promises (each is listed
+   in the change's pull request), the startup budget (tabmail-ios memory 042), sync by UID, the one removal
+   core, no mail content stored, nothing provider-specific above the boundary
+   (`ChangeSeamFenceTests.otherFolderRunIsProviderBlindAndUngated`).
+
+**Consequences.** A change made to an other folder elsewhere reaches the device within about 15 minutes
+while the app is open. Cost per run: IMAP with no change tracking, one STATUS per quiet folder; IMAP with
+tracking, one SELECT per folder; Outlook, one delta request per quiet folder; Gmail, nothing. An account's
+first runs also store each folder's first bookmark or baseline, spread over runs by the working time.
+Limits:
+- The run starts only after a clock-due foreground pass: while the app is closed the other folders wait for
+  the next opening.
+- The run passes no re-read list (`ChangeRequest.recheck` is empty): a message a reader could not read in an
+  other folder (an Outlook last verb past the slice's allowance, an answer that could not be used) goes on
+  that folder's re-read list, which the foreground passes already read for a folder outside the synced set,
+  within their per-pass re-read budget (`changeRereadBudgetPerPass`) and after the folders' changes (Outlook)
+  or the Inbox (IMAP). One re-read path, the passes'. A list a read takes over `changeRecheckLimit` is cut
+  in an other folder as in a syncable one, and the folder's catch-up is armed for the cut ids (the catch-up
+  checks every folder, decision 5; a folder holding a bookmark drops it, which leaves the full sync as it
+  was). *Superseded (2026-11-23):* other folders were exempt from the cut, which kept every id because the
+  catch-up never checked them.
+- On IMAP with no change tracking a flag change made elsewhere moves no counter: it arrives with the weekly
+  check, or at once when the user opens the folder (which then follows it, #1109).
+- A folder whose read keeps failing is left out for the rest of its run and goes behind the others in the
+  next.
+- A new-mail follow-up asked for during a slice takes the account's turn in the order the turn's line keeps
+  (first come, first served): it waits for the slice holding the turn plus the slices of the other runs
+  already waiting for it (the older-mail worker, an access run, the other-folder run: at most one each), each
+  at most about 5 s. ios#1360 makes the turn hand the follow-up ahead of them; this change leaves the
+  hand-over as it is (decided 2026-11-23).
+- A slice reads its folder rows inside the turn with the awaited database read, which first awaits the
+  single-flight merge of the notification extension's staged rows. A pass waiting for the turn does the
+  same merge at its own first read (the same awaited read, the same single flight), so the merge only moves
+  earlier and a trigger's time to its first read does not grow (decided 2026-11-23: no change).
+
+Tests: `OtherFolderRunTests` (`OtherFolderRuleTests`: the weekly and daily check, the order, Outlook's
+folders, Gmail's empty read, the dropped bookmark; `OtherFolderIMAPTests`, against `FakeIMAPServer` with and
+without QRESYNC: rule-filed mail arrives after a clock-due pass, the passes send nothing for the other
+folders, a listing-only full sync starts no run, the account's clocks and the folders' coverage stay as they
+were, a quiet folder costs one STATUS, a trigger during a slice gets its stage 2 before the run's next slice,
+waiting is not working time, a folder not reached is read first next run, a listing starts only within the
+slice, a failed folder is left out of the run, a run's listing runs no deletion check, a cut first folder
+does not stop the run (#1358, both modes, run after run), the reader reports a cut read apart from a folder
+not reached and from a pass's cut (`theReaderReportsACutReadApart`), a run's listing is bounded as an
+older-mail request (a new-mail trigger brings the Inbox while the listing's answer is held, and the next run
+lists the folder again), an other folder's whole-folder check is weekly end to end, removing the account
+ends the run when its slice ends (`removingTheAccountEndsTheRun`), a run goes on when the app leaves the
+screen (`aRunGoesOnWhenTheAppLeavesTheScreen`), a slice waits for its slot in the older-mail tier
+(`aSliceTakesTheOlderMailSlot`);
+`OtherFolderRuleTests.outlookRunKeepsTheEnginesOrder`, `OtherFolderRuleTests.listingRequestBound`;
+`OtherFolderSliceRuleTests`: what a slice reports for cut, not reached, moved and failed folders (a folder
+not reached goes ahead of a baseline that moved), an Outlook baseline the reader reports cut, the order
+forgets a folder that is gone (`aGoneFolderLeavesTheOrder`), a listing whose window read the slice's end
+leaves unstarted has not started and owes nothing (`aListingCutBeforeItsReadHasNotStarted`), the account
+parts it ignores (no re-read list), a reader that throws or none; `OtherFolderOutlookTests`: baseline, then
+new, deleted and read changes, a baseline page not passed is cut (`aBaselinePageNotPassedIsCut`), the
+older-mail check works a due syncable folder before a due other folder under one shared budget
+(`olderMailWorksTheSyncableFolderFirst`)), `GmailCatchUpTests.olderMailWorksTheSyncableFolderFirst`,
+`IMAPChangeCondstoreCheckTests.otherFolderRunTakesOneCheckStepPerSlice`,
+`ReleaseBoundaryRecheckTests.applyOverflowIsCutInEveryFolder`, and
+`ChangeSeamFenceTests.otherFolderRunIsProviderBlindAndUngated`. *Superseded (2026-11-23):* "a run starts
+and takes each slice only in the foreground".
+
+Keywords: other folder, other-folder run, startOtherFolderRun, readOtherFolders, readsOtherFolders,
+otherFolderReadOrder, otherFolderAttemptedAt, otherFolderRunSeconds, otherFolderReadShare, ChangeScope
+otherFolders, catchUpOtherFolderFullCheckIntervalSeconds, otherFolderIds, catchUpFolderIds,
+listingNotStarted, listedByFullSync, changeRecheckLimit, later wakes, rule-filed mail, folder outside the
+syncable set, 15-minute clock, clockDue, readCut, cut folder, tried, slow link, ListingRequestBound,
+listing bound, catchUpRequestTimeoutSeconds, Outlook baseline page not passed, baselining readCut, #1110,
+#1358, runRemovalCheck, removal check step, CONDSTORE without QRESYNC, per provider call, account removal,
+headerFetch slot, staging merge, firstFolderDeadline, forFirstFolder, slow NOOP, first folder in the slice, pendingCheck kept.
+
+### Amendment 2026-11-26 (#1363): a folder the older-mail walk found empty is held whole
+
+**Context.** Decision 3 lets a baseline insert nothing in a folder with no held range, and Outlook's reader
+(decision 5) fetches nothing for it. The older-mail walk sets the held range (`Folder.oldestSyncedDate`) only
+from messages it sees, so a folder it finds empty is marked complete (`Folder.backfillComplete`) with no range.
+Mail that landed there after the walk and before the folder's first read was skipped by that read, and the
+bookmark then passed it: later reads report only later changes, and the Outlook catch-up lists only the ranges
+between the folder's own rows, of which there are none. It stayed missing from the folder's list and from
+search until the user opened the folder. This shows on folders outside the syncable set, whose first read is
+the other-folder run's (#1110): a synced folder's window listing fetches its newest `syncMessageLimit`
+messages, and sets its range once the folder holds that many. IMAP already holds the whole folder once its walk
+has completed (`IMAPProvider.heldRangeStart`, amendment 2026-11-16).
+
+**Decision.**
+1. **A folder with no held range whose older-mail walk has completed holds the whole folder.** A baseline
+   record inserts a message the folder lacks whatever the message's date. The apply reads `backfillComplete`
+   from the folder row it already loads in the folder's transaction (`SyncEngine.applyChangeRecord`). Outlook's
+   reader fetches the headers of every such message (`ExchangeProvider.needsHeader`, from
+   `ChangeFolder.olderMailComplete`, which `SyncEngine.changeFolder` already fills). Before the walk has
+   completed, a folder with no range still inserts and fetches nothing: the walk takes what is there.
+2. **A completed walk never widens a held range.** A folder with a range keeps decision 3: mail below the
+   range of a walked folder is the older-mail catch-up's (ADR-IOS-107: once the walk has completed, it lists
+   a folder that holds rows down to the epoch). A folder with no rows has no such listing, which is why the
+   no-range case above needed its own rule.
+3. **Resets are unchanged.** Every reset clears `backfillComplete` in the same write that clears or
+   re-anchors the range (`resetSyncStateTxn`, the startup resets and the shipped migration clear both;
+   Smart Reindex's `resetCrawlState` anchors the range at now), so decision 3's folder "after a reset" still
+   inserts nothing until its walk runs again.
+4. **Nothing new is stored or asked.** No new query, statement, column or migration, and no new kind of
+   request: Outlook's first read already fetches missing messages in `$batch`es, within its time budget and
+   request allowance. Only Outlook's first read carries records today (IMAP's and Gmail's set the bookmark
+   only), so nothing changes for them; the apply's rule stays provider-neutral.
+5. **Sync timing promises: unchanged** (each is listed in the change's pull request). No trigger, gate, turn,
+   deadline, skip, IDLE step or start-of-pass work changes. The header fetches run inside the read's own budget
+   and allowance; a pass reads tracked folders and the Inbox before folders on their first read; an
+   other-folder slice stays one slice; nothing is added to the startup or return path.
+
+**Consequences.**
+- A folder the walk completed empty is healed by its first read on a build with this change, mail moved in
+  with an older date included. A folder whose first read ran on an earlier build keeps what that read skipped
+  until it is opened.
+- Cost: one header fetch per message the folder lacks, inside the read's allowance; a long first read goes on
+  across slices and runs (#1358), and bodies follow by the download rules. Under a storage limit such a folder
+  may take more mail than the walk would have; the storage prune trims it as it does any folder, and a
+  re-baseline loads trimmed mail again, as for any folder.
+- The reader decides from the folder as its read began (`ChangeFolder`, a value snapshot), the apply from the
+  row in its transaction. A reset while a read is under way leaves the apply inserting nothing (the row's
+  `backfillComplete` is false again). A walk that completes while a first read is under way: that read keeps
+  the earlier rule, and the baseline's later reads take the new one.
+
+Tests: `OutlookChangeReadingTests` (`baselineWithNoHeldRangeAfterTheWalkTakesEveryMessage`, `needsHeaderRule`,
+`baselineFetchesOnlyWithinTheHeldRange` with and without a completed walk, `baselineWithNoHeldRangeInsertsNothing`
+before the walk), `ChangeApplyTests.firstReadInsertsWithinTheHeldRange`, and end to end on the Graph fake
+`OtherFolderOutlookTests.mailAfterAnEmptyWalkComesInWithTheFirstRead` (the walk finds an other folder empty, a
+new and an older moved-in message land, the run's first read inserts both).
+
+Keywords: #1363, walked empty, empty folder, no held range, held whole, oldestSyncedDate nil, backfillComplete,
+olderMailComplete, needsHeader, heldRangeApplies, first read, baseline gate, older-mail walk completed, moved in
+with an older date, other-folder run, IMAP heldRangeStart rule.

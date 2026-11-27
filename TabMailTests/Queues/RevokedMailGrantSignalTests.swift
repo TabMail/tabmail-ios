@@ -267,7 +267,13 @@ struct RevokedMailGrantSignalTests {
                 #expect(current?.outboxStatus == .failed,
                         "\(kind): the failed send changed state before the user pressed Retry")
                 #expect(AccountManager.shared.retryOutboxMessage(seeded.id))
+                // Retry starts its own drain in an unawaited task. When that drain
+                // takes the outbox first, this call returns at once
+                // (`isDrainingOutbox`) while the send is still on its way, so the
+                // row is read only once no drain owns the outbox.
                 await AccountManager.shared.drainOutbox()
+                try #require(await OutboxDrainLatch.waitForClear(),
+                             "\(kind): the drain after Retry never let the outbox go")
                 let sent = try await f.pool.read { db in try OutboxMessage.fetchOne(db, key: seeded.id) }
                 #expect(sent == nil, "\(kind): the kept send did not go out after signing in")
                 #expect(reachedTheServer(routes.sendPath) == 1)

@@ -209,7 +209,7 @@ extension SyncEngine {
     /// allocated size of the files in Application Support, reached the limit, walked
     /// again before every folder, every page and every deleted row (that check ran
     /// inside the batch's write). A delete never shrinks a SQLite file (the pages it
-    /// frees go to the freelist, and auto_vacuum is off), so that size never fell and
+    /// frees go to the freelist, and auto_vacuum was off), so that size never fell and
     /// every run trimmed every folder to its floor. The release after each batch was
     /// not awaited.
     nonisolated static func runPruneIfOverBudget(
@@ -1312,7 +1312,11 @@ extension SyncEngine {
     ///
     /// `Mutex` (SE-0433) per the Resilience rule — not `NSLock`, not
     /// `nonisolated(unsafe)`.
-    private static let plannerStatisticsRefreshInFlight = Mutex<Bool>(false)
+    ///
+    /// The email database's switch to `auto_vacuum = INCREMENTAL` holds it too
+    /// (`switchEmailDatabaseToIncremental`), so no `ANALYZE` stores its marker
+    /// between that switch's `VACUUM` and its carry of the marker.
+    static let plannerStatisticsRefreshInFlight = Mutex<Bool>(false)
 
     /// The SQLite `schema_version` right now, or `nil` if it could not be read.
     ///

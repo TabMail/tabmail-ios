@@ -163,9 +163,10 @@ enum AppDataWiper {
         // 2. Disconnect Device Sync WebSocket.
         DeviceSyncService.shared.disconnect()
 
-        // Reclaim disk space — VACUUM can't run inside a transaction
+        // Reclaim disk space — VACUUM can't run inside a transaction. It also leaves
+        // the database on auto_vacuum = INCREMENTAL (ADR-IOS-121).
         try? await dbPool.writeWithoutTransaction { db in
-            try db.execute(sql: "VACUUM")
+            try DatabaseVacuum.vacuum(db)
         }
 
         // 5b. Delete outbox attachment files from disk

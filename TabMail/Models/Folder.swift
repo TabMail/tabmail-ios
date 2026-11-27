@@ -42,6 +42,15 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     var unreadCount: Int
     var totalCount: Int
     var isFavorite: Bool = false
+    /// A user action landed in this folder (#1109): opening it, a move, archive
+    /// or delete with it as source or destination, or opening one of its
+    /// messages. A followed folder is in the syncable set
+    /// (`SyncEngine.isSyncable`) as a favourite is. Set once, never cleared; a
+    /// renamed IMAP folder is a new row and starts unfollowed. Not part of the
+    /// record's persistence (`Folder.followedColumn`): its one writer is
+    /// `SyncEngine.markFollowed`, so a whole-record write from an older read can
+    /// never clear it.
+    var isFollowed: Bool = false
 
     /// Whether progressive backfill has completed for this folder (all messages within age limit synced)
     var backfillComplete: Bool = false
@@ -276,6 +285,11 @@ struct Folder: Codable, FetchableRecord, PersistableRecord, Identifiable, Hashab
     /// every other column is encoded, so a new field cannot be dropped from
     /// here unnoticed.
     static let listingCounterColumns: Set<String> = ["totalCount", "lastKnownUidNext", "lastKnownHighestModSeq"]
+
+    /// The follow mark (`isFollowed`) is not part of the record's persistence
+    /// either: a whole record insert, update or save never writes it. Its one
+    /// writer is the column-scoped `SyncEngine.markFollowed` (#1109).
+    static let followedColumn = "isFollowed"
 
     func encode(to container: inout PersistenceContainer) throws {
         container["id"] = id

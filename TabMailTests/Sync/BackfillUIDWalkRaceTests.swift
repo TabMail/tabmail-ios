@@ -101,6 +101,15 @@ struct BackfillUIDWalkRaceTests {
             await engine.runBackfill(account: account, deadline: F.deadline())
         }
 
+        /// One backfill call, as `call()`, with the walk's own result kept
+        /// apart from the older-mail check's. The check runs after the walk in
+        /// the same call and covers this folder too (it is not a synced folder,
+        /// #1110), so the call's combined result can be the check's progress
+        /// alone (#1558). A test of what the walk reports reads `walked`.
+        func cycle() async -> SyncEngine.BackfillCycle {
+            await engine.runBackfillCycle(account: account, deadline: F.deadline(), walkAllowed: true)
+        }
+
         func callUntilComplete() async throws {
             for _ in 0..<BackfillUIDWalkRaceTests.convergenceCalls {
                 if try row().backfillComplete { return }
@@ -403,14 +412,15 @@ struct BackfillUIDWalkRaceTests {
 
     /// Walk the folder of `walk` (resumed at `cursor`) once, with `reset`
     /// landing while the server holds the SEARCH of the walk's top range,
-    /// before that range's empty answer is confirmed. Returns the call's
-    /// result and whether the reset finished inside the hold.
+    /// before that range's empty answer is confirmed. Returns whether the
+    /// call's walk did work (`Walk.cycle()`) and whether the reset finished
+    /// inside the hold.
     private static func resetDuringTopRangeSearch(
         _ walk: Walk, _ reset: UserReset, cursor: Int = resumedCursor
-    ) async -> (didWork: Bool, resetInsideHold: Bool) {
+    ) async -> (walked: Bool, resetInsideHold: Bool) {
         let topRange = ":\(cursor)"
         walk.server.stallNextCommand(containing: topRange, seconds: searchStallSeconds)
-        let call = Task { await walk.call() }
+        let call = Task { await walk.cycle().walked }
         var sent = false
         for _ in 0..<commandWaitPolls {
             if walk.server.recordedCommands().contains(where: { $0.contains(topRange) }) { sent = true; break }
@@ -489,7 +499,7 @@ struct BackfillUIDWalkRaceTests {
     /// 5000) lands after its workers joined, before its final write. That
     /// completion is the first thing it writes after the reset: it is refused,
     /// so the reset folder is not marked complete without UID 5000, and the
-    /// call, which loaded nothing and landed nothing, reports no work.
+    /// call's walk, which loaded nothing and landed nothing, reports no work.
     @Test("A reset between a walk's last range and its completion: the completion is refused and the call reports no work",
           arguments: UserReset.allCases)
     func resetBeforeTheWalkEndWrite(_ reset: UserReset) async throws {
@@ -516,7 +526,7 @@ struct BackfillUIDWalkRaceTests {
             progressCursor.set(row?.backfillUidCursor)
             await reset.run(on: walk, missingLocally: [Self.aboveCursor])
         }
-        let didWork = await walk.call()
+        let walked = await walk.cycle().walked
 
         #expect(progressVersion.get().map { $0 > versionBefore } == true,
                 "\(reset): precondition: the walk's own progress write landed before the reset (version \(versionBefore) then \(String(describing: progressVersion.get())), cursor \(String(describing: progressCursor.get())))")
@@ -524,7 +534,7 @@ struct BackfillUIDWalkRaceTests {
         #expect(!row.backfillComplete, "\(reset): the stale walker completed the reset folder")
         let claim = try walk.claim()
         #expect(claim == nil, "\(reset): after the walker's call, \(claim ?? "")")
-        #expect(!didWork, "\(reset): the call's only write after the reset was refused and it loaded nothing, yet it reported work")
+        #expect(!walked, "\(reset): the call's only write after the reset was refused and it loaded nothing, yet its walk reported work")
 
         try await walk.callUntilComplete()
         #expect(try walk.row().backfillComplete, "\(reset): the folder's walk never completed again after the reset")
@@ -647,12 +657,12 @@ struct BackfillUIDWalkRaceTests {
             cursor: lastRangeCursor, localUIDs: [Self.aboveCursor], pool: pool)
         defer { Self.tearDown(walk) }
 
-        let didWork = await walk.call()
+        let walked = await walk.cycle().walked
 
         let row = try walk.row()
         #expect(row.backfillComplete && row.backfillUidCursor == nil,
                 "after one call: complete \(row.backfillComplete), cursor \(String(describing: row.backfillUidCursor))")
-        #expect(didWork, "the call completed the folder, yet reported no work")
+        #expect(walked, "the call completed the folder, yet its walk reported no work")
     }
 
     /// The walk-position write a call makes, refused because a reset landed.
@@ -666,8 +676,10 @@ struct BackfillUIDWalkRaceTests {
     }
 
     /// The reset lands before the call's walk-position writes, and the call
-    /// has nothing to load, so nothing it did landed. It must report no work,
-    /// or the worker paces the next call as if it had made progress.
+    /// has nothing to load, so nothing it did landed. Its walk must report no
+    /// work, or the worker paces the next call as if it had made progress.
+    /// The older-mail check that runs in the same call reports its own
+    /// progress, so the test reads the walk's result (`Walk.cycle()`).
     @Test("A call whose walk-position writes were refused, and which loaded nothing, reports no work",
           arguments: RefusedWrite.allCases)
     func refusedWriteIsNoWork(_ write: RefusedWrite) async throws {
@@ -675,7 +687,7 @@ struct BackfillUIDWalkRaceTests {
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
         defer { F.clearWalkCheckpoints() }
 
-        let didWork: Bool
+        let walked: Bool
         let walk: Walk
         switch write {
         case .emptyMailboxCompletion:
@@ -684,14 +696,14 @@ struct BackfillUIDWalkRaceTests {
             F.atCheckpoint(1, .beforeFreshBookkeepingWrite(folderId: walk.folderId)) {
                 await UserReset.accountReset.run(on: walk, missingLocally: [])
             }
-            didWork = await walk.call()
+            walked = await walk.cycle().walked
         case .walkEndWrite:
             walk = try await Self.makeWalk(
                 accountId: "uid-race-no-work-\(write)", serverUIDs: [Self.aboveCursor],
                 cursor: Self.resumedCursor, localUIDs: [Self.aboveCursor], pool: pool)
             let (result, resetInsideHold) = await Self.resetDuringTopRangeSearch(walk, .accountReset)
             #expect(resetInsideHold, "precondition: the reset landed while the top range's SEARCH was held")
-            didWork = result
+            walked = result
         }
         defer { Self.tearDown(walk) }
 
@@ -699,7 +711,7 @@ struct BackfillUIDWalkRaceTests {
         let loaded = try walk.local()
         #expect(!row.backfillComplete && row.backfillUidCursor == nil && loaded.isEmpty,
                 "\(write): precondition: nothing the call did landed (complete \(row.backfillComplete), cursor \(String(describing: row.backfillUidCursor)), loaded \(loaded.sorted()))")
-        #expect(!didWork, "\(write): the call landed nothing, yet reported work")
+        #expect(!walked, "\(write): the call landed nothing, yet its walk reported work")
     }
 
     // MARK: - (4) A change read proves a fetched message gone before its insert (#755)

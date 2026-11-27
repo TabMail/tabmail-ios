@@ -374,8 +374,10 @@ struct SyncRunBannerEntryPointTests {
     /// listed the folders on screen). RED while a busy change read counted as
     /// read, and with a busy refresh left out of the completion stamp. A pass
     /// that queued behind A's listing takes A's turn when the listing ends, so
-    /// A's change read, which follows its listing, finds it held. With A free,
-    /// the same refresh clears.
+    /// A's change read, which follows its listing, finds it held. The refresh
+    /// also starts the access run of the folders on screen (#1109), which waits
+    /// behind the held pass; after it, the flag's follow-up reads A once,
+    /// before the next refresh. With A free, the same refresh clears.
     @Test("a unified-inbox refresh whose change read finds an account busy never clears")
     func busyChangeReadRefreshNeverClears() async throws {
         try await withWorld { world in try await withAppSchedulerRecording { stages in
@@ -429,18 +431,33 @@ struct SyncRunBannerEntryPointTests {
             #expect(stamped, "a refresh that found an account busy did not advance \"Updated\"")
 
             // The flag's follow-up (the app's scheduler only records its asks),
-            // then the same refresh with A free.
+            // then the same refresh with A free. The refresh also started the
+            // access run of the folders on screen (#1109), which waits behind the
+            // held pass: the order is fixed so the asks are the same every run.
+            // The pass hands the turn to the run's slice; the slice ends with the
+            // turn free and the flag still set, which asks again; then the
+            // follow-up below finds the turn free.
+            let runInLine = Date().addingTimeInterval(10)
+            while await engine.syncPassWaiters[accountId]?.count != 1, Date() < runInLine {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let accessRunWaits = await engine.syncPassWaiters[accountId]?.count == 1
+            #expect(accessRunWaits, "the busy refresh started the access run of the folders on screen, which waits behind the held pass")
             release.continuation.yield()
             if let pass = held.withLock({ $0 }) { await pass.value }
+            guard accessRunWaits else { return }
+            await engine.awaitAccessCatchUpForTesting(accountId: accountId)
+            let readsBeforeFollowUp = await world.providerA.changeRequests.count
             _ = await AccountManager.shared.followUpRun(world.accountA, mayStart: { true })
             // The follow-up's pass started A's backfill worker, whose catch-up
             // takes A's turn soon after, even with nothing to catch up; the last
             // refresh below needs A free (#1340).
             await engine.stopBackfillWorkerForTesting(accountId: accountId)
-            let followUpReads = await world.providerA.changeRequests.count
+            let followUpReads = await world.providerA.changeRequests.count - readsBeforeFollowUp
             let stillWanted = await engine.followUpWanted(accountId: accountId)
             let flagServed = !stillWanted
-            #expect(followUpReads == 1, "the follow-up did not read the busy account once: \(followUpReads) reads")
+            #expect(readsBeforeFollowUp == 0, "precondition: nothing read A before its follow-up")
+            #expect(followUpReads == 1, "the follow-up stage 2 read A once, after the held pass and before the next refresh: \(followUpReads) reads")
             #expect(flagServed, "the follow-up left the flag set")
             let settle = Date().addingTimeInterval(10)
             while await engine.syncPassRunning.contains(accountId), Date() < settle {

@@ -92,6 +92,19 @@ struct CatchUpContext: Sendable {
     /// Longest one catch-up request may take (`SyncConfig.catchUpRequestTimeoutSeconds`).
     /// A test shortens it to time a request out without waiting seconds.
     var requestTimeoutSeconds = SyncConfig.catchUpRequestTimeoutSeconds
+    /// The folders a user action just landed in (#1109): this call belongs to the
+    /// catch-up run that action started (`SyncEngine.folderAccessed`). A provider
+    /// may check such a folder where its own schedule would not yet (IMAP with no
+    /// mod-sequences, `IMAPProvider.catchUpPlan`). Empty for the backfill worker's
+    /// runs.
+    var accessedFolderIds: Set<String> = []
+    /// The folders outside the syncable set among those this call is asked
+    /// about (#1110: no main role, not a favourite, no user action landed in
+    /// them; an other-folder run reads their changes). A provider works them
+    /// after every other folder (`CatchUpSchedule.leastRecentlyAttemptedFirst`),
+    /// and may give them a longer periodic check (IMAP,
+    /// `SyncConfig.catchUpOtherFolderFullCheckIntervalSeconds`).
+    var otherFolderIds: Set<String> = []
     /// Requests charged so far, shared by every copy of this context.
     private let charged = OSAllocatedUnfairLock<Int>(initialState: 0)
 
@@ -322,18 +335,26 @@ enum CatchUpSchedule {
     /// True when the folder has never completed a listing, or its last one
     /// completed at least `interval` ago. A provider with a periodic check passes
     /// its own interval from `SyncConfig`, below the provider boundary (IMAP:
-    /// daily). Gmail has no periodic check (`GmailProvider.catchUpPlan`).
+    /// daily, weekly for an other folder, #1110). Gmail has no periodic check
+    /// (`GmailProvider.catchUpPlan`).
     static func fullCheckDue(lastCompletedAt: Date?, now: Date, interval: TimeInterval) -> Bool {
         guard let lastCompletedAt else { return true }
         return now.timeIntervalSince(lastCompletedAt) >= interval
     }
 
-    /// `folders` in the order a slice works them: never-tried first, then by the
-    /// last try (a completion is a try), so a folder whose requests keep failing
-    /// goes behind the others and cannot hold their catch-up past its bound.
-    /// Stable on the caller's order for ties.
-    static func leastRecentlyAttemptedFirst(_ folders: [Folder], lastAttemptAt: (Folder) -> Date?) -> [Folder] {
+    /// `folders` in the order a slice works them: the folders in `later` (the
+    /// other folders, `CatchUpContext.otherFolderIds`, #1110) after all the
+    /// rest, so their first checks never hold back a due check of the syncable
+    /// set; in each group never-tried first, then by the last try (a completion
+    /// is a try), so a folder whose requests keep failing goes behind the others
+    /// and cannot hold their catch-up past its bound. Stable on the caller's
+    /// order for ties.
+    static func leastRecentlyAttemptedFirst(
+        _ folders: [Folder], later: Set<String> = [], lastAttemptAt: (Folder) -> Date?
+    ) -> [Folder] {
         folders.enumerated().sorted { lhs, rhs in
+            let lLater = later.contains(lhs.element.id), rLater = later.contains(rhs.element.id)
+            if lLater != rLater { return rLater }
             let l = lastAttemptAt(lhs.element) ?? .distantPast, r = lastAttemptAt(rhs.element) ?? .distantPast
             return l == r ? lhs.offset < rhs.offset : l < r
         }.map(\.element)

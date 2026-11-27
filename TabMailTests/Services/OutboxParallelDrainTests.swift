@@ -214,7 +214,7 @@ struct OutboxParallelDrainTests {
         await withTaskGroup(of: Void.self) { group in
             for draft in drafts {
                 group.addTask {
-                    try? await mock.send(draft: draft)
+                    _ = try? await mock.send(draft: draft)
                 }
             }
         }

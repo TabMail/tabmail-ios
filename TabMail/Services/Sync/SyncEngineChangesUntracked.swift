@@ -75,9 +75,29 @@ extension SyncEngine {
     /// changed folder the window listing (which writes the folder's counters)
     /// and the deletion check on that listing's count. Returns what the refresh
     /// did (`UntrackedRefresh`).
+    /// - Parameter otherFolderSlice: the request bound of the other-folder run's
+    ///   slice this refresh belongs to (#1110), nil for a pass. A listing starts
+    ///   only while the slice has budget (`.listingNotStarted` otherwise: the run
+    ///   lists the folder in a later slice), and each of its requests is bounded
+    ///   as a request of the older-mail check (`ListingRequestBound`): a window
+    ///   read the slice's end leaves unstarted (`ListingRequestBound.Cut`, after
+    ///   the epoch check) is a listing not started (`.listingNotStarted`); one
+    ///   the request limit cuts proves nothing (`.unproven`). Either way the
+    ///   folder's counters stay as they were, so it stays changed and a later
+    ///   slice or run lists it, and the run's listing owes no deep pass and
+    ///   marks nothing due (`listFolder`); the listing shows no download count
+    ///   (no pass is running to clear it); and a due mark alone
+    ///   (`FolderChangeState.listingDue`) does not list the folder, only counters
+    ///   that moved or a check the reader owes (`UntrackedObservation.mustList`).
+    ///   The listing runs no deletion check (its walk can take longer than a
+    ///   slice) and leaves any due mark as it is; the catch-up's weekly
+    ///   whole-folder check of an other folder removes what the check would
+    ///   have. *Superseded (#1110):* "A deletion check cut by a slice's end
+    ///   leaves that mark, and honouring it would list the folder again in every
+    ///   run".
     func refreshUntrackedFolder(
         folderId: String, observation: UntrackedObservation, account: Account, provider: any EmailProvider,
-        deadline: Date? = nil, pass: UUID? = nil
+        deadline: Date? = nil, pass: UUID? = nil, otherFolderSlice: ListingRequestBound? = nil
     ) async throws -> UntrackedRefresh {
         guard let folder = try await dbPool.read({ db in try Folder.fetchOne(db, key: folderId) }),
               !folder.path.isEmpty, folder.uidValidityResetPendingAt == nil else { return .notListed }
@@ -92,10 +112,11 @@ extension SyncEngine {
             return .notListed
         }
 
+        let markedDue = otherFolderSlice == nil && FolderChangeState(raw: folder.changeState).listingDue
         guard Self.untrackedFolderChanged(
             observation: observation, lastKnownUidNext: folder.lastKnownUidNext,
             totalCount: folder.totalCount, lastKnownHighestModSeq: folder.lastKnownHighestModSeq,
-            listingDue: FolderChangeState(raw: folder.changeState).listingDue || observation.mustList) else {
+            listingDue: markedDue || observation.mustList) else {
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) unchanged (uidNext=\(observation.uidNext), count=\(observation.messageCount), modseq=\(observation.highestModSeq.map(String.init) ?? "-"))")
             // A quiet folder is the one that would otherwise never get an epoch.
             // Bootstrap only (never an overwrite); the binding predicates are
@@ -106,13 +127,18 @@ extension SyncEngine {
             return .notListed
         }
 
+        if let otherFolderSlice, !otherFolderSlice.slice.hasBudget() {
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) changed: no slice time left to start its listing — later slice")
+            return .listingNotStarted
+        }
         BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name) changed (uidNext: \(folder.lastKnownUidNext ?? 0)→\(observation.uidNext), count: \(folder.totalCount)→\(observation.messageCount))")
         let newCount = max(0, observation.messageCount - folder.totalCount)
-        if newCount > 0 { publishDownloading(newCount, forAccount: account.id) }
+        if newCount > 0, otherFolderSlice == nil { publishDownloading(newCount, forAccount: account.id) }
         // The listing writes the folder's counters from its own selection, with
         // its rows (`runSyncMessages`); this observation only decided to list.
         // One classifier (`listFolder` → `runListing`): no error escapes it.
-        let outcome = await listFolder(folder, provider: provider, limit: SyncConfig.syncMessageLimit, pass: pass)
+        let outcome = await listFolder(
+            folder, provider: provider, limit: SyncConfig.syncMessageLimit, pass: pass, bound: otherFolderSlice)
         try Task.checkCancellation()
         // ADR-IOS-051 phase 2: the live local count against the count of the
         // listing that just ran, never the observation's. A listing that
@@ -124,6 +150,12 @@ extension SyncEngine {
         case .notListable:
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): not listable — skipping")
             return .notListed
+        case .unproven(_, _, let error?) where error is ListingRequestBound.Cut:
+            // The slice ended before the window read could start (after the
+            // epoch check): nothing of the listing was asked, so it has not
+            // started, and a later slice lists the folder.
+            BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): slice ended before its window read — later slice")
+            return .listingNotStarted
         case .unproven:
             BackgroundSyncLogger.logDebug("[Sync] Untracked \(folder.name): listing unproven — skipping")
             return .unproven
@@ -132,6 +164,10 @@ extension SyncEngine {
             return .notListed
         }
         guard let serverCount = result.listedCounters?.messageCount else { return .unproven }
+        // An other-folder run's listing ends here (#1110): the deletion check
+        // can walk the whole folder, longer than a slice, and the catch-up's
+        // weekly whole-folder check of an other folder removes what it would.
+        guard otherFolderSlice == nil else { return .listed }
         // Bounded by the pass's deadline: this runs inside the account's turn.
         await reconcileDeletionsAfterListing(
             folder: folder, provider: provider, serverCount: serverCount, logPrefix: "[Sync] Untracked", deadline: deadline)
@@ -149,4 +185,39 @@ enum UntrackedRefresh: Sendable, Equatable {
     /// A listing started and failed to prove its window (a short FETCH, an
     /// EXISTS 0 not confirmed): the pass's full-sync stamp is withheld.
     case unproven
+    /// Changed, but the other-folder run's slice had no time left to start its
+    /// listing, or its window read after the epoch check (#1110): the run lists
+    /// it in a later slice. Never for a pass.
+    case listingNotStarted
+}
+
+/// The bound of a listing in an other-folder run's slice (#1110), the same as
+/// a request of the older-mail check (each provider's `catchUpFolder`). A request
+/// is one provider call (the epoch check's sample, the listing's window read),
+/// bounded as a whole: the call starts only while the slice has time, and the
+/// listing waits for it at most `timeoutSeconds` (the run's
+/// `CatchUpContext.requestTimeoutSeconds`, `SyncConfig.catchUpRequestTimeoutSeconds`).
+/// The limit covers everything inside the call: the connection checkout, a
+/// connect and login on a cold session, SELECT, and the FETCH or SEARCH, and
+/// `withTimeout` returns at the limit whether or not the call stops at once.
+/// So a command of a call that started before the slice's end may start after
+/// it, and the slice holds the account's turn at most to its end plus one
+/// request, as an older-mail slice does. A read cut or timed out throws before
+/// the listing writes anything: the listing proved nothing, the folder stays
+/// changed, and a later slice or run lists it.
+struct ListingRequestBound: Sendable {
+    /// The slice's time.
+    let slice: ChangeContext
+    /// Longest one request may take.
+    let timeoutSeconds: TimeInterval
+
+    /// The slice's time ran out before a request of the listing could start.
+    struct Cut: Error {}
+
+    /// `operation` as one request: not started once the slice is over, and
+    /// abandoned (`TimeoutError`) after `timeoutSeconds`.
+    func request<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        guard slice.hasBudget() else { throw Cut() }
+        return try await withTimeout(seconds: timeoutSeconds, operation: operation)
+    }
 }

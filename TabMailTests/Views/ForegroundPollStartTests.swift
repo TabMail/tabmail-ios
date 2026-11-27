@@ -201,7 +201,8 @@ struct ForegroundPollStartTests {
         #expect(root.components(separatedBy: ".startForegroundPolling()").count - 1 == 1,
                 "RootView calls startForegroundPolling in one place")
 
-        // App-wide, the only other caller is Settings' database reset.
+        // App-wide, the only other callers are Settings' database reset and the
+        // one-time database upgrade's exit while the app is active (ADR-IOS-121).
         var callers: [String: Int] = [:]
         let appRoot = Self.projectRoot.appendingPathComponent("TabMail")
         let files = FileManager.default.enumerator(at: appRoot, includingPropertiesForKeys: nil)
@@ -211,7 +212,7 @@ struct ForegroundPollStartTests {
             let calls = text.components(separatedBy: ".startForegroundPolling()").count - 1
             if calls > 0 { callers[url.lastPathComponent] = calls }
         }
-        #expect(callers == ["RootView.swift": 1, "SettingsView.swift": 1], "callers: \(callers)")
+        #expect(callers == ["RootView.swift": 1, "SettingsView.swift": 1, "DatabaseUpgrade.swift": 1], "callers: \(callers)")
     }
 
     // MARK: - Helpers

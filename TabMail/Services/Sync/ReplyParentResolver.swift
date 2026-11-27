@@ -31,6 +31,13 @@ enum ReplyParentResolver {
     struct SentCopy: Sendable {
         let inReplyTo: String?
         let subject: String
+
+        /// Whether this copy is a forward, not a reply: its subject starts with a
+        /// forward prefix (`ThreadUtils.hasForwardPrefix`), whatever its
+        /// `In-Reply-To` says. The one rule every reader of a stored Sent copy
+        /// applies: `markParentsReplied` marks such a copy's parent forwarded
+        /// instead of replied, and `hasStoredReply` does not count it as a reply.
+        var isForward: Bool { ThreadUtils.hasForwardPrefix(subject) }
     }
 
     /// Within an open write transaction, mark the local parent messages the
@@ -40,7 +47,7 @@ enum ReplyParentResolver {
     /// when folder is not Sent: early returns without touching the DB.
     ///
     /// A copy whose subject starts with a forward prefix
-    /// (`ThreadUtils.hasForwardPrefix`) is a forward even though it names its
+    /// (`SentCopy.isForward`) is a forward even though it names its
     /// original in `In-Reply-To`: Thunderbird sets `In-Reply-To` on every forward
     /// (it derives it from References whatever the compose kind). Its original is
     /// marked forwarded, never replied, and keeps its "Reply" tag: the user has not
@@ -58,17 +65,18 @@ enum ReplyParentResolver {
         guard folderRole == .sent else { return [] }
         guard !sentCopies.isEmpty else { return [] }
 
-        // Normalize defensively. IMAPProvider normalizes at the boundary
-        // (`IMAPProvider.mapMessageInfo`) but Gmail/Exchange providers pass raw
-        // metadata through — `normalizeMessageId` is idempotent so this costs
-        // nothing when the value was already normalized.
+        // Normalize defensively. Every provider already hands In-Reply-To over
+        // bare (IMAP's `IMAPProvider.mapMessageInfo` through `normalizeMessageId`,
+        // Gmail and RFC 822 parsing through `extractFirstMessageId`; Graph gives
+        // none), and `normalizeMessageId` is idempotent, so this costs nothing
+        // when the value was already normalized.
         var replied = Set<String>()
         var forwarded = Set<String>()
         for copy in sentCopies {
             guard let raw = copy.inReplyTo else { continue }
             let parent = EmailFilter.normalizeMessageId(raw)
             guard !parent.isEmpty else { continue }
-            if ThreadUtils.hasForwardPrefix(copy.subject) {
+            if copy.isForward {
                 forwarded.insert(parent)
             } else {
                 replied.insert(parent)
@@ -204,13 +212,54 @@ enum ReplyParentResolver {
             let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
             var args: [any DatabaseValueConvertible] = [accountId, FolderRole.sent.rawValue]
             for value in slice { args.append(value) }
+            // Named index: where the stored mail has no In-Reply-To (Outlook stores
+            // none), ANALYZE counts all its rows under one value and the planner read
+            // every row of each Sent folder instead (#1563). The index is
+            // migration-built (v13), never deferred or dropped.
             copies += try Row.fetchAll(db, sql: """
                 SELECT DISTINCT r.inReplyTo, r.subject
-                FROM messageHeader r JOIN folder f ON f.id = r.folderId
+                FROM messageHeader r INDEXED BY messageHeader_inReplyTo JOIN folder f ON f.id = r.folderId
                 WHERE r.accountId = ? AND f.role = ? AND r.inReplyTo IN (\(placeholders))
                 """, arguments: StatementArguments(args)).map { SentCopy(inReplyTo: $0["inReplyTo"], subject: $0["subject"]) }
         }
         return try markParentsReplied(sentCopies: copies, folderRole: .sent, accountId: accountId, db: db)
+    }
+
+    /// Whether a reply to the message whose Message-ID is `rfc822MessageId` is
+    /// stored in a Sent folder of `accountId`: a copy there that names it in
+    /// `In-Reply-To` and is not a forward (`SentCopy.isForward`), the evidence
+    /// the two functions above mark a parent replied by. Another app's forward
+    /// that names the message in `In-Reply-To` marks it forwarded there, so it
+    /// is no reply here either. The unsent-removal revert asks it
+    /// (`AccountManager.revertQueuedOriginalChanges`, #1490) so a reply the user
+    /// sent from another client while TabMail's reply waited keeps the original
+    /// replied. It only ever stops a change, so a Message-ID shared by several
+    /// messages never chooses one to change (ADR-IOS-068 D4).
+    ///
+    /// Forced onto `messageHeader_inReplyTo`, it visits only the stored rows
+    /// naming this one Message-ID in `In-Reply-To` (that message's replies and
+    /// the forwards that name it, in any account or folder: a number that does
+    /// not grow with the mailbox) and reads the subjects of those in this
+    /// account's Sent, since the forward rule is Swift's. Every writer stores In-Reply-To
+    /// normalized (Gmail and RFC 822 parsing through
+    /// `EmailFilter.extractFirstMessageId`; IMAP's envelope mapping and the
+    /// extension's `IMAPFetchMapping` through `EmailFilter.normalizeMessageId`;
+    /// the optimistic Sent copy; Graph stores none), so the bare form is the only
+    /// one matched, as `markInsertedParentsOfStoredReplies` matches it.
+    static func hasStoredReply(
+        toRfc822MessageId rfc822MessageId: String?,
+        accountId: String,
+        db: Database
+    ) throws -> Bool {
+        let normalized = rfc822MessageId.map(EmailFilter.normalizeMessageId) ?? ""
+        guard !normalized.isEmpty else { return false }
+        let subjects = try String.fetchAll(db, sql: """
+            SELECT r.subject
+            FROM messageHeader r INDEXED BY messageHeader_inReplyTo
+            JOIN folder f ON f.id = r.folderId
+            WHERE r.inReplyTo = ? AND r.accountId = ? AND f.role = ?
+            """, arguments: [normalized, accountId, FolderRole.sent.rawValue])
+        return subjects.contains { !SentCopy(inReplyTo: normalized, subject: $0).isForward }
     }
 
     /// The set lookup executed by `markParentsReplied`, named so plan coverage

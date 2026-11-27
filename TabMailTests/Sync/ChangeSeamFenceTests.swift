@@ -63,6 +63,27 @@ struct ChangeSeamFenceTests {
         }
     }
 
+    /// The other-folder run (#1110) reads every provider's folders through the
+    /// one change seam, and is a scan: it reads no download gate.
+    @Test("the other-folder run names no concrete provider, tests no account provider, and never reads the network type, the battery or Low Power Mode (#1110)")
+    func otherFolderRunIsProviderBlindAndUngated() throws {
+        let source = try Self.file(Self.sources(), "TabMail/Services/Sync/SyncEngineOtherFolders.swift")
+        for term in [
+            "GmailProvider", "ExchangeProvider", "IMAPProvider", "DemoProvider",
+            ".provider ==", ".provider !=", "provider as?", "provider as!", "as? IMAP", "as! IMAP",
+            "case .gmail", "case .outlook", "case .imap",
+            "checkExpensive", "isExpensiveNetwork", "batteryLevel", "batteryState", "isLowPowerModeEnabled",
+        ] {
+            #expect(!source.contains(term), "SyncEngineOtherFolders.swift names \(term)")
+        }
+        // The runner its slices go through reads no download gate either (it
+        // names no concrete provider: `missingMessageRepairIsProviderBlind`).
+        let runner = try Self.file(Self.sources(), "TabMail/Services/Sync/SyncEngineCatchUp.swift")
+        for term in ["checkExpensive", "isExpensiveNetwork", "batteryLevel", "batteryState", "isLowPowerModeEnabled"] {
+            #expect(!runner.contains(term), "SyncEngineCatchUp.swift names \(term)")
+        }
+    }
+
     @Test("the engine's older-mail check and the repair of missing messages name no concrete provider and test no account provider (#1061)")
     func missingMessageRepairIsProviderBlind() throws {
         let files = try Self.sources().filter {
@@ -171,9 +192,13 @@ struct FolderChangeStateMigrationTests {
         let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
         let column = try #require(columns.first { ($0["name"] as String) == "changeState" })
         #expect((column["notnull"] as Int) == 0)
-        let folder = try #require(try db.read { try Folder.fetchOne($0) })
-        #expect(folder.changeState == nil)
-        #expect(FolderChangeState(raw: folder.changeState).tracking == false)
+        // The raw column, not a `Folder`: the record reads columns later
+        // migrations add (`isFollowed`, v112), which this schema does not have yet.
+        let stateRow = try db.read { try Row.fetchOne($0, sql: "SELECT changeState FROM folder") }
+        let row = try #require(stateRow)
+        let changeState: String? = row["changeState"]
+        #expect(changeState == nil)
+        #expect(FolderChangeState(raw: changeState).tracking == false)
     }
 
     @Test("The state round-trips, and the untracked empty state is stored as NULL")
@@ -203,8 +228,12 @@ struct FolderChangeCursorMigrationTests {
         let columns = try db.read { try Row.fetchAll($0, sql: "PRAGMA table_info(folder)") }
         let column = try #require(columns.first { ($0["name"] as String) == "changeCursor" })
         #expect((column["notnull"] as Int) == 0)
-        let folder = try #require(try db.read { try Folder.fetchOne($0) })
-        #expect(folder.changeCursor == nil)
-        #expect(OutlookFolderCursor(raw: folder.changeCursor) == nil)
+        // The raw column, not a `Folder`: the record reads columns later
+        // migrations add (`isFollowed`, v112), which this schema does not have yet.
+        let cursorRow = try db.read { try Row.fetchOne($0, sql: "SELECT changeCursor FROM folder") }
+        let row = try #require(cursorRow)
+        let changeCursor: String? = row["changeCursor"]
+        #expect(changeCursor == nil)
+        #expect(OutlookFolderCursor(raw: changeCursor) == nil)
     }
 }
