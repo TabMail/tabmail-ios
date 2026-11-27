@@ -53,19 +53,25 @@ struct DatabaseUpgradeView: View {
         "TabMail needs \(ByteCountFormatter.string(fromByteCount: bytesNeeded, countStyle: .file)) free right now. Free up space, then try again."
     }
 
+    /// Centred on the screen while it fits; at large text sizes the content keeps its
+    /// full height and scrolls (#1589), so no text is cut off and every button stays
+    /// reachable.
     var body: some View {
-        VStack(spacing: 20) {
-            Spacer()
-            switch upgrade.screen {
-            case .notice: notice
-            case .upgrading: upgrading
-            case .done: result(title: Self.doneTitle, message: Self.doneMessage, symbol: "checkmark.circle.fill", tint: .green)
-            case .failed: result(title: Self.failedTitle, message: Self.failedMessage, symbol: "exclamationmark.triangle.fill", tint: .orange)
+        GeometryReader { screen in
+            ScrollView {
+                VStack(spacing: 20) {
+                    switch upgrade.screen {
+                    case .notice: notice
+                    case .upgrading: upgrading
+                    case .done: result(title: Self.doneTitle, message: Self.doneMessage, symbol: "checkmark.circle.fill", tint: .green)
+                    case .failed: result(title: Self.failedTitle, message: Self.failedMessage, symbol: "exclamationmark.triangle.fill", tint: .orange)
+                    }
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, minHeight: screen.size.height)
             }
-            Spacer()
+            .scrollBounceBehavior(.basedOnSize)
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Palette.previewPaneBg)
         .keepScreenAwake(while: upgrade.screen == .upgrading)
         .onChange(of: scenePhase) { _, phase in
