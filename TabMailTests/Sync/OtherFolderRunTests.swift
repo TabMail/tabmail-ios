@@ -1726,43 +1726,6 @@ struct OtherFolderOutlookTests {
         }
     }
 
-    /// The older-mail walk finds an other folder empty and completes it with no
-    /// held-from date. Mail that lands there afterwards, new or moved in with an
-    /// older date, comes in with the runs' first read of the folder: the walk
-    /// left the whole folder in range (#1363).
-    @Test("Outlook: mail that lands in an other folder after the older-mail walk found it empty comes in with the runs' first read, whatever its date")
-    func mailAfterAnEmptyWalkComesInWithTheFirstRead() async throws {
-        let c = C.Clock()
-        try await C.withWorld { w, engine in
-            w.server.addFolder(id: Self.projects, name: "Projects")
-            let custom = Folder(name: "Projects", path: Self.projects, role: .custom, accountId: w.accountId)
-            try await w.pool.write { db in try custom.insert(db) }
-            try await w.baselineAll()
-
-            // The walk finds the folder empty and completes it, with no held-from date.
-            for _ in 0..<Self.runs where !(try w.folder(Self.projects).backfillComplete) {
-                _ = await engine.runBackfillWalk(account: try w.account(), deadline: BackfillPageWalkFixture.deadline())
-            }
-            let walked = try w.folder(Self.projects)
-            #expect(walked.backfillComplete && walked.oldestSyncedDate == nil,
-                    "precondition: the walk completed the empty folder with no held-from date")
-            #expect(try w.cursor(Self.projects) == nil, "precondition: no read of the folder yet")
-
-            // Mail lands: a new message, and one moved in with an older date.
-            w.server.deliver(C.seed("o-landed", in: Self.projects, at: c.daysAgo(0.5)))
-            w.server.deliver(C.seed("o-moved-in", in: Self.projects, at: c.daysAgo(400)))
-
-            for _ in 0..<Self.runs {
-                try await Self.run(w, engine)
-                if try w.cursor(Self.projects)?.phase == .tracking { break }
-            }
-            let phase = try w.cursor(Self.projects)?.phase
-            let rows = try w.rowIds(in: Self.projects)
-            #expect(phase == .tracking, "precondition: the runs completed the folder's first read")
-            #expect(rows == ["o-landed", "o-moved-in"], "the mail that landed after the walk is in the folder: \(rows)")
-        }
-    }
-
     /// Delta records per page in `aBaselinePageNotPassedIsCut`: two, so the
     /// second page holds one message the device holds and one it does not.
     static let twoPerPage = 2

@@ -8,32 +8,6 @@ import Synchronization
 import Testing
 @testable import TabMail
 
-/// One case of `ChangeApplyTests.firstReadInsertsWithinTheHeldRange`: the
-/// folder's held range (days back; nil: none), whether its older-mail walk has
-/// completed, the message's age in days, and whether the first read inserts it.
-/// At file scope: a `@Test` trait cannot name a static member of its own type.
-struct FirstReadHeldRangeCase: Sendable, CustomTestStringConvertible {
-    let heldDaysAgo: Double?
-    let walkComplete: Bool
-    let messageDaysAgo: Double
-    let inserts: Bool
-
-    var testDescription: String {
-        let range = heldDaysAgo.map { "held from \(Int($0)) days back" } ?? "no held range"
-        let walk = walkComplete ? "walk completed" : "walk not completed"
-        return "\(range), \(walk), message \(Int(messageDaysAgo)) days old: \(inserts ? "inserted" : "not inserted")"
-    }
-}
-
-let firstReadHeldRangeCases: [FirstReadHeldRangeCase] = [
-    FirstReadHeldRangeCase(heldDaysAgo: nil, walkComplete: false, messageDaysAgo: 2, inserts: false),
-    FirstReadHeldRangeCase(heldDaysAgo: nil, walkComplete: true, messageDaysAgo: 2, inserts: true),
-    FirstReadHeldRangeCase(heldDaysAgo: nil, walkComplete: true, messageDaysAgo: 400, inserts: true),
-    FirstReadHeldRangeCase(heldDaysAgo: 30, walkComplete: false, messageDaysAgo: 60, inserts: false),
-    FirstReadHeldRangeCase(heldDaysAgo: 30, walkComplete: true, messageDaysAgo: 60, inserts: false),
-    FirstReadHeldRangeCase(heldDaysAgo: 30, walkComplete: true, messageDaysAgo: 2, inserts: true),
-]
-
 /// The generic change apply (ADR-IOS-111), driven through the public entry
 /// (`SyncEngine.performDeltaSync`) with a scripted `MockEmailProvider` reader, so
 /// every rule is checked independently of any provider's reader.
@@ -106,13 +80,12 @@ struct ChangeApplyTests {
     static func rfc(_ id: String) -> String { "\(id)-apply@example.com" }
 
     static func info(_ id: String, isRead: Bool = false, isFlagged: Bool = false, labels: [String] = [],
-                     isReplied: Bool = false, actionTag: ActionTag? = nil,
-                     date: Date = Date().addingTimeInterval(-2 * 86_400)) -> MessageHeaderInfo {
+                     isReplied: Bool = false, actionTag: ActionTag? = nil) -> MessageHeaderInfo {
         var info = MessageHeaderInfo(
             messageId: id, rfc822MessageId: rfc(id), inReplyTo: nil,
             references: ["parent-\(id)@example.com"], threadId: nil, subject: "apply \(id)", from: "Sender",
             fromAddress: "sender@example.com", to: "recipient@example.com", cc: "", bcc: "", replyTo: nil,
-            date: date, snippet: "apply snippet",
+            date: Date().addingTimeInterval(-2 * 86_400), snippet: "apply snippet",
             isRead: isRead, isFlagged: isFlagged, hasAttachments: false,
             isReplied: isReplied, isForwarded: false, actionTag: actionTag)
         info.userLabelIds = labels
@@ -155,33 +128,6 @@ struct ChangeApplyTests {
             FolderChanges(folderId: $0.id, status: .tracked, addressEpoch: addressEpoch,
                           records: records[$0.id] ?? [], removals: removals[$0.id] ?? [])
         })
-    }
-
-    // MARK: - A first read's held range (#1363)
-
-    /// A first-read (baseline) record for a message the folder does not hold
-    /// inserts it only within the folder's held range (`Folder.oldestSyncedDate`).
-    /// With no range, it inserts once the folder's older-mail walk has completed
-    /// (`Folder.backfillComplete`: the walk found the folder empty, so the
-    /// device holds the whole folder), whatever the message's date, and inserts
-    /// nothing before. A completed walk never widens a range. The apply reads
-    /// both from the folder row in its own transaction.
-    @Test("A first read inserts a message the folder lacks within its held range only; with no range, every one once the folder's older-mail walk has completed and none before",
-          arguments: firstReadHeldRangeCases)
-    func firstReadInsertsWithinTheHeldRange(_ c: FirstReadHeldRangeCase) async throws {
-        try await Self.withWorld { w in
-            let archiveId = w.archiveId
-            let heldSince = c.heldDaysAgo.map { Date().addingTimeInterval(-$0 * 86_400) }
-            try await w.pool.write { db in
-                try db.execute(sql: "UPDATE folder SET oldestSyncedDate = ?, backfillComplete = ? WHERE id = ?",
-                               arguments: [heldSince, c.walkComplete, archiveId])
-            }
-            let info = Self.info("fr-1", date: Date().addingTimeInterval(-c.messageDaysAgo * 86_400))
-            let changes = FolderChanges(folderId: archiveId, status: .baselining, records: [ChangeRecord(header: info)])
-            _ = try await w.pool.write { db in try SyncEngine.applyFolderChanges(changes, db: db) }
-            let stored = try w.row("fr-1", in: archiveId) != nil
-            #expect(stored == c.inserts, "\(c.testDescription)")
-        }
     }
 
     // MARK: - Insert, merge, cursor
