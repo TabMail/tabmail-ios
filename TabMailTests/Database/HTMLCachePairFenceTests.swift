@@ -47,9 +47,8 @@ struct HTMLCachePairFenceTests {
         "TabMail/Services/Account/AccountManagerUidValidityReset.swift\tAccountManager.uidValidityResetPurgeTxn":
             Allowed(count: 3, reason: "UIDVALIDITY reset: deletes every body in the folder's id range, with or without a header, and by key the bodies of its own headers whose id tail holds a ':'"),
         "TabMail/Services/AI/Tools/AttachmentReadPdfTool.swift\tAttachmentReadPdfTool.readBody": Allowed(count: 1, reason: readsHTML),
-        "TabMail/Services/AI/Tools/EmailForwardTool.swift\tEmailForwardTool.execute": Allowed(count: 1, reason: readsHTML),
+        "TabMail/Services/AI/Tools/EmailComposeTool.swift\tEmailComposeTool.relatedEmail": Allowed(count: 1, reason: readsHTML),
         "TabMail/Services/AI/Tools/EmailReadTool.swift\tEmailReadTool.execute": Allowed(count: 1, reason: readsHTML),
-        "TabMail/Services/AI/Tools/EmailReplyTool.swift\tEmailReplyTool.execute": Allowed(count: 1, reason: readsHTML),
         "TabMail/Services/AppDataWiper.swift\tAppDataWiper.wipeRowsTxn": Allowed(count: 2, reason: "wipe: " + deletesHTML),
         "TabMail/Services/BodyAssetMaintenance.swift\tBodyAssetMaintenance.dropMessage": Allowed(count: 2, reason: deletesHTML),
         "TabMail/Services/BodyAssetMaintenance.swift\tBodyAssetMaintenance.wipeAll": Allowed(count: 2, reason: deletesHTML),
@@ -79,8 +78,6 @@ struct HTMLCachePairFenceTests {
         "TabMail/ViewModels/MessageDetailViewModel.swift\tMessageDetailViewModel.loadBody": Allowed(count: 2, reason: readsHTML),
         "TabMail/ViewModels/MessageDetailViewModel.swift\tMessageDetailViewModel.refetchBody": Allowed(count: 2, reason: readsHTML),
         "TabMail/ViewModels/MessageDetailViewModel.swift\tMessageDetailViewModel.startBodyPoll": Allowed(count: 1, reason: readsHTML),
-        "TabMail/Views/Compose/ComposeView.swift\tComposeView.buildComposeEditContext": Allowed(count: 1, reason: readsHTML),
-        "TabMail/Views/Compose/ComposeView.swift\tComposeView.recomputeReply": Allowed(count: 1, reason: readsHTML),
     ]
 
     static let pairFile = "TabMail/Services/HTMLCachePair.swift"
