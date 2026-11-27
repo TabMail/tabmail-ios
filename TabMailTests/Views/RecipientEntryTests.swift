@@ -147,7 +147,8 @@ struct RecipientEntryTests {
     func everyRecipientIsSendable(text: String) throws {
         let addresses = RecipientEntry(text).addresses
         #expect(!addresses.isEmpty)
-        #expect(try IMAPProvider.sendableRecipients(addresses).map(\.address) == addresses)
+        let sendable = try OutgoingRecipients.sendableRecipients(addresses)
+        #expect(sendable.map(\.address) == addresses)
         for address in addresses { #expect(isValidEmailAddress(address), "\(address)") }
     }
 
@@ -587,8 +588,9 @@ struct RecipientEntryTests {
         #expect(result.tokens == Self.field.tokens)
         #expect(result.rejected == rejected)
         #expect(ComposeDraftGuards.trimmedInput(result.input) == input)
+        // The kept recipient is stored under its name, then the rejected entries.
         let stored = ComposeDraftGuards.committedRecipients(result)
-        #expect(Array(stored.prefix(Self.field.tokens.count + rejected.count)) == Self.field.tokens + rejected)
+        #expect(Array(stored.prefix(1 + rejected.count)) == ["\"Old\" <old@example.com>"] + rejected)
         guard case .refused(let message) = ComposeDraftGuards.sendRecipients(to: result, cc: .init(), bcc: .init()) else {
             Issue.record("Send was not refused")
             return

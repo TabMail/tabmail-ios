@@ -60,11 +60,16 @@ enum RFC5322Parse {
             return Date()
         }()
 
-        let from = EmailAddress.parse(decodeRFC2047(fromRaw))
-        let to = splitAddressList(toRaw).map { EmailAddress.parse(decodeRFC2047($0)) }
-        let cc = splitAddressList(ccRaw).map { EmailAddress.parse(decodeRFC2047($0)) }
-        let bcc = splitAddressList(bccRaw).map { EmailAddress.parse(decodeRFC2047($0)) }
-        let replyTo = replyToRaw.map { EmailAddress.parse(decodeRFC2047($0)) }
+        // Address fields are parsed raw, structure first; the parser decodes an
+        // encoded-word only as a display-name word after that. Decoding the field
+        // before parsing would let a decoded name's `<`, `,` or `"` be read as
+        // structure (see `EmailAddress.sender(of:)`).
+        let from = EmailAddress.sender(of: AddressParser.parseAddressList(fromRaw))
+            ?? EmailAddress(name: "", email: "")
+        let to = EmailAddress.mailboxes(of: AddressParser.parseAddressList(toRaw))
+        let cc = EmailAddress.mailboxes(of: AddressParser.parseAddressList(ccRaw))
+        let bcc = EmailAddress.mailboxes(of: AddressParser.parseAddressList(bccRaw))
+        let replyTo = replyToRaw.flatMap { EmailAddress.mailboxes(of: AddressParser.parseAddressList($0)).first }
 
         let isRead = flags.contains("\\Seen")
         let isFlagged = flags.contains("\\Flagged")
@@ -185,27 +190,5 @@ enum RFC5322Parse {
             i = s.index(after: i)
         }
         return String(data: Data(bytes), encoding: encoding)
-    }
-
-    /// Split an RFC 2822 address list handling quoted display names with commas.
-    private static func splitAddressList(_ s: String) -> [String] {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var out: [String] = []
-        var current = ""
-        var inQuotes = false
-        for c in trimmed {
-            if c == "\"" { inQuotes.toggle(); current.append(c); continue }
-            if c == "," && !inQuotes {
-                let t = current.trimmingCharacters(in: .whitespaces)
-                if !t.isEmpty { out.append(t) }
-                current = ""
-                continue
-            }
-            current.append(c)
-        }
-        let t = current.trimmingCharacters(in: .whitespaces)
-        if !t.isEmpty { out.append(t) }
-        return out
     }
 }

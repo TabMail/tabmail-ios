@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 
 /// Provider-agnostic message header returned by shared API/command layers.
 /// Main app converts to `MessageHeaderInfo` at the boundary; NSE converts to its
@@ -60,24 +61,36 @@ struct EmailAddress: Sendable, Equatable {
         self.email = email
     }
 
-    /// Parse "John Smith <john@example.com>" or bare "john@example.com".
-    static func parse(_ raw: String) -> EmailAddress {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return EmailAddress(name: "", email: "") }
-        // Search for the closing `>` only AFTER the opening `<`. A bare
-        // `firstIndex(of: ">")` matches a `>` that appears earlier — e.g. inside
-        // a quoted display name like `"a@b.com >> Name" <a@b.com>` — yielding
-        // angleEnd < angleStart and a `lowerBound > upperBound` range crash.
-        // Mirrors the safe idiom in EmailFilter.extractFirstMessageId.
-        if let angleStart = trimmed.firstIndex(of: "<"),
-           let angleEnd = trimmed[trimmed.index(after: angleStart)...].firstIndex(of: ">") {
-            let name = String(trimmed[trimmed.startIndex..<angleStart])
-                .trimmingCharacters(in: .whitespaces)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-            let email = String(trimmed[trimmed.index(after: angleStart)..<angleEnd])
-                .trimmingCharacters(in: .whitespaces)
-            return EmailAddress(name: name.isEmpty ? email : name, email: email)
+    /// The sender a message is listed under: the first mailbox of its From
+    /// field, by display name (its address when it has none). A From with no
+    /// valid mailbox is listed under its text with no address, so a malformed
+    /// sender still shows what the sender wrote. `nil` for a message with no From.
+    ///
+    /// IMAP gets the entries from SwiftMail's parse of the server's ENVELOPE
+    /// (`MessageInfo.fromAddresses`, never by re-parsing its `from` string,
+    /// which is header text that joins every author); Gmail and raw RFC 5322
+    /// headers parse the field value with `AddressParser.parseAddressList`.
+    /// That parser reads the whole field's structure first (quoted-strings,
+    /// comments, angle-addrs, list commas) and decodes an encoded-word only as a
+    /// display-name word after that, so no text inside a name, quoted or encoded,
+    /// is ever read as an address or as a list separator.
+    static func sender(of entries: [AddressListEntry]) -> EmailAddress? {
+        if let mailbox = entries.mailboxes.first {
+            return EmailAddress(name: mailbox.name ?? mailbox.address, email: mailbox.address)
         }
-        return EmailAddress(name: trimmed, email: trimmed)
+        let text = entries.compactMap { entry -> String? in
+            switch entry {
+                case .invalid(let text): return text
+                case .group(let name, _): return name
+                case .mailbox: return nil
+            }
+        }.joined(separator: ", ")
+        return text.isEmpty ? nil : EmailAddress(name: text, email: "")
+    }
+
+    /// Every mailbox of an address field, in order, by display name (its
+    /// address when it has none). A group contributes its members.
+    static func mailboxes(of entries: [AddressListEntry]) -> [EmailAddress] {
+        entries.mailboxes.map { EmailAddress(name: $0.name ?? $0.address, email: $0.address) }
     }
 }

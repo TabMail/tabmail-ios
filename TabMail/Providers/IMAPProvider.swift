@@ -7077,9 +7077,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     static func buildEmail(from draft: DraftMessage, senderEmail: String) throws -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
-            recipients: try sendableRecipients(draft.to),
-            ccRecipients: try sendableRecipients(draft.cc),
-            bccRecipients: try sendableRecipients(draft.bcc)
+            recipients: try OutgoingRecipients.sendableRecipients(draft.to),
+            ccRecipients: try OutgoingRecipients.sendableRecipients(draft.cc),
+            bccRecipients: try OutgoingRecipients.sendableRecipients(draft.bcc)
         )
     }
 
@@ -7092,16 +7092,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     static func buildDraftEmail(from draft: DraftMessage, senderEmail: String) -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
-            recipients: draftRecipients(draft.to),
-            ccRecipients: draftRecipients(draft.cc),
-            bccRecipients: draftRecipients(draft.bcc)
+            recipients: OutgoingRecipients.draftRecipients(draft.to),
+            ccRecipients: OutgoingRecipients.draftRecipients(draft.cc),
+            bccRecipients: OutgoingRecipients.draftRecipients(draft.bcc)
         )
-    }
-
-    private static func draftRecipients(_ recipients: [String]) -> [SwiftMail.EmailAddress] {
-        recipients.flatMap { recipient in
-            (try? sendableRecipients([recipient])) ?? [SwiftMail.EmailAddress(address: recipient)]
-        }
     }
 
     /// The recipients as one header field body, each written as a draft writes
@@ -7114,7 +7108,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the comma that follows it when another recipient comes next, so the comma is
     /// counted on the line it ends.
     static func recipientsFieldBody(_ name: String, _ recipients: [String]) -> String {
-        let written = draftRecipients(recipients).map(\.description)
+        let written = OutgoingRecipients.draftRecipients(recipients).map(\.description)
         let tokens = written.enumerated().map { index, recipient in
             index < written.count - 1 ? recipient + "," : recipient
         }
@@ -7163,34 +7157,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     static func threadingMessageIDs(_ ids: [String]) -> [String] {
         ids.filter { !$0.isEmpty && !$0.unicodeScalars.contains { CharacterSet.newlines.contains($0) } }
             .map { $0.hasPrefix("<") ? $0 : "<\($0)>" }
-    }
-
-    /// The mailboxes each recipient names. Compose hands over one address per
-    /// recipient (ADR-IOS-092), but a send queued by an earlier version can hold a
-    /// typed list such as `a@example.com, b@example.com` in one recipient; it goes
-    /// to every mailbox it names. Throws on the first recipient that names no
-    /// mailbox or holds text that is not one (an empty group included). Each mailbox is written again by
-    /// SwiftMail, never copied as text, so no recipient can add a header line.
-    static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
-        try recipients.flatMap { recipient in
-            var mailboxes: [SwiftMail.EmailAddress] = []
-            for entry in AddressParser.parseAddressList(recipient) {
-                switch entry {
-                case .mailbox(let mailbox): mailboxes.append(mailbox)
-                case .group(_, let members):
-                    // A group naming nobody is not an address: beside other
-                    // recipients it fails the send too, never silently dropped.
-                    guard !members.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
-                    mailboxes += members
-                case .invalid:
-                    // Any entry that is not a mailbox fails the whole send, even
-                    // one whose decoded text is empty (`""`): nothing is dropped.
-                    throw SMTPError.invalidEmailAddress(recipient)
-                }
-            }
-            guard !mailboxes.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
-            return mailboxes
-        }
     }
 
     private static func buildEmail(
@@ -8010,7 +7976,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func mapMessageInfo(_ info: MessageInfo, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Shared with the NSE (`NSEIMAPConnection.mapInfoToMetadata`), so both
         // targets list a message under the same sender.
-        let from = IMAPFetchMapping.sender(from: info)
+        let from = EmailAddress.sender(of: info.fromAddresses)
             ?? EmailAddress(name: "Unknown", email: "")
         let fromName = from.name
         let fromAddr = from.email

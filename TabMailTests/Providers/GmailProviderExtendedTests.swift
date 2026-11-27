@@ -242,46 +242,6 @@ struct GmailHasAttachmentPartsExtendedTests {
     }
 }
 
-// MARK: - GmailProvider.parseFromHeader edge cases
-
-@Suite("GmailProvider.parseFromHeader extended")
-struct GmailParseFromHeaderExtendedTests {
-
-    @Test("Handles multiple angle brackets (takes first pair)")
-    func multipleAngleBrackets() {
-        let result = GmailProvider.parseFromHeader("Name <first@test.com> <second@test.com>")
-        #expect(result.address == "first@test.com")
-        #expect(result.displayName == "Name")
-    }
-
-    @Test("Handles name with nested quotes")
-    func nestedQuotes() {
-        let result = GmailProvider.parseFromHeader("\"O'Brien\" <ob@test.com>")
-        #expect(result.displayName == "O'Brien")
-        #expect(result.address == "ob@test.com")
-    }
-
-    @Test("Address-only with surrounding whitespace is trimmed (parser improvement)")
-    func addressWithWhitespace() {
-        // Post-consolidation behavior: EmailAddress.parse trims outer
-        // whitespace. Pre-refactor GmailProvider.parseFromHeader preserved
-        // whitespace, which meant GRDB-stored addresses could include
-        // surrounding whitespace — a latent data-quality bug. Trimmed
-        // output is the intentional improvement; downstream consumers
-        // see clean email addresses.
-        let result = GmailProvider.parseFromHeader("  user@test.com  ")
-        #expect(result.displayName == "user@test.com")
-        #expect(result.address == "user@test.com")
-    }
-
-    @Test("Handles name with special characters before angle bracket")
-    func specialCharsInName() {
-        let result = GmailProvider.parseFromHeader("Team (Engineering) <eng@company.com>")
-        #expect(result.displayName == "Team (Engineering)")
-        #expect(result.address == "eng@company.com")
-    }
-}
-
 // MARK: - GmailProvider.gmailDisplayName extended
 
 @Suite("GmailProvider.gmailDisplayName extended")

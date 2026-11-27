@@ -235,7 +235,7 @@ enum NSEIMAPConnection {
     ) -> NSEMessageMetadata? {
         // Sender — the same mapping the main-app sync uses, so the NSE row and
         // the synced row list the same sender.
-        let from = IMAPFetchMapping.sender(from: info) ?? EmailAddress(name: "", email: "")
+        let from = EmailAddress.sender(of: info.fromAddresses) ?? EmailAddress(name: "", email: "")
         let senderName = from.name.isEmpty ? from.email : from.name
         let senderEmail = from.email
 

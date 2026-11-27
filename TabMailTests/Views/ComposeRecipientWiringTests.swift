@@ -15,14 +15,12 @@ import Testing
 struct ComposeRecipientWiringTests {
     /// ComposeView's source with every run of whitespace made one space, so a
     /// line break or indent change does not matter.
-    private static func source() throws -> String {
+    private static func source(_ path: String = "TabMail/Views/Compose/ComposeView.swift") throws -> String {
         let projectRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-        let text = try String(
-            contentsOf: projectRoot.appendingPathComponent("TabMail/Views/Compose/ComposeView.swift"),
-            encoding: .utf8)
+        let text = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
         return text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
     }
 
@@ -116,5 +114,16 @@ struct ComposeRecipientWiringTests {
             "toJSON: Draft.encodeStringArray(capTo), ccJSON: Draft.encodeStringArray(capCc), bccJSON: Draft.encodeStringArray(capBcc),"))
         #expect(Self.count("capBcc", in: text) == 3)
         #expect(text.contains("composeRecipients: { recipients.stored },"))
+    }
+
+    /// Send now carries each recipient's name (#1031); the Undo Send toast and
+    /// the Outbox row still list addresses, through the formatters
+    /// SendRecipientNamesTests checks with named recipients.
+    @Test("The Undo Send toast and the Outbox row show what Send sent as addresses")
+    func shownRecipientsAreAddresses() throws {
+        let compose = try Self.source()
+        #expect(Self.count("ComposeDraftGuards.undoSendSummary(to: snapshot.to, cc: snapshot.cc)", in: compose) == 1)
+        let outbox = try Self.source("TabMail/Views/Outbox/OutboxView.swift")
+        #expect(Self.count("Text(Self.recipientLine(message.to))", in: outbox) == 1)
     }
 }

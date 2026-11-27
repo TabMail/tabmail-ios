@@ -827,7 +827,7 @@ actor GmailProvider: EmailProvider {
     /// the send is stamped, and keys the optimistic Sent row by it.
     @discardableResult
     func send(draft: DraftMessage) async throws -> SentCopyIdentity? {
-        _ = try IMAPProvider.sendableRecipients(draft.to + draft.cc + draft.bcc)
+        _ = try OutgoingRecipients.sendableRecipients(draft.to + draft.cc + draft.bcc)
         let body = buildSendBody(draft: draft)
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let response = try await request(path: "/messages/send", method: "POST", body: jsonData)
@@ -2083,15 +2083,6 @@ actor GmailProvider: EmailProvider {
             }
         }
         return false
-    }
-
-    /// Delegates to shared `EmailAddress.parse` — single source of truth for
-    /// From-header parsing across Gmail/Graph/IMAP/NSE. Kept as static on
-    /// GmailProvider so existing tests (GmailProviderHelpersTests,
-    /// GmailProviderExtendedTests, GmailProviderParsingTests) compile unchanged.
-    static func parseFromHeader(_ from: String) -> (displayName: String, address: String) {
-        let parsed = EmailAddress.parse(from)
-        return (parsed.name, parsed.email)
     }
 
     /// Extracts body content, falling back to the attachments API for large messages
