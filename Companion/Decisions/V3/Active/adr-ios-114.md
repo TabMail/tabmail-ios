@@ -775,15 +775,20 @@ same AI result, kept as long as the email itself is shown.
    Accepted (P4): a Gmail copy that a sync stored before the send's own filing write (tabmail-ios
    #1628), or whose read right after the send failed (#1629), does not get the words, and its bubble
    shows the summary's text message.
-   Tests: `ChatSendingBubbleTests.ownWordsKeepTheSummarysTodosAndReminder` (both copy shapes: a slow
-   summary lands its to-dos and reminder on the copy that arrived first, and the chat shows the words
-   on the copy before and after it lands), `ChatSendingBubbleTests.sendingBubbleKeepsTheUserWords`,
+   Tests: `ChatSendingBubbleTests.ownWordsKeepTheSummarysTodosAndReminder` (both copy shapes; a
+   summary that lands before or after the copy arrives puts its to-dos and reminder on the copy, a
+   failed one leaves the words, the chat shows the words on the copy throughout, and a copy a sync
+   stores again under its own Message-ID gets them all back), `ChatSendingBubbleTests.sendingBubbleKeepsTheUserWords`,
+   `ChatSendingBubbleTests.newEmailKeepsTheUserWords`,
    `ChatSendingBubbleTests.queueSendWritesTheTextVersionInHand`,
-   `ChatSendingBubbleTests.queueSendDecidesOnce` (the chat view turned off while the queue write
-   waits), `ChatAISummariesNoticeHostedTests.reportSendsSummariesNotTheUsersWords`,
-   `ChatUndoSendTests.undoKeepsOnlyTheUsersWords`, `AITextMessageStorageTests` (v118, an upgrade
-   from v117, the cache write-through, the restore), `HeaderCanonicalizeTests.userWordsCarryToTheSurvivor`,
-   `ChatUndoSendRoutingTests` 1h.
+   `ChatSendingBubbleTests.queueSendDecidesOnce` (the chat view turned off, or on, while the queue
+   write is held at its outbox insert), `ChatSendingBubbleTests.reportSendsTheSummariesOfTheChatsSends`
+   (from rows the real paths wrote; the inbox preview stays the summary),
+   `ChatAISummariesNoticeHostedTests.reportSendsSummariesNotTheUsersWords`,
+   `ChatUndoSendTests.undoKeepsOnlyTheUsersWords`, `AITextMessageStorageTests` (v118 as nullable TEXT
+   with no default, an upgrade from v117, the cache write-through, the restore),
+   `FolderIsFollowedMigrationTests` (v118 pending on a released install),
+   `HeaderCanonicalizeTests.userWordsCarryToTheSurvivor`, `ChatUndoSendRoutingTests` 1h.
    **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
    chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
    instead of the undo-send toast, which is not shown for it. Who offers a send's Undo

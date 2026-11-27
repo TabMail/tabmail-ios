@@ -1808,7 +1808,7 @@ struct FolderIsFollowedMigrationTests {
 }
 
 /// A released app's schema, for `FolderIsFollowedMigrationTests`: the migrations registered
-/// after v112 that the release did NOT have yet, each with the column it adds. v112 itself is
+/// after v112 that the release did NOT have yet, each with the column it adds. v112 and v118 are
 /// in neither release.
 enum ReleasedMigrationState: String, CaseIterable, Sendable {
     case v1_11_7
@@ -1823,9 +1823,14 @@ enum ReleasedMigrationState: String, CaseIterable, Sendable {
     var notYetApplied: [Step] {
         let v112 = Step(migration: "v112_addFolderIsFollowed", table: "folder", column: "isFollowed")
         let v117 = Step(migration: "v117_addOutboxOriginalChangesAtQueue", table: "outboxMessage", column: "originalChangesAtQueue")
+        // v118 adds one column to each of two tables under one ledger row.
+        let v118 = [
+            Step(migration: "v118_addUserTextMessage", table: "messageHeader", column: "userTextMessage"),
+            Step(migration: "v118_addUserTextMessage", table: "messageAICache", column: "userTextMessage"),
+        ]
         switch self {
-        case .v1_11_7: return [v112]
-        case .v1_11_6: return [v112, v117]
+        case .v1_11_7: return [v112] + v118
+        case .v1_11_6: return [v112, v117] + v118
         }
     }
 }

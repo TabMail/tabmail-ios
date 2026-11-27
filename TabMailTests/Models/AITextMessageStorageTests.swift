@@ -230,12 +230,18 @@ struct AITextMessageStorageTests {
 
     // MARK: - The user's own words for a sent email (v118)
 
-    @Test("v118 adds the user's words column to messageHeader and messageAICache, registered right after v117")
+    @Test("v118 adds the user's words column to messageHeader and messageAICache, nullable TEXT with no default, registered right after v117")
     func migrationAddsUserTextMessage() throws {
         let db = try TestDatabase.make()
         for table in ["messageHeader", "messageAICache"] {
             let cols = try columns(db, table)
             #expect(cols.contains("userTextMessage"), "\(table)")
+            let info = try db.read { db in try db.columns(in: table).first { $0.name == "userTextMessage" } }
+            let column = try #require(info, "\(table)")
+            let declared = column.type.uppercased()
+            #expect(declared == "TEXT", "\(table): stored as text, \(declared)")
+            #expect(!column.isNotNull, "\(table): empty until a send writes the words")
+            #expect(column.defaultValueSQL == nil, "\(table): no default, so every earlier row reads empty")
         }
         var migrator = DatabaseMigrator()
         AppDatabase.registerAllMigrations(on: &migrator)
