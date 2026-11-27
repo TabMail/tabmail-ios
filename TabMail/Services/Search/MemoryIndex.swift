@@ -429,6 +429,32 @@ actor MemoryIndex {
         }
     }
 
+    /// Moves the memory rows of each followed chat session to its new id, both
+    /// stored forms (`ChatStore.storedForms`): the session follows its email
+    /// (`ChatStore.followRekeyedEmails` moved the turns and history in the
+    /// re-key's transaction; this database is a separate file, so its copy
+    /// moves after that commit). Bounded by `idx_memory_meta_sessionId`.
+    func followSessions(_ sessions: [(old: String, new: String)]) {
+        guard !sessions.isEmpty else { return }
+        ensureReady()
+        guard let dbPool else { return }
+        do {
+            try dbPool.write { db in
+                for session in sessions {
+                    for (oldForm, newForm) in zip(
+                        ChatStore.storedForms(ofSessionId: session.old),
+                        ChatStore.storedForms(ofSessionId: session.new)) {
+                        try db.execute(
+                            sql: "UPDATE memory_meta SET sessionId = ? WHERE sessionId = ?",
+                            arguments: [newForm, oldForm])
+                    }
+                }
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[MemoryIndex] followSessions failed for \(sessions.count) session(s): \(error)")
+        }
+    }
+
     // MARK: - Self-heal introspection
 
     /// All chatHistory IDs known to memory.db. Used by Stage A self-heal's

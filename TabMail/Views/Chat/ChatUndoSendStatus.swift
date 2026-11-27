@@ -19,7 +19,7 @@ extension ChatUnsentReply {
     /// does not answer Cancel Send (the deadline has passed, the row is sending, failed or sent), or
     /// the row names no draft to reopen.
     func undoSecondsLeft(at instant: Date) -> Int? {
-        guard draftId != nil, instanceEpoch != nil,
+        guard !isSent, draftId != nil, instanceEpoch != nil,
               OutboxCancellationPolicy.action(status: status, sentAt: sentAt, holdUntil: holdUntil, at: instant) == .cancelSend
         else { return nil }
         return Int(undoDeadline.timeIntervalSince(instant).rounded(.up))
@@ -28,7 +28,7 @@ extension ChatUnsentReply {
     /// The row's delivery has settled: the provider took the email, or the send failed (its own
     /// "Not sent" look). A row still queued or sending has not, however long it waits (offline).
     var deliverySettled: Bool {
-        sentAt != nil || failed
+        sentAt != nil || failed || isSent
     }
 
     /// How the bubble looks at `instant`: pending while Undo is offered, with the solid blue risen

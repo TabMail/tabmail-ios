@@ -135,14 +135,14 @@ final class DatabaseUpgrade {
     func refreshConditions() async {
         let states = await readStates()
         needsUpgrade = states.contains { $0.state?.autoVacuum == DatabaseVacuum.noneMode }
-        let notUpgraded = states.compactMap { entry -> (path: String, bytes: Int64)? in
+        let notUpgraded = states.compactMap { entry -> (path: String, liveBytes: Int64)? in
             guard let state = entry.state, state.autoVacuum == DatabaseVacuum.noneMode else { return nil }
-            return (entry.path, state.allBytes)
+            return (entry.path, state.liveBytes)
         }
-        bytesNeeded = notUpgraded.map { SyncEngine.bytesNeededForUpgrade(databaseBytes: $0.bytes) }.max() ?? 0
+        bytesNeeded = notUpgraded.map { SyncEngine.bytesNeededForUpgrade(liveBytes: $0.liveBytes) }.max() ?? 0
         bytesToFree = notUpgraded.compactMap { entry -> Int64? in
             guard let available = SyncEngine.deviceAvailableBytes(forVolumeOf: entry.path) else { return nil }
-            return SyncEngine.bytesToFreeForUpgrade(databaseBytes: entry.bytes, availableBytes: available)
+            return SyncEngine.bytesToFreeForUpgrade(liveBytes: entry.liveBytes, availableBytes: available)
         }.max() ?? 0
         let battery = readBattery()
         needsPower = Self.needsPower(level: battery.level, state: battery.state)

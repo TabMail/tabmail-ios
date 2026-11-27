@@ -649,13 +649,22 @@ actor DraftStore {
         return true
     }
 
+    /// Returns whether the entry moved to the server's id, and the move a view
+    /// or chat holding the entry follows. The entry is the placeholder, or the
+    /// uploaded copy this save replaced; either way the provider's answer to
+    /// this save names the new address, so the move is posted for both (unlike
+    /// the sync's dedup, which matches by Message-ID and follows a placeholder
+    /// only). It carries no provider authority, as the sync's placeholder
+    /// replacement does not. On a collision the server's copy already lives at
+    /// the new id, so they follow it there; their saved chats move in this
+    /// write either way.
     private static func migrateExactPlaceholder(
         _ migration: HeaderMigration,
         freshRfc: String,
         db: Database
-    ) throws -> Bool {
+    ) throws -> (rekeyed: Bool, move: HeaderRekeyRecord?) {
         guard let placeholder = try MessageHeader.fetchOne(db, key: migration.oldHeaderId) else {
-            return false
+            return (false, nil)
         }
         var migrated = placeholder
         migrated.id = migration.newHeaderId
@@ -674,7 +683,13 @@ actor DraftStore {
         // return (`false`, after both deletes) is byte-for-byte the disposition this
         // function's own early return had — which is why the caller's `rekeyed`
         // false-branch (`MessageContentStore.releaseUnowned`) still applies unchanged.
-        return try MessageHeaderRekey.apply(from: placeholder, to: migrated, db: db)
+        let rekeyed = try MessageHeaderRekey.apply(from: placeholder, to: migrated, db: db)
+        let move = HeaderRekeyRecord(
+            oldHeaderId: placeholder.id, newHeaderId: migrated.id,
+            newProviderMessageId: migrated.messageId, carriesProviderAuthority: false,
+            stableIds: StableIds(from: placeholder, to: migrated))
+        try ChatStore.followRekeyedEmails([move], db: db)
+        return (rekeyed, move)
     }
 
     /// PORT — exact pre-A initialDraft/payload + StageAContext shape. Stage A
@@ -921,7 +936,7 @@ actor DraftStore {
         // second write failed), and an action on that row had no address to use.
         // If this write throws, the completion rolls back with the migration and
         // the save is retried (the existing one-stray cost, see above).
-        let (completion, rekeyed) = try await AppDatabase.dbPool.write { db -> (PushCompletion, Bool) in
+        let (completion, rekeyed, move) = try await AppDatabase.dbPool.write { db -> (PushCompletion, Bool, HeaderRekeyRecord?) in
             let completion = try Self.applyPushCompletion(
                 context: context,
                 outcome: outcome,
@@ -929,15 +944,19 @@ actor DraftStore {
                 draftsFolderPath: draftsFolderPath,
                 db: db)
             guard completion.applied, let migration = completion.migration else {
-                return (completion, false)
+                return (completion, false, nil)
             }
-            let rekeyed = try Self.migrateExactPlaceholder(
+            let (rekeyed, move) = try Self.migrateExactPlaceholder(
                 migration, freshRfc: context.freshRfc, db: db)
-            return (completion, rekeyed)
+            return (completion, rekeyed, move)
         }
 
         guard completion.applied else { return .notApplied }
 
+        // An open view or chat holding the placeholder follows it now that the
+        // write has committed; nothing here waits on the stores outside the
+        // main database.
+        await MailPointerMoves.publishRekeys(move.map { [$0] } ?? [])
         if let migration = completion.migration {
             if rekeyed {
                 try? await SearchIndex.shared.rekeyHeaders([(

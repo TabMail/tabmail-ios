@@ -39,7 +39,7 @@ struct ChatUndoSendTests {
         draftId: String? = "d", id: String = "o"
     ) -> ChatUnsentReply {
         ChatUnsentReply(outboxId: id, status: status, sentAt: sentAt, holdUntil: holdUntil,
-                        draftId: draftId, instanceEpoch: "E1", filed: false, textMessage: nil)
+                        draftId: draftId, instanceEpoch: "E1", textMessage: nil)
     }
 
     // MARK: - 1. Visible iff now < undoDeadline
@@ -502,7 +502,7 @@ struct ChatUndoSendTests {
         let messageId = EmailFilter.normalizeMessageId(rowMessageId)
         let email = ChatNewEmailSend.Email(accountId: row.accountId, messageId: messageId)
         #expect(queued.email == email, "the email the row names")
-        #expect(queued.sentCopyId == nil && queued.reply?.filed == false, "no Sent copy yet")
+        #expect(queued.sentCopyId == nil, "no Sent copy yet")
 
         // A copy outside the Sent folder (the email received back, say) is not the sent copy.
         func header(_ id: String, folder: String) -> MessageHeader {
@@ -523,7 +523,6 @@ struct ChatUndoSendTests {
         try await pool.write { try copy.insert($0) }
         let filed = try await pool.read { [key] in try ChatNewEmailSend.fetch(key, db: $0) }
         #expect(filed.sentCopyId == copy.id, "the copy in the account's Sent folder")
-        #expect(filed.reply?.filed == true, "the bubble reads as filed")
 
         // The row gone before the chat saw the copy: the email the chat kept from the row finds it.
         let rowId = row.id
@@ -955,7 +954,7 @@ struct ChatUndoSendTests {
         // 4 s of Undo left, 1 s of the window passed.
         let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 4)
         let reply = ChatUnsentReply(outboxId: "o-reduce", status: .queued, sentAt: nil, holdUntil: hold,
-                                    draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "ok, Tuesday works.")
+                                    draftId: "d", instanceEpoch: "E1", textMessage: "ok, Tuesday works.")
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
         window.frame = CGRect(x: 0, y: 0, width: 393, height: 300)
@@ -1015,7 +1014,7 @@ struct ChatUndoSendTests {
         let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 1.5)
         func reply(_ id: String, _ status: OutboxStatus, sentAt: Date? = nil) -> ChatUnsentReply {
             ChatUnsentReply(outboxId: id, status: status, sentAt: sentAt, holdUntil: hold,
-                            draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "ok, Tuesday works.")
+                            draftId: "d", instanceEpoch: "E1", textMessage: "ok, Tuesday works.")
         }
         let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
         let window = UIWindow(windowScene: scene)
@@ -1118,7 +1117,7 @@ struct ChatUndoSendTests {
         // Undo ends 2.5 s from now; the reply stays queued past it (a claim buffer, or offline).
         let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 2.5)
         let reply = ChatUnsentReply(outboxId: "o-mounted", status: .queued, sentAt: nil, holdUntil: hold,
-                                    draftId: "d", instanceEpoch: "E1", filed: false, textMessage: "ok, Tuesday works.")
+                                    draftId: "d", instanceEpoch: "E1", textMessage: "ok, Tuesday works.")
         let deadline = reply.undoDeadline
         let controller = UIHostingController(rootView: ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {}))
         window.rootViewController = controller

@@ -825,11 +825,19 @@ struct ChatReplyFieldTests {
         #expect(Self.count("guard case .sent = outcome else { return }", in: ended) == 1)
         #expect(Self.count("ChatFieldWords", in: ended) == 0 && Self.count("fieldFill", in: ended) == 0,
                 "the view never completes the field: the request does, on its own key (ChatFieldWordsRuntimeTests)")
-        // The bubbles are the database's: one observation keyed by the chat's Message-IDs.
+        // The bubbles are the database's rows (one observation keyed by the chat's Message-IDs) and
+        // the moves of their emails (`ChatSendBubbles`).
         #expect(Self.count("for try await found in ChatUnsentReply.changes(answering: messageIds) {", in: text) == 1)
-        // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
-        #expect(Self.count("unsentReplies = found if left || found.contains(where: \\.filed) { viewModel.reloadThread() }", in: text) == 1)
-        #expect(Self.count("unsentReplies = ", in: text) == 1, "nothing else writes them")
+        // A row gone, or a send filed, reloads the chat's emails, so a sent reply's copy takes its place.
+        #expect(Self.count("if sends.read(found) { viewModel.reloadThread() }", in: text) == 1)
+        #expect(Self.count("if sends.follow(moves) { viewModel.reloadThread() } sends.end(shownIn: chatRowIds)", in: text) == 1)
+        #expect(Self.count(".onChange(of: chatRowIds) { _, shown in endSends(shownIn: shown) }", in: text) == 1)
+        #expect(Self.count("private func endSends(shownIn rowIds: Set<String>) { sends.end(shownIn: rowIds) }", in: text) == 1)
+        // Each handler is wired from the body in one line (the body's chain is at the type checker's limit),
+        // and the moves' name with its type spelled out: the implicit `.mailPointersMoved` failed the build.
+        #expect(Self.count(".task(id: messageIds) { await observeSends() }", in: text) == 1)
+        #expect(Self.count(".onReceive(NotificationCenter.default.publisher(for: Notification.Name.mailPointersMoved)) { followMoves($0) }", in: text) == 1)
+        #expect(Self.count("sends.read(", in: text) == 1 && Self.count("sends.follow(", in: text) == 1, "nothing else feeds them")
         // The bubbles show through the chat's outgoing rows, as on every chat, with this screen's Undo.
         #expect(Self.count("ChatOutgoingRows(unsentReplies: unsentReplies, heldGhost: heldGhost, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .chat) {", in: text) == 1)
         #expect(Self.count("ChatUnsentReplyBubble(", in: text) == 0, "no outbox bubble of its own")
@@ -975,7 +983,7 @@ struct ChatReplyFieldTests {
     func sentMorphIds() {
         func reply(_ id: String) -> ChatUnsentReply {
             ChatUnsentReply(outboxId: id, status: .queued, sentAt: nil, holdUntil: nil, draftId: nil, instanceEpoch: nil,
-                            filed: false, textMessage: nil)
+                            textMessage: nil)
         }
         let older = reply("outbox-1"), newest = reply("outbox-2")
         #expect(ChatOutgoing.sentMorphId(newest, newest: newest) == ChatOutgoing.heldGhostMorphId)
@@ -990,8 +998,8 @@ struct ChatReplyFieldTests {
     @Test("A new email's chat shows its send through the thread's own rows, and ends its hold by the thread's rule")
     func newEmailSharesTheOutgoingRows() throws {
         let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
-        #expect(Self.count("ChatOutgoingRows(unsentReplies: cardSend?.reply.map { [$0] } ?? [], heldGhost: heldMessage, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .newEmailChat) { EmptyView() }", in: view) == 1,
-                "the card's send, the held message and the field's message, in the thread's rows")
+        #expect(Self.count("ChatOutgoingRows(unsentReplies: sends.replies(showing: []), heldGhost: heldMessage, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .newEmailChat) { EmptyView() }", in: view) == 1,
+                "the card's send (its bubble, `ChatSendBubbles`), the held message and the field's message, in the thread's rows")
         for bubble in ["ChatUnsentReplyBubble(", "ChatFieldMessageBubble(", ".matchedGeometryEffect("] {
             #expect(Self.count(bubble, in: view) == 0, "\(bubble): no copy of the rows' bubbles")
         }

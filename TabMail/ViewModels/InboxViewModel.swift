@@ -349,42 +349,44 @@ final class InboxViewModel {
     /// The durable row has already moved to `newHeaderId`; waiting for the
     /// ordinary 500ms reload leaves the visible snapshot naming the deleted old
     /// primary key, so a second gesture during that window resolves nothing and
-    /// appears to be ignored. This changes identity fields only; all visual
-    /// content remains the snapshot the user is already looking at until the
-    /// normal reload reconciles it.
-    func applyHeaderRekeys(_ records: [HeaderRekeyRecord]) {
-        guard !records.isEmpty else { return }
-        let byOldId = Dictionary(
-            records.map { ($0.oldHeaderId, $0) },
-            uniquingKeysWith: { first, _ in first })
+    /// appears to be ignored. A renamed row keeps the visual content the user
+    /// is already looking at until the normal reload reconciles it.
+    ///
+    /// A move onto an id the list holds after this post (a row no move names,
+    /// such as a placeholder's server copy that was stored first, or another
+    /// moved row of this post, earlier in the list, that took that id) drops
+    /// the moved snapshot: the list never holds one id twice.
+    func applyHeaderRekeys(_ moves: MailPointerMoves) {
+        guard !moves.isEmpty else { return }
         var changed = false
+        // The ids the list holds after this post, starting with the rows no
+        // move names. Read from the snapshots: `loadedIds` also keeps evicted
+        // rows' ids.
+        var held = Set(loadedMessages.lazy.map(\.id).filter { moves.row(movedFrom: $0) == nil })
+        var dropped = IndexSet()
         for index in loadedMessages.indices {
-            guard let record = byOldId[loadedMessages[index].id] else { continue }
+            guard let record = moves.row(movedFrom: loadedMessages[index].id) else { continue }
+            changed = true
+            guard held.insert(record.newHeaderId).inserted else {
+                dropped.insert(index)
+                continue
+            }
             loadedMessages[index].id = record.newHeaderId
             loadedMessages[index].messageId = record.newProviderMessageId
             loadedMessages[index].observedUidValidity = record.newObservedUidValidity
-            changed = true
         }
-        loadedIds = Self.rekeyedHeaderIDs(loadedIds, using: records)
-        snippetQueue = Self.rekeyedHeaderIDs(snippetQueue, using: records)
-        snippetInFlight = Self.rekeyedHeaderIDs(snippetInFlight, using: records)
-        snippetFailed = Self.rekeyedHeaderIDs(snippetFailed, using: records)
-        pendingAIBatch = Self.rekeyedHeaderIDs(pendingAIBatch, using: records)
+        // Only when a row goes: any write to the list re-renders the inbox.
+        if !dropped.isEmpty { loadedMessages.remove(atOffsets: dropped) }
+        // The same committed mapping as the snapshots, for the view-local id
+        // sets (`InboxView` follows its dismissed and fading rows the same
+        // way, so a forward move stays hidden after its primary key changes
+        // while an undone visible row remains actionable under the new key).
+        loadedIds = moves.following(headers: loadedIds)
+        snippetQueue = moves.following(headers: snippetQueue)
+        snippetInFlight = moves.following(headers: snippetInFlight)
+        snippetFailed = moves.following(headers: snippetFailed)
+        pendingAIBatch = moves.following(headers: pendingAIBatch)
         if changed { rebuildDisplayGroups() }
-    }
-
-    /// Rekey view-local identity sets with the same committed mapping as
-    /// the snapshots. Used by `InboxView` for dismissed/fading rows too, so a
-    /// forward move stays hidden after its primary key changes while an undone
-    /// visible row remains actionable under the new key.
-    nonisolated static func rekeyedHeaderIDs(
-        _ ids: Set<String>,
-        using records: [HeaderRekeyRecord]
-    ) -> Set<String> {
-        let byOldId = Dictionary(
-            records.map { ($0.oldHeaderId, $0.newHeaderId) },
-            uniquingKeysWith: { first, _ in first })
-        return Set(ids.map { byOldId[$0] ?? $0 })
     }
 
     /// Undo snapshots must capture the VISUALIZED state (act-on-visualized-state
@@ -658,14 +660,13 @@ final class InboxViewModel {
             NotificationCenter.default.removeObserver(old)
         }
         headerRekeyObserver = NotificationCenter.default.addObserver(
-            forName: .messageHeadersRekeyed,
+            forName: .mailPointersMoved,
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            guard let records = notification.object as? [HeaderRekeyRecord],
-                  !records.isEmpty else { return }
+            guard let moves = MailPointerMoves.posted(in: notification) else { return }
             MainActor.assumeIsolated {
-                self?.applyHeaderRekeys(records)
+                self?.applyHeaderRekeys(moves)
             }
         }
     }

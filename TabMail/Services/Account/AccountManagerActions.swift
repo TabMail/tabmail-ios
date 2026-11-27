@@ -418,7 +418,7 @@ extension AccountManager {
 
     /// Post `.messageMovesRefused` for the members a `move` call did not move.
     /// Delivered on the MainActor before `move` returns, as
-    /// `publishMoveFinish` delivers `.messageHeadersRekeyed`, so a list that
+    /// `publishMoveFinish` delivers `.mailPointersMoved`, so a list that
     /// hid those rows at gesture time shows them again in the same step that
     /// settles the action (#441).
     private static func announceMovesRefused(_ ids: Set<String>) async {
@@ -1669,7 +1669,7 @@ extension AccountManager {
                 + "deferredRegistered=\(deferredSuccessors.count)")
         // Settle the gesture-time hide of every member this call did NOT
         // move, the way a completed move settles it through
-        // `.messageHeadersRekeyed`: a list hid the row when the user acted,
+        // `.mailPointersMoved`: a list hid the row when the user acted,
         // and only this call knows the move never happened.
         let deferredIds = Set(deferredSuccessors.map(\.oldHeaderId))
         let refusedIds = requestedIds

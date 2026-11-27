@@ -1303,10 +1303,15 @@ struct ChatThreadViewLifecycleTests {
         #expect(!ghostTexts().contains(ready), "no suggestion while the reply is in the outbox: \(ghostTexts())")
 
         // Online, the provider takes it: the send stamps `sentAt`, then writes the Sent copy, in two
-        // writes, and nothing tells the chat (no merge signal is posted here).
+        // writes, then posts its filing (`MailPointerMoves`), as the send does before its cleanup
+        // deletes the row. No merge signal is posted here.
         // The user's own bubble: "You said: …", or "You replied only to …" for a reply to fewer people.
         func said() -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.hasPrefix("You said") || $0.hasPrefix("You replied") }.count }
         func sending() -> Int { HostedAccessibility.labels(in: controller.view).filter { $0.contains("Sending") }.count }
+        // The send's own bubble (Sending, or Sent once filed), as against the sent email in the chat.
+        func bubbleShows() -> Bool {
+            HostedAccessibility.identifiers(in: controller.view).contains(ChatUnsentReplyBubble.bubbleId)
+        }
         try await pool.write { db in
             try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), queued.outboxId])
         }
@@ -1316,12 +1321,13 @@ struct ChatThreadViewLifecycleTests {
         own.rfc822MessageId = EmailFilter.normalizeMessageId(sentId)
         let ownCopy = own
         try await pool.write { db in try ownCopy.insert(db) }
+        MailPointerMoves.publish(MailPointerMoves([.sent(outboxId: queued.outboxId, copyHeaderId: ownCopy.id)]))
         var neither = 0
-        for _ in 0..<60 where !(said() == 1 && sending() == 0) {
+        for _ in 0..<60 where !(said() == 1 && sending() == 0 && !bubbleShows()) {
             if said() == 0 { neither += 1 }
             try await Task.sleep(for: .milliseconds(50))
         }
-        #expect(said() == 1 && sending() == 0, "the sent email is in the chat and its outbox bubble is gone")
+        #expect(said() == 1 && sending() == 0 && !bubbleShows(), "the sent email is in the chat and its outbox bubble is gone")
         #expect(neither == 0, "never neither the bubble nor the email on screen")
         try await Task.sleep(for: .milliseconds(500))
         #expect(!ghostTexts().contains(ready), "no suggestion once the sent email is in the chat: \(ghostTexts())")

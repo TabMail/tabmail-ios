@@ -1195,10 +1195,14 @@ extension Notification.Name {
     /// provider-proven re-key has since handed it to; a list that hid those
     /// rows at gesture time shows them again.
     static let messageMovesRefused = Notification.Name("messageMovesRefused")
-    /// Posted after a provider move or sync UID remap has atomically re-keyed a
-    /// local row. Object is `[HeaderRekeyRecord]`; active lists follow the new
-    /// primary key immediately instead of waiting for their debounced reload.
-    static let messageHeadersRekeyed = Notification.Name("messageHeadersRekeyed")
+    /// Posted after an email the user may be looking at changed place, once
+    /// the write that moved it has committed: a provider move or sync UID remap
+    /// re-keyed its row, the sync replaced a sent or saved email's placeholder
+    /// row by the server's copy, or a send filed its outbox item as the app's
+    /// Sent copy. Object is `MailPointerMoves` (posted only through
+    /// `MailPointerMoves.publish`); active lists, the selection, open details and
+    /// chats follow at once instead of waiting for their debounced reload.
+    static let mailPointersMoved = Notification.Name("mailPointersMoved")
     /// Posted by the NSE merge with just-read staged mail so the inbox can render
     /// it IN-MEMORY without waiting for the durable header write (ADR-IOS-049).
     /// Object is `[StagedInboxRow]`.

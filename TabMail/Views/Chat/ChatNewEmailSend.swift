@@ -51,7 +51,7 @@ struct ChatNewEmailSend: Equatable, Sendable {
         guard let row else { return ChatNewEmailSend(reply: nil, email: email, sentCopyId: sentCopyId) }
         let reply = ChatUnsentReply(
             outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
-            draftId: row.draftId, instanceEpoch: row.instanceEpoch, filed: sentCopyId != nil,
+            draftId: row.draftId, instanceEpoch: row.instanceEpoch,
             textMessage: try SentEmailSummary.textMessage(of: row, db: db))
         return ChatNewEmailSend(reply: reply, email: email, sentCopyId: sentCopyId)
     }
