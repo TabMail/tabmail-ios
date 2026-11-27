@@ -55,6 +55,11 @@ struct GraphAPIPathEncodingTests {
     /// The single URL the helper composed. Fails loudly if the call never
     /// reached the injected session (which would mean it escaped to the network)
     /// or if it made more than one request.
+    /// `raw` as the session sends it: a space in the query is encoded once.
+    private func composed(_ raw: String) throws -> String {
+        try #require(URL(string: raw)).absoluteString
+    }
+
     private func soleRecordedURL(_ scenario: FakeHTTP.Scenario) throws -> String {
         let calls = scenario.recordedCalls()
         try #require(calls.count == 1, "the helper must reach the injected session exactly once")
@@ -73,8 +78,9 @@ struct GraphAPIPathEncodingTests {
         )
 
         let url = try soleRecordedURL(scenario)
-        #expect(url == "\(Self.base)/messages/\(Self.hostileIdEncoded)"
-                + "?\(GraphAPI.metadataSelection.queryParameter)")
+        let expected = try composed("\(Self.base)/messages/\(Self.hostileIdEncoded)"
+            + "?\(GraphAPI.metadataSelection.withExtendedProperties.queryParameter)")
+        #expect(url == expected)
         // The id cannot reach the query, the fragment, or a second path segment.
         #expect(!url.contains("/messages/AA/BB"))
         #expect(url.split(separator: "?").count == 2)
@@ -91,14 +97,43 @@ struct GraphAPIPathEncodingTests {
         )
 
         let url = try soleRecordedURL(scenario)
-        #expect(url == "\(Self.base)/messages/\(Self.ordinaryId)"
-                + "?\(GraphAPI.metadataSelection.queryParameter)")
-        // No percent escape anywhere: neither `-._~` in the id nor `$` and `,`
-        // in the query string may be touched. Encoding the whole URL instead of
-        // the segment would break exactly this.
-        #expect(!url.contains("%"))
+        let expected = try composed("\(Self.base)/messages/\(Self.ordinaryId)"
+            + "?\(GraphAPI.metadataSelection.withExtendedProperties.queryParameter)")
+        #expect(url == expected)
+        // No percent escape before the expand: neither `-._~` in the id nor `$`
+        // and `,` in the query string may be touched. Encoding the whole URL
+        // instead of the segment would break exactly this. The expand's spaces
+        // are encoded once, when the request is sent.
+        let selectPart = try #require(url.components(separatedBy: "&$expand=").first)
+        #expect(!selectPart.contains("%"))
         #expect(url.contains("?$select=id,subject,from,"))
-        #expect(url.hasSuffix(",parentFolderId"))
+        #expect(selectPart.hasSuffix(",parentFolderId"))
+        // The threading ids come with the metadata, so a row the notification
+        // extension stages threads as a synced one does (#1559).
+        let decoded = try #require(url.removingPercentEncoding)
+        #expect(decoded.hasSuffix(
+            "&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081'"
+                + " or id eq 'String 0x1042' or id eq 'String 0x1039')"))
+    }
+
+    /// What the notification extension stages: the threading ids of the
+    /// expanded answer reach `MessageMetadata`, which `OutlookNSEClient` copies
+    /// onto the staged row as it does for Gmail (#1559).
+    @Test("messageMetadata returns the threading ids the expanded answer carries")
+    func messageMetadataReadsThreadingIds() async throws {
+        let scenario = FakeHTTP.Scenario()
+        defer { scenario.close() }
+        scenario.register(path: "/messages/\(Self.ordinaryId)", response: .json(raw: """
+            {"id": "\(Self.ordinaryId)", "receivedDateTime": "2023-11-14T22:13:20Z", "parentFolderId": "fld-inbox",
+             "singleValueExtendedProperties": [
+               {"id": "String 0x1042", "value": "<parent@example.com>"},
+               {"id": "String 0x1039", "value": "<root@example.com> <parent@example.com>"}]}
+            """))
+
+        let metadata = try await GraphAPI.messageMetadata(http: makeHTTP(scenario), id: Self.ordinaryId)
+
+        #expect(metadata.inReplyTo == "parent@example.com")
+        #expect(metadata.references == ["root@example.com", "parent@example.com"])
     }
 
     // MARK: - messageFull

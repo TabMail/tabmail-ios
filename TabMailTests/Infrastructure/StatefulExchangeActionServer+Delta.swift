@@ -186,6 +186,19 @@ extension StatefulExchangeActionServer {
         }
     }
 
+    /// The threading ids the message arrived with (In-Reply-To, References, as
+    /// the sender's client wrote them), kept as Exchange keeps them: extended
+    /// properties, served only to a request that expands them. A message as
+    /// delivered; nothing is logged to the delta.
+    func setThreadingIds(providerMessageId: String, inReplyTo: String?, references: String? = nil) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.extendedProperties["String 0x1042"] = inReplyTo
+            message.extendedProperties["String 0x1039"] = references
+            model.messagesByProviderId[providerMessageId] = message
+        }
+    }
+
     /// Another client (Outlook web or desktop) sets the message's categories, the
     /// whole array, as Graph's PATCH does.
     func setCategoriesFromOtherClient(providerMessageId: String, categories: [String]) {
@@ -571,7 +584,7 @@ extension StatefulExchangeActionServer {
                     continue
                 }
                 responses.append(["id": id, "status": 200,
-                                  "body": graphRow(message, expandLastVerb: expandsLastVerb(path))])
+                                  "body": graphRow(message, expanding: expandedPropertyIds(path))])
             }
             let data = (try? JSONSerialization.data(withJSONObject: ["responses": responses])) ?? Data()
             return .bytes(data, contentType: "application/json")

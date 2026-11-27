@@ -438,9 +438,13 @@ extension ExchangeProvider {
 
     /// Reads the last verb (replied, forwarded) of messages whose records came
     /// from a delta page, in `$batch`es within the allowance, and sets those
-    /// records' marks. Returns the ids not read: past the budget or allowance, a
-    /// failed batch, a throttle or an unusable answer. A message gone or now in
-    /// another folder needs nothing (that folder's round reports it).
+    /// records' marks. The same answer carries the threading ids, which the
+    /// delta page cannot (#1559): they go on the record's header, which only the
+    /// apply's insert reads, so a new message threads under the one it answers
+    /// and a stored row's chain and thread stay (`fullRecord`). Returns the ids
+    /// not read: past the budget or allowance, a failed batch, a throttle or an
+    /// unusable answer. A message gone or now in another folder needs nothing
+    /// (that folder's round reports it).
     private func readLastVerbs(
         _ ids: [String], folder: ChangeFolder, context: ChangeContext, allowance: inout ChangeReadAllowance,
         changes: inout FolderChanges
@@ -465,6 +469,8 @@ extension ExchangeProvider {
                     guard let header = verbs[changes.records[index].messageId] else { continue }
                     changes.records[index].isReplied = header.isReplied
                     changes.records[index].isForwarded = header.isForwarded
+                    changes.records[index].header?.inReplyTo = header.inReplyTo
+                    changes.records[index].header?.references = header.references
                 }
                 notRead += batch.unreadable + batch.unanswered.keys
             } catch {
@@ -481,8 +487,9 @@ extension ExchangeProvider {
 
     // MARK: - Records
 
-    /// A record from a whole Graph message. No selection asks Graph for a
-    /// References header, so the record carries none and a stored chain stays.
+    /// A record from a whole Graph message. Its references stay unset, so a
+    /// stored row's chain stays; a new row takes its threading ids from the
+    /// header, present when the read expanded them (#1559).
     private nonisolated static func fullRecord(_ header: MessageHeaderInfo) -> ChangeRecord {
         var change = ChangeRecord(header: header)
         change.references = nil

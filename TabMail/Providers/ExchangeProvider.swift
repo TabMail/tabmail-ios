@@ -25,19 +25,20 @@ enum ExchangeGraphMessageRequest: CaseIterable, Hashable, Sendable {
 
     /// The listings and the change reader's message reads also expand
     /// Outlook's last verb, so a message replied to or forwarded on another
-    /// device shows it (#890). The message delta (`readChanges`) cannot.
+    /// device shows it (#890), and the threading ids, so a reply threads under
+    /// the message it answers (#1559). The message delta (`readChanges`) cannot.
     var selection: GraphMessageSelection {
         switch self {
         case .search, .readChanges:
             GraphAPI.headerOnlySelection
         case .fetchMessages, .fetchMessageHeaders, .fetchOlderMessages:
-            GraphAPI.headerOnlySelection.withLastVerb
+            GraphAPI.headerOnlySelection.withExtendedProperties
         case .fetchSingleBackfill:
             GraphAPI.backfillSelection
         case .fetchMessage:
             GraphAPI.fullSelection
         case .fetchMessageDetails:
-            GraphAPI.metadataSelection.withLastVerb
+            GraphAPI.metadataSelection.withExtendedProperties
         }
     }
 }
@@ -1925,11 +1926,6 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Sending Helpers
 
-    /// PidTagInReplyToId, the property Exchange writes a sent message's In-Reply-To from.
-    static let graphInReplyToProperty = "String 0x1042"
-    /// PidTagInternetReferences, the property Exchange writes a sent message's References from.
-    static let graphReferencesProperty = "String 0x1039"
-
     /// - Parameter sending: true when the payload sends the message (`sendMail`, or
     ///   the draft a send with files creates). Only then does it carry
     ///   `draft.messageId`, as Graph's `internetMessageId` (writable while the
@@ -1968,14 +1964,15 @@ actor ExchangeProvider: EmailProvider {
         // the MAPI properties Exchange writes those headers from (confirmed by a live
         // reply on `sendMail`). A send with files carries them on its draft create,
         // then `/messages/{id}/send` (#422); a draft save uploads without them
-        // (`DraftStore.uploadThreadHeaders`).
+        // (`DraftStore.uploadThreadHeaders`). Every expanded read reads them back
+        // (`GraphParse.parseMessage`).
         var threading: [[String: String]] = []
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
-            threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
+            threading.append(["id": GraphAPI.inReplyToPropertyId, "value": inReplyTo])
         }
         let references = IMAPProvider.threadingMessageIDs(draft.references)
         if !references.isEmpty {
-            threading.append(["id": Self.graphReferencesProperty, "value": references.joined(separator: " ")])
+            threading.append(["id": GraphAPI.referencesPropertyId, "value": references.joined(separator: " ")])
         }
         if !threading.isEmpty {
             message["singleValueExtendedProperties"] = threading
@@ -2141,7 +2138,7 @@ struct GraphMessage: Codable {
     let bodyPreview: String?
     let body: GraphBody?
     let parentFolderId: String?
-    /// Present only when the request expanded it (`GraphAPI.lastVerbExpandParameter`).
+    /// Present only when the request expanded it (`GraphAPI.extendedPropertiesExpandParameter`).
     var singleValueExtendedProperties: [GraphExtendedProperty]? = nil
 
     /// PidTagLastVerbExecuted, when the request expanded it and Outlook has one.

@@ -84,8 +84,9 @@ struct FolderInfo: Sendable {
 struct MessageHeaderInfo: Sendable {
     let messageId: String
     let rfc822MessageId: String? // RFC 2822 Message-ID header (device-independent, for cross-device AI cache probe)
-    let inReplyTo: String? // RFC 2822 In-Reply-To header (parent message ID for thread detection)
-    let references: [String] // RFC 2822 References header (ancestor chain for thread detection fallback)
+    // `var`: the Outlook change reader fills both from a later by-id read (#1559).
+    var inReplyTo: String? // RFC 2822 In-Reply-To header (parent message ID for thread detection)
+    var references: [String] // RFC 2822 References header (ancestor chain for thread detection fallback)
     let threadId: String?
     let subject: String
     let from: String

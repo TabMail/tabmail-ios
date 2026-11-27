@@ -86,7 +86,7 @@ struct GraphParseTests {
         #expect(m?.from.email == "")
     }
 
-    @Test("parseMessage: In-Reply-To and References are nil (Graph uses conversationId)")
+    @Test("parseMessage: In-Reply-To and References are nil when the answer carries no threading ids")
     func noInReplyToReferences() {
         let json: [String: Any] = [
             "id": "m1",
@@ -95,6 +95,55 @@ struct GraphParseTests {
         let m = GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection)
         #expect(m?.inReplyTo == nil)
         #expect(m?.references == [])
+    }
+
+    /// The expanded answer's shape, as Graph returned it on a test account
+    /// (2026-11-27): one array, the property ids spelled `String 0x1042` and
+    /// `String 0x1039`, the values as the sender's client wrote the headers.
+    @Test("parseMessage reads In-Reply-To and References from the expanded extended properties (#1559)")
+    func threadingIdsFromExtendedProperties() throws {
+        let json: [String: Any] = [
+            "id": "m1",
+            "receivedDateTime": "2023-11-14T22:13:20Z",
+            "singleValueExtendedProperties": [
+                ["id": "Integer 0x1081", "value": "102"],
+                ["id": "String 0x1042", "value": "<parent@example.com>"],
+                ["id": "String 0x1039", "value": "<root@example.com>\r\n <parent@example.com>"],
+            ],
+        ]
+        let m = try #require(GraphParse.parseMessage(json, selection: GraphAPI.metadataSelection.withExtendedProperties))
+        #expect(m.inReplyTo == "parent@example.com")
+        #expect(m.references == ["root@example.com", "parent@example.com"])
+    }
+
+    @Test("parseMessage matches the threading property ids without regard to case")
+    func threadingIdsMatchAnyCase() throws {
+        let json: [String: Any] = [
+            "id": "m1",
+            "receivedDateTime": "2023-11-14T22:13:20Z",
+            "singleValueExtendedProperties": [
+                ["id": "string 0X1042", "value": "<parent@example.com>"],
+                ["id": "STRING 0x1039", "value": "<parent@example.com>"],
+            ],
+        ]
+        let m = try #require(GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection))
+        #expect(m.inReplyTo == "parent@example.com")
+        #expect(m.references == ["parent@example.com"])
+    }
+
+    @Test("parseMessage leaves the threading ids empty when only other properties came back")
+    func otherPropertiesFillNoThreadingIds() throws {
+        let json: [String: Any] = [
+            "id": "m1",
+            "receivedDateTime": "2023-11-14T22:13:20Z",
+            "singleValueExtendedProperties": [
+                ["id": "Integer 0x1081", "value": "102"],
+                ["id": "String 0x1043", "value": "<not-a-parent@example.com>"],
+            ],
+        ]
+        let m = try #require(GraphParse.parseMessage(json, selection: GraphAPI.headerOnlySelection))
+        #expect(m.inReplyTo == nil)
+        #expect(m.references == [])
     }
 
     @Test("parseMessage handles flag.flagStatus == 'flagged'")

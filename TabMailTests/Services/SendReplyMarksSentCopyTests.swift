@@ -209,8 +209,8 @@ extension SendReplyMarksTests {
                 pool: w.pool, accountId: w.accountId, original: original, isForward: isForward)
             let draft = try await Self.queuedDraft(w.pool, outboxId: queued.outboxId)
             let payload = w.provider.buildGraphSendPayload(draft: draft, sending: true)
-            let inReplyTo = Self.graphProperty(ExchangeProvider.graphInReplyToProperty, in: payload)
-            let references = Self.graphProperty(ExchangeProvider.graphReferencesProperty, in: payload)
+            let inReplyTo = Self.graphProperty(GraphAPI.inReplyToPropertyId, in: payload)
+            let references = Self.graphProperty(GraphAPI.referencesPropertyId, in: payload)
             #expect(references?.hasSuffix("<\(originalRfc)>") == true,
                     "the send names the original as its last References id: \(references ?? "nil")")
             if isForward {

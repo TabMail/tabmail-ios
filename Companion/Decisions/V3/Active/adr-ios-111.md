@@ -599,12 +599,22 @@ does not read the verb. The arrow is never written to the server (Mail.Send and 
 out of scope).
 *Amended 2026-11-15 (#915):* the app now writes the verb on the original after a confirmed send
 (memory 151); the reader sees that echo as a mark already set locally, so it changes nothing.
+*Amended 2026-11-27 (#1559):* the same expand also names the threading ids `String 0x1042` (In-Reply-To)
+and `String 0x1039` (References), joined with `or`; the names became
+`GraphMessageSelection.expandsExtendedProperties` / `withExtendedProperties` and
+`GraphAPI.extendedPropertiesExpandParameter`, and the notification extension's `messageMetadata` expands
+too. `GraphParse.parseMessage` reads both ids. `readLastVerbs` also copies them onto the record's
+header, which only the apply's insert reads, so a new message threads under the one it answers while a
+stored row's chain and thread stay. No new request. Residuals (allowance cut, Inbox baseline, search) in
+IOS-THREAD-002 case 4.
 
-Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`).
+Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`); threading ids:
+`OutlookReplyThreadingTests.swift`.
 
 Keywords: last verb, PidTagLastVerbExecuted, 0x1081, replied, answered, forwarded, reply arrow,
 singleValueExtendedProperties, $expand, expandsLastVerb, readLastVerbs, batchItemURL,
-double encoding, ReplyDetect, #890.
+double encoding, ReplyDetect, #890, expandsExtendedProperties, extendedPropertiesExpandParameter,
+0x1042, 0x1039, In-Reply-To, References, threading ids, #1559.
 
 ### Amendment 2026-11-16: Gmail resumes its history read (#491)
 

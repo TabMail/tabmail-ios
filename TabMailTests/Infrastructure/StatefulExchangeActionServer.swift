@@ -527,7 +527,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let queryItems = components?.queryItems ?? []
             let filter = queryItems.first(where: { $0.name == "$filter" })?.value
             let rfc822MessageId = Self.rfcIdentity(fromLookupURL: request.url)
-            let expandVerb = Self.expandsLastVerb(request.url.absoluteString)
+            let expanded = Self.expandedPropertyIds(request.url.absoluteString)
             if let filter, filter.contains("receivedDateTime") {
                 return Self.serveDateFilteredListing(request, folderId: folderId, state: state)
             }
@@ -577,7 +577,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     }
                 // Unpaged (the default), and every `$filter` lookup: no link.
                 guard let pageSize = model.listPageSize, filter == nil else {
-                    return (matches.dropFirst(skip).prefix(top).map { Self.graphRow($0, expandLastVerb: expandVerb) }, nil)
+                    return (matches.dropFirst(skip).prefix(top).map { Self.graphRow($0, expanding: expanded) }, nil)
                 }
                 var start = 0
                 if let skipToken {
@@ -597,7 +597,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
                     link?.queryItems = [URLQueryItem(name: "$skiptoken", value: token)]
                     nextLink = link?.url?.absoluteString
                 }
-                return (matches[start..<end].map { Self.graphRow($0, expandLastVerb: expandVerb) }, nextLink)
+                return (matches[start..<end].map { Self.graphRow($0, expanding: expanded) }, nextLink)
             }
             guard let page else {
                 return .bytes(Self.unclassifiedBadRequestBody(), contentType: "application/json", statusCode: 400)
@@ -630,7 +630,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             let message = state.value.withLock { $0.messagesByProviderId[providerId] }
             guard let message else { return .status(404) }
             let body = (try? JSONSerialization.data(withJSONObject: Self.graphRow(
-                message, expandLastVerb: Self.expandsLastVerb(request.url.absoluteString)))) ?? Data()
+                message, expanding: Self.expandedPropertyIds(request.url.absoluteString)))) ?? Data()
             if let hook = state.value.withLock({ $0.catchUp.afterGet[providerId] }) { hook() }
             return .bytes(body, contentType: "application/json")
         }
@@ -885,18 +885,39 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             .replacingOccurrences(of: "''", with: "'")
     }
 
-    /// Whether a message request expands the last verb, as Graph serves
-    /// `singleValueExtendedProperties` only when asked for.
-    static func expandsLastVerb(_ url: String) -> Bool {
+    /// The extended property ids a message request expands, as Graph serves
+    /// `singleValueExtendedProperties` only when asked for, and only the ids
+    /// its `$filter` names (`id eq '...'`, joined with `or`).
+    static func expandedPropertyIds(_ url: String) -> Set<String> {
         let decoded = url.removingPercentEncoding ?? url
-        return decoded.contains("$expand=singleValueExtendedProperties") && decoded.contains("Integer 0x1081")
+        guard let start = decoded.range(of: "$expand=singleValueExtendedProperties(") else { return [] }
+        let filter = decoded[start.upperBound...].prefix { $0 != ")" }
+        var ids = Set<String>()
+        var rest = filter[...]
+        while let open = rest.range(of: "id eq '") {
+            let after = rest[open.upperBound...]
+            guard let close = after.firstIndex(of: "'") else { break }
+            ids.insert(String(after[..<close]))
+            rest = after[after.index(after: close)...]
+        }
+        return ids
     }
 
-    static func graphRow(_ message: Message, expandLastVerb: Bool) -> [String: Any] {
+    /// The threading ids a message carries as extended properties
+    /// (PidTagInReplyToId, PidTagInternetReferences), served back only when a
+    /// request expands them, like Graph (measured 2026-11-27).
+    static let threadingPropertyIds = ["String 0x1042", "String 0x1039"]
+
+    static func graphRow(_ message: Message, expanding ids: Set<String>) -> [String: Any] {
         var row = graphRow(message)
-        if expandLastVerb, let verb = message.lastVerb {
-            row["singleValueExtendedProperties"] = [["id": "Integer 0x1081", "value": String(verb)]]
+        var properties: [[String: String]] = []
+        if ids.contains("Integer 0x1081"), let verb = message.lastVerb {
+            properties.append(["id": "Integer 0x1081", "value": String(verb)])
         }
+        for id in threadingPropertyIds where ids.contains(id) {
+            if let value = message.extendedProperties[id] { properties.append(["id": id, "value": value]) }
+        }
+        if !properties.isEmpty { row["singleValueExtendedProperties"] = properties }
         return row
     }
 

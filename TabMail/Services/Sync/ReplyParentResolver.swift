@@ -67,8 +67,8 @@ enum ReplyParentResolver {
 
         // Normalize defensively. Every provider already hands In-Reply-To over
         // bare (IMAP's `IMAPProvider.mapMessageInfo` through `normalizeMessageId`,
-        // Gmail and RFC 822 parsing through `extractFirstMessageId`; Graph gives
-        // none), and `normalizeMessageId` is idempotent, so this costs nothing
+        // Gmail, RFC 822 and Graph's extended property through
+        // `extractFirstMessageId`), and `normalizeMessageId` is idempotent, so this costs nothing
         // when the value was already normalized.
         var replied = Set<String>()
         var forwarded = Set<String>()

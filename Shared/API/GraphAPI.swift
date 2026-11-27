@@ -14,18 +14,19 @@ import Foundation
 /// names are discrete comma-separated identifiers.
 struct GraphMessageSelection: Sendable {
     let fields: [String]
-    /// Whether the request also expands Outlook's last verb
-    /// (`GraphAPI.lastVerbExpandParameter`). Never on a message delta: Graph
-    /// answers `$expand` on delta with 400.
-    var expandsLastVerb = false
+    /// Whether the request also expands the Outlook properties the app reads:
+    /// the last verb and the threading ids
+    /// (`GraphAPI.extendedPropertiesExpandParameter`). Never on a message delta:
+    /// Graph answers `$expand` on delta with 400.
+    var expandsExtendedProperties = false
 
     var fieldList: String {
         fields.joined(separator: ",")
     }
 
     var queryParameter: String {
-        expandsLastVerb
-            ? "$select=\(fieldList)&\(GraphAPI.lastVerbExpandParameter)"
+        expandsExtendedProperties
+            ? "$select=\(fieldList)&\(GraphAPI.extendedPropertiesExpandParameter)"
             : "$select=\(fieldList)"
     }
 
@@ -34,12 +35,12 @@ struct GraphMessageSelection: Sendable {
     }
 
     func appending(_ fields: String...) -> GraphMessageSelection {
-        GraphMessageSelection(fields: self.fields + fields, expandsLastVerb: expandsLastVerb)
+        GraphMessageSelection(fields: self.fields + fields, expandsExtendedProperties: expandsExtendedProperties)
     }
 
-    /// The same fields, with Outlook's last verb expanded.
-    var withLastVerb: GraphMessageSelection {
-        GraphMessageSelection(fields: fields, expandsLastVerb: true)
+    /// The same fields, with the last verb and the threading ids expanded.
+    var withExtendedProperties: GraphMessageSelection {
+        GraphMessageSelection(fields: fields, expandsExtendedProperties: true)
     }
 }
 
@@ -128,12 +129,22 @@ enum GraphAPI {
 
     /// The property id as Graph names it.
     static let lastVerbPropertyId = "Integer 0x1081"
-    /// `$expand` of that one property. Its spaces are literal, as in every other
-    /// query this app builds: a request URL is percent-encoded once when it is
-    /// sent (a pre-encoded `%20` would be encoded again), and a `$batch` item's
-    /// URL is encoded where it is built (`batchItemURL`).
-    static let lastVerbExpandParameter =
-        "$expand=singleValueExtendedProperties($filter=id eq '\(lastVerbPropertyId)')"
+    /// A message's In-Reply-To (PidTagInReplyToId) and References
+    /// (PidTagInternetReferences, ids separated by spaces). Graph lists neither
+    /// as a message field; the send path writes them and every expanded read
+    /// reads them back (#419, #1559). Measured 2026-11-27: Graph returns the ids
+    /// spelled exactly so.
+    static let inReplyToPropertyId = "String 0x1042"
+    static let referencesPropertyId = "String 0x1039"
+    /// `$expand` of the last verb and the two threading ids, in one filter; one
+    /// answer carries every one the message has (measured 2026-11-27). Its
+    /// spaces are literal, as in every other query this app builds: a request
+    /// URL is percent-encoded once when it is sent (a pre-encoded `%20` would be
+    /// encoded again), and a `$batch` item's URL is encoded where it is built
+    /// (`batchItemURL`).
+    static let extendedPropertiesExpandParameter =
+        "$expand=singleValueExtendedProperties($filter=id eq '\(lastVerbPropertyId)'"
+        + " or id eq '\(inReplyToPropertyId)' or id eq '\(referencesPropertyId)')"
     /// PidTagLastVerbExecuted values: reply to sender, reply to all, forward.
     static let lastVerbReplyToSender = 102
     static let lastVerbReplyToAll = 103
@@ -317,12 +328,13 @@ enum GraphAPI {
     }
 
     /// Fetch a single message's metadata. Graph returns header fields inline on
-    /// `/messages/{id}` (no `format=metadata` equivalent needed).
+    /// `/messages/{id}` (no `format=metadata` equivalent needed); the threading
+    /// ids come with the expand, so a staged row threads like a synced one.
     static func messageMetadata(http: AuthedHTTP, id: String) async throws -> MessageMetadata {
         guard let encodedId = encodedGraphPathSegment(id) else {
             throw HTTPError.invalidURL("Graph message id")
         }
-        let selection = metadataSelection
+        let selection = metadataSelection.withExtendedProperties
         let url = "\(baseURL)/messages/\(encodedId)?\(selection.queryParameter)"
         let data = try await http.get(url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
