@@ -1413,6 +1413,19 @@ while the Undo names one. A different email, or a waiting email with no Message-
 and leaves the waiting move in place, and that move is queued once the move ahead of it lands; the
 same email, or an Undo with no Message-ID, cancels it as before, and nothing is queued.
 
+## Address fields — read whole by SwiftMail's parser (ADR-IOS-120)
+
+`AddressFieldReadTests` runs each From value through both `GmailParse.parseMessage` and
+`RFC5322Parse.buildMetadata` and asserts the sender the message is listed under: ordinary forms,
+a legacy `address (Name)` mailbox, an encoded name, a comment before the address, text that names
+no single mailbox (two angle-addrs, a stray `<` or `>`, an unterminated quote, `MAILER-DAEMON`:
+a name with no address; a group with no members, by its name; several such entries, their texts
+joined), names whose quoted, escaped, commented or encoded text holds `<…@…>`, a
+quote followed by a combining mark, an encoded-word inside a quoted-string (literal), and a From
+naming several mailboxes or a group (the first). The list rows assert To/Cc/Bcc and Reply-To split
+only at commas outside quoted-strings, comments and encoded-words. `IMAPFetchMappingAddressTests`
+covers `EmailAddress.sender(of:)` over SwiftMail's structured entries.
+
 ## Database proof harness
 
 `DBProofHarnessTests` keeps the shared query-proof harness (`TabMailTests/Helpers/DBProofHarness.swift`,

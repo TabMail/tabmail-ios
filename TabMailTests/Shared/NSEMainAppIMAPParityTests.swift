@@ -91,9 +91,9 @@ struct NSEMainAppIMAPParityTests {
         // hasAttachments — predicate parity with IMAPProvider.mapMessageInfo.
         #expect(IMAPFetchMapping.hasAttachments(from: info))
 
-        // Sender and recipient fields — both sites store `sender(from:)` and
-        // `addressField`, never SwiftMail's header text (`info.to`).
-        let sender = IMAPFetchMapping.sender(from: info)
+        // Sender and recipient fields — both sites store `EmailAddress.sender(of:)`
+        // and `addressField`, never SwiftMail's header text (`info.to`).
+        let sender = TabMail.EmailAddress.sender(of: info.fromAddresses)
         #expect(sender?.name == "sender@example.com")
         #expect(sender?.email == "sender@example.com")
         let to = IMAPFetchMapping.addressField(info.toAddresses)

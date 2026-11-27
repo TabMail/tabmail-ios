@@ -2085,15 +2085,6 @@ actor GmailProvider: EmailProvider {
         return false
     }
 
-    /// Delegates to shared `EmailAddress.parse` — single source of truth for
-    /// From-header parsing across Gmail/Graph/IMAP/NSE. Kept as static on
-    /// GmailProvider so existing tests (GmailProviderHelpersTests,
-    /// GmailProviderExtendedTests, GmailProviderParsingTests) compile unchanged.
-    static func parseFromHeader(_ from: String) -> (displayName: String, address: String) {
-        let parsed = EmailAddress.parse(from)
-        return (parsed.name, parsed.email)
-    }
-
     /// Extracts body content, falling back to the attachments API for large messages
     /// where Gmail omits inline body data and provides an attachmentId instead.
     private func extractBodyWithFallback(from msg: GmailMessage, mimeType: String) async throws -> String? {

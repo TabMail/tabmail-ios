@@ -9,6 +9,11 @@
 > physical Subject lines within 76. SwiftMail's equivalent library defects and
 > MIME parameter interpolation remain open upstream work under `IOS-IMAP-016` / issue #10; the fork
 > remains deviation-free.
+>
+> **Current note — 2026-11-25 (ADR-IOS-120):** `GmailParse` now reads From/To/Cc/Bcc/Reply-To with
+> SwiftMail's `AddressParser`, which decodes an encoded-word as a display-name word after the
+> field's structure is read, so Gmail names ARE decoded. The "deliberately does NOT decode
+> From/To/Cc names" line below is history; `GmailProvider.parseFromHeader` is deleted.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Outgoing email header encoding — RFC 2047 (mojibake fix, 2026-06-21)

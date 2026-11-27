@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 
 /// Pure, GRDB-free, main-app-independent JSON parsing for Gmail REST responses.
 /// Compiled into both the main app and the NSE via the Shared/ glob.
@@ -68,11 +69,15 @@ enum GmailParse {
                 .compactMap { EmailFilter.extractFirstMessageId($0) }
         }()
 
-        let from = EmailAddress.parse(fromRaw)
-        let to = splitAddressList(toRaw).map { EmailAddress.parse($0) }
-        let cc = splitAddressList(ccRaw).map { EmailAddress.parse($0) }
-        let bcc = splitAddressList(bccRaw).map { EmailAddress.parse($0) }
-        let replyTo = replyToRaw.map { EmailAddress.parse($0) }
+        // Address fields are read whole by SwiftMail's parser, structure first:
+        // a name's quoted or encoded text is never read as an address or split
+        // as a list (see `EmailAddress.sender(of:)`).
+        let from = EmailAddress.sender(of: AddressParser.parseAddressList(fromRaw))
+            ?? EmailAddress(name: "", email: "")
+        let to = EmailAddress.mailboxes(of: AddressParser.parseAddressList(toRaw))
+        let cc = EmailAddress.mailboxes(of: AddressParser.parseAddressList(ccRaw))
+        let bcc = EmailAddress.mailboxes(of: AddressParser.parseAddressList(bccRaw))
+        let replyTo = replyToRaw.flatMap { EmailAddress.mailboxes(of: AddressParser.parseAddressList($0)).first }
 
         let labelIds = json["labelIds"] as? [String] ?? []
         let snippet = json["snippet"] as? String ?? ""
@@ -360,28 +365,5 @@ enum GmailParse {
         while base64.count % 4 != 0 { base64.append("=") }
         guard let data = Data(base64Encoded: base64) else { return nil }
         return String(data: data, encoding: .utf8)
-    }
-
-    /// Split an RFC 2822 address list into individual address tokens.
-    /// Handles commas inside quoted display names.
-    private static func splitAddressList(_ s: String) -> [String] {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var out: [String] = []
-        var current = ""
-        var inQuotes = false
-        for c in trimmed {
-            if c == "\"" { inQuotes.toggle(); current.append(c); continue }
-            if c == "," && !inQuotes {
-                let t = current.trimmingCharacters(in: .whitespaces)
-                if !t.isEmpty { out.append(t) }
-                current = ""
-                continue
-            }
-            current.append(c)
-        }
-        let t = current.trimmingCharacters(in: .whitespaces)
-        if !t.isEmpty { out.append(t) }
-        return out
     }
 }

@@ -29,40 +29,40 @@ struct IMAPFetchMappingAddressTests {
 
     @Test("The sender is the first From mailbox, by its display name as written")
     func senderIsFirstMailboxByName() throws {
-        let sender = try #require(IMAPFetchMapping.sender(from: info(from: [
+        let sender = try #require(TabMail.EmailAddress.sender(of: [
             mailbox("jane@example.com", name: #"Jane "JJ" Doe, PhD"#),
             mailbox("bob@example.com", name: "Bob")
-        ])))
+        ]))
         #expect(sender.name == #"Jane "JJ" Doe, PhD"#)
         #expect(sender.email == "jane@example.com")
     }
 
     @Test("A sender with no display name is listed by address")
     func senderWithoutNameUsesAddress() throws {
-        let sender = try #require(IMAPFetchMapping.sender(from: info(from: [mailbox("jane@example.com")])))
+        let sender = try #require(TabMail.EmailAddress.sender(of: [mailbox("jane@example.com")]))
         #expect(sender.name == "jane@example.com")
         #expect(sender.email == "jane@example.com")
     }
 
     @Test("A From group is listed under its first member")
     func senderFromGroupIsFirstMember() throws {
-        let sender = try #require(IMAPFetchMapping.sender(from: info(from: [
+        let sender = try #require(TabMail.EmailAddress.sender(of: [
             .group(name: "Team", members: [SwiftMail.EmailAddress(name: "Ann", address: "ann@example.com")])
-        ])))
+        ]))
         #expect(sender.name == "Ann")
         #expect(sender.email == "ann@example.com")
     }
 
     @Test("A From with no valid mailbox shows its text, with no address")
     func invalidSenderShowsTextWithoutAddress() throws {
-        let sender = try #require(IMAPFetchMapping.sender(from: info(from: [.invalid("Mailer Daemon <<broken")])))
+        let sender = try #require(TabMail.EmailAddress.sender(of: [.invalid("Mailer Daemon <<broken")]))
         #expect(sender.name == "Mailer Daemon <<broken")
         #expect(sender.email == "")
     }
 
     @Test("A message with no From has no sender")
     func noFromHasNoSender() {
-        #expect(IMAPFetchMapping.sender(from: info()) == nil)
+        #expect(TabMail.EmailAddress.sender(of: []) == nil)
     }
 
     // MARK: - Address fields

@@ -56,59 +56,6 @@ struct GmailDisplayNameTests {
     }
 }
 
-@Suite("GmailProvider.parseFromHeader")
-struct GmailParseFromHeaderTests {
-
-    @Test("Parses display name and address from angle-bracket format")
-    func parsesDisplayNameAndAddress() {
-        let result = GmailProvider.parseFromHeader("John Doe <john@example.com>")
-        #expect(result.displayName == "John Doe")
-        #expect(result.address == "john@example.com")
-    }
-
-    @Test("Parses quoted display name with comma")
-    func parsesQuotedDisplayName() {
-        let result = GmailProvider.parseFromHeader("\"Doe, John\" <john@example.com>")
-        #expect(result.displayName == "Doe, John")
-        #expect(result.address == "john@example.com")
-    }
-
-    @Test("Returns address as both fields when no angle brackets")
-    func bareAddress() {
-        let result = GmailProvider.parseFromHeader("john@example.com")
-        #expect(result.displayName == "john@example.com")
-        #expect(result.address == "john@example.com")
-    }
-
-    @Test("Uses address as display name when name part is empty")
-    func emptyNamePart() {
-        let result = GmailProvider.parseFromHeader("<john@example.com>")
-        #expect(result.displayName == "john@example.com")
-        #expect(result.address == "john@example.com")
-    }
-
-    @Test("Trims whitespace from display name")
-    func trimsWhitespace() {
-        let result = GmailProvider.parseFromHeader("  Alice   <alice@example.com>")
-        #expect(result.displayName == "Alice")
-        #expect(result.address == "alice@example.com")
-    }
-
-    @Test("Strips surrounding quotes from display name")
-    func stripsQuotes() {
-        let result = GmailProvider.parseFromHeader("\"Bob Smith\" <bob@example.com>")
-        #expect(result.displayName == "Bob Smith")
-        #expect(result.address == "bob@example.com")
-    }
-
-    @Test("Handles empty string")
-    func emptyString() {
-        let result = GmailProvider.parseFromHeader("")
-        #expect(result.displayName == "")
-        #expect(result.address == "")
-    }
-}
-
 @Suite("GmailProvider.hasAttachmentParts")
 struct GmailHasAttachmentPartsTests {
 
