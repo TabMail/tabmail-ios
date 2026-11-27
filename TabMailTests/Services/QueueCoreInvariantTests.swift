@@ -1277,7 +1277,7 @@ struct QueueCoreInvariantTests {
             try MessageHeaderRekey.finishMove(
                 op, destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
-                addressChangesOnMove: true, accountScopedIds: false, db: db)
+                addressChangesOnMove: true, accountScopedIds: false, copiedNothing: false, db: db)
         }
 
         #expect(outcome.applied.map(\.newHeaderId) == [newId], "precondition: the move re-keyed the row")
