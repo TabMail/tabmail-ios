@@ -57,7 +57,8 @@ struct SendRecipientNamesTests {
     /// header block 7-bit ASCII.
     private static func expectNamedHeaders(_ message: String, _ label: String) {
         let head = message.components(separatedBy: "\r\n\r\n").first ?? message
-        #expect(head.unicodeScalars.allSatisfy(\.isASCII), "\(label): a header is not 7-bit ASCII")
+        let ascii = head.unicodeScalars.allSatisfy(\.isASCII)
+        #expect(ascii, "\(label): a header is not 7-bit ASCII")
         let fields = headerFields(message)
         #expect(fields["To"] == "Sam Lee <sam@example.com>", "\(label)")
         #expect(fields["Cc"] == #""Lee, Ann" <ann@example.com>"#, "\(label)")
@@ -343,7 +344,8 @@ struct SendRecipientNamesTests {
     /// order under their names, in a 7-bit header.
     private static func expectHardNames(_ message: String, bcc: Bool = true, _ label: String) {
         let head = message.components(separatedBy: "\r\n\r\n").first ?? message
-        #expect(head.unicodeScalars.allSatisfy(\.isASCII), "\(label): a header is not 7-bit ASCII")
+        let ascii = head.unicodeScalars.allSatisfy(\.isASCII)
+        #expect(ascii, "\(label): a header is not 7-bit ASCII")
         let to = written("To", in: message)
         let cc = written("Cc", in: message)
         let writtenBcc = written("Bcc", in: message)
