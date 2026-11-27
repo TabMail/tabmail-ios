@@ -5,6 +5,7 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// A chat about an email belongs to that email wherever its row moves. The
@@ -133,6 +134,43 @@ struct OpenChatFollowsItsEmailTests {
         #expect(session.sessionEmailContexts[key("g-old")] == nil)
         #expect(bystander.currentSessionId == key("g-other"))
         #expect(bystander.sessionEmailContexts[key("g-other")] == context("acc1:INBOX:g-other"))
+    }
+
+    /// The open chat follows inside the publish, before the post: a holder that
+    /// hears of the move and opens the email's chat finds it on the new row
+    /// (`MailPointerMoves.publish`).
+    @Test("A published move reaches the open chat before any holder hears of it")
+    func publishMovesTheOpenChatBeforeThePost() {
+        let old = "pub-\(UUID().uuidString)"
+        let new = "pub-\(UUID().uuidString)"
+        let oldKey = key(old)
+        let newKey = key(new)
+        let pills = ChatPillState.shared
+        defer {
+            pills.removeSession(for: oldKey)
+            pills.removeSession(for: newKey)
+        }
+        let session = pills.session(for: oldKey)
+        session.currentSessionId = oldKey
+        let record = move(old, new)
+        let heard = Mutex<String?>(nil)
+        let token = NotificationCenter.default.addObserver(
+            forName: .mailPointersMoved, object: nil, queue: nil
+        ) { notification in
+            // Other suites may post at the same time: read only this test's move.
+            guard let moves = MailPointerMoves.posted(in: notification),
+                  moves.row(movedFrom: record.oldHeaderId) != nil else { return }
+            let found = MainActor.assumeIsolated {
+                ChatPillState.shared.session(for: newKey).currentSessionId
+            }
+            heard.withLock { $0 = found }
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        MailPointerMoves.publish(MailPointerMoves([.row(record)]))
+
+        let current = heard.withLock { $0 }
+        #expect(current == newKey, "the chat a holder opens names the new row's session")
     }
 
     @Test("An unchanged stable id keeps the chat's key and names the new row")
