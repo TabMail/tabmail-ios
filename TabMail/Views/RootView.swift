@@ -1204,7 +1204,8 @@ extension Notification.Name {
     /// admission, a vanished row, a rolled-back write, and also a row that
     /// already sits at the destination (nothing left to move). Also posted
     /// when a move left waiting behind an in-flight opposite move is later
-    /// dropped. Object is `[String]` header ids, each with the id a
+    /// dropped, and when a UIDVALIDITY reset drops a queued move with no
+    /// provider-confirmed result (#814). Object is `[String]` header ids, each with the id a
     /// provider-proven re-key has since handed it to; a list that hid those
     /// rows at gesture time shows them again.
     static let messageMovesRefused = Notification.Name("messageMovesRefused")
