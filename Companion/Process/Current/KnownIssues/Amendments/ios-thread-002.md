@@ -22,7 +22,7 @@ notification tap; `seedFromStagedPublish`; Outlook `conversationId`; `GraphParse
 `Fwd:`; `Fw:`; localized forward prefix; rewritten subject; first sync; older mail; UIDVALIDITY
 reset; account reset; another device; Trash; Junk; `SyncConfig.threadQueryLimit`; In-Reply-To on
 Outlook; #1555; #1559; IOS-THREAD-001; IOS-OUTBOX-008; `extendedPropertiesExpandParameter`;
-`String 0x1042`; `String 0x1039`; `readLastVerbs`; allowance cut; Inbox baseline.
+`String 0x1042`; `String 0x1039`; `readLastVerbs`; allowance cut; failed by-id read; `rereadLater`; Inbox baseline.
 
 ## The behaviour
 
@@ -62,8 +62,9 @@ failing that, a stored email that names it (the reverse and lateral probes, unch
    so a reply to a forward on Outlook threads under the forward as on Gmail and IMAP. No new request.
    Residuals, each keeping the earlier grouping by Outlook's conversation id (display only; the thread
    is set once, at insert):
-   - **Allowance or budget cut.** A new Inbox email whose by-id read the pass's request allowance or
-     budget did not reach is stored from the delta page without its ids; the later re-read does not
+   - **Allowance or budget cut, or a failed read.** A new Inbox email whose by-id read the pass's
+     request allowance or budget did not reach, or whose read failed (5xx, 429, a failed batch, an
+     unusable answer), is stored from the delta page without its ids; the later re-read does not
      move its thread. The last verb has the same reach; the Inbox's ids are read first.
    - **Inbox baseline.** A baseline (the folder's first change read, or a restart after a refused
      bookmark) reads no ids by id; mail it stores itself has none. Most mail it meets is already
@@ -99,7 +100,7 @@ failing that, a stored email that names it (the reverse and lateral probes, unch
 ## When it happens
 
 Cases 1 and 2 depend on what other people's mail apps write. Case 3 needs the older email stored
-after the newer one, which a first sync does for most of an account. Case 4 is every forward on an Outlook account (since #1559 only its residuals: a cut by-id read, an Inbox baseline, search, mail stored before the release). Case 5 needs a rewritten subject
+after the newer one, which a first sync does for most of an account. Case 4 is every forward on an Outlook account (since #1559 only its residuals: a cut or failed by-id read, an Inbox baseline, search, mail stored before the release). Case 5 needs a rewritten subject
 on a forward. Cases 6 and 7 need a notification that arrives before the merge. Case 8 is every
 forward already on the device, and its view gap needs a conversation already split across threads.
 Case 9 needs the forward in Trash or Junk, or a conversation of over 100 emails.

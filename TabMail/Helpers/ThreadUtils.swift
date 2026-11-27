@@ -131,7 +131,8 @@ enum ThreadUtils {
         let placeholders = L.map { _ in "?" }.joined(separator: ",")
 
         // (2) + (4) Reverse + lateral via inReplyTo. Named index: where the
-        // stored mail has no In-Reply-To (Outlook stores none), ANALYZE counts
+        // stored mail has no In-Reply-To (Outlook mail stored before #1559, by
+        // an Inbox baseline or from search), ANALYZE counts
         // all its rows under one value and the planner would read the whole
         // table instead (#1563). The index is migration-built (v13), never
         // deferred or dropped, so every caller has it.

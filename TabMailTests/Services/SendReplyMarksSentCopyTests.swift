@@ -21,9 +21,11 @@ import Testing
 /// is not run, so what the original shows comes from Send's own mark (#1490) and
 /// the Sent copy.
 ///
-/// Outlook's sync reads no In-Reply-To (`GraphParse.parseMessage` sets it nil),
-/// so an Outlook Sent copy marks nothing for a reply or a forward; its marks come
-/// from the completion's last-verb write. Its test pins the wire only.
+/// Outlook's sync reads In-Reply-To since #1559 (the extended property
+/// `String 0x1042`), so an Outlook Sent copy marks its original as on Gmail and
+/// IMAP; that sync is pinned by
+/// `OutlookChangeReadingTests.sentReplyMarksItsParentReplied`. The Outlook test
+/// here pins the wire only.
 extension SendReplyMarksTests {
 
     /// The original's marks after its Sent copy synced, with the send not yet
