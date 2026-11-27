@@ -1147,6 +1147,75 @@ struct IncrementalVacuumTests {
         #expect(!both, "suspended in the foreground: it does not run")
     }
 
+    @Test("The Optimize Storage tap's check runs the steps only in the foreground with the databases not suspended")
+    func theTapsCheckNeedsTheForegroundAndNoSuspension() {
+        let foreground = SyncEngine.optimizeStorageMayRun(isSuspended: false, isAppActive: true)
+        let suspended = SyncEngine.optimizeStorageMayRun(isSuspended: true, isAppActive: true)
+        let background = SyncEngine.optimizeStorageMayRun(isSuspended: false, isAppActive: false)
+        let both = SyncEngine.optimizeStorageMayRun(isSuspended: true, isAppActive: false)
+        #expect(foreground, "in the foreground, not suspended: it runs")
+        #expect(!suspended, "suspended: it does not run")
+        #expect(!background, "the app left the foreground: it does not run, the rest waits for the background job")
+        #expect(!both, "suspended in the background: it does not run")
+    }
+
+    /// One Optimize Storage tap with `readMeasure`'s measure and `giveBack`'s steps, the
+    /// tap's check in the foreground with the databases not suspended, and a threshold
+    /// of one byte (a test database's empty pages are far under the app's): the row
+    /// before the tap, and the row and the space used after it.
+    @MainActor
+    private static func tapOnce(
+        readMeasure: @escaping @Sendable () async -> StorageOptimizer.Measure,
+        giveBack: @escaping @Sendable (@escaping @Sendable () -> Bool) async -> [SyncEngine.SpaceReturnStep]
+    ) async -> (before: StorageOptimizer.Row?, after: StorageOptimizer.Row?, usedAfter: Int64?) {
+        let optimizer = StorageOptimizer(
+            readMeasure: readMeasure, readNeedsUpgrade: { false }, openUpgradeNotice: {},
+            giveBack: giveBack,
+            mayRun: { SyncEngine.optimizeStorageMayRun(isSuspended: false, isAppActive: true) },
+            minimumGainBytes: 1)
+        await optimizer.refresh()
+        let before = optimizer.row
+        await optimizer.tap()
+        return (before, optimizer.row, optimizer.measure?.usedBytes)
+    }
+
+    @Test("An Optimize Storage tap on a real upgraded email database brings the database and its WAL down to the size its row promised, and the row goes")
+    func theTapReachesTheSizeItsRowPromised() async throws {
+        let email = try await makeIncrementalEmailWithEmptyPages()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: email.pool, directory: email.directory) }
+        let key = Self.markerKey()
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        let pool = email.pool
+        let path = email.path
+        let target = SyncEngine.SpaceReturnTarget.email(email.background, markerKey: key, inboxObserver: nil)
+        let stepPages = Self.smallStep
+        let beforeRead = try Self.spaceState(email.pool)
+        let before = try #require(beforeRead)
+
+        let outcome = await Self.tapOnce(
+            readMeasure: {
+                // The row's measure, on this database alone: the files on disk and the empty pages.
+                let pages = try? await pool.read { db in try StorageEstimator.PageTotals.read(db) }
+                return StorageOptimizer.Measure(
+                    usedBytes: StorageEstimator.databaseFileBytes(ofDatabaseAt: path), emptyBytes: pages?.emptyBytes)
+            },
+            giveBack: { shouldRun in
+                await SyncEngine.runOvernightSpaceReturn(targets: [target], stepPages: stepPages, shouldRun: shouldRun)
+            })
+        let promised: Int64? = {
+            guard case .ready(let bytes, false)? = outcome.before else { return nil }
+            return bytes
+        }()
+        let usedAfter = outcome.usedAfter ?? .max
+        let wal = Self.walBytes(path)
+
+        #expect(before.freePages > Int64(stepPages * 2), "precondition: empty pages for several steps (\(before))")
+        #expect(promised != nil, "precondition: the row offers the tap (\(String(describing: outcome.before)))")
+        #expect(usedAfter <= (promised ?? 0), "the database and its WAL take no more than the row promised: \(usedAfter) for \(String(describing: promised))")
+        #expect(outcome.after == nil, "no empty page left, so no row: \(String(describing: outcome.after))")
+        #expect(wal == 0, "the WAL is empty (\(wal) bytes)")
+    }
+
     @Test("The background job's default check starts no step while the app is in the foreground")
     func theDefaultCheckStartsNothingInTheForeground() async throws {
         let active = DatabaseSuspension.isAppActive
@@ -1258,6 +1327,40 @@ struct IncrementalVacuumTests {
         #expect(emailLog.switchCount == 1 && searchLog.switchCount == 1)
         #expect(emailLog.truncateCount == 1 && searchLog.truncateCount == 1, "each switch's WAL is truncated")
         #expect(emailLog.steps.isEmpty && searchLog.steps.isEmpty, "the upgrade takes no step")
+    }
+
+    /// The upgrade screen's bar (#1583) learns of each database's end from the loop
+    /// itself, not from a read of the databases.
+    @Test("Each database's step is told as soon as it ends, before the next database starts, the step that ends the upgrade included")
+    func eachStepIsToldAsItEnds() async {
+        let emailLog = StepLog()
+        let searchLog = StepLog()
+        let told = Lines()
+        let steps = await SyncEngine.runDatabaseUpgrade(
+            targets: [
+                Self.fakeTarget("email", autoVacuum: DatabaseVacuum.noneMode, freePages: 10, log: emailLog),
+                Self.fakeTarget("search", autoVacuum: DatabaseVacuum.noneMode, freePages: 10, log: searchLog),
+            ],
+            availableBytes: { _ in Self.plentyOfSpace }, shouldRun: { true },
+            finished: { step in told.add("\(step): email \(emailLog.switchCount), search \(searchLog.switchCount)") })
+        let shortLog = StepLog()
+        let toldShort = Lines()
+        let short = await SyncEngine.runDatabaseUpgrade(
+            targets: [
+                Self.fakeTarget("email", autoVacuum: DatabaseVacuum.incrementalMode, freePages: 10, log: StepLog()),
+                Self.fakeTarget("search", autoVacuum: DatabaseVacuum.noneMode, freePages: 10, log: shortLog),
+            ],
+            availableBytes: { _ in 0 }, shouldRun: { true },
+            finished: { step in toldShort.add("\(step)") })
+        let shortSteps = short.map { "\($0)" }
+
+        #expect(steps == [.upgraded("email"), .upgraded("search")], "\(steps)")
+        #expect(told.all == [
+            "\(SyncEngine.UpgradeStep.upgraded("email")): email 1, search 0",
+            "\(SyncEngine.UpgradeStep.upgraded("search")): email 1, search 1",
+        ], "each step told once, after its own switch and before the next: \(told.all)")
+        #expect(toldShort.all == shortSteps, "every step told, in order, the one that ends the upgrade included: \(toldShort.all)")
+        #expect(short.count == 2, "precondition: one step for each database: \(short)")
     }
 
     @Test("A database already upgraded is left alone, its free space not read, and the next one is upgraded")
@@ -1395,7 +1498,8 @@ struct IncrementalVacuumTests {
     }
 
     /// Every production call of the background steps, the upgrade and their targets:
-    /// the background job's two lines, and `DatabaseUpgrade`'s run and state read.
+    /// the background job's two lines, `DatabaseUpgrade`'s run and state read, and the
+    /// Optimize Storage tap's two lines.
     private static func spaceReturnCalls(_ lines: [(file: String, code: String)]) -> [String] {
         lines
             .filter {
@@ -1410,7 +1514,9 @@ struct IncrementalVacuumTests {
     private static let expectedSpaceReturnCalls = [
         "DatabaseUpgrade.swift: let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.dbPool)",
         "DatabaseUpgrade.swift: let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.dbPool)",
-        "DatabaseUpgrade.swift: return await SyncEngine.runDatabaseUpgrade(targets: targets)",
+        "DatabaseUpgrade.swift: return await SyncEngine.runDatabaseUpgrade(targets: targets, finished: finished)",
+        "StorageOptimizer.swift: let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.backgroundPool)",
+        "StorageOptimizer.swift: return await SyncEngine.runOvernightSpaceReturn(targets: targets, shouldRun: shouldRun)",
         "SyncScheduler.swift: await SyncEngine.runOvernightSpaceReturn(targets: targets)",
         "SyncScheduler.swift: let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.backgroundPool)",
     ].sorted()
@@ -1426,10 +1532,15 @@ struct IncrementalVacuumTests {
         let stop = upgrade.firstIndex(of: "scheduler.stopPolling()")
         let resume = upgrade.firstIndex(of: "defer { if DatabaseSuspension.isAppActive { scheduler.startForegroundPolling() } }")
         let queues = upgrade.firstIndex(of: "await SyncScheduler.cancelAllInFlightQueues(inboxOnly: false)")
-        let rewrite = upgrade.firstIndex(of: "let steps = await upgradeDatabases()")
+        let rewrite = upgrade.firstIndex(of: "let steps = await upgradeDatabases { step in await self.databaseFinished(step) }")
+        // The progress bar's data (#1583): read once paused, just before the rewrite.
+        let sizes: Int? = {
+            guard let run else { return nil }
+            return upgrade[run...].firstIndex(of: "let states = await readStates()")
+        }()
         let inOrder: Bool = {
-            guard let run, let stop, let resume, let queues, let rewrite else { return false }
-            return run < stop && stop + 1 == resume && resume < queues && queues < rewrite
+            guard let run, let stop, let resume, let queues, let sizes, let rewrite else { return false }
+            return run < stop && stop + 1 == resume && resume < queues && queues < sizes && sizes < rewrite
         }()
         let otherFunction: [String] = {
             guard let run, let rewrite, run < rewrite else { return ["(not found)"] }
@@ -1438,7 +1549,7 @@ struct IncrementalVacuumTests {
         let appDefaults = [
             "static let shared = DatabaseUpgrade()",
             "scheduler: SyncScheduler = .shared,",
-            "upgradeDatabases: @escaping @Sendable () async -> [SyncEngine.UpgradeStep] = DatabaseUpgrade.upgradeTheAppsDatabases,",
+            "upgradeDatabases: @escaping @Sendable (StepFinished) async -> [SyncEngine.UpgradeStep] = DatabaseUpgrade.upgradeTheAppsDatabases,",
             "readStates: @escaping @Sendable () async -> [DatabaseState] = DatabaseUpgrade.readTheAppsStates,",
             "readBattery: @escaping @MainActor () -> (level: Float, state: UIDevice.BatteryState) = DatabaseUpgrade.theDevicesBattery",
         ].filter { !upgrade.contains($0) }
@@ -1447,7 +1558,7 @@ struct IncrementalVacuumTests {
         let persisted = upgrade.filter { $0.contains("UserDefaults.standard.set(") }
 
         #expect(calls == Self.expectedSpaceReturnCalls, "the production callers, with the app's targets and the default checks: \(calls)")
-        #expect(inOrder, "stop polling, set the exit that starts it, empty the queues, upgrade (run \(String(describing: run)), stop \(String(describing: stop)), exit \(String(describing: resume)), queues \(String(describing: queues)), upgrade \(String(describing: rewrite)))")
+        #expect(inOrder, "stop polling, set the exit that starts it, empty the queues, read the data for the progress, upgrade (run \(String(describing: run)), stop \(String(describing: stop)), exit \(String(describing: resume)), queues \(String(describing: queues)), data \(String(describing: sizes)), upgrade \(String(describing: rewrite)))")
         #expect(otherFunction.isEmpty, "inside run's own function: \(otherFunction)")
         #expect(appDefaults.isEmpty, "the shared upgrade uses the app's scheduler, rewrite and states: missing \(appDefaults)")
         #expect(pollingCalls == ["scheduler.stopPolling()", "defer { if DatabaseSuspension.isAppActive { scheduler.startForegroundPolling() } }"], "one stop, and one exit that turns polling back on while the app is active: \(pollingCalls)")
@@ -1499,8 +1610,8 @@ struct IncrementalVacuumTests {
 
     /// The tests above pass their own targets and checks, so only the source shows
     /// what production runs.
-    @Test("Production runs the background steps only as the background processing job's last step, after the full sync and the tokenizer rebuild, with the app's targets and the default check")
-    func theStepsRunOnlyFromTheBackgroundJob() {
+    @Test("Production runs the steps as the background processing job's last step, after the full sync and the tokenizer rebuild, with the app's targets and the default check, and otherwise only from the Optimize Storage tap")
+    func theStepsRunOnlyFromTheBackgroundJobAndTheTap() {
         let lines = SyncEngineMaintenanceTests.productionCodeLines()
         let calls = Self.spaceReturnCalls(lines)
         let expected = Self.expectedSpaceReturnCalls
@@ -1521,5 +1632,42 @@ struct IncrementalVacuumTests {
         #expect(calls == expected, "the production callers, with the app's targets and the default checks: \(calls)")
         #expect(inOrder, "after the full sync and the tokenizer rebuild (job \(String(describing: job)), sync \(String(describing: fullSync)), rebuild \(String(describing: rebuild)), run \(String(describing: run)))")
         #expect(otherFunction.isEmpty, "inside the job's own function: \(otherFunction)")
+    }
+
+    /// `StorageOptimizerTests` passes its own measure, upgrade state, notice, steps and
+    /// check, and calls `stop` itself, so only the source shows what the app's tap runs,
+    /// what the app's row measures, and that Settings stops the run when it goes.
+    @Test("The Optimize Storage tap runs the app's steps on the email database's background pool with the tap's check, the row measures both databases, and Settings measures on opening and stops the run when it goes")
+    func theTapRunsTheAppsStepsWithItsCheck() {
+        let lines = SyncEngineMaintenanceTests.productionCodeLines()
+        let optimizer = lines.filter { $0.file == "StorageOptimizer.swift" }.map { $0.code }
+        let appDefaults = [
+            "readMeasure: @escaping @Sendable () async -> Measure = StorageOptimizer.measureTheApp,",
+            "readNeedsUpgrade: @escaping @MainActor () async -> Bool = StorageOptimizer.theAppNeedsUpgrade,",
+            "openUpgradeNotice: @escaping @MainActor () async -> Void = { await DatabaseUpgrade.shared.openNotice() },",
+            "giveBack: @escaping @Sendable (@escaping @Sendable () -> Bool) async -> [SyncEngine.SpaceReturnStep] = StorageOptimizer.giveBackTheAppsEmptyPages,",
+            "mayRun: @escaping @Sendable () -> Bool = { SyncEngine.optimizeStorageMayRun() },",
+            "minimumGainBytes: Int64 = SyncConfig.optimizeStorageMinimumGainBytes",
+            "await giveBack { mayRun() && !Task.isCancelled }",
+            "let source = StorageEstimator.SpaceSource.app(pool: AppDatabase.dbPool)",
+            "let used = source.reportedBytes()",
+            "let pages = await source.pageTotals()",
+            "return Measure(usedBytes: used, emptyBytes: pages?.emptyBytes)",
+            "await DatabaseUpgrade.shared.refresh()",
+            "return DatabaseUpgrade.shared.needsUpgrade",
+        ].filter { !optimizer.contains($0) }
+        let settings = lines.filter { $0.file == "SettingsView.swift" }.map { $0.code }
+        let settingsCalls = [
+            ".task { await optimizer.refresh() }",
+            ".onDisappear { optimizer.stop() }",
+            "if !isPresented { Task { await optimizer.refresh() } }",
+        ].filter { !settings.contains($0) }
+        let optimizers = lines
+            .filter { $0.code.contains("StorageOptimizer(") && !$0.code.contains("func ") }
+            .map { "\($0.file): \($0.code)" }
+
+        #expect(appDefaults.isEmpty, "the app's optimizer measures both databases and runs the app's steps with the tap's check and its stop: missing \(appDefaults)")
+        #expect(settingsCalls.isEmpty, "Settings measures on opening and after the upgrade's screen closes, and stops the run when it goes: missing \(settingsCalls)")
+        #expect(optimizers == ["SettingsView.swift: @State private var optimizer = StorageOptimizer()"], "Settings alone makes one, with the app's defaults: \(optimizers)")
     }
 }

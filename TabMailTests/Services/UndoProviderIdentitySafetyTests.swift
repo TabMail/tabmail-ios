@@ -40,6 +40,41 @@ private actor UndoWriteGate {
     }
 }
 
+/// Which email an Undo names, against the email whose move waits behind an
+/// in-flight opposite move at the same address. File scope: a `@Test`
+/// argument list cannot name a member of the suite it is attached to.
+enum DeferredUndoWitness: String, CaseIterable, Sendable {
+    /// The Undo was recorded for a different email that once held this
+    /// address: the waiting move is another email's newer intention.
+    case otherEmail
+    /// The Undo names the same email: its own waiting move is cancelled.
+    case sameEmail
+    /// The Undo's email has no usable Message-ID: the address check alone
+    /// decides, as before.
+    case noWitness
+    /// The waiting email has no Message-ID while the Undo names one: nothing
+    /// shows the waiting move is the Undo's email, so it is not cancelled.
+    case waitingEmailHasNoId
+
+    /// The Message-ID of the waiting email in both tests below.
+    static let waitingRfc = "waiting@example.com"
+
+    var waitingRowRfc: String? {
+        self == .waitingEmailHasNoId ? nil : Self.waitingRfc
+    }
+
+    var undoRfc: String? {
+        switch self {
+        case .otherEmail, .waitingEmailHasNoId: return "earlier@example.com"
+        case .sameEmail: return Self.waitingRfc
+        case .noWitness: return nil
+        }
+    }
+
+    /// Whether the Undo cancels the waiting move.
+    var cancels: Bool { self == .sameEmail || self == .noWitness }
+}
+
 // A3.4: `queuedInverseDiagnosticCorrelatesWithTheInsertedRow` below redirects
 // `AppLogStore.fileURLOverride` and forces
 // `DebugModeManager.loggingEnabledOverrideForTesting` — process-global seams
@@ -806,6 +841,146 @@ struct UndoProviderIdentitySafetyTests {
         }
         #expect(settled.0?.folderPath == "INBOX")
         #expect(settled.1.isEmpty)
+    }
+
+    /// An Undo cancels a waiting move only for the email it names. An Undo
+    /// recorded for one email must not drop the waiting Delete of a different
+    /// email that now sits at the same address; that Delete still reaches the
+    /// server once the move ahead of it lands.
+    @Test("Undo cancels a waiting Delete only for the email it names",
+          arguments: DeferredUndoWitness.allCases)
+    @MainActor
+    func undoCancelsOnlyTheSameEmailsWaitingDelete(witness: DeferredUndoWitness) async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let manager = AccountManager.shared
+        await manager.clearDeferredMoveSuccessorsForTesting()
+
+        // The waiting email: back in Inbox optimistically while its Trash ->
+        // Inbox move is in flight, so its Delete waits behind that move (the
+        // shape of the test above).
+        var row = sourceHeader(
+            fixture, providerId: "901", rfc: witness.waitingRowRfc,
+            sourcePath: "Trash", sourceEpoch: nil)
+        row.folderId = MessageIdentity.folderId(
+            accountId: fixture.accountId, folderPath: "INBOX")
+        row.folderPath = "INBOX"
+        row.isInInbox = true
+        let insertedRow = row
+        try await fixture.pool.write { db in try insertedRow.insert(db) }
+        let moveBack = try await insertInFlightMove(
+            fixture, messageIds: ["901"], from: "Trash", to: "INBOX", epoch: 74)
+        let deletion = await manager.move([insertedRow], to: "Trash")
+        #expect(deletion.pendingIds == [insertedRow.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+
+        // The Undo names the same address and folders; only the email it was
+        // recorded for differs between the cases.
+        var undoneRow = insertedRow
+        undoneRow.rfc822MessageId = witness.undoRfc
+        let restored = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Trash",
+            members: [UndoMember(header: undoneRow)])
+
+        let pending = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(pending.map(\.id) == [moveBack.id], "the Undo queued a move of its own")
+        let remaining = await manager.deferredMoveSuccessorCountForTesting()
+        if witness.cancels {
+            #expect(restored == [insertedRow.id])
+            #expect(remaining == 0)
+        } else {
+            #expect(restored.isEmpty, "an Undo for another email restored \(restored)")
+            #expect(remaining == 1, "an Undo for another email cancelled the waiting email's Delete")
+        }
+
+        // Once the move ahead lands, the waiting email's Delete is queued
+        // exactly when it was not cancelled.
+        let result = try await finishMove(
+            fixture, operation: moveBack, sourceId: "901",
+            destinationId: "102", destinationEpoch: 41)
+        await manager.materializeDeferredMoveSuccessors(after: moveBack, result: result)
+        await manager.awaitWriteQueueDrain()
+        let settled = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        if witness.cancels {
+            #expect(settled.isEmpty, "a cancelled Delete was queued")
+        } else {
+            #expect(settled.count == 1, "the waiting email's Delete was not queued: \(settled.count) ops")
+            guard settled.count == 1 else { return }
+            #expect(settled[0].messageIds == ["102"])
+            #expect(settled[0].folderPath == "INBOX")
+            #expect(settled[0].destinationPath == "Trash")
+        }
+        await manager.clearDeferredMoveSuccessorsForTesting()
+    }
+
+    /// The same rule for a waiting move an Undo itself recorded (an Undo
+    /// behind its in-flight forward move): a later Undo of that Undo cancels
+    /// it only for the email it names.
+    @Test("Undo cancels an Undo's waiting move only for the email it names",
+          arguments: DeferredUndoWitness.allCases)
+    @MainActor
+    func undoCancelsAnUndosWaitingMoveOnlyForItsEmail(witness: DeferredUndoWitness) async throws {
+        let fixture = try install(provider: .imap)
+        defer { uninstall(fixture) }
+        let manager = AccountManager.shared
+        await manager.clearDeferredMoveSuccessorsForTesting()
+
+        let original = sourceHeader(
+            fixture, providerId: "101", rfc: witness.waitingRowRfc)
+        try installOptimisticallyMoved(original, pool: fixture.pool)
+        let forward = try await insertInFlightMove(
+            fixture, messageIds: ["101"], from: "INBOX", to: "Archive", epoch: 41)
+        let firstUndo = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "Archive",
+            members: [UndoMember(header: original)])
+        #expect(firstUndo == [original.id])
+        #expect(await manager.deferredMoveSuccessorCountForTesting() == 1)
+
+        // Undo the Undo: the same address, from Archive back to Inbox; only
+        // the email the second Undo was recorded for differs.
+        var undone = original
+        undone.folderId = MessageIdentity.folderId(
+            accountId: fixture.accountId, folderPath: "Archive")
+        undone.folderPath = "Archive"
+        undone.isInInbox = false
+        undone.rfc822MessageId = witness.undoRfc
+        let secondUndo = await manager.undoMove(
+            accountId: fixture.accountId,
+            forwardDestinationPath: "INBOX",
+            members: [UndoMember(header: undone)])
+
+        let remaining = await manager.deferredMoveSuccessorCountForTesting()
+        if witness.cancels {
+            #expect(secondUndo == [original.id])
+            #expect(remaining == 0)
+        } else {
+            #expect(secondUndo.isEmpty, "an Undo for another email restored \(secondUndo)")
+            #expect(remaining == 1, "an Undo for another email cancelled this email's waiting move")
+        }
+        let pending = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        #expect(pending.map(\.id) == [forward.id], "the second Undo queued a move of its own")
+
+        // Once the forward move lands, the waiting move back to Inbox is
+        // queued exactly when it was not cancelled (the shape of
+        // `copyUidMaterializesDeferredInverse`).
+        let result = try await finishMove(
+            fixture, operation: forward, sourceId: "101",
+            destinationId: "901", destinationEpoch: 52)
+        await manager.materializeDeferredMoveSuccessors(after: forward, result: result)
+        await manager.awaitWriteQueueDrain()
+        let settled = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        if witness.cancels {
+            #expect(settled.isEmpty, "a cancelled move back was queued")
+        } else {
+            #expect(settled.count == 1, "the waiting move back was not queued: \(settled.count) ops")
+            guard settled.count == 1 else { return }
+            #expect(settled[0].messageIds == ["901"])
+            #expect(settled[0].folderPath == "Archive")
+            #expect(settled[0].destinationPath == "INBOX")
+        }
+        await manager.clearDeferredMoveSuccessorsForTesting()
     }
 
     @Test("Undo after Delete cancels then reinstates an in-flight move-back")

@@ -1,10 +1,12 @@
 ## ADR-IOS-121: Both Databases Move to `auto_vacuum = INCREMENTAL` Through a One-Time Upgrade the User Starts, Then Give Their Empty Pages Back Overnight in Short Steps
 
 **Status:** Active (2026-11-26, #1450; the upgrade's free-space need amended 2026-11-26, #1449 and #1545,
-decision 3 "Room and power"). Amends ADR-IOS-006 (its current note of 2026-11-24 left
+decision 3 "Room and power"; the notice's time estimate and the running screen's progress bar amended
+2026-11-27, #1583, decision 3 "The time"). Amends ADR-IOS-006 (its current note of 2026-11-24 left
 "returning the empty pages to the file system" as separate work) and ADR-IOS-029 (a `VACUUM` carries
 the planner statistics marker). First written 2026-11-25 with an overnight switch the app ran by
-itself; that design was replaced before release (see "Replaced design" at the end).
+itself; that design was replaced before release (see "Replaced design" at the end). Amended
+2026-11-26 (#1448): the Optimize Storage tap, the steps' one run in the foreground (decision 5).
 
 **Context:** A row delete moves the pages it frees to the database's freelist. On
 `auto_vacuum = NONE`, the mode of every database the app created until now, no file ever shrinks: the
@@ -46,16 +48,17 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      fence `IncrementalVacuumTests.theUpgradeCheckReadsAfterTheLaunch`), a banner sits on top of the inbox
      (`DatabaseUpgradeBanner`, the shape of the sign-in and significant-update banners: no dismiss
      button, one action, gone once its condition clears). Its action opens the notice
-     (`DatabaseUpgradeView`, a full-screen cover): what the upgrade does, that it is one time, that it
-     takes a minute or so (longer for a large mailbox) and that TabMail must stay open; **Upgrade now**
-     and **Later**. Later closes it and the banner stays. The notice also shows by itself once per
+     (`DatabaseUpgradeView`, a full-screen cover): what the upgrade does, that it is one time, how long
+     it can take ("It can take up to N minutes", below: "The time", amended 2026-11-27, #1583) and that
+     TabMail must stay open; **Upgrade now** and **Later**. Later closes it and the banner stays. The notice also shows by itself once per
      install, from the same check right after that read: only while the app is active and nothing else
      is presented, checked and presented with no wait between; the `DatabaseUpgrade.noticeOffered`
      flag records that it has shown. After that only the banner opens it.
-   - **The storage limits come after it.** The size-limit features (Optimize Storage, #1448; the
-     low-space cleanup, #1449; neither exists yet) must give space back only on an upgraded database:
-     their entry points must read `DatabaseUpgrade.needsUpgrade`, say the upgrade comes first, and open
-     this same notice (`DatabaseUpgrade.openNotice`).
+   - **The storage limits come after it.** The size-limit features (Optimize Storage, #1448, decision
+     5; the low-space cleanup, #1449, which does not exist yet) must give space back only on an
+     upgraded database: their entry points must read `DatabaseUpgrade.needsUpgrade`, say the upgrade
+     comes first, and open this same notice (`DatabaseUpgrade.openNotice`). Optimize Storage does
+     (`StorageOptimizer.Row.upgradeFirst`).
    - **Room and power.** Upgrade now is off while the device lacks
      `SyncConfig.incrementalVacuumSwitchFreeSpaceMultiple` (2.05) times a not-yet-upgraded database's
      pages less its empty pages free (`DatabaseVacuum.SpaceState.liveBytes`, the storage measure's
@@ -78,8 +81,8 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      on a battery change, and once more when Upgrade now is tapped. Upgrade now starts only from the
      notice: a second tap (or a repeated VoiceOver activation) while the first tap's read runs finds the
      upgrade under way and starts nothing (`DatabaseUpgradeTests.twoTapsRunOneUpgrade`).
-   - **Upgrade mode.** Upgrade now shows a spinner on the same full-screen cover, with the screen kept
-     awake (`keepScreenAwake`, as Fast Sync), so the user cannot use the app until it ends; and it makes
+   - **Upgrade mode.** Upgrade now shows a progress screen (until 2026-11-27 a spinner; below: "The
+     time") on the same full-screen cover, with the screen kept awake (`keepScreenAwake`, as Fast Sync), so the user cannot use the app until it ends; and it makes
      the light pause, the two stops the app already makes on going to the background:
      `SyncScheduler.stopPolling` (the poll timer, IMAP IDLE, the foreground maintenance pass) and
      `SyncScheduler.cancelAllInFlightQueues(inboxOnly: false)` (every body, AI and embedding queue
@@ -95,6 +98,50 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      work waits behind the writer like the rest, and the final TRUNCATE may then find a reader and leave
      part of the WAL to the later checkpoints (below). No gate is added for this (ADR-IOS-009); the
      exit's start is then a second start, whose timer guard keeps one timer.
+   - **The time** (amended 2026-11-27, #1583; it replaced the notice's fixed "up to 10 minutes" and
+     the running screen's spinner). One rate, `SyncConfig.databaseUpgradeSecondsPerGB` (40 s for a
+     gigabyte of data, a database's pages less its empty pages; measured on an iPhone, 1.00 GB of email
+     data in 37.6 s and 3.80 GB of search data in 134.8 s, memory 162), drives both, through the pure
+     `DatabaseUpgradeProgress`. Every number is in `SyncConfig`.
+     - **The notice** says "It can take up to N minutes": the data of the databases still on NONE, read
+       by `refreshConditions` with the space check (no other read), at that rate times
+       `databaseUpgradeNoticeTimeMargin` (3, room for a slower phone), rounded up to whole minutes, at
+       least 1 (`DatabaseUpgrade.noticeMinutes`). When a database's mode and pages cannot be read it
+       says `databaseUpgradeNoticeFallbackMinutes` (10, the earlier fixed text).
+     - **The running screen** shows one bar for both databases and "About N minutes remaining"
+       (rounded up), then "Less than a minute remaining", then "Almost done", at the rate with no
+       margin. Once paused, `run` reads the databases' states once more (the same header read; no
+       table) for the data of those still on NONE, a snapshot for the run, and starts its clock
+       (`ContinuousClock`); the screen recomputes every `databaseUpgradeProgressRefreshSeconds` (1 s).
+       Each database owns a share of the bar in proportion to its data; its part fills against its
+       estimate up to `databaseUpgradeProgressHoldFraction` (95%) of the share, holds there past the
+       estimate, and jumps to the share's end when the database finishes, so the bar never goes back
+       within a run. Once a database has finished, the later ones are estimated at the rate it took.
+       "Almost done" shows only past the last database's estimate: an earlier database past its
+       estimate holds its part and the text shows the later databases' minutes. Full when all have
+       finished, then the done screen.
+     - **The finish signal** comes from the upgrade loop itself, not from a read:
+       `SyncEngine.runDatabaseUpgrade` tells its `finished` argument each database's step as it ends,
+       before the next starts, and `DatabaseUpgrade` records the time of each `.upgraded` step. A
+       database found upgraded already is not in the run's data (the snapshot holds NONE databases
+       only). Nothing the upgrade does to the databases changed.
+     - **The finishes are matched to the data by position:** the n-th `.upgraded` step fills the n-th
+       share. The snapshot holds the NONE databases in the loop's order and the loop rewrites only
+       those, so the two line up, except when a database's state cannot be read at the run's start:
+       then the run has no bar (`progress` nil: an empty bar and no minutes), and the rewrite still
+       runs that database. This replaced keying finishes by database name, which would need a name in
+       `DatabaseUpgrade.DatabaseState` and in the targets for this one case.
+     - **A run started again after a suspension** (decision 3, "Leaving mid-upgrade"): the stopped run
+       drops its bar, and the new run reads the data again: its bar covers what is left, starting
+       empty. The app was in the background in between, so the user sees only the new run's bar.
+     - Pinned by `DatabaseUpgradeProgressTests` (the bar never goes back, the share jump, the
+       re-estimate, the hold and "Almost done", full at the end, the rounding, the notice's N),
+       `DatabaseUpgradeViewTests` (the notice's and the running screen's words, the fallback),
+       `DatabaseUpgradeTests.theNoticeMinutesComeFromTheData`, `theRunRecordsItsProgress`,
+       `onlyAnUpgradedDatabaseRecordsAFinish`, `anUnreadableDatabaseLeavesTheRunWithoutABar` and
+       `aStoppedRunDropsItsBarAndTheNextCoversWhatIsLeft`,
+       `IncrementalVacuumTests.eachStepIsToldAsItEnds`, and the order in
+       `theUpgradeRunsOnlyInUpgradeMode` (the data are read after the pause, just before the rewrite).
    - **The rewrite** (`SyncEngine.runDatabaseUpgrade`): the email database first, then the search
      database. Each one's free space is checked against its data (its pages less its empty pages)
      read just before, so the search
@@ -130,10 +177,10 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      handler, after the return's own start). If iOS freezes the app between the interrupt and the
      switch's catch, the catch runs after the resume, finds the databases no longer suspended and the
      screen says the upgrade could not finish: nothing is lost, the banner stays and Upgrade now runs it
-     again. A rarer order leaves the spinner up with nothing running: the rewrite's stop is computed just
+     again. A rarer order leaves the progress screen up with nothing running (its bar runs on to "Almost done" and holds): the rewrite's stop is computed just
      before iOS freezes the app, and at the resume the screen's `appBecameActive` runs before `run` has
      set `continuesOnReturn`. The screen also stays awake until then (`keepScreenAwake` follows the
-     spinner), so a phone put down in that state does not lock by itself. One gesture recovers it:
+     progress screen), so a phone put down in that state does not lock by itself. One gesture recovers it:
      leaving and returning starts the upgrade again (killing the app also does: the banner shows at the
      next launch). Accepted; no mechanism is added for it (re-running from the stopped branch whenever
      `isAppActive` is true would loop in ADR-IOS-041's stranded-suspension race: run, stop, run again,
@@ -210,6 +257,36 @@ rewrite to the user's next opening of the app, with every save, search and AI to
      300 MB, a writer hold of about 0.6 to 2 s at 2 to 6 ms per MB (memory 162). The TRUNCATE after the
      steps copies what the last checkpoint left. A write therefore waits for at most one step and the
      checkpoint after it, the cost class of any batch writer (memory 158), or for the final TRUNCATE.
+   - **The Optimize Storage tap (#1448), the steps' one run in the foreground.** Settings > Email Index
+     shows an Optimize Storage row while the two databases' empty pages come to at least
+     `SyncConfig.optimizeStorageMinimumGainBytes` (50 MB; `StorageEstimator.PageTotals` of both, the
+     storage limit's own measure), with the size "Email Index Used" can drop to: the space used less
+     those empty pages. The WAL files are not counted: a run with no empty page to give back truncates
+     no WAL, so the row promises only what a run gives back. On a database not upgraded the row says
+     the upgrade comes first and the tap opens the upgrade's notice (decision 3). On upgraded databases
+     the tap runs the same `runOvernightSpaceReturn` now (`StorageOptimizer`), on the email database's
+     background pool, so a sync or user write waiting for the writer goes first, with its own check:
+     the app in the foreground and the databases not suspended (`SyncEngine.optimizeStorageMayRun`), and
+     the run not stopped (`StorageOptimizer.stop`, when Settings goes, a page is pushed over it or a
+     full-screen cover opens, cancels the run, and the check reads the cancellation; a sheet or an alert
+     over Settings lets the run finish its steps). The app leaving, the suspension or Settings going
+     stops it between two steps; a step running at a stop finishes or is interrupted and rolls back, and
+     the rest waits for the night. Sync is not paused, no turn is held, and polling and IDLE stay on:
+     each step is one short write followed on the email database by the app's throttled checkpoint, the
+     cost class of any batch writer, and the TRUNCATE at the end copies what the last checkpoint left.
+     A sync or user write that arrives during a run therefore waits for at most one of the run's writer
+     holds: a step, one throttled PASSIVE checkpoint (about 0.6 to 2 s), or the final TRUNCATE (about
+     0.4 to 1.1 s on the measured 960 MB database with 190 MB empty, at 2 to 6 ms per MB). Latency only:
+     no signal or write is dropped.
+     One run at a time: a second tap while it runs starts nothing. A step that fails shows "Could not
+     finish now. Nothing was lost. TabMail will try again overnight."; a stop by Settings going shows
+     nothing. A step the databases' suspension aborts (the app left with a step running) is a failed
+     step, so the line shows on the return; it stays true. "Email Index
+     Used" (until then a walk of the storage folder in the view's body) and the row are measured off the
+     main thread when Settings opens, after a run, when the upgrade's screen closes and after "Delete
+     All Email Index Data". Pinned by `StorageOptimizerTests`,
+     `IncrementalVacuumTests.theTapsCheckNeedsTheForegroundAndNoSuspension`,
+     `theTapReachesTheSizeItsRowPromised` and `theTapRunsTheAppsStepsWithItsCheck`.
 6. **The email database's switch carries the planner statistics marker** (ADR-IOS-029). A `VACUUM` adds
    one to `schema_version` and copies `sqlite_stat1` unchanged, so without a carry it would re-arm a
    whole `ANALYZE` for statistics that did not change. `SyncEngine.switchEmailDatabaseToIncremental`
@@ -262,37 +339,48 @@ rewrite to the user's next opening of the app, with every save, search and AI to
 **Sync timing promises** (root rule `sync-timing-promises.md`, whose note "One owner-accepted exception:
 the one-time database upgrade" records the exception below). The steps run outside every account's
 sync turn, at the end of the background processing job, and touch no connection, trigger, flag or clock.
-The upgrade holds no turn and adds no trigger, flag or clock; while its screen is up it stops polling
-and IDLE and empties the queues (the app's own background stops), and every exit turns them back on.
+The Optimize Storage tap's run of the same steps (decision 5) is the same outside the job: in the
+foreground, while Settings shows its row, on the email database's background pool, with nothing
+paused. The upgrade holds no turn and adds no trigger, flag or clock; while its screen is up it stops
+polling and IDLE and empties the queues (the app's own background stops), and every exit turns them
+back on.
 1. A new-mail signal is never dropped: kept. During the upgrade a push or other signal still starts its
    work, which waits behind the writer and runs after; the exit's start (or the return's) syncs at once.
    A pass's reads on their own connections go on during a step or a `VACUUM`; its writes wait for a step
-   and the checkpoint after it, or for the `VACUUM`.
+   and the checkpoint after it, or for the `VACUUM`. The tap's run drops and delays no signal: the work
+   a signal starts runs as always, its writes waiting for at most one writer hold of the run: a step,
+   one throttled PASSIVE checkpoint (about 0.6 to 2 s), or the final TRUNCATE (about 0.4 to 1.1 s on the
+   measured 960 MB database with 190 MB empty) (decision 5).
 2. A deadline starts when its work starts: kept for the steps (a write waits for one step and its
-   throttled checkpoint, as after any batch writer, or for the final TRUNCATE). A write that arrives
-   during the upgrade waits for its `VACUUM` and TRUNCATE inside its pass's time: part of the
-   one-time exception, only while the upgrade screen is up.
-3. No clock skip, one follow-up flag: unchanged; neither the upgrade nor the steps set or read a flag
-   or clock.
+   throttled checkpoint, as after any batch writer, or for the final TRUNCATE), the tap's steps
+   included: they queue at the background tier, so a sync write waiting for the writer goes before
+   the next step. A write that arrives during the upgrade waits for its `VACUUM` and TRUNCATE inside its
+   pass's time: part of the one-time exception, only while the upgrade screen is up.
+3. No clock skip, one follow-up flag: unchanged; neither the upgrade nor the steps (the job's or the
+   tap's) set or read a flag or clock.
 4. Returning to the app runs whatever is due at once: kept. The return's start runs as always; an
    upgrade the suspension rolled back then starts again, and its pause stops polling until it ends.
-   No step and no TRUNCATE after the steps starts once the app is in the foreground; a step already
-   running finishes.
+   No job step and no TRUNCATE after the job's steps starts once the app is in the foreground; a step
+   already running finishes. The tap's run stops when the app leaves, so none runs into a return.
 5. The foreground keeps time: suspended only while the upgrade screen is up, the one-time exception
    (the pause stops the poll timer; a change to an active scene during the rewrite, such as a glance at
    Control Center, turns it back on through the app's return path, and its work waits behind the
-   writer); back on at every exit while the app is active, else on the return.
+   writer); back on at every exit while the app is active, else on the return. The tap's run stops no
+   timer.
 6. IMAP IDLE stays live in the foreground: suspended only while the upgrade screen is up, the one-time
-   exception (turned back on with the timer as in 5); back on as in 5.
+   exception (turned back on with the timer as in 5); back on as in 5. The tap's run stops no IDLE.
 7. Pull-to-refresh reads now, and new mail and the folder view go ahead of background slices:
-   unchanged; while the upgrade screen is up the user cannot pull or open a folder.
+   unchanged; while the upgrade screen is up the user cannot pull or open a folder. During the tap's
+   run their reads go on and their writes wait for at most one writer hold of the run, as in 1.
 8. Startup and maintenance work never starve the reads: unchanged. Neither is start-of-pass work, and
-   the steps run only from the background processing job
-   (`IncrementalVacuumTests.theStepsRunOnlyFromTheBackgroundJob`).
+   the steps run only from the background processing job and the Optimize Storage tap
+   (`IncrementalVacuumTests.theStepsRunOnlyFromTheBackgroundJobAndTheTap`,
+   `theTapRunsTheAppsStepsWithItsCheck`).
 Pinned by `DatabaseUpgradeTests`, `theUpgradeRunsOnlyInUpgradeMode`, `theUpgradesCheckNeedsOnlyNoSuspension`,
 `theUpgradeStartsNothingWhenSuspended`, `nothingStartsWhenTheJobMayNotRun`,
 `theAppsCheckNeedsTheBackgroundAndNoSuspension`, `theDefaultCheckStartsNothingInTheForeground`,
-`aStopBetweenStepsEndsTheRun` and `aStopBeforeTheTruncateSkipsIt`.
+`aStopBetweenStepsEndsTheRun`, `aStopBeforeTheTruncateSkipsIt`,
+`theTapsCheckNeedsTheForegroundAndNoSuspension` and `StorageOptimizerTests`.
 
 **New statements:** `PRAGMA auto_vacuum = INCREMENTAL` (new files and every `VACUUM`), `PRAGMA page_count`
 (read on every writer open, to tell a new file; only the mode set is limited to new files),
@@ -303,7 +391,11 @@ Reused at a new call site: the existing PASSIVE checkpoint `SyncEngine.checkpoin
 nightly email step (an existing helper and registry row: like every batch writer, the steps checkpoint
 after each batch, memory 158).
 None reads a table; each has its row in `query-registry.tsv`. No migration, no new column, table or
-index. `DatabaseUpgrade` runs no SQL of its own.
+index. `DatabaseUpgrade` runs no SQL of its own. The Optimize Storage tap (#1448) adds no statement:
+it calls `runOvernightSpaceReturn` (the steps, the checkpoint after each email step, the TRUNCATE) from
+a new place, `StorageOptimizer`, and Settings reads the existing header measures each time it opens and
+after a run (`StorageEstimator.PageTotals` through `SpaceSource.app`, and `DatabaseUpgrade.refresh`'s
+`SpaceState` read). `StorageOptimizer` runs no SQL of its own.
 
 **Alternatives rejected:**
 - The overnight switch the app ran by itself (the first design for this ADR): see "Replaced design".
@@ -325,7 +417,9 @@ emptied its pages. Until then nothing changes for that database. Tests: `Increme
 files start INCREMENTAL, an existing file keeps its mode until an upgrade, both upgrades with rowids, the
 check asked again on the writer, a suspension during an upgrade, the space and power checks, every app
 `VACUUM`, the marker carry and the stale marker, the statistics latch, the observer map, the steps on both
-databases and their checkpoints, the stops, both checks, the order of the databases, the source fences),
+databases and their checkpoints, the stops, the three checks, the order of the databases, the Optimize
+Storage tap's run on a real database, the source fences), `StorageOptimizerTests` (the Optimize Storage
+row: its threshold, its states and copy, the tap's run, failure, stop and single run),
 `DatabaseUpgradeTests` (each exit of the upgrade, active and in the background), `ForegroundPollStartTests`
 (the start's callers) and the query registry. Not testable: a process end during a copy-back
 (decision 3).
