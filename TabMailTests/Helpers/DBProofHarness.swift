@@ -229,6 +229,7 @@ enum DBProof {
                       name: $0.providerLabelId, isSystem: $0.isSystem)
         }
         for label in userLabels { try label.insert(db) }
+        let headerColumns = Set(try db.columns(in: MessageHeader.databaseTableName).map(\.name))
         var labelMembers = Array(repeating: 0, count: userLabels.count)
         var firstLabelable: String?
 
@@ -282,7 +283,9 @@ enum DBProof {
                 header.headerComplete = Double.random(in: 0..<1, using: &rng) < Config.headerCompleteShare
                 let bodyDraw = Double.random(in: 0..<1, using: &rng)
                 header.bodyComplete = header.headerComplete && bodyDraw < Config.bodyCompleteShare
-                try header.insert(db)
+                // Only the columns the schema has: a proof can seed a database stopped at an
+                // older migration (`migratedUpTo`), before a later one added a header column.
+                try TestDatabase.insertAtOldSchema(header, db, columns: headerColumns)
 
                 guard labelable else { continue }
                 if firstLabelable == nil { firstLabelable = header.id }
