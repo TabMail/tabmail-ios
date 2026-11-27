@@ -101,6 +101,10 @@ enum DatabaseVacuum {
         /// The database's size: all its pages, the empty ones included.
         var allBytes: Int64 { pageCount * pageSize }
 
+        /// Its pages less its empty pages, the storage measure's count (ADR-IOS-006):
+        /// what a `VACUUM` copies.
+        var liveBytes: Int64 { (pageCount - freePages) * pageSize }
+
         /// nil if SQLite returns no row.
         static func read(_ db: Database) throws -> SpaceState? {
             guard let row = try Row.fetchOne(db, sql: """

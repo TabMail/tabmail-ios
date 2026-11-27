@@ -68,72 +68,60 @@ enum DraftDeleteRefusalNotice {
 }
 
 /// Keeps the already-large InboxView modifier chain below Swift's type-check
-/// limit while applying committed primary-key changes to view-owned bindings.
+/// limit while applying committed pointer moves to view-owned bindings.
 /// The model observes the same notification directly for its loaded/pending
 /// state so that production notification delivery is unit-testable.
+///
+/// The pushed message id (`pushedMessageId`, a chat pill's open) is not
+/// followed here: the pushed detail follows its own email
+/// (`OpenedMessage`), so the push stays as it is when its email moves.
 struct HeaderRekeyReceiver: ViewModifier {
     @Binding var dismissedMessages: Set<String>
     @Binding var swipeFadingMessages: Set<String>
     @Binding var selectedMessageId: String?
-    @Binding var pushedMessageId: String?
 
     func body(content: Content) -> some View {
-        // Both production publishers post this notification from MainActor.
+        // Every production publisher posts this notification from MainActor.
         // Keep delivery synchronous so model and view-owned bindings apply one
         // committed transition before the publisher returns.
         content.onReceive(
-            NotificationCenter.default.publisher(for: .messageHeadersRekeyed)
+            NotificationCenter.default.publisher(for: .mailPointersMoved)
         ) { notification in
             handle(notification)
         }
     }
 
     private func handle(_ notification: Notification) {
-        guard let records = notification.object as? [HeaderRekeyRecord],
-              !records.isEmpty else { return }
+        guard let moves = MailPointerMoves.posted(in: notification) else { return }
         var dismissed = dismissedMessages
         var fading = swipeFadingMessages
         var selected = selectedMessageId
-        var pushed = pushedMessageId
         Self.apply(
-            records,
+            moves,
             dismissedMessages: &dismissed,
             swipeFadingMessages: &fading,
-            selectedMessageId: &selected,
-            pushedMessageId: &pushed)
+            selectedMessageId: &selected)
         dismissedMessages = dismissed
         swipeFadingMessages = fading
         selectedMessageId = selected
-        pushedMessageId = pushed
     }
 
     /// Pure transition seam for the authority split between optimistic action
     /// state and presentation/navigation identity.
     static func apply(
-        _ records: [HeaderRekeyRecord],
+        _ moves: MailPointerMoves,
         dismissedMessages: inout Set<String>,
         swipeFadingMessages: inout Set<String>,
-        selectedMessageId: inout String?,
-        pushedMessageId: inout String?
+        selectedMessageId: inout String?
     ) {
         // Weak sync correlation may keep presentation identity coherent, but
         // it must not carry optimistic action state across keys. Otherwise an
         // already-deferred gesture can leave the new row hidden even though no
         // provider-authorized operation was recorded.
-        let actionRecords = records.filter(\.carriesProviderAuthority)
-        dismissedMessages = InboxViewModel.rekeyedHeaderIDs(
-            dismissedMessages, using: actionRecords)
-        swipeFadingMessages = InboxViewModel.rekeyedHeaderIDs(
-            swipeFadingMessages, using: actionRecords)
-        let byOldId = Dictionary(
-            records.map { ($0.oldHeaderId, $0.newHeaderId) },
-            uniquingKeysWith: { first, _ in first })
-        if let existingSelected = selectedMessageId, let newId = byOldId[existingSelected] {
-            selectedMessageId = newId
-        }
-        if let existingPushed = pushedMessageId, let newId = byOldId[existingPushed] {
-            pushedMessageId = newId
-        }
+        let actionMoves = moves.withProviderAuthority
+        dismissedMessages = actionMoves.following(headers: dismissedMessages)
+        swipeFadingMessages = actionMoves.following(headers: swipeFadingMessages)
+        selectedMessageId = selectedMessageId.map { moves.following(header: $0) }
     }
 }
 
@@ -1020,8 +1008,7 @@ struct InboxView: View {
         .modifier(HeaderRekeyReceiver(
             dismissedMessages: $dismissedMessages,
             swipeFadingMessages: $swipeFadingMessages,
-            selectedMessageId: $selectedMessageId,
-            pushedMessageId: $pushedMessageId))
+            selectedMessageId: $selectedMessageId))
         .modifier(MoveRefusalReceiver(
             dismissedMessages: $dismissedMessages,
             swipeFadingMessages: $swipeFadingMessages))
