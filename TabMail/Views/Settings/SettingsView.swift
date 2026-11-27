@@ -92,6 +92,10 @@ struct SettingsView: View {
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                         }
+                        // The separator under a row with an icon starts at the row's leading
+                        // edge, under the icon, as under the rows without one; a list starts it
+                        // at the row's first text otherwise. The same on every icon row here.
+                        .alignmentGuide(.listRowSeparatorLeading) { d in d[.leading] }
                     }
                     .swipeActions(edge: .trailing) {
                         Button(role: .destructive) {
@@ -124,6 +128,7 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 4)
+                    .alignmentGuide(.listRowSeparatorLeading) { d in d[.leading] }
 
                     Button {
                         showArchiveConfirm = true
@@ -138,6 +143,7 @@ struct SettingsView: View {
                     Label("Push notifications need a TabMail sign-in", systemImage: "person.crop.circle.badge.exclamationmark")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                        .alignmentGuide(.listRowSeparatorLeading) { d in d[.leading] }
                 }
 
                 Toggle("Enable Inbox Push Notifications", isOn: $pushEnabled)
@@ -269,6 +275,7 @@ struct SettingsView: View {
                                 .transition(.scale.combined(with: .opacity))
                         }
                     }
+                    .alignmentGuide(.listRowSeparatorLeading) { d in d[.leading] }
                 }
                 .buttonStyle(.borderless)
 
@@ -384,6 +391,7 @@ struct SettingsView: View {
                                 .foregroundStyle(.green)
                         }
                     }
+                    .alignmentGuide(.listRowSeparatorLeading) { d in d[.leading] }
                 }
 
                 Toggle("Backfill on Wi-Fi only", isOn: $backgroundSyncWiFiOnly)

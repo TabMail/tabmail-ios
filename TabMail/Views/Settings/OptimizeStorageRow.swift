@@ -15,6 +15,8 @@ import SwiftUI
 /// its icon and `LabeledContent` puts its value under its title, so the size and the lines go
 /// under the title from the row's leading edge, as the rows around it do, and the title may
 /// wrap, as theirs do: held to one line it is cut short ("Optim…" at AX5 on a 320-pt row).
+/// The separator under the row starts at the row's leading edge, under the icon, as in the
+/// rest of Settings; a list starts it at a label's text otherwise.
 struct OptimizeStorageRow: View {
     let row: StorageOptimizer.Row
     /// Formats a size as "Email Index Used" shows it.
@@ -63,6 +65,7 @@ struct OptimizeStorageRow: View {
             }
             .multilineTextAlignment(.leading)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .alignmentGuide(.listRowSeparatorLeading) { d in d[.leading] }
             .contentShape(Rectangle())
         }
         .buttonStyle(.borderless)
