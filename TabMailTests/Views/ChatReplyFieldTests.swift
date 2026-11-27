@@ -833,9 +833,10 @@ struct ChatReplyFieldTests {
         #expect(Self.count("if sends.follow(moves) { viewModel.reloadThread() } sends.end(shownIn: chatRowIds)", in: text) == 1)
         #expect(Self.count(".onChange(of: chatRowIds) { _, shown in endSends(shownIn: shown) }", in: text) == 1)
         #expect(Self.count("private func endSends(shownIn rowIds: Set<String>) { sends.end(shownIn: rowIds) }", in: text) == 1)
-        // Each handler is wired from the body in one line (the body's chain is at the type checker's limit).
+        // Each handler is wired from the body in one line (the body's chain is at the type checker's limit),
+        // and the moves' name with its type spelled out: the implicit `.mailPointersMoved` failed the build.
         #expect(Self.count(".task(id: messageIds) { await observeSends() }", in: text) == 1)
-        #expect(Self.count(".onReceive(NotificationCenter.default.publisher(for: .mailPointersMoved)) { followMoves($0) }", in: text) == 1)
+        #expect(Self.count(".onReceive(NotificationCenter.default.publisher(for: Notification.Name.mailPointersMoved)) { followMoves($0) }", in: text) == 1)
         #expect(Self.count("sends.read(", in: text) == 1 && Self.count("sends.follow(", in: text) == 1, "nothing else feeds them")
         // The bubbles show through the chat's outgoing rows, as on every chat, with this screen's Undo.
         #expect(Self.count("ChatOutgoingRows(unsentReplies: unsentReplies, heldGhost: heldGhost, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .chat) {", in: text) == 1)

@@ -322,8 +322,9 @@ struct ChatThreadView: View {
         // The sends follow their emails, from outbox item to Sent copy to the server's copy
         // (`ChatSendBubbles.follow`), as the chat's emails do. A send filed: the chat reads its
         // emails again, after its bubble points at the copy, so the bubble gives way to the copy
-        // in the pass that shows it.
-        .onReceive(NotificationCenter.default.publisher(for: .mailPointersMoved)) { followMoves($0) }
+        // in the pass that shows it. The name's type is spelled out: the implicit `.mailPointersMoved`
+        // took this chain past the type checker's limit (memory 163).
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name.mailPointersMoved)) { followMoves($0) }
         .onChange(of: reopenedKey) { _, _ in adoptReopened() }
         // One observation per open chat of its outbox replies, keyed by its Message-IDs.
         .task(id: messageIds) { await observeSends() }
