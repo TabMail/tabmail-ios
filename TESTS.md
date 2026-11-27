@@ -1296,11 +1296,15 @@ the tool queues (the card itself is not presented).
     request, the request still carries the account. A primary change while the edit runs leaves
     the request on the account the body was signed as.
   - Demo boundary: with the demo row and a real primary both primary, a new email is the demo
-    account's in demo and the real primary's out of demo. With no real primary, it is the active
-    real account (not the demo row, not an inactive account).
-- `AssistantComposeCardAccountWiringTests`: a source fence that the `.compose` case of
-  `composeViewForAgentRequest` in both presenting views (`InboxView`, `MessageDetailView`) passes
-  `account: req.account` and no other account argument.
+    account's in demo and the real primary's out of demo. With no active real primary (none, or
+    an inactive one), it is the active real account (not the demo row, not an inactive account).
+    The rows a lookup filter must skip are inserted before the expected account, so a lookup
+    without that filter picks the wrong one.
+- `AssistantComposeCardAccountWiringTests`: a source fence over every app-target
+  `composeViewForAgentRequest` (exactly two: `InboxView`, `MessageDetailView`), comments masked.
+  The `.compose` case passes `account: req.account` and no other account argument; the `.reply`
+  and `.forward` cases pass `replyTo: req.replyTo` and no account argument, so the card sends
+  from the email's own account.
 
 ## CalDAV organizer — every event with guests names its organizer
 

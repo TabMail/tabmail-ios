@@ -43,12 +43,23 @@ struct ComposeEditSenderAccountTests {
     /// A database with the home and work accounts and an Inbox for each. `primaryId` is the
     /// primary account (nil: none is), `inactive` the accounts that are not active, and
     /// `withDemoRow` adds the demo account as the app seeds it (active and primary).
+    ///
+    /// Rows are inserted demo first, then home, then work. The account lookups have no order,
+    /// so they read rows in this order: a row a filter must skip comes BEFORE the expected one,
+    /// and a lookup without that filter returns the wrong account.
     private func makeContext(
         primaryId: String?,
         inactive: Set<String> = [],
         withDemoRow: Bool = false
     ) throws -> (ToolContext, DatabaseQueue, MockChatIdTranslator, AgentToolRouter) {
         let db = try TestDatabase.make()
+        if withDemoRow {
+            var account = Account(emailAddress: Self.demo.email, displayName: Self.demo.name, provider: .imap)
+            account.id = Self.demo.id
+            account.isActive = true
+            account.isPrimary = true
+            try db.write { try account.insert($0) }
+        }
         for seed in [Self.home, Self.work] {
             var account = Account(emailAddress: seed.email, displayName: seed.name, provider: .gmail)
             account.id = seed.id
@@ -56,13 +67,6 @@ struct ComposeEditSenderAccountTests {
             account.isActive = !inactive.contains(seed.id)
             try db.write { try account.insert($0) }
             try TestDatabase.insertFolder(db, accountId: seed.id)
-        }
-        if withDemoRow {
-            var account = Account(emailAddress: Self.demo.email, displayName: Self.demo.name, provider: .imap)
-            account.id = Self.demo.id
-            account.isActive = true
-            account.isPrimary = true
-            try db.write { try account.insert($0) }
         }
         let translator = MockChatIdTranslator()
         let router = AgentToolRouter()
@@ -321,12 +325,13 @@ struct ComposeEditSenderAccountTests {
         }
     }
 
-    /// With no real primary account, the new email uses an active real account: never the
-    /// demo row (which is primary) and never an account that is not active.
-    @Test("email_compose: with no real primary the new email uses the active real account")
-    func newEmailWithoutPrimaryUsesTheActiveRealAccount() async throws {
+    /// With no active real primary account, the new email uses an active real account: never
+    /// the demo row (which is primary), never an account that is not active, and never a
+    /// primary account that is not active. Home (inactive) and the demo row come before work.
+    @Test("email_compose: with no active real primary the new email uses the active real account", arguments: [nil, homeAccountId])
+    func newEmailWithoutActivePrimaryUsesTheActiveRealAccount(primaryId: String?) async throws {
         try await withDemoMode(false) {
-            let (ctx, _, _, router) = try makeContext(primaryId: nil, inactive: [Self.work.id], withDemoRow: true)
+            let (ctx, _, _, router) = try makeContext(primaryId: primaryId, inactive: [Self.home.id], withDemoRow: true)
             let tool = EmailComposeTool(context: ctx)
             let captured = try await captureEditAndRequest(router: router) {
                 try await tool.execute(arguments: [
@@ -336,44 +341,56 @@ struct ComposeEditSenderAccountTests {
             }
             #expect(captured.contexts.count == 1)
             guard captured.contexts.count == 1 else { return }
-            #expect(captured.contexts[0].senderName == Self.home.name)
-            #expect(captured.card?.account?.id == Self.home.id)
+            #expect(captured.contexts[0].senderName == Self.work.name)
+            #expect(captured.card?.account?.id == Self.work.id)
         }
     }
 }
 
-/// Every view that presents an assistant compose request opens a new email's card with the
-/// request's account, the one the body was signed as, never an account of its own choosing
-/// (both views observe the request, and either can present it).
+/// Every view that presents an assistant compose request opens the card with the account the
+/// body was signed as: a new email with the request's account, and a reply or forward with no
+/// account of the view's own, so the card sends from the replied or forwarded email's account
+/// (`ComposeView` prefers a passed account over `replyTo`'s). Both views observe the request,
+/// and either can present it.
 @Suite("Assistant compose card account wiring")
 struct AssistantComposeCardAccountWiringTests {
 
-    private static let projectRoot = URL(fileURLWithPath: #filePath)
-        .deletingLastPathComponent()
-        .deletingLastPathComponent()
-        .deletingLastPathComponent()
-
-    private static func source(_ path: String) throws -> String {
-        let raw = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
-        return raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    /// Every app-target `composeViewForAgentRequest` body, with comments and string contents
+    /// masked (a commented-out argument must not satisfy the fence) and whitespace collapsed.
+    private static func hostBodies() throws -> [String] {
+        try DiagnosticPrintGateTests.appTargetSources().flatMap { file -> [String] in
+            DiagnosticPrintGateTests.codeOnly(file.source)
+                .components(separatedBy: "func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest)")
+                .dropFirst()
+                .map { $0.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+        }
     }
 
-    /// The `.compose` case of `composeViewForAgentRequest` in `text`.
-    private static func composeCase(in text: String) throws -> Substring {
-        let function = try #require(text.range(of: "func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest)"))
-        let open = try #require(text[function.upperBound...].range(of: "case .compose:"))
-        let close = try #require(text[open.upperBound...].range(of: "case .reply:"))
-        return text[open.upperBound..<close.lowerBound]
+    /// The text of `body` between the first `start` and the next `end` after it.
+    private static func section(of body: String, from start: String, to end: String) throws -> String {
+        let open = try #require(body.range(of: start))
+        let close = try #require(body.range(of: end, range: open.upperBound..<body.endIndex))
+        return String(body[open.upperBound..<close.lowerBound])
     }
 
-    @Test("A new email's card opens with the request's account", arguments: [
-        "TabMail/Views/Inbox/InboxView.swift",
-        "TabMail/Views/Message/MessageDetailView+Actions.swift",
-    ])
-    func newEmailCardOpensWithTheRequestsAccount(path: String) throws {
-        let compose = String(try Self.composeCase(in: Self.source(path)))
-        #expect(compose.contains("account: req.account,"), "\(path)")
-        let accountArguments = compose.components(separatedBy: "account:").count - 1
-        #expect(accountArguments == 1, "\(path): one account argument")
+    @Test("A new email's card opens with the request's account; a reply's and a forward's with the email's own")
+    func cardsOpenWithTheSignedAccount() throws {
+        let bodies = try Self.hostBodies()
+        #expect(bodies.count == 2, "expected the inbox and message-detail hosts, found \(bodies.count)")
+        for body in bodies {
+            let compose = try Self.section(of: body, from: "case .compose:", to: "case .reply:")
+            let reply = try Self.section(of: body, from: "case .reply:", to: "case .forward:")
+            let forward = try Self.section(of: body, from: "case .forward:", to: "}")
+
+            #expect(compose.contains("account: req.account,"))
+            let composeAccountArguments = compose.components(separatedBy: "account:").count - 1
+            #expect(composeAccountArguments == 1, "a new email: one account argument")
+
+            for parentCase in [reply, forward] {
+                #expect(parentCase.contains("replyTo: req.replyTo,"))
+                let accountArguments = parentCase.components(separatedBy: "account:").count - 1
+                #expect(accountArguments == 0, "a reply or forward: no account argument")
+            }
+        }
     }
 }
