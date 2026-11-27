@@ -42,7 +42,8 @@ enum ThreadDetection {
     /// - `messageReference WHERE referencedRfc822Id IN L` covers (3) + (5).
     ///
     /// All three use existing indexes (`messageHeader_rfc822MessageId`,
-    /// `messageHeader_inReplyTo`, `messageReference_referencedRfc822Id`).
+    /// `messageHeader_inReplyTo`, `messageReference_referencedRfc822Id`); the
+    /// `inReplyTo` lookup names its index (`INDEXED BY`), see below.
     ///
     /// Messages whose `folderId` points at a Trash or Spam folder are excluded —
     /// deleted replies and junk should not reappear in thread bubbles. Applied as a
@@ -104,13 +105,20 @@ enum ThreadDetection {
                 // (2) + (4) Reverse + lateral via inReplyTo: messages whose inReplyTo is in L.
                 // - in L because of my rfc822 → classic direct children (reverse).
                 // - in L because of one of my ancestors → classic siblings (lateral).
-                let inReplyToMatches = try MessageHeader
-                    .filter(L.contains(Column("inReplyTo"))
-                            && !seenIds.contains(Column("id"))
-                            && !excludedFolderIds.contains(Column("folderId")))
-                    .order(Column("date").desc)
-                    .limit(SyncConfig.threadQueryLimit)
-                    .fetchAll(db)
+                // Named index: where the stored mail has no In-Reply-To (Outlook stores
+                // none), ANALYZE counts all its rows under one value and the planner
+                // walked the date index over the whole table instead (#1563). The index
+                // is migration-built (v13), never deferred or dropped.
+                let seen = Array(seenIds)
+                let excluded = Array(excludedFolderIds)
+                let inReplyToMatches = try MessageHeader.fetchAll(db, sql: """
+                    SELECT * FROM messageHeader INDEXED BY messageHeader_inReplyTo
+                    WHERE inReplyTo IN (\(Self.placeholders(L.count)))
+                      AND id NOT IN (\(Self.placeholders(seen.count)))
+                      AND folderId NOT IN (\(Self.placeholders(excluded.count)))
+                    ORDER BY date DESC
+                    LIMIT ?
+                    """, arguments: StatementArguments(L + seen + excluded) + [SyncConfig.threadQueryLimit])
 
                 // (3) + (5) Reverse + lateral via References: messages whose References
                 // header contains any entry of L. The messageReference junction table is
@@ -161,9 +169,50 @@ enum ThreadDetection {
 
         if collected.isEmpty { return [] }
 
+        // A forward's thread and its source's stay apart (ADR-IOS-043, forward split).
+        let kept = excludeAcrossForwards(collected, of: msg)
+
         // Deduplicate cross-folder copies, sort by date, cap to limit.
-        let deduped = excludeCopies(collected, of: msg)
+        let deduped = excludeCopies(kept, of: msg)
         return Array(deduped.sorted { $0.date > $1.date }.prefix(SyncConfig.threadQueryLimit))
+    }
+
+    /// The related emails on `msg`'s side of every forward among them.
+    ///
+    /// A forward shares References with the thread it came from (and on Gmail its
+    /// thread id), so the search above reaches across it both ways. Its own thread
+    /// (`ThreadUtils.assignComputedThreadId`: the forward, its copies and replies)
+    /// is told apart by `computedThreadId`:
+    /// - a forward in another thread than `msg`'s: that thread is left out;
+    /// - a forward in `msg`'s thread (`msg` is it, or is a reply to it): the
+    ///   threads of the emails it forwards are left out.
+    /// A forward stored before the split shares its source's thread and shows with
+    /// it; seen from another thread of the conversation it is a forward elsewhere and
+    /// its whole thread is left out (IOS-THREAD-002). An email not stored yet (opened
+    /// from its notification before the merge) has no thread, so nothing is left out.
+    static func excludeAcrossForwards(_ results: [MessageHeader], of msg: MessageHeader) -> [MessageHeader] {
+        let own = msg.computedThreadId
+        guard !own.isEmpty else { return results }
+        let all = [msg] + results
+        var threadByMessageId: [String: String] = [:]
+        for header in all {
+            if let rfc = header.rfc822MessageId, !rfc.isEmpty, threadByMessageId[rfc] == nil {
+                threadByMessageId[rfc] = header.computedThreadId
+            }
+        }
+        var excluded = Set<String>()
+        for forward in all where ThreadUtils.hasForwardPrefix(forward.subject) && !forward.computedThreadId.isEmpty {
+            if forward.computedThreadId != own {
+                excluded.insert(forward.computedThreadId)
+            } else {
+                let sources = (forward.inReplyTo.map { [$0] } ?? []) + forward.references
+                for source in sources {
+                    if let thread = threadByMessageId[source], !thread.isEmpty, thread != own { excluded.insert(thread) }
+                }
+            }
+        }
+        guard !excluded.isEmpty else { return results }
+        return results.filter { !excluded.contains($0.computedThreadId) }
     }
 
     /// Filter out copies of the same email that exist in different folders.
@@ -194,6 +243,11 @@ enum ThreadDetection {
                 .limit(SyncConfig.threadQueryLimit)
                 .fetchAll(db)
         }
+    }
+
+    /// `count` comma-separated `?` placeholders for a SQL `IN` list.
+    private static func placeholders(_ count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ",")
     }
 
 }

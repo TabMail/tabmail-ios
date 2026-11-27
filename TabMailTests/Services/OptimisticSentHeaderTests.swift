@@ -1695,6 +1695,42 @@ struct OptimisticSentProductionProbeTests {
         }
     }
 
+    @Test("a sent forward starts its own thread even when its subject reads as an ordinary email (forward split)")
+    func sentForwardStartsOwnThread() async throws {
+        let accountId = "sent-forward"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        // The forwarded email, in a thread of its own.
+        try await fixture.pool.write { db in
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId).insert(db)
+            var source = MessageHeader(
+                messageId: "source-uid", subject: "Plans", from: "Alice", fromAddress: "alice@example.com",
+                to: "\(accountId)@example.com", date: Date().addingTimeInterval(-600), snippet: "",
+                folderId: "\(accountId):INBOX", accountId: accountId, folderPath: "INBOX", isInInbox: true)
+            source.rfc822MessageId = "a-source@example.com"
+            source.computedThreadId = "T-source"
+            try source.insert(db)
+        }
+        // The forward as the outbox queues it: References end with the source,
+        // and the user rewrote the subject.
+        let messageId = "<m-sent-forward@example.com>"
+        var draft = DraftMessage(to: ["recipient@example.com"], subject: "Plans for Friday", body: "Body")
+        draft.references = ["a-source@example.com"]
+        var message = OutboxMessage(accountId: accountId, draft: draft, isForward: true)
+        message.id = "outbox-sent-forward"
+        message.status = OutboxStatus.sending.rawValue
+        message.sentMessageId = messageId
+        let claimed = message
+        try await fixture.pool.write { try claimed.insert($0) }
+
+        await send(claimed, messageId: messageId, accountId: accountId, provider: MockEmailProvider())
+
+        let rows = try await sentRows(fixture.pool, accountId: accountId)
+        #expect(rows.headers.count == 1)
+        guard rows.headers.count == 1 else { return }
+        #expect(rows.headers[0].computedThreadId == "m-sent-forward@example.com")
+    }
+
     @Test("a read Sent copy is ONE row with the provider's Message-ID, date and order date, read after the stamp, which a later Sent listing leaves as is")
     func readSentCopyIsTheRowTheSyncKeeps() async throws {
         let accountId = "sentcopy-named"

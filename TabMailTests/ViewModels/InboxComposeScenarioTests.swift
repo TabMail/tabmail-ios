@@ -1563,6 +1563,52 @@ struct InboxComposeScenarioTests {
         )
     }
 
+    /// A forward starts its own thread (ADR-IOS-043, forward split), so a staged
+    /// forward adopts no on-screen thread, though its References and its Gmail
+    /// thread id name one: it never animates into its source's group.
+    @Test("stagedForwardAdoptsNoThread — a staged forward stays out of its source's on-screen thread")
+    func stagedForwardAdoptsNoThread() {
+        let accountId = "acc1"
+        let folderPath = "INBOX"
+        let folderId = MessageIdentity.folderId(accountId: accountId, folderPath: folderPath)
+
+        var sourceHeader = MessageHeader(
+            messageId: "1", subject: "Original", from: "Alice", fromAddress: "alice@example.com",
+            to: "me@example.com", date: Date(), snippet: "snip",
+            folderId: folderId, accountId: accountId, folderPath: folderPath, isInInbox: true
+        )
+        sourceHeader.rfc822MessageId = "rfc-source@example.com"
+        sourceHeader.threadId = "gm-thread"
+        sourceHeader.computedThreadId = "T1"
+        sourceHeader.headerComplete = true
+        let source = MessageSnapshot(from: sourceHeader)
+
+        let forward = StagedInboxRow(
+            accountId: accountId, folderPath: folderPath, messageId: "2",
+            rfc822MessageId: "rfc-forward@example.com", threadId: "gm-thread", inReplyTo: "rfc-source@example.com",
+            references: ["rfc-source@example.com"], subject: "Fwd: Original", senderName: "Bob",
+            senderAddress: "bob@example.com", to: "me@example.com", snippet: "snip",
+            date: Date(), isRead: false, isFlagged: false, hasAttachments: false,
+            isReplied: false, isForwarded: false, actionTag: nil, summaryBlurb: nil
+        )
+        let resolutions: [String: StagedIdentityResolution] = [
+            forward.headerId: StagedIdentityResolution(stagedHeaderId: forward.headerId, durable: nil),
+        ]
+        let query = InboxListQuery(
+            displayedFolderIds: [folderId], filterUnread: false, filterLabelIds: [],
+            mode: .normal, targetCount: 50, before: nil
+        )
+        let composed = InboxListComposer.compose(ComposeInputs(
+            durable: [source], pinned: [], staged: [forward],
+            stagedResolutions: resolutions, overlay: [:], query: query
+        ))
+
+        #expect(composed.count == 2)
+        let forwardComposed = composed.first { $0.id == forward.headerId }
+        #expect(forwardComposed != nil)
+        #expect(forwardComposed?.computedThreadId != "T1", "a staged forward adopted its source's thread")
+    }
+
     // MARK: - Permutation checks (commutable step pairs — §5A.1)
 
     /// Runs `setup`, then the pair in both orders (fresh worlds), asserting

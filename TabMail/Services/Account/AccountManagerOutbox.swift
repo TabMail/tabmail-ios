@@ -959,7 +959,10 @@ extension AccountManager {
                 // sets it on a row it already holds.
                 header.threadId = sentCopy?.identity.threadId
                 // Thread grouping so the sent message appears in the conversation
-                try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: sentCopy?.identity.threadId, db: db)
+                // A forward starts its own thread, even with its subject rewritten
+                // (the send records it); the sync's copy then joins this row.
+                try ThreadUtils.assignComputedThreadId(
+                    to: &header, nativeThreadId: sentCopy?.identity.threadId, sentAsForward: msg.isForward, db: db)
                 try header.insert(db)
                 try ThreadUtils.insertMessageReferences(for: header, db: db)
 

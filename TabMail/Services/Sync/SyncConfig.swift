@@ -625,6 +625,32 @@ enum SyncConfig {
     /// its notice, shown by itself once, wait (`DatabaseUpgrade.checkAfterLaunch`):
     /// not during startup.
     static let databaseUpgradeNoticeQuietDelaySeconds: Double = 3
+    /// The upgrade's time for a gigabyte of a database's data (its pages less its empty
+    /// pages, `DatabaseVacuum.SpaceState.liveBytes`): the `VACUUM` and the TRUNCATE
+    /// after it (`DatabaseUpgradeProgress`, #1583). Measured on an iPhone: 1.00 GB of
+    /// email data in 37.6 s and 3.80 GB of search data in 134.8 s, 36 s a gigabyte over
+    /// both (memory 162).
+    static let databaseUpgradeSecondsPerGB: Double = 40
+    /// Bytes in the gigabyte of `databaseUpgradeSecondsPerGB` (decimal, as measured).
+    static let databaseUpgradeBytesPerGB: Double = 1_000_000_000
+    /// The notice's "It can take up to N minutes" is the estimate at
+    /// `databaseUpgradeSecondsPerGB` times this (`DatabaseUpgradeProgress.noticeMinutes`):
+    /// room for a slower phone. The running screen's minutes use the estimate alone.
+    static let databaseUpgradeNoticeTimeMargin: Double = 3
+    /// The fewest minutes the notice says.
+    static let databaseUpgradeNoticeMinimumMinutes = 1
+    /// The minutes the notice says when a database's size cannot be read.
+    static let databaseUpgradeNoticeFallbackMinutes = 10
+    /// Past its estimate, a database's part of the running screen's bar stops at this
+    /// fraction of its share until the database finishes (`DatabaseUpgradeProgress`).
+    static let databaseUpgradeProgressHoldFraction: Double = 0.95
+    /// How often the running screen recomputes its bar and the minutes left.
+    static let databaseUpgradeProgressRefreshSeconds: Double = 1
+    /// Settings shows its Optimize Storage row (`StorageOptimizer`, #1448) only while
+    /// the email and search databases' empty pages come to at least this much: below it
+    /// a tap would give back too little to see in "Email Index Used", and the
+    /// background job gives it back anyway.
+    static let optimizeStorageMinimumGainBytes: Int64 = 50 * 1024 * 1024
     /// Entries of `bodyAssetPendingDelete` per batch of the pending-delete worker
     /// (`BodyAssetMaintenance.processPendingDeletes`): one manifest read, one
     /// main-database read and one main-database write per batch (#1376).

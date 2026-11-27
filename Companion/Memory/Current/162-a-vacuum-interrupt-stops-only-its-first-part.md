@@ -110,5 +110,20 @@ two runs with the machine's load. A phone was not measured.
   after the copy-back checkpoints the whole WAL and its wait looks like a writer hold; and keep one connection
   open, because closing the last connection checkpoints and deletes the WAL.
 
+## The one-time upgrade on an iPhone (2026-11, #1583)
+
+The upgrade (ADR-IOS-121: one `VACUUM` with `temp_store = FILE`, then a TRUNCATE checkpoint, email database
+first) on an iPhone, the app paused (`DatabaseUpgrade`'s light pause):
+
+| Database | Data (pages less empty pages) | Time |
+|---|---|---|
+| Email | 1.00 GB | 37.6 s |
+| Search | 3.80 GB | 134.8 s |
+| Both | 4.80 GB | 172.5 s |
+
+About 36 s a gigabyte of data (decimal gigabytes), close for both kinds of database. The app's estimate uses 40 s
+(`SyncConfig.databaseUpgradeSecondsPerGB`): the notice's "up to N minutes" is that times 3, the running screen's
+minutes left that alone (`DatabaseUpgradeProgress`).
+
 Related: [158](158-every-batch-writer-checkpoints-the-wal-after-each-batch.md) (WAL checkpoints after batch
 writers), [157](157-a-keyset-tie-break-must-be-in-the-index.md) (rowids and keyset cursors).
