@@ -485,6 +485,44 @@ struct ChatUndoSendTests {
         #expect(service.reopenSnapshot?.id == reply.id, "the second compose opens when the first closes")
     }
 
+    /// What an Undo hands the compose it reopens to keep for a send again
+    /// (`ReopenSnapshot.sentTextVersion`): the user's own words the send was queued with, and only
+    /// those. The summary made at Send has landed with a text message of its own before the Undo,
+    /// as it does for a send undone after a few seconds.
+    @Test("An Undo keeps the user's own words the send was queued with, never its summary's text message, after the summary landed",
+          arguments: [false, true])
+    func undoKeepsOnlyTheUsersWords(withWords: Bool) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let service = PendingSendService.shared
+        defer {
+            service.dismiss()
+            service.resetUndoOwnersForTesting()
+            while service.reopenSnapshot != nil { service.finishReopen() }
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        while service.reopenSnapshot != nil { service.finishReopen() }
+        let fixture = try await Self.makeFixture(pool)
+        let draftId = "draft-undo-words-\(withWords)"
+        let row = try await Self.queueReply(fixture, draftId: draftId, textVersion: withWords ? "Tuesday works!" : nil)
+        let hold = Date().addingTimeInterval(3600)
+        try await Self.setHold(pool, row.id, hold)
+        let sentMessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId, "control: the queued row has its Message-ID"))
+        try await pool.write { db in
+            try MessageAICache.writeThrough(
+                accountId: Self.account, folderPath: "Sent", rfc822MessageId: sentMessageId,
+                summaryBlurb: "A plan.", summaryTextMessage: "I said Tuesday works.", db: db)
+        }
+        service.present(outboxId: row.id, draftId: draftId, instanceEpoch: "E1",
+                        toSummary: "To: sender@example.com", holdUntil: hold, owner: .toast)
+        service.undoAndReopen()
+
+        let left = try await pool.read { try OutboxMessage.fetchAll($0).map(\.id) }
+        #expect(!left.contains(row.id), "control: the send is cancelled")
+        let reopen = try #require(service.reopenSnapshot, "the compose reopens")
+        #expect(reopen.sentTextVersion == (withWords ? "Tuesday works!" : nil),
+                "the user's words when it had them, else none: \(reopen.sentTextVersion ?? "none")")
+    }
+
     @Test("A new email's chat finds its send by the card's draft: the row while it is queued, then its copy in the account's Sent folder by Message-ID, after the row has gone too")
     func newEmailSendFoundByItsDraft() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -1545,7 +1583,7 @@ struct ChatUndoSendTests {
     /// new email (`newEmail`).
     private static func queueReply(
         _ fixture: Fixture, draftId: String, inReplyTo: String? = nil, newEmail: Bool = false, forward: Bool = false,
-        body: String = "Tuesday works"
+        body: String = "Tuesday works", textVersion: String? = nil
     ) async throws -> OutboxMessage {
         let parent = newEmail ? nil : (inReplyTo ?? fixture.parent.rfc822MessageId)
         try await fixture.pool.write { db in
@@ -1560,7 +1598,7 @@ struct ChatUndoSendTests {
             draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: "Tuesday works for me.",
                                 inReplyTo: forward ? nil : parent, references: forward ? (parent.map { [$0] } ?? []) : []),
             accountId: Self.account, replyToHeaderId: newEmail ? nil : fixture.parent.id, isForward: forward, serverDraftId: nil,
-            draftId: draftId, instanceEpoch: "E1", holdsForUndo: true)
+            draftId: draftId, instanceEpoch: "E1", holdsForUndo: true, textVersion: textVersion)
         return try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) })
     }
 

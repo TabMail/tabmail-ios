@@ -109,8 +109,9 @@ extension AccountManager {
     /// `AIService.shared`; tests pass one built on a `FakeHTTP` session (AIService's own seam).
     ///
     /// `textVersion`: the email's text version already in hand (written with its body, sent
-    /// unchanged; ADR-IOS-114 decision 10). Where the Send-time summary would run, it is written
-    /// with the queue write instead (`SentEmailSummary.writeTextVersion`), and no summary is made.
+    /// unchanged; ADR-IOS-114 decision 10). Where the Send-time summary would run, it is kept as the
+    /// user's words with the queue write (`SentEmailSummary.writeTextVersion`), apart from the
+    /// summary, which is made all the same.
     @discardableResult
     nonisolated func queueSend(
         draft: DraftMessage,
@@ -167,11 +168,10 @@ extension AccountManager {
         if !result.deduped {
             Task { await AppDatabase.checkpointForDurability() }
             // The chat view summarizes the email now, for its Sending bubble and its Sent copy,
-            // unless its text version went in with the queue write. The demo account's sends (the
-            // tutorial's practice reply) are summarized on the device.
+            // its user's words or not (those stay apart and the bubbles show them first). The demo
+            // account's sends (the tutorial's practice reply) are summarized on the device.
             let outboxId = result.outboxId
             Task {
-                guard writtenTextVersion == nil else { return }
                 if isDemo {
                     await SentEmailSummary.summarizeLocally(outboxId: outboxId)
                     return
@@ -334,8 +334,9 @@ extension AccountManager {
                 row.sentMessageId = AccountManager.generateMessageId(senderEmail: senderEmail ?? "user@tabmail.local")
                 let changedOriginalHeaderId = try Self.markOriginalAtQueue(&row, db: db)
                 try row.insert(db)
-                // The text version already in hand goes in with the row, so the chat's Sending
-                // bubble never reads "Summarizing" for it (`SentEmailSummary.writeTextVersion`).
+                // The text version already in hand goes in with the row as the user's words, so
+                // the chat's Sending bubble never reads "Summarizing" for it
+                // (`SentEmailSummary.writeTextVersion`).
                 if let textVersion {
                     try SentEmailSummary.writeTextVersion(textVersion, outboxId: row.id, db: db)
                 }

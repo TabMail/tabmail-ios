@@ -1033,6 +1033,8 @@ extension SyncEngine {
                 survivor.summaryTextMessage = row.summaryTextMessage
             }
             if survivor.summaryTodos == nil { survivor.summaryTodos = row.summaryTodos }
+            // The user's own words for a sent email stand apart from its summary.
+            if survivor.userTextMessage == nil { survivor.userTextMessage = row.userTextMessage }
             if survivor.reminderDate == nil { survivor.reminderDate = row.reminderDate }
             if survivor.reminderTime == nil { survivor.reminderTime = row.reminderTime }
             if survivor.reminderContent == nil { survivor.reminderContent = row.reminderContent }

@@ -173,6 +173,11 @@ struct MessageHeader: Codable, Equatable, FetchableRecord, PersistableRecord, Id
     /// and restored with the other summary fields, never alone. Nil when the summary came from a
     /// source without one (a Thunderbird peer over Device Sync, a pre-2.0 result).
     var summaryTextMessage: String?
+    /// The words the user wrote for an email sent from the chat (its text version in hand at the
+    /// queue write), kept apart from the summary: the chat's bubbles show them instead of
+    /// `summaryTextMessage`, and nothing else reads them. Restored from the AI cache with the
+    /// email's other cached fields (`MessageAICache.restoreIfCached`); nil for every other email.
+    var userTextMessage: String?
 
     // AI-generated reply cache (matches TB's reply: IDB prefix)
     var cachedReply: String?

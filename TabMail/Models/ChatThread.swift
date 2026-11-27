@@ -39,10 +39,12 @@ struct ChatThread: Equatable {
         /// Written by the user: a blue bubble on the right.
         let isOwn: Bool
         let sender: Person
-        /// The bubble's text message; nil while it is being summarized. An email with
-        /// nothing to summarize is done without one (`MessageHeader.noContentSummary`): its bubble
-        /// says so, never "Summarizing".
+        /// The bubble's text message: the user's own words for an email sent from the chat with
+        /// them (`MessageHeader.userTextMessage`), else the summary's; nil while it is being
+        /// summarized. An email with nothing to summarize is done without one
+        /// (`MessageHeader.noContentSummary`): its bubble says so, never "Summarizing".
         var textMessage: String? {
+            if let words = header.userTextMessage, !words.isEmpty { return words }
             if let text = header.summaryTextMessage, !text.isEmpty { return text }
             return header.summaryBlurb == MessageHeader.noContentSummary ? MessageHeader.noContentSummary : nil
         }
@@ -230,8 +232,13 @@ struct ChatThread: Equatable {
     }
 
     /// One header per email: copies of one message in two folders share a `copyKey`. Keeps the
-    /// opened copy, else one with a text message, else the first.
+    /// opened copy, else one with the user's own words (the bubble shows them first), else one with
+    /// a text message, else the first.
     static func oneCopyEach(_ headers: [MessageHeader], preferredId: String?) -> [MessageHeader] {
+        func textRank(_ header: MessageHeader) -> Int {
+            if header.userTextMessage != nil { return 2 }
+            return header.summaryTextMessage != nil ? 1 : 0
+        }
         var order: [String] = []
         var chosen: [String: MessageHeader] = [:]
         for header in headers {
@@ -242,7 +249,7 @@ struct ChatThread: Equatable {
                 continue
             }
             if current.id == preferredId { continue }
-            if header.id == preferredId || (current.summaryTextMessage == nil && header.summaryTextMessage != nil) {
+            if header.id == preferredId || textRank(header) > textRank(current) {
                 chosen[key] = header
             }
         }

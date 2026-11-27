@@ -27,8 +27,10 @@ import UIKit
 ///     another chat show nothing.
 ///  5. A queued (not deduplicated) send summarizes at once, through the real `queueSend`, only with
 ///     the chat view on and AI allowed; the gate is driven through each of its real inputs. A send
-///     with its text version in hand writes it with the queue write instead, behind the same gate,
-///     and asks for no summary.
+///     with its text version in hand keeps it as the user's words with the queue write, behind the
+///     same gate, and is summarized all the same: the summary's to-dos and reminder land on its Sent
+///     copy, even when the summary returns after the copy arrived, and its bubbles show the user's
+///     words before and after the summary lands.
 ///  6. A send that failed for good shows the red mark beside its bubble; the
 ///     mark's Retry puts the same outbox row back in the queue and the bubble back to "Sending",
 ///     and its Delete removes the row and the bubble. Driven through the hosted chat's own actions.
@@ -79,10 +81,10 @@ struct ChatSendingBubbleTests {
     }
 
     /// Queues a reply as the compose card does, from `account` to `inReplyTo` (the parent's
-    /// Message-ID by default), and returns its outbox row.
+    /// Message-ID by default), with `textVersion` in hand when given, and returns its outbox row.
     private static func queueReply(
         _ fixture: Fixture, draftId: String, holdsForUndo: Bool,
-        from account: String = Self.account, inReplyTo: String? = nil
+        from account: String = Self.account, inReplyTo: String? = nil, textVersion: String? = nil
     ) async throws -> OutboxMessage {
         try await fixture.pool.write { db in
             var draft = Draft(
@@ -96,7 +98,7 @@ struct ChatSendingBubbleTests {
             draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: "Tuesday works for me.",
                                 inReplyTo: inReplyTo ?? fixture.parent.rfc822MessageId),
             accountId: account, replyToHeaderId: fixture.parent.id, isForward: false, serverDraftId: nil,
-            draftId: draftId, instanceEpoch: "E1", holdsForUndo: holdsForUndo)
+            draftId: draftId, instanceEpoch: "E1", holdsForUndo: holdsForUndo, textVersion: textVersion)
         return try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: queued.outboxId) })
     }
 
@@ -271,6 +273,128 @@ struct ChatSendingBubbleTests {
     /// Waits on `semaphore` off the main actor, up to ten seconds.
     nonisolated private static func waited(for semaphore: DispatchSemaphore) -> Bool {
         semaphore.wait(timeout: .now() + 10) == .success
+    }
+
+    /// A slow summary call at Send: the backend signals `asked`, then holds its answer until
+    /// `answer` is signalled. The answer has a to-do and a reminder due `reminderDue`, and a text
+    /// message of its own ("I said Tuesday works.").
+    private static func slowSummaryBackend(
+        asked: DispatchSemaphore, answer: DispatchSemaphore, reminderDue: String
+    ) -> FakeHTTP.Scenario {
+        let http = FakeHTTP.Scenario()
+        http.register(path: "/completions/chat", method: "POST") { _ in
+            asked.signal()
+            answer.wait()
+            let object: [String: Any] = [
+                "summary": "A plan.", "todos": ["Book a table for Tuesday"],
+                "reminder": ["due_date": reminderDue, "due_time": NSNull(), "content": "Lunch on Tuesday"],
+                "text_message": "I said Tuesday works."]
+            let assistant = String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+            let final = String(decoding: try! JSONSerialization.data(withJSONObject: ["assistant": assistant]), as: UTF8.self)
+            return .bytes(Data("event: final\ndata: \(final)\n\n".utf8), contentType: "text/event-stream")
+        }
+        return http
+    }
+
+    /// A reminder date a week from today, as the summary writes it.
+    private static func reminderDueInAWeek() -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy/MM/dd"
+        return formatter.string(from: Date().addingTimeInterval(7 * 24 * 3600))
+    }
+
+    @Test("An email sent with the user's own words still gets the summary made at Send: a slow one lands its to-dos and reminder on the Sent copy that arrived first, and the chat shows the user's words on the copy before and after it lands, whatever Message-ID the provider gave the copy",
+          arguments: CopyShape.allCases)
+    func ownWordsKeepTheSummarysTodosAndReminder(_ shape: CopyShape) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restoreAISetting = AITestSetting.save()
+        AITestSetting.set(aiOff: false)
+        defer { restoreAISetting() }
+        let fixture = try await Self.makeFixture(pool)
+        let words = "Tuesday works!"
+        let row = try await Self.queueReply(
+            fixture, draftId: "draft-words-\(shape.rawValue)", holdsForUndo: false, textVersion: words)
+        let sentFolderId = MessageIdentity.folderId(accountId: Self.account, folderPath: "Sent")
+        // The sent email's bubble, as the thread's chat builds it from its emails.
+        func copyBubble() async throws -> String? {
+            let sent = try await Self.sentHeaders(pool)
+            let thread = ChatThread(
+                members: [fixture.parent] + sent, replyAddresses: { _ in [] },
+                ownAddresses: [], draftFolderIds: [], sentFolderIds: [sentFolderId], unreadAtOpen: [], preferredId: nil)
+            return thread.items.first { $0.isOwn }?.textMessage
+        }
+
+        let asked = DispatchSemaphore(value: 0)
+        let answer = DispatchSemaphore(value: 0)
+        let due = Self.reminderDueInAWeek()
+        let http = Self.slowSummaryBackend(asked: asked, answer: answer, reminderDue: due)
+        defer { http.close() }
+        let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        let summarizing = Task { await SentEmailSummary.summarize(outboxId: row.id, aiService: service) }
+        let wasAsked = await Task.detached { Self.waited(for: asked) }.value
+        #expect(wasAsked, "control: the summary was asked at Send")
+
+        _ = try await Self.send(row, shape: shape)
+        let arrived = try await Self.sentHeaders(pool)
+        #expect(arrived.count == 1, "control: the Sent copy arrived while the summary was made")
+        let beforeSummary = try await copyBubble()
+        #expect(beforeSummary == words, "the Sent copy shows the user's words before the summary lands")
+        answer.signal()
+        await summarizing.value
+
+        let copies = try await Self.sentHeaders(pool)
+        #expect(copies.count == 1, "one Sent copy: \(copies.map(\.id))")
+        guard copies.count == 1 else { return }
+        #expect(copies[0].summaryTodos?.contains("Book a table for Tuesday") == true,
+                "the summary's to-dos land on the Sent copy: \(copies[0].summaryTodos ?? "none")")
+        #expect(copies[0].reminderContent == "Lunch on Tuesday" && copies[0].reminderDate == due,
+                "and its reminder: \(copies[0].reminderContent ?? "none") \(copies[0].reminderDate ?? "none")")
+        let afterSummary = try await copyBubble()
+        #expect(afterSummary == words, "the Sent copy still shows the user's words once the summary landed")
+    }
+
+    @Test("The Sending bubble of an email sent with the user's own words shows them from the queue write, while its summary is made, and after the summary lands")
+    func sendingBubbleKeepsTheUserWords() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restoreAISetting = AITestSetting.save()
+        AITestSetting.set(aiOff: false)
+        defer { restoreAISetting() }
+        let fixture = try await Self.makeFixture(pool)
+        let words = "Tuesday works!"
+        let row = try await Self.queueReply(fixture, draftId: "draft-words-sending", holdsForUndo: false, textVersion: words)
+        let parentMessageId = try #require(fixture.parent.rfc822MessageId)
+        let chat: Set<String> = [EmailFilter.normalizeMessageId(parentMessageId)]
+        func sendingBubble() async throws -> String? {
+            let replies = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+            return replies.first { $0.id == row.id }?.textMessage
+        }
+        let atQueue = try await sendingBubble()
+        #expect(atQueue == words, "from the queue write")
+
+        let asked = DispatchSemaphore(value: 0)
+        let answer = DispatchSemaphore(value: 0)
+        let http = Self.slowSummaryBackend(asked: asked, answer: answer, reminderDue: Self.reminderDueInAWeek())
+        defer { http.close() }
+        let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        let summarizing = Task { await SentEmailSummary.summarize(outboxId: row.id, aiService: service) }
+        let wasAsked = await Task.detached { Self.waited(for: asked) }.value
+        #expect(wasAsked, "control: the summary was asked at Send")
+        let whileMade = try await sendingBubble()
+        #expect(whileMade == words, "while the summary is made")
+        answer.signal()
+        await summarizing.value
+
+        let sentMessageId = try #require(row.sentMessageId)
+        let key = try #require(MessageAICache.cacheKey(
+            accountId: Self.account, folderPath: "Sent", rfc822MessageId: EmailFilter.normalizeMessageId(sentMessageId)))
+        let landed = try await pool.read { try MessageAICache.fetchOne($0, key: key) }
+        #expect(landed?.summaryTodos?.contains("Book a table for Tuesday") == true, "control: the summary landed")
+        let afterLanded = try await sendingBubble()
+        #expect(afterLanded == words, "after the summary lands, still the user's words")
     }
 
     // MARK: - 3. In the chat
@@ -790,10 +914,11 @@ struct ChatSendingBubbleTests {
     }
 
     /// The real producer with the text version in hand (ADR-IOS-114 decision 10): with the gate
-    /// open it is written in the queue write itself, blurb and text message alike, under the email's
-    /// Sent folder and Message-ID, so the Sending bubble's first value has it and no summary is asked;
-    /// with the gate closed nothing is written or asked; one that says nothing is summarized as before.
-    @Test("A send with its text version in hand writes it with the queue write and asks for no summary, only with the gate open",
+    /// open it is kept as the user's words in the queue write itself, under the email's Sent folder
+    /// and Message-ID, so the Sending bubble's first value has it; the summary is asked all the same
+    /// and lands beside the words without replacing them. With the gate closed nothing is written or
+    /// asked; one that says nothing is summarized as before, with no words kept.
+    @Test("A send with its text version in hand keeps it as the user's words with the queue write, and its summary is made all the same, only with the gate open",
           arguments: InHand.allCases)
     func queueSendWritesTheTextVersionInHand(_ inHand: InHand) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -834,22 +959,31 @@ struct ChatSendingBubbleTests {
         let bubbleText = bubbles.first { $0.id == outboxId }?.textMessage
         switch inHand {
         case .written:
-            #expect(atQueue?.summaryTextMessage == "Tuesday works!", "written with the queue write")
-            #expect(atQueue?.summaryBlurb == "Tuesday works!", "as the summary's blurb too, so it counts as summarized")
+            #expect(atQueue?.userTextMessage == "Tuesday works!", "kept as the user's words with the queue write")
             #expect(bubbleText == "Tuesday works!", "the Sending bubble's first value, never Summarizing")
         case .gated:
             #expect(atQueue == nil, "nothing written with the gate closed")
         case .blank:
-            for _ in 0..<100 where try await cached() == nil { try await Task.sleep(for: .milliseconds(100)) }
-            #expect(try await cached()?.summaryTextMessage == "I said Tuesday works.", "summarized as before")
+            break
         }
-        // Long enough for a summary to have been asked.
+        if inHand != .gated {
+            for _ in 0..<100 where try await cached()?.summaryBlurb == nil { try await Task.sleep(for: .milliseconds(100)) }
+            let summarized = try await cached()
+            #expect(summarized?.summaryBlurb == "A plan.", "the summary is made, words or not")
+            #expect(summarized?.summaryTextMessage == "I said Tuesday works.", "the summary's own text message, beside the words")
+            #expect(summarized?.userTextMessage == (inHand == .written ? "Tuesday works!" : nil),
+                    "the user's words stay as they were, and none are kept without them")
+        }
+        // Long enough for a second summary, or a gated one, to have been asked.
         try await Task.sleep(for: .seconds(2))
-        #expect(http.recordedCalls().count == (inHand == .blank ? 1 : 0), "a summary only without a text version")
+        #expect(http.recordedCalls().count == (inHand == .gated ? 0 : 1), "one summary per queued email, none when gated")
         if inHand == .written {
-            #expect(try await cached()?.summaryTextMessage == "Tuesday works!", "no summary replaced it")
+            let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
+            let later = bubbles.first { $0.id == outboxId }?.textMessage
+            #expect(later == "Tuesday works!", "no summary replaced the words in the bubble")
         } else if inHand == .gated {
-            #expect(try await cached() == nil, "still nothing with the gate closed")
+            let gated = try await cached()
+            #expect(gated == nil, "still nothing with the gate closed")
         }
     }
 

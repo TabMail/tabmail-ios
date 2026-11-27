@@ -228,6 +228,94 @@ struct AITextMessageStorageTests {
         #expect(header.replyTextMessage == nil)
     }
 
+    // MARK: - The user's own words for a sent email (v118)
+
+    @Test("v118 adds the user's words column to messageHeader and messageAICache, registered right after v117")
+    func migrationAddsUserTextMessage() throws {
+        let db = try TestDatabase.make()
+        for table in ["messageHeader", "messageAICache"] {
+            let cols = try columns(db, table)
+            #expect(cols.contains("userTextMessage"), "\(table)")
+        }
+        var migrator = DatabaseMigrator()
+        AppDatabase.registerAllMigrations(on: &migrator)
+        let identifiers = migrator.migrations
+        let v117 = try #require(identifiers.firstIndex(of: "v117_addOutboxOriginalChangesAtQueue"))
+        let v118 = try #require(identifiers.firstIndex(of: "v118_addUserTextMessage"))
+        #expect(v118 == v117 + 1, "v118 registers right after v117: \(identifiers.suffix(4))")
+    }
+
+    @Test("The user's words stand apart in the cache: stored when given, kept by every summary and reply write")
+    func userWordsStandApartFromResults() throws {
+        let db = try TestDatabase.make()
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "w@example.com",
+                                            userTextMessage: "Tuesday works!", db: $0)
+        }
+        let atQueue = try entry(db, "w@example.com")
+        #expect(atQueue?.userTextMessage == "Tuesday works!")
+        #expect(atQueue?.summaryBlurb == nil && atQueue?.summaryTextMessage == nil, "no AI result is written with them")
+
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "w@example.com",
+                                            summaryBlurb: "A plan.", summaryTodos: "• Book a table",
+                                            summaryTextMessage: "I said Tuesday works.", db: $0)
+        }
+        let summarized = try entry(db, "w@example.com")
+        #expect(summarized?.userTextMessage == "Tuesday works!", "a summary leaves the words")
+        #expect(summarized?.summaryTextMessage == "I said Tuesday works." && summarized?.summaryTodos == "• Book a table",
+                "and lands beside them")
+
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "w@example.com",
+                                            summaryBlurb: "Peer", db: $0)
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "w@example.com",
+                                            reply: ReplyResult(body: "Body", textMessage: "Reply text"), db: $0)
+        }
+        let later = try entry(db, "w@example.com")
+        #expect(later?.userTextMessage == "Tuesday works!", "a later summary or reply leaves the words")
+    }
+
+    @Test("restoreIfCached restores the user's words on their own, before any summary, and never over the header's own")
+    func restoreCarriesUserWords() throws {
+        let db = try TestDatabase.make()
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "u@example.com",
+                                            userTextMessage: "Tuesday works!", db: $0)
+        }
+        func copy(_ messageId: String) -> MessageHeader {
+            var header = MessageHeader(
+                messageId: messageId, subject: "S", from: "a@example.com", fromAddress: "a@example.com",
+                to: "b@example.com", date: Date(), snippet: "", folderId: "acc1:INBOX",
+                accountId: "acc1", folderPath: "INBOX", isInInbox: true
+            )
+            header.rfc822MessageId = "u@example.com"
+            return header
+        }
+        // A copy that arrives before the summary: the words now, no summary.
+        var early = copy("10")
+        try db.write { try MessageAICache.restoreIfCached(into: &early, accountId: "acc1", folderPath: "INBOX", db: $0) }
+        #expect(early.userTextMessage == "Tuesday works!")
+        #expect(early.summaryBlurb == nil, "control: no summary yet")
+
+        // The summary lands: the same copy takes it and keeps the words.
+        try db.write {
+            try MessageAICache.writeThrough(accountId: "acc1", folderPath: "INBOX", rfc822MessageId: "u@example.com",
+                                            summaryBlurb: "A plan.", summaryTodos: "• Book a table",
+                                            summaryTextMessage: "I said Tuesday works.", db: $0)
+        }
+        try db.write { try MessageAICache.restoreIfCached(into: &early, accountId: "acc1", folderPath: "INBOX", db: $0) }
+        #expect(early.summaryTodos == "• Book a table" && early.summaryTextMessage == "I said Tuesday works.")
+        #expect(early.userTextMessage == "Tuesday works!")
+
+        // A header with words of its own keeps them.
+        var own = copy("11")
+        own.userTextMessage = "Own words"
+        try db.write { try MessageAICache.restoreIfCached(into: &own, accountId: "acc1", folderPath: "INBOX", db: $0) }
+        #expect(own.userTextMessage == "Own words")
+        #expect(own.summaryBlurb == "A plan.", "control: the summary is restored as for any header")
+    }
+
     // MARK: - Upgrading a database that has AI results
 
     /// A database file migrated up to `migration`, as an older build left it.
