@@ -111,15 +111,17 @@ enum ThreadUtils {
         guard !L.isEmpty else { return nil }
 
         // (1) Forward: the nearest stored email in L, one id at a time. Exclude
-        // self to handle re-inserts/upserts of the same row.
+        // self to handle re-inserts/upserts of the same row. The statement is
+        // compiled once per connection (its cache) and only bound per id.
+        let nearest = try db.cachedStatement(sql: """
+            SELECT computedThreadId FROM messageHeader
+            WHERE rfc822MessageId = ?
+              AND id != ?
+              AND computedThreadId != ''
+            LIMIT 1
+        """)
         for messageId in L {
-            if let found = try String.fetchOne(db, sql: """
-                SELECT computedThreadId FROM messageHeader
-                WHERE rfc822MessageId = ?
-                  AND id != ?
-                  AND computedThreadId != ''
-                LIMIT 1
-            """, arguments: [messageId, myHeaderId]) {
+            if let found = try String.fetchOne(nearest, arguments: [messageId, myHeaderId]) {
                 return found
             }
         }
