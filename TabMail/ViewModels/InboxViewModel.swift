@@ -355,31 +355,34 @@ final class InboxViewModel {
     /// The durable row has already moved to `newHeaderId`; waiting for the
     /// ordinary 500ms reload leaves the visible snapshot naming the deleted old
     /// primary key, so a second gesture during that window resolves nothing and
-    /// appears to be ignored. This changes identity fields only; all visual
-    /// content remains the snapshot the user is already looking at until the
-    /// normal reload reconciles it.
+    /// appears to be ignored. A renamed row keeps the visual content the user
+    /// is already looking at until the normal reload reconciles it.
     ///
-    /// A move onto a row the list already shows (a placeholder whose server
-    /// copy was stored first) drops the moved snapshot: the list never holds
-    /// one id twice.
+    /// A move onto an id the list holds after this post (a row no move names,
+    /// such as a placeholder's server copy that was stored first, or a row an
+    /// earlier move of this post renamed) drops the moved snapshot: the list
+    /// never holds one id twice.
     func applyHeaderRekeys(_ moves: MailPointerMoves) {
         guard !moves.isEmpty else { return }
         var changed = false
-        // The snapshots' own ids: `loadedIds` also keeps evicted rows' ids.
-        let shownIds = Set(loadedMessages.map(\.id))
-        var occupied = IndexSet()
+        // The ids the list holds after this post, starting with the rows no
+        // move names. Read from the snapshots: `loadedIds` also keeps evicted
+        // rows' ids.
+        var held = Set(loadedMessages.lazy.map(\.id).filter { moves.row(movedFrom: $0) == nil })
+        var dropped = IndexSet()
         for index in loadedMessages.indices {
             guard let record = moves.row(movedFrom: loadedMessages[index].id) else { continue }
             changed = true
-            if shownIds.contains(record.newHeaderId) {
-                occupied.insert(index)
+            guard held.insert(record.newHeaderId).inserted else {
+                dropped.insert(index)
                 continue
             }
             loadedMessages[index].id = record.newHeaderId
             loadedMessages[index].messageId = record.newProviderMessageId
             loadedMessages[index].observedUidValidity = record.newObservedUidValidity
         }
-        loadedMessages.remove(atOffsets: occupied)
+        // Only when a row goes: any write to the list re-renders the inbox.
+        if !dropped.isEmpty { loadedMessages.remove(atOffsets: dropped) }
         // The same committed mapping as the snapshots, for the view-local id
         // sets (`InboxView` follows its dismissed and fading rows the same
         // way, so a forward move stays hidden after its primary key changes
