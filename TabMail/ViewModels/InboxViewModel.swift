@@ -358,16 +358,28 @@ final class InboxViewModel {
     /// appears to be ignored. This changes identity fields only; all visual
     /// content remains the snapshot the user is already looking at until the
     /// normal reload reconciles it.
+    ///
+    /// A move onto a row the list already shows (a placeholder whose server
+    /// copy was stored first) drops the moved snapshot: the list never holds
+    /// one id twice.
     func applyHeaderRekeys(_ moves: MailPointerMoves) {
         guard !moves.isEmpty else { return }
         var changed = false
+        // The snapshots' own ids: `loadedIds` also keeps evicted rows' ids.
+        let shownIds = Set(loadedMessages.map(\.id))
+        var occupied = IndexSet()
         for index in loadedMessages.indices {
             guard let record = moves.row(movedFrom: loadedMessages[index].id) else { continue }
+            changed = true
+            if shownIds.contains(record.newHeaderId) {
+                occupied.insert(index)
+                continue
+            }
             loadedMessages[index].id = record.newHeaderId
             loadedMessages[index].messageId = record.newProviderMessageId
             loadedMessages[index].observedUidValidity = record.newObservedUidValidity
-            changed = true
         }
+        loadedMessages.remove(atOffsets: occupied)
         // The same committed mapping as the snapshots, for the view-local id
         // sets (`InboxView` follows its dismissed and fading rows the same
         // way, so a forward move stays hidden after its primary key changes

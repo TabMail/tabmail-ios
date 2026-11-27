@@ -274,6 +274,35 @@ struct InboxViewModelInsertUndoneTests {
         #expect(!vm.loadedMessages.contains(where: { $0.id == id }))
     }
 
+    /// A move whose new id is a row the list already shows (the server's copy
+    /// stored before its placeholder went) leaves that row once: the list never
+    /// holds one id twice.
+    @Test("A move onto a row the list already shows leaves one row with that id")
+    @MainActor func moveOntoAShownRowLeavesOneRow() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        let movedId = try insertHeader(
+            pool, messageId: "201", folderId: inbox.id, folderPath: inbox.path, isInInbox: true)
+        let shownId = try insertHeader(
+            pool, messageId: "202", folderId: inbox.id, folderPath: inbox.path, isInInbox: true)
+        let vm = InboxViewModel(folders: [inbox])
+        let shownBefore = vm.loadedMessages.map(\.id).filter { $0 == movedId || $0 == shownId }.sorted()
+        #expect(shownBefore == [movedId, shownId].sorted(), "setup: the list shows both rows")
+
+        vm.applyHeaderRekeys(MailPointerMoves([.row(HeaderRekeyRecord(
+            oldHeaderId: movedId, newHeaderId: shownId, newProviderMessageId: "202"))]))
+
+        let ids = vm.loadedMessages.map(\.id)
+        let rowsWithShownId = ids.filter { $0 == shownId }.count
+        #expect(rowsWithShownId == 1)
+        #expect(!ids.contains(movedId))
+    }
+
     @Test("Provider re-key immediately updates the visible row and dismissed identity")
     @MainActor func providerRekeyKeepsVisibleRowActionable() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
