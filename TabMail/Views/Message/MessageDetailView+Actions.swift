@@ -66,11 +66,6 @@ extension MessageDetailView {
 
     // MARK: - Agent Tool Compose
 
-    var currentAccount: Account? {
-        guard let accountId = viewModel.message?.accountId else { return nil }
-        return try? AppDatabase.dbPool.read { db in try Account.fetchOne(db, key: accountId) }
-    }
-
     func replyAllComposeView(for msg: MessageHeader) -> some View {
         let allAccounts = (try? AppDatabase.dbPool.read { db in try Account.fetchAll(db) }) ?? []
         let recipients = buildReplyAllRecipients(for: msg, allAccounts: allAccounts)
@@ -86,9 +81,10 @@ extension MessageDetailView {
     func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest) -> some View {
         switch req.mode {
         case .compose:
+            // The account the tool signed the AI-written body as.
             ComposeView(
                 suggestedBody: req.body,
-                account: currentAccount,
+                account: req.account,
                 prefillTo: req.to,
                 prefillCc: req.cc,
                 prefillBcc: req.bcc,

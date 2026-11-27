@@ -67,4 +67,19 @@ ComposeView contains `.alert`, `.popover`, `.photosPicker`, `.fileImporter`, and
 
 **PARTIALLY SUPERSEDED (routing) by ADR-IOS-053:** the InboxView/MessageDetailView `pendingCompose` observer race noted in the Consequences is slated to be fixed (Phase 2) by re-homing compose routing to the owned `AgentUISink`. The cover-serialization FIFO (`composeQueue`/`presentationCount`/`awaitingAppear`) is retained — it solves the distinct "SwiftUI can't stack two fullScreenCovers" constraint, which owned routing does not address.
 
+**Amendment (2026-11-27, tabmail-ios #1521): the request carries the account it is signed as.**
+
+- *Problem:* the AI-written body was signed by `EmailComposeTool.runComposeEdit` with the primary account's name (the edit request's `user_name`). The email went out from another account in two cases:
+  - a reply or forward, which is sent from the email's own account;
+  - a new email whose card the email screen presented, because it opened the card with the open email's account (the observer race above decides which view presents).
+- *Decision:* `runComposeEdit` takes the sending account (`sender:`) and does no account lookup of its own.
+  - A reply or forward passes the email's own account: the reply tool takes it from its existing account list, the forward tool reads it by primary key. The card sends from `replyTo`'s account, the same one.
+  - A new email: the tool reads the account once (`EmailComposeTool.sendingAccount`), signs with it, and carries it on `ComposeRequest.account`. Asked on an email's screen, it is that email's account (if active); in the inbox, the primary account, else the oldest account; in demo, the demo account either way (ADR-IOS-038). Both views open a new email's card with `req.account`, so the account no longer depends on which view wins the race, and neither view reads an account of its own for this card (the inbox's primary had no demo filter; the email screen's was a synchronous read on the main thread).
+  - The tool's one read is the sidebar's own account request (`Account.sidebarRequest`: active mail accounts, oldest first, the demo account alone in demo and never otherwise), and the account is picked from that list in memory. So a new email never goes from a calendar-only account, which has no mail to send with, even when it is the primary account.
+  - The email screen's chat tells the tool which email is open: `ToolInvocation.openEmailAccountId` (ADR-IOS-053's per-call value), set from the chat view's `message` by its one `toolInvocation` builder, nil in the inbox and for non-interactive callers. Every completion call of the chat (a fresh turn, a resumed turn, a compose edit) passes that invocation.
+  - Product decision (2026-11-27): from the open email's account on its screen, from the primary account in the inbox, rather than always the primary account.
+  - *Considered and not taken:* sending the sending account's address in the edit request as well as its name. The reference client (Thunderbird) sends only the name (`user_name`), and the backend prompt has no address variable.
+- *Accepted limitation:* if the user changes From in the card after the body was written, the sign-off keeps the first account's name. The text is on screen and editable.
+- *Tests:* `ComposeEditSenderAccountTests`, `AssistantChatOpenEmailAccountWiringTests`, `AssistantComposeCardAccountWiringTests`.
+
 ---

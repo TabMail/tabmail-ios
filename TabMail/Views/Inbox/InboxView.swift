@@ -2124,9 +2124,10 @@ struct InboxView: View {
     private func composeViewForAgentRequest(_ req: AgentToolRouter.ComposeRequest) -> some View {
         switch req.mode {
         case .compose:
+            // The account the tool signed the AI-written body as.
             ComposeView(
                 suggestedBody: req.body,
-                account: viewModel.primaryAccount,
+                account: req.account,
                 prefillTo: req.to,
                 prefillCc: req.cc,
                 prefillBcc: req.bcc,

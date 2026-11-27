@@ -19,6 +19,12 @@ struct EmailComposeTool: AgentTool, Sendable {
     }
 
     func execute(arguments: [String: JSONValue]) async throws -> String {
+        try await execute(arguments: arguments, invocation: .noninteractive)
+    }
+
+    /// The real entry point: `invocation` carries the account of the email open where the user
+    /// asked (an email screen's chat), which the new email is sent from.
+    func execute(arguments: [String: JSONValue], invocation: ToolInvocation) async throws -> String {
         // Parse recipients
         let to = Self.parseStringArray(arguments["to"]) ?? Self.parseStringArray(arguments["recipients"]) ?? []
         let cc = Self.parseStringArray(arguments["cc"]) ?? []
@@ -54,6 +60,10 @@ struct EmailComposeTool: AgentTool, Sendable {
 
         if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[EmailComposeTool] Opening compose: to=\(to) cc=\(cc) subject=\(subject ?? "(none)") bodyLen=\(body?.count ?? 0) requestLen=\(composeRequest?.count ?? 0)") }
 
+        // The account the new email is sent from, read once: the AI signs the body as this
+        // account, and the compose card opens with it, so the two cannot differ.
+        let account = await Self.sendingAccount(openEmailAccountId: invocation.openEmailAccountId, db: ctx.db)
+
         // When a compose instruction is present, run it through the backend LLM
         // to generate the actual email content — matching TB's runComposeEdit() flow.
         var generatedSubject = subject
@@ -67,7 +77,7 @@ struct EmailComposeTool: AgentTool, Sendable {
                     body: body,
                     request: composeRequest,
                     mode: "edit_new",
-                    db: ctx.db
+                    sender: account
                 )
                 generatedSubject = result.subject ?? generatedSubject
                 generatedBody = result.body ?? generatedBody
@@ -82,6 +92,7 @@ struct EmailComposeTool: AgentTool, Sendable {
             AgentToolRouter.ComposeRequest(
                 mode: .compose,
                 replyTo: nil,
+                account: account,
                 to: to,
                 cc: cc,
                 bcc: bcc,
@@ -119,10 +130,32 @@ struct EmailComposeTool: AgentTool, Sendable {
     /// the tool calls made inside its own `withValue` scope.
     @TaskLocal static var inlineEditOverride: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)?
 
+    /// The account a new email the assistant writes is sent from: the account of the email open
+    /// where the user asked (`openEmailAccountId`, an email screen's chat), else the primary
+    /// account, else the oldest account. It is picked from the accounts the sidebar lists
+    /// (`Account.sidebarRequest`), so it is always a mail account: never a calendar-only one,
+    /// which has no mail to send with.
+    /// Demo boundary (ADR-IOS-038): in demo, compose MUST use the demo account — during
+    /// debug-menu coexistence the real primary is ALSO isPrimary, so an unscoped lookup could
+    /// pick (and send via) the real account. The sidebar's list is the demo account alone in
+    /// demo and never has it otherwise.
+    static func sendingAccount(openEmailAccountId: String?, db: any DatabaseReader & Sendable) async -> Account? {
+        let demoActive = DemoModeStore.isDemoActive
+        let accounts = ((try? await db.read { db in
+            try Account.sidebarRequest(demoActive: demoActive).fetchAll(db)
+        }) ?? []).filter(\.isActive)
+        return accounts.first { $0.id == openEmailAccountId }
+            ?? accounts.first { $0.isPrimary }
+            ?? accounts.first
+    }
+
     /// Shared compose edit flow matching TB's `runComposeEdit()`.
-    /// Resolves account/prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
+    /// Resolves prompts, builds `ComposeEditContext`, and calls `performInlineEdit()`.
     /// Used by email_compose (mode "edit_new"), email_reply (mode "edit_reply"),
     /// and email_forward (mode "edit_forward") tools for full TB parity.
+    /// `sender` is the account the email is sent from (a reply or forward: the email's own
+    /// account; a new email: `sendingAccount`); the AI signs the body with its display name,
+    /// which the edit request sends as `user_name`.
     static func runComposeEdit(
         to: [String],
         cc: [String],
@@ -132,33 +165,8 @@ struct EmailComposeTool: AgentTool, Sendable {
         mode: String,
         relatedHeader: MessageHeader? = nil,
         relatedBodyText: String? = nil,
-        db: (any DatabaseReader & Sendable)? = nil
+        sender account: Account?
     ) async throws -> InlineEditResult {
-        let dbReader = db ?? AppDatabase.rawPool
-        // Get sender info from primary account (matching TB's user identity
-        // resolution). Demo boundary (ADR-IOS-038): in demo, compose MUST use
-        // the demo account — during debug-menu coexistence the real primary is
-        // ALSO isPrimary, so an unscoped lookup could pick (and send via) the
-        // real account. Normal mode excludes the demo row symmetrically.
-        let demoActive = DemoModeStore.isDemoActive
-        let account: Account? = try? await dbReader.read { db in
-            if demoActive {
-                return try Account
-                    .filter(Column("id") == DemoSeed.demoAccountId && Column("isActive") == true)
-                    .fetchOne(db)
-            }
-            if let primary = try Account
-                .filter(Column("isActive") == true && Column("isPrimary") == true)
-                .filter(Column("id") != DemoSeed.demoAccountId)
-                .fetchOne(db) {
-                return primary
-            }
-            return try Account
-                .filter(Column("isActive") == true)
-                .filter(Column("id") != DemoSeed.demoAccountId)
-                .fetchOne(db)
-        }
-
         // Get composition prompt and KB text (MainActor-isolated)
         let (kbText, compositionPrompt) = await MainActor.run {
             (PromptStore.shared.kbText(), PromptStore.shared.compositionMarkdown())

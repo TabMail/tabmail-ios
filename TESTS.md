@@ -1288,6 +1288,57 @@ host's zone, and compares the write on the fake with the card.
   `this_and_following` delete with no cut or no zone is retired as failed with nothing sent. An event
   that does not repeat, given any `delete_scope`, is deleted as it is (the scope dropped).
 
+## Assistant-written emails — signed as the account they are sent from
+
+`TabMailTests/Tools/ComposeEditSenderAccountTests.swift` pins #1521. Each case has a home and a
+work account and captures the edit context the tool builds through
+`EmailComposeTool.inlineEditOverride`; the assertions read that context and the compose request
+the tool queues (the card itself is not presented).
+
+- `ComposeEditSenderAccountTests` (`.processGlobalState`, demo mode pinned per case):
+  - A reply and a forward of an email in the work account (sent to a team alias, not the
+    account's address), with either account as the primary, build an edit context with the work
+    account's name and address, and the request's parent email is the work account's.
+  - The edit of a reply, a forward and a new email (asked on the work email's screen), each sent
+    through a real `AIService` request with home as the primary, reaches the backend with the work
+    account's name as `user_name`.
+  - A new email asked in the inbox (no open email), with either account as the primary, carries
+    the primary account on its compose request, and the edit context has that same account's name
+    and address. Without a writing
+    request, the request still carries the account. A primary change while the edit runs leaves
+    the request on the account the body was signed as.
+  - Demo boundary: with the demo row and a real primary both primary, a new email is the demo
+    account's in demo and the real primary's out of demo. With no active real primary (none, or
+    an inactive one), it is the active real account (not the demo row, not an inactive account).
+    The rows a lookup filter must skip are inserted before the expected account, so a lookup
+    without that filter picks the wrong one.
+  - A calendar-only primary is never the new email's account: the mail account is. With no
+    primary, the oldest account is, though another comes first by insertion and by id. In demo
+    with no demo account, neither the context nor the request has a real account.
+  - Asked on an email's screen (run through a `ToolRegistry` with a `ToolInvocation` that names
+    the open email's account, as a chat turn runs it): a new email is the open email's account,
+    with the other account as the primary, for either account, with or without a writing
+    request. In demo it is still the demo account when the open email is a real account's; out
+    of demo an email of the demo row gives the real primary. An open email whose account is not
+    active gives the primary. A reply and a forward asked on another account's screen are signed
+    as, and sent from, the email's own account (the work account's; in demo the demo account's,
+    with a real primary coexisting).
+- `AssistantChatOpenEmailAccountWiringTests`: a source fence over the app target, comments and
+  strings masked. Exactly one `ToolInvocation` is built with a chat session's `SessionUISink`
+  (the chat view's `toolInvocation`, used by every chat turn), and it passes
+  `openEmailAccountId: message?.accountId`. In the chat view, the fresh turn
+  (`TutorialChatScript.response` and `AIService.sendChatMessage`), the resumed turn
+  (`resumeChatMessage`) and the compose edit (`performInlineEdit`) each pass it (`toolInvocation`,
+  or the one local `let invocation = toolInvocation`), since a call without it runs the tools as
+  `.noninteractive`. The chat gets its email from the email screen: `MessageDetailView` builds its
+  pill with `message: chatContextMessage ?? message`, and `InboxView` and `ComposeView` with no
+  `message` (the first initializer argument), and no other view builds one.
+- `AssistantComposeCardAccountWiringTests`: a source fence over every app-target
+  `composeViewForAgentRequest` (exactly two: `InboxView`, `MessageDetailView`), comments masked.
+  The `.compose` case passes `account: req.account` and no other account argument; the `.reply`
+  and `.forward` cases pass `replyTo: req.replyTo` and no account argument, so the card sends
+  from the email's own account.
+
 ## CalDAV organizer — every event with guests names its organizer
 
 `TabMailTests/Providers/CalDAVOrganizerTests.swift` pins ADR-IOS-109 (#711): every CalDAV PUT runs

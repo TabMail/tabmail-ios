@@ -84,6 +84,10 @@ struct EmailForwardTool: AgentTool, Sendable {
         if let composeRequest {
             let wrappedRequest = "Forward email with subject \"\(header.subject)\" to recipients: \(recipientsFormatted). Content request: \(composeRequest)"
             do {
+                // The forward is sent from the forwarded email's account, so the AI signs as it.
+                let sender: Account? = try? await ctx.db.read { db in
+                    try Account.fetchOne(db, key: header.accountId)
+                }
                 let result = try await EmailComposeTool.runComposeEdit(
                     to: to,
                     cc: cc,
@@ -93,7 +97,7 @@ struct EmailForwardTool: AgentTool, Sendable {
                     mode: "edit_forward",
                     relatedHeader: header,
                     relatedBodyText: relatedBodyText,
-                    db: ctx.db
+                    sender: sender
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody

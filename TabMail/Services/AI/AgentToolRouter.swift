@@ -247,6 +247,10 @@ final class AgentToolRouter {
         let id = UUID()
         let mode: Mode
         let replyTo: MessageHeader?
+        /// The account a new email (`.compose`) is sent from: the one the tool signed the
+        /// AI-written body as, so the compose card opens with it whichever view presents
+        /// the card. A reply or forward sends from `replyTo`'s own account (nil here).
+        let account: Account?
         let to: [String]
         let cc: [String]
         let bcc: [String]
@@ -271,6 +275,7 @@ final class AgentToolRouter {
         init(
             mode: Mode,
             replyTo: MessageHeader?,
+            account: Account? = nil,
             to: [String],
             cc: [String],
             bcc: [String],
@@ -282,6 +287,7 @@ final class AgentToolRouter {
         ) {
             self.mode = mode
             self.replyTo = replyTo
+            self.account = account
             self.to = to
             self.cc = cc
             self.bcc = bcc

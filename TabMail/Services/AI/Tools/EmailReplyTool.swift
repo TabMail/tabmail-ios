@@ -92,6 +92,7 @@ struct EmailReplyTool: AgentTool, Sendable {
         if let composeRequest {
             let wrappedRequest = "Reply to email with subject \"\(header.subject)\" with request: \(composeRequest)"
             do {
+                // The reply is sent from the replied email's account, so the AI signs as it.
                 let result = try await EmailComposeTool.runComposeEdit(
                     to: to,
                     cc: cc,
@@ -101,7 +102,7 @@ struct EmailReplyTool: AgentTool, Sendable {
                     mode: "edit_reply",
                     relatedHeader: header,
                     relatedBodyText: relatedBodyText,
-                    db: ctx.db
+                    sender: accounts.first(where: { $0.id == header.accountId })
                 )
                 generatedSubject = result.subject
                 generatedBody = result.body ?? generatedBody

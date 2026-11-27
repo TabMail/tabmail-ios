@@ -114,6 +114,12 @@ struct DynamicIslandChat: View {
         return "inbox"
     }
     private var session: ChatPillState.Session { ChatPillState.shared.session(for: sessionKey) }
+    /// The tool channel for a turn of this session (ADR-IOS-053): confirmation cards go to this
+    /// session, and on an email's screen the tools get that email's account (a new email the
+    /// assistant writes is sent from it).
+    private var toolInvocation: ToolInvocation {
+        ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey, openEmailAccountId: message?.accountId)
+    }
     private var chatMessages: [ChatMessage] {
         get { session.chatMessages }
         nonmutating set { session.chatMessages = newValue }
@@ -1593,7 +1599,7 @@ struct DynamicIslandChat: View {
                 // Owned UI delivery (ADR-IOS-053): compose inline edit enables
                 // calendar/contact tools, so route their confirmation cards to
                 // THIS compose session's pill rather than fast-failing.
-                invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
+                invocation: toolInvocation
             )
         }
         let timeoutTask = Task {
@@ -2357,7 +2363,7 @@ struct DynamicIslandChat: View {
                 // THIS session so any FSM tool's card is delivered to (and rendered
                 // by) the session that launched the turn — never a global slot that
                 // other mounted pills race for.
-                let invocation = ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
+                let invocation = toolInvocation
                 let response: ChatResponse?
                 response = try await TutorialChatScript.response(for: script, invocation: invocation) {
                     try await AIService.shared.sendChatMessage(
@@ -2528,7 +2534,7 @@ struct DynamicIslandChat: View {
                 let response = try await AIService.shared.resumeChatMessage(
                     request: request,
                     onSSEEvent: makeCompletionsSSEHandler(idleLabel: "Thinking..."),
-                    invocation: ToolInvocation(uiSink: SessionUISink(session: session), sessionKey: sessionKey)
+                    invocation: toolInvocation
                 )
 
                 let replyText = response?.text ?? "I couldn't generate a response. Please try again."
