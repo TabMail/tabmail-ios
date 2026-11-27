@@ -423,8 +423,8 @@ struct ChatThreadContextTests {
                 .split(whereSeparator: \.isWhitespace).joined(separator: " ")
         }
         let navigation = try source("TabMail/Views/MailNavigationView.swift")
-        #expect(navigation.contains("MessageOpenView( messageId: messageId, opensWithSkeletonDwell: opensWithSkeletonDwell, highlightsMessage: highlightsMessage)"),
-                "the folder, notification and email-reference opens")
+        #expect(navigation.contains("MessageOpenView( messageId: openedMessage.currentId(for: messageId), opensWithSkeletonDwell: opensWithSkeletonDwell, highlightsMessage: highlightsMessage)"),
+                "the folder, notification and email-reference opens, with the id that follows the email's moves")
         #expect(!navigation.contains("DraftComposePresenter(source: .header("), "no second draft check beside MessageOpenView's")
         #expect(try source("TabMail/Views/Inbox/SearchView.swift").contains("MessageOpenView( messageId: target.headerId,"), "search")
         #expect(try source("TabMail/Views/Settings/RemindersSettingsView.swift").contains("MessageOpenView(messageId: messageId,"), "a reminder")
