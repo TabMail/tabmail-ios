@@ -673,7 +673,7 @@ struct ChatNewThreadScreenTests {
         }
     }
 
-    @Test("Through the real send, from the Sending bubble to the sent email's thread, every frame shows the user's words: the Sending bubble stays until the thread shows the sent email, even once the send's cleanup has deleted its row",
+    @Test("Through the real send, from the Sending bubble to the sent email's thread, every frame shows the user's words: the send's bubble stays, Sent once filed, until the thread shows the sent email, even once the send's cleanup has deleted its row",
           arguments: 0..<3)
     func realSendKeepsTheWordsOnScreen(attempt: Int) async throws {
         // Each attempt sends once: where the row's delete falls between two frames varies.

@@ -700,6 +700,25 @@ same AI result, kept as long as the email itself is shown.
    whose copy could not be read does. Tests: `ChatSendingBubbleTests` (both copy shapes):
    `summaryAtSendIsTheEmailsOwn`, `lateSummaryReachesTheSentCopy`, `sentReplyHandsOverToItsCopy`,
    `newEmailFollowFindsItsCopy`.
+   *Amended 2026-11-27 (the bubble stays through the send's cleanup):* when the provider files the
+   copy itself, the send's cleanup deletes the row milliseconds after the Sent copy is written, before
+   the chat's reload shows the copy (a thread), or before the new email's chat has read the sent
+   email's thread (decision 24): frames with none of the user's words, then the email. A bubble is now
+   one pointer that moves (`ChatSendBubbles`, display state in both chats): its outbox item while the
+   row waits and sends, then the Sent copy the send's filing names (`MailPointerMove.sent`, posted
+   before the row can be deleted), then the server's copy that replaced it (`MailPointerMove.row`).
+   A bubble the filing moved stays after its row has gone, reading "Sent" with no Undo, as the email
+   that takes its place does, until the chat shows that email: in a thread, until the copy is one of
+   the chat's rows (`MessageDetailViewModel.chatRows`, so a copy left out for another folder's copy
+   counts), hidden in the same pass that shows the email, and never shown again after; in a new
+   email's chat, until the chat is the sent email's thread. A row that goes with no move (Undo, a
+   discard) ends its bubble at once, as before. A send with no Sent copy written stays "Sent" until
+   the chat closes. No query, column, observation or registry row: the bubbles follow the moves every
+   holder of an email already follows (`.mailPointersMoved`). Tests: `ChatSendBubblesTests` (the
+   rule), `ChatSendingBubbleTests.sentReplyKeepsTheWordsOnScreen` and
+   `ChatNewThreadScreenTests.realSendKeepsTheWordsOnScreen` (every frame through the real send shows
+   the user's words, never twice), `ChatSendingBubbleTests.sendingBubbleHandsOver` (the bubble goes as
+   the email shows).
    **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
    chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
    instead of the undo-send toast, which is not shown for it. Who offers a send's Undo

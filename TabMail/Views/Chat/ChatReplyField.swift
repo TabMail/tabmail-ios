@@ -674,11 +674,14 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     let filed: Bool
     /// The email's summary as a text message, once made.
     let textMessage: String?
+    /// The send filed the email (`ChatSendBubbles`): it went out, and the bubble stays, "Sent",
+    /// until the chat shows the email itself.
+    var isSent = false
 
     var id: String { outboxId }
 
     /// The line under the bubble, as under every email of the user's.
-    var caption: String { failed ? "Not sent" : "Sending" }
+    var caption: String { failed ? "Not sent" : isSent ? "Sent" : "Sending" }
 
     /// The outbox rows answering one of `messageIds` (normalized Message-IDs of the chat's emails)
     /// whose email is not one of them, oldest first. A sent row without its Message-ID cannot be

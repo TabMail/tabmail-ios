@@ -327,10 +327,14 @@ struct ChatSendingBubbleTests {
         #expect(count(text) == 1 && count("Sending") == 1, "the summary shows while still sending: \(labels().prefix(20))")
 
         // The real send: it stamps `sentAt`, writes the Sent copy and deletes the row; nothing else
-        // tells the chat (no merge signal is posted here).
+        // tells the chat (no merge signal is posted here). The bubble, "Sent" once filed, goes as the
+        // email shows.
         _ = try await Self.send(row)
-        try await waitFor { count("Sending") == 0 && count(text) == 1 }
-        #expect(count(text) == 1, "the email shows the same summary, once: \(labels().prefix(20))")
+        func bubbleShows() -> Bool {
+            HostedAccessibility.identifiers(in: controller.view).contains(ChatUnsentReplyBubble.bubbleId)
+        }
+        try await waitFor { !bubbleShows() && count(text) == 1 }
+        #expect(!bubbleShows() && count(text) == 1, "the email shows the same summary, once: \(labels().prefix(20))")
         #expect(count("Sending") == 0 && count("Summarizing") == 0 && count("You said: summarizing") == 0,
                 "no second bubble and no flash back: \(labels().prefix(20))")
         await queue.clearForTesting()
@@ -379,7 +383,8 @@ struct ChatSendingBubbleTests {
         try await waitFor { count("Lunch plans") > 0 }
 
         // The reply with its summary made, so its bubble and its email in the chat read the same words.
-        let row = try await Self.queueReply(fixture, draftId: "draft-frames", holdsForUndo: false)
+        // Held, so no drain of the app's own sends it before the test does; the hold ends just before.
+        let row = try await Self.queueReply(fixture, draftId: "draft-frames", holdsForUndo: true)
         let text = "I said Tuesday works."
         let http = Self.summaryBackend(textMessage: text)
         defer { http.close() }
@@ -391,15 +396,24 @@ struct ChatSendingBubbleTests {
 
         let frames = OwnWordsFrames(view: controller.view)
         frames.start()
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?",
+                           arguments: [Date().addingTimeInterval(-1), row.id])
+        }
         _ = try await Self.send(row, shape: shape)
         let rowGone = try await pool.read { try OutboxMessage.fetchOne($0, key: row.id) } == nil
         #expect(rowGone, "control: the send's cleanup deleted the row")
-        try await waitFor { count("Sending") == 0 && count(text) == 1 }
+        // The send's bubble, "Sent" once filed, hands over to the sent email.
+        func bubbleShows() -> Bool {
+            HostedAccessibility.identifiers(in: controller.view).contains(ChatUnsentReplyBubble.bubbleId)
+        }
+        try await waitFor { !bubbleShows() && count(text) == 1 }
         try await Task.sleep(for: .milliseconds(300))
         frames.stop()
         print("[OwnWordsFrames] thread reply shape=\(shape.rawValue) attempt=\(attempt) \(frames.summary)")
 
-        #expect(count("Sending") == 0 && count(text) == 1, "control: the chat ends on the sent email: \(labels().prefix(20))")
+        #expect(!bubbleShows() && count("Sending") == 0 && count(text) == 1,
+                "control: the chat ends on the sent email: \(labels().prefix(20))")
         let none = frames.frames.filter(OwnWordsFrames.showsNone).count
         #expect(none == 0, "every frame shows the user's words; \(none) of \(frames.frames.count) show none: \(frames.summary)")
         let apart = frames.frames.filter(OwnWordsFrames.showsTwoApart).count
