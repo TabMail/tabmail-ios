@@ -130,7 +130,15 @@ extension AccountManager {
         summaryService: AIService = .shared
     ) async throws -> (outboxId: String, holdUntil: Date?) {
         let isDemo = account.id == DemoSeed.demoAccountId
-        let writtenTextVersion = await SentEmailSummary.textVersionToWrite(textVersion, isDemo: isDemo)
+        // Whether this send summarizes its email now, read once: the words and the summary follow
+        // the one answer, and a setting changed meanwhile applies to the next send.
+        let summarizes: Bool
+        if isDemo {
+            summarizes = true
+        } else {
+            summarizes = await SentEmailSummary.mayRun()
+        }
+        let writtenTextVersion = SentEmailSummary.textVersionToWrite(textVersion, summarizes: summarizes)
         let result = try await Self.persistQueuedSend(
             draft: draft,
             accountId: account.id,
@@ -171,13 +179,14 @@ extension AccountManager {
             // its user's words or not (those stay apart and the bubbles show them first). The demo
             // account's sends (the tutorial's practice reply) are summarized on the device.
             let outboxId = result.outboxId
-            Task {
-                if isDemo {
-                    await SentEmailSummary.summarizeLocally(outboxId: outboxId)
-                    return
+            if summarizes {
+                Task {
+                    if isDemo {
+                        await SentEmailSummary.summarizeLocally(outboxId: outboxId)
+                    } else {
+                        await SentEmailSummary.summarize(outboxId: outboxId, aiService: summaryService)
+                    }
                 }
-                guard await SentEmailSummary.mayRun() else { return }
-                await SentEmailSummary.summarize(outboxId: outboxId, aiService: summaryService)
             }
         }
         Task { await self.drainOutbox() }

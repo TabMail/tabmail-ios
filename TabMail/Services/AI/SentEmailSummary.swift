@@ -12,8 +12,8 @@ import GRDB
 /// Message-ID, which the outbox row carries from the queue write. Only with the chat view on.
 ///
 /// Thunderbird summarizes a sent email when it processes its Sent copy; this only moves the trigger
-/// earlier (ADR-IOS-008, recorded divergence). Nothing new is stored: it is the AI cache entry the
-/// Sent copy would have written. An entry no Sent copy takes (the send was undone, or Outlook filed
+/// earlier (ADR-IOS-008, recorded divergence). The summary is the AI cache entry the Sent copy would
+/// have written. An entry no Sent copy takes (the send was undone, or Outlook filed
 /// its own copy under a Message-ID of its own) is purged with the other orphaned AI cache entries.
 ///
 /// An email sent with its text version already in hand (written with its body: the chat's field
@@ -101,12 +101,11 @@ enum SentEmailSummary {
     }
 
     /// The text version a send keeps as the user's words with its queue write, or nil: only a text
-    /// version that says something, and only when the chat that shows it would (`mayRun`, or the
-    /// demo account's own sends).
-    static func textVersionToWrite(_ text: String?, isDemo: Bool) async -> String? {
-        guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        if isDemo { return text }
-        return await mayRun() ? text : nil
+    /// version that says something, and only when the send summarizes (`summarizes`: `mayRun`, or
+    /// the demo account's own sends, read once by the caller for both).
+    static func textVersionToWrite(_ text: String?, summarizes: Bool) -> String? {
+        guard summarizes, let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return text
     }
 
     /// Writes `text`, the queued email's text version already in hand, as the user's words
@@ -124,11 +123,22 @@ enum SentEmailSummary {
             db: db)
     }
 
-    /// The bubble's text of the queued email `row`: the user's own words when it was sent with them,
-    /// else the summary made at Send; nil until there is one.
-    static func textMessage(of row: OutboxMessage, db: Database) throws -> String? {
+    /// The two texts the bubble of a queued email can show, from its AI cache entry.
+    struct BubbleTexts: Equatable, Sendable {
+        /// The user's own words it was sent with.
+        let words: String?
+        /// The summary made at Send's text message.
+        let summary: String?
+        /// The bubble's text: the user's own words when it was sent with them, else the summary's;
+        /// nil until there is one.
+        var shown: String? { words ?? summary }
+    }
+
+    /// The bubble texts of the queued email `row`.
+    static func texts(of row: OutboxMessage, db: Database) throws -> BubbleTexts {
         let entry = try cacheEntry(of: row, db: db)
-        return [entry?.userTextMessage, entry?.summaryTextMessage].compactMap { $0 }.first { !$0.isEmpty }
+        func said(_ text: String?) -> String? { text.flatMap { $0.isEmpty ? nil : $0 } }
+        return BubbleTexts(words: said(entry?.userTextMessage), summary: said(entry?.summaryTextMessage))
     }
 
     /// The user's own words the queued email `row` was sent with (its text version), nil when it was

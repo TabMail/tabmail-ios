@@ -49,10 +49,11 @@ struct ChatNewEmailSend: Equatable, Sendable {
         let email = rowEmail ?? (row == nil ? key.email : nil)
         let sentCopyId = try email.flatMap { try sentCopy(of: $0, db: db) }
         guard let row else { return ChatNewEmailSend(reply: nil, email: email, sentCopyId: sentCopyId) }
+        let texts = try SentEmailSummary.texts(of: row, db: db)
         let reply = ChatUnsentReply(
             outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
             draftId: row.draftId, instanceEpoch: row.instanceEpoch,
-            textMessage: try SentEmailSummary.textMessage(of: row, db: db))
+            textMessage: texts.shown, summaryTextMessage: texts.summary)
         return ChatNewEmailSend(reply: reply, email: email, sentCopyId: sentCopyId)
     }
 

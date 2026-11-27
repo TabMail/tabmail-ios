@@ -216,6 +216,39 @@ struct HeaderCanonicalizeTests {
         #expect(rows[0].replyTextMessage == nil)
     }
 
+    @Test("A duplicate's user words move to a survivor that has a summary of its own, and a survivor's own words stay",
+          arguments: [false, true])
+    func userWordsCarryToTheSurvivor(survivorHasWords: Bool) throws {
+        let db = try makeDB()
+        let messageId = survivorHasWords ? "g8" : "g9"
+        let remnant = try insertRemnant(db, messageId: messageId)
+        try db.write { dbConn in
+            try dbConn.execute(
+                sql: "UPDATE messageHeader SET summaryBlurb = ?, userTextMessage = ? WHERE id = ?",
+                arguments: ["old blurb", "Tuesday works!", remnant.id]
+            )
+        }
+        let canonical = try insertCanonical(db, messageId: messageId)
+        let ownWords: String? = survivorHasWords ? "Own words" : nil
+        try db.write { dbConn in
+            try dbConn.execute(
+                sql: "UPDATE messageHeader SET summaryBlurb = ?, summaryTextMessage = ?, userTextMessage = ? WHERE id = ?",
+                arguments: ["own blurb", "own summary text", ownWords, canonical.id]
+            )
+        }
+
+        _ = try canonicalize(db, messageId: messageId)
+
+        let rows = try db.read { try MessageHeader.filter(Column("messageId") == messageId).fetchAll($0) }
+        #expect(rows.count == 1)
+        guard rows.count == 1 else { return }
+        #expect(rows[0].id == canonical.id, "control: the canonical row survives")
+        #expect(rows[0].summaryBlurb == "own blurb" && rows[0].summaryTextMessage == "own summary text",
+                "control: the survivor keeps its own summary")
+        #expect(rows[0].userTextMessage == (survivorHasWords ? "Own words" : "Tuesday works!"),
+                "the words stand apart from the summary: \(rows[0].userTextMessage ?? "none")")
+    }
+
     @Test("Clean canonical row is untouched")
     func cleanRowUntouched() throws {
         let db = try makeDB()

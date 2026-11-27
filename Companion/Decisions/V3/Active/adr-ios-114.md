@@ -758,23 +758,32 @@ same AI result, kept as long as the email itself is shown.
    restores the words on their own, before any summary and never over a header's own, and no
    summary or reply write changes them (`MessageAICache.writeThrough`); they go with their cache
    entry. Only the chat's bubbles read them, before the summary's text message:
-   `ChatThread.Item.textMessage` (and the one-copy choice, `ChatThread.oneCopyEach`) and
-   `SentEmailSummary.textMessage(of:)` (the Sending bubble, a new email's chat). Nothing else does:
+   `ChatThread.Item.textMessage` and `SentEmailSummary.texts(of:)` (the Sending bubble, a new
+   email's chat). Nothing else does:
    the summary, to-dos and reminder are made and shown exactly as for any email, and every other
    reader of a Sent copy's summary, the list preview (`MessageSnapshot.preview`) among them, reads
-   the summary. An Undo keeps only the user's words (`SentEmailSummary.textVersion(of:)` for
+   the summary; the chat's "Report a concern" sends the summaries' text messages, never the words
+   (`ChatThread.Item.summaryTextMessage`, `ChatUnsentReply.summaryTextMessage`). `queueSend` reads
+   the gate (`SentEmailSummary.mayRun`) once, at the queue write, and both the words and the summary
+   follow that one answer. An Undo keeps only the user's words (`SentEmailSummary.textVersion(of:)` for
    `ReopenSnapshot.sentTextVersion`), never the summary's text message, so a send again never takes
    an AI text as the user's. A duplicate merge carries the words to its survivor with the other AI
    fields (`SyncEngine.canonicalizeLocalRows`); the pre-sync reclaim, which matches Inbox rows only,
    does not, since the words are kept only under the Sent folder's key. The 2026-11-25 Accepted item
    (other readers of a Sent copy's summary get the text version as its blurb) no longer holds for new
    sends. Earlier sends whose text version stood in as their summary keep it; nothing converts them.
+   Accepted (P4): a Gmail copy that a sync stored before the send's own filing write (tabmail-ios
+   #1628), or whose read right after the send failed (#1629), does not get the words, and its bubble
+   shows the summary's text message.
    Tests: `ChatSendingBubbleTests.ownWordsKeepTheSummarysTodosAndReminder` (both copy shapes: a slow
    summary lands its to-dos and reminder on the copy that arrived first, and the chat shows the words
    on the copy before and after it lands), `ChatSendingBubbleTests.sendingBubbleKeepsTheUserWords`,
    `ChatSendingBubbleTests.queueSendWritesTheTextVersionInHand`,
-   `ChatUndoSendTests.undoKeepsOnlyTheUsersWords`, `AITextMessageStorageTests` (v118, the cache
-   write-through, the restore), `ChatUndoSendRoutingTests` 1h.
+   `ChatSendingBubbleTests.queueSendDecidesOnce` (the chat view turned off while the queue write
+   waits), `ChatAISummariesNoticeHostedTests.reportSendsSummariesNotTheUsersWords`,
+   `ChatUndoSendTests.undoKeepsOnlyTheUsersWords`, `AITextMessageStorageTests` (v118, an upgrade
+   from v117, the cache write-through, the restore), `HeaderCanonicalizeTests.userWordsCarryToTheSurvivor`,
+   `ChatUndoSendRoutingTests` 1h.
    **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
    chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
    instead of the undo-send toast, which is not shown for it. Who offers a send's Undo

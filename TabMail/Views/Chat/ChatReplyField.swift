@@ -645,7 +645,7 @@ struct ChatFieldMessage: Equatable {
 /// or the last References id of a forward, `AccountManager.queuedParentRfc822MessageId`) is the
 /// Message-ID of an email in the chat, from any account (the send may go out from another account
 /// than the email it answers). A failed row reads "Not sent", with Retry and Delete; any other
-/// "Sending". Its text is the email's text version (`SentEmailSummary.textMessage`): the one written
+/// "Sending". Its text is the email's text version (`SentEmailSummary.texts`): the one written
 /// with its body when it was sent unchanged, from its first value; otherwise the summary made at
 /// Send, "Summarizing" until then.
 ///
@@ -670,11 +670,15 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     let draftId: String?
     let instanceEpoch: String?
     var failed: Bool { status == .failed }
-    /// The email's summary as a text message, once made.
+    /// The bubble's text: the user's own words it was sent with, else its summary as a text
+    /// message, once made (`SentEmailSummary.BubbleTexts.shown`).
     let textMessage: String?
     /// The send filed the email (`ChatSendBubbles`): it went out, and the bubble stays, "Sent",
     /// until the chat shows the email itself.
     var isSent = false
+    /// The summary's text message alone, never the user's own words: what the chat's "Report a
+    /// concern" sends for this reply (`AISummariesNotice.reportContent`).
+    var summaryTextMessage: String? = nil
 
     var id: String { outboxId }
 
@@ -697,9 +701,10 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
                           SentCopyLink.copyMessageId(accountId: row.accountId, sentMessageId: $0) }),
                       !messageIds.contains(sentId) else { return nil }
             }
+            let texts = try SentEmailSummary.texts(of: row, db: db)
             return ChatUnsentReply(outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
                                    draftId: row.draftId, instanceEpoch: row.instanceEpoch,
-                                   textMessage: try SentEmailSummary.textMessage(of: row, db: db))
+                                   textMessage: texts.shown, summaryTextMessage: texts.summary)
         }
     }
 

@@ -377,6 +377,45 @@ struct AITextMessageStorageTests {
         #expect(entry?.replyTextMessage == nil)
     }
 
+    @Test("Upgrading from v117 leaves the user's words empty and keeps an earlier send's text version as its summary, which its bubble still shows")
+    func upgradeFromV117KeepsEarlierSends() throws {
+        let (pool, dir) = try Self.migrated(upTo: "v117_addOutboxOriginalChangesAtQueue")
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let words = "Tuesday works!"
+        try pool.write { db in
+            var account = Account(emailAddress: "acc1@example.com", displayName: "A", provider: .imap)
+            account.id = "acc1"
+            try TestDatabase.insertAtOldSchema(account, db)
+            try TestDatabase.insertAtOldSchema(Folder(name: "Sent", path: "Sent", role: .sent, accountId: "acc1"), db)
+            // An earlier send's Sent copy and cache entry, its text version standing in as its summary.
+            var header = Self.header("1", folder: "Sent", rfc: "sent@example.com")
+            header.summaryBlurb = words
+            header.summaryTextMessage = words
+            try TestDatabase.insertAtOldSchema(header, db)
+            var entry = Self.cacheEntry("acc1:Sent:sent@example.com", rfc: "sent@example.com", daysAgo: 0)
+            entry.summaryBlurb = words
+            entry.summaryTextMessage = words
+            try TestDatabase.insertAtOldSchema(entry, db)
+        }
+
+        try AppDatabase.runMigrations(on: pool)
+
+        let header = try #require(try pool.read {
+            try MessageHeader.fetchOne($0, key: MessageIdentity.headerId(accountId: "acc1", folderPath: "Sent", messageId: "1"))
+        })
+        #expect(header.userTextMessage == nil, "no words for an earlier send")
+        #expect(header.summaryBlurb == words && header.summaryTextMessage == words && header.cachedReply == "Old reply",
+                "every earlier result survives")
+        let entry = try #require(try pool.read { try MessageAICache.fetchOne($0, key: "acc1:Sent:sent@example.com") })
+        #expect(entry.userTextMessage == nil, "no words in an earlier entry")
+        #expect(entry.summaryBlurb == words && entry.summaryTextMessage == words && entry.cachedReply == "Old reply",
+                "every earlier cached result survives")
+        let bubble = ChatThread.Item(
+            header: header, isOwn: true, sender: .init(address: "acc1@example.com", name: "A"),
+            repliedOnlyTo: nil, showsTimeStamp: false, showsUnreadLine: false)
+        #expect(bubble.textMessage == words, "the earlier send's bubble still shows its text version")
+    }
+
     @Test("An older build's entries without a Message-ID: the upgrade fills the ones whose email is where the key says, and the purge keeps only those")
     func legacyEntriesSurviveUpgradeAndPurge() async throws {
         let (pool, dir) = try Self.migrated(upTo: "v105_addAITextMessages")

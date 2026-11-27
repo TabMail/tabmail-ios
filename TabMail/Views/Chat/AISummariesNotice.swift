@@ -63,9 +63,10 @@ enum AISummariesNotice {
     }
 
     /// The report for a chat as it is shown: its emails, oldest first, then the user's replies
-    /// still sending or not sent, which the chat shows after them.
+    /// still sending or not sent, which the chat shows after them. Only the AI's summaries: a
+    /// bubble that shows the user's own words sends its summary, or nothing before it is made.
     static func reportContent(items: [ChatThread.Item], unsent: [ChatUnsentReply]) -> String {
-        reportContent(oldestFirst: items.map(\.textMessage) + unsent.map(\.textMessage))
+        reportContent(oldestFirst: items.map(\.summaryTextMessage) + unsent.map(\.summaryTextMessage))
     }
 }
 

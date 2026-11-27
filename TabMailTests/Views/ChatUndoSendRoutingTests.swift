@@ -1051,16 +1051,25 @@ struct ChatUndoSendRoutingTests {
     /// What the chat shows for `row`, its Sending bubble and then its Sent copy: the email's text
     /// version under its Sent folder and Message-ID.
     private static func sentText(_ row: OutboxMessage, _ fixture: Fixture) async throws -> String? {
-        try await fixture.pool.read { try SentEmailSummary.textMessage(of: row, db: $0) }
+        try await fixture.pool.read { try SentEmailSummary.texts(of: row, db: $0).shown }
     }
 
     /// Sent from the demo account, which makes no AI request at Send whatever the gate: every send
     /// of it is summarized on the device in the email's own words (`SentEmailSummary.summarizeLocally`),
     /// which differ from the suggestion's text version, so the two are told apart with no backend.
-    /// Waits long enough for the summary at Send to have landed, then expects `row`'s text to be the
-    /// written suggestion's text version still.
+    /// Waits for the summary at Send to land (in the email's own words, not the text version), then
+    /// expects `row`'s text to be the written suggestion's text version still.
     private static func expectNoSummaryReplaces(_ row: OutboxMessage, _ fixture: Fixture) async throws {
-        try await Task.sleep(for: .seconds(1))
+        func summary() async throws -> String? {
+            try await fixture.pool.read { try SentEmailSummary.texts(of: row, db: $0).summary }
+        }
+        var landed = try await summary()
+        for _ in 0..<50 where landed == nil {
+            try await Task.sleep(for: .milliseconds(100))
+            landed = try await summary()
+        }
+        #expect(landed != nil && landed != Self.writtenSuggestion.textMessage,
+                "control: the summary made at Send landed, in the email's own words: \(landed ?? "nil")")
         let later = try await Self.sentText(row, fixture)
         #expect(later == Self.writtenSuggestion.textMessage, "no summary replaced it")
     }

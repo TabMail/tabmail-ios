@@ -30,7 +30,8 @@ import UIKit
 ///     with its text version in hand keeps it as the user's words with the queue write, behind the
 ///     same gate, and is summarized all the same: the summary's to-dos and reminder land on its Sent
 ///     copy, even when the summary returns after the copy arrived, and its bubbles show the user's
-///     words before and after the summary lands.
+///     words before and after the summary lands. The gate is read once per send: the words and the
+///     summary follow that one answer, even when the chat view turns off while the queue write waits.
 ///  6. A send that failed for good shows the red mark beside its bubble; the
 ///     mark's Retry puts the same outbox row back in the queue and the bubble back to "Sending",
 ///     and its Delete removes the row and the bubble. Driven through the hosted chat's own actions.
@@ -276,25 +277,31 @@ struct ChatSendingBubbleTests {
     }
 
     /// A slow summary call at Send: the backend signals `asked`, then holds its answer until
-    /// `answer` is signalled. The answer has a to-do and a reminder due `reminderDue`, and a text
-    /// message of its own ("I said Tuesday works.").
+    /// `answer` is signalled, at most `slowSummaryHold` (the caller signals it on every exit). The
+    /// answer has a to-do and a reminder due `reminderDue`, and a text message of its own ("I said
+    /// Tuesday works.").
     private static func slowSummaryBackend(
         asked: DispatchSemaphore, answer: DispatchSemaphore, reminderDue: String
     ) -> FakeHTTP.Scenario {
         let http = FakeHTTP.Scenario()
         http.register(path: "/completions/chat", method: "POST") { _ in
-            asked.signal()
-            answer.wait()
-            let object: [String: Any] = [
-                "summary": "A plan.", "todos": ["Book a table for Tuesday"],
-                "reminder": ["due_date": reminderDue, "due_time": NSNull(), "content": "Lunch on Tuesday"],
-                "text_message": "I said Tuesday works."]
-            let assistant = String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
-            let final = String(decoding: try! JSONSerialization.data(withJSONObject: ["assistant": assistant]), as: UTF8.self)
-            return .bytes(Data("event: final\ndata: \(final)\n\n".utf8), contentType: "text/event-stream")
+            .parked {
+                asked.signal()
+                _ = answer.wait(timeout: .now() + Self.slowSummaryHold)
+                let object: [String: Any] = [
+                    "summary": "A plan.", "todos": ["Book a table for Tuesday"],
+                    "reminder": ["due_date": reminderDue, "due_time": NSNull(), "content": "Lunch on Tuesday"],
+                    "text_message": "I said Tuesday works."]
+                let assistant = String(decoding: try! JSONSerialization.data(withJSONObject: object), as: UTF8.self)
+                let final = String(decoding: try! JSONSerialization.data(withJSONObject: ["assistant": assistant]), as: UTF8.self)
+                return .bytes(Data("event: final\ndata: \(final)\n\n".utf8), contentType: "text/event-stream")
+            }
         }
         return http
     }
+
+    /// The longest a slow summary holds its answer when the test never releases it.
+    nonisolated private static let slowSummaryHold: DispatchTimeInterval = .seconds(30)
 
     /// A reminder date a week from today, as the summary writes it.
     private static func reminderDueInAWeek() -> String {
@@ -310,9 +317,8 @@ struct ChatSendingBubbleTests {
     func ownWordsKeepTheSummarysTodosAndReminder(_ shape: CopyShape) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
-        let restoreAISetting = AITestSetting.save()
-        AITestSetting.set(aiOff: false)
-        defer { restoreAISetting() }
+        let restore = try Self.openGate(except: .none)
+        defer { restore() }
         let fixture = try await Self.makeFixture(pool)
         let words = "Tuesday works!"
         let row = try await Self.queueReply(
@@ -332,6 +338,7 @@ struct ChatSendingBubbleTests {
         let due = Self.reminderDueInAWeek()
         let http = Self.slowSummaryBackend(asked: asked, answer: answer, reminderDue: due)
         defer { http.close() }
+        defer { answer.signal() }
         let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
         let summarizing = Task { await SentEmailSummary.summarize(outboxId: row.id, aiService: service) }
         let wasAsked = await Task.detached { Self.waited(for: asked) }.value
@@ -360,18 +367,18 @@ struct ChatSendingBubbleTests {
     func sendingBubbleKeepsTheUserWords() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
-        let restoreAISetting = AITestSetting.save()
-        AITestSetting.set(aiOff: false)
-        defer { restoreAISetting() }
+        let restore = try Self.openGate(except: .none)
+        defer { restore() }
         let fixture = try await Self.makeFixture(pool)
         let words = "Tuesday works!"
         let row = try await Self.queueReply(fixture, draftId: "draft-words-sending", holdsForUndo: false, textVersion: words)
         let parentMessageId = try #require(fixture.parent.rfc822MessageId)
         let chat: Set<String> = [EmailFilter.normalizeMessageId(parentMessageId)]
-        func sendingBubble() async throws -> String? {
+        func sendingReply() async throws -> ChatUnsentReply? {
             let replies = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
-            return replies.first { $0.id == row.id }?.textMessage
+            return replies.first { $0.id == row.id }
         }
+        func sendingBubble() async throws -> String? { try await sendingReply()?.textMessage }
         let atQueue = try await sendingBubble()
         #expect(atQueue == words, "from the queue write")
 
@@ -379,6 +386,7 @@ struct ChatSendingBubbleTests {
         let answer = DispatchSemaphore(value: 0)
         let http = Self.slowSummaryBackend(asked: asked, answer: answer, reminderDue: Self.reminderDueInAWeek())
         defer { http.close() }
+        defer { answer.signal() }
         let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
         let summarizing = Task { await SentEmailSummary.summarize(outboxId: row.id, aiService: service) }
         let wasAsked = await Task.detached { Self.waited(for: asked) }.value
@@ -395,6 +403,8 @@ struct ChatSendingBubbleTests {
         #expect(landed?.summaryTodos?.contains("Book a table for Tuesday") == true, "control: the summary landed")
         let afterLanded = try await sendingBubble()
         #expect(afterLanded == words, "after the summary lands, still the user's words")
+        let reported = try await sendingReply()?.summaryTextMessage
+        #expect(reported == "I said Tuesday works.", "the reply carries the summary's own text apart, for the concern report")
     }
 
     // MARK: - 3. In the chat
@@ -926,8 +936,12 @@ struct ChatSendingBubbleTests {
         let restore = try Self.openGate(except: inHand == .gated ? .chatViewOff : .none)
         defer { restore() }
         let fixture = try await Self.makeFixture(pool)
-        let http = Self.summaryBackend(textMessage: "I said Tuesday works.")
+        // The summary is held until the queue write's state is read, so that read is its first value.
+        let asked = DispatchSemaphore(value: 0)
+        let answer = DispatchSemaphore(value: 0)
+        let http = Self.slowSummaryBackend(asked: asked, answer: answer, reminderDue: Self.reminderDueInAWeek())
         defer { http.close() }
+        defer { answer.signal() }
         let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
         try await pool.write { db in
             var draft = Draft(
@@ -953,20 +967,26 @@ struct ChatSendingBubbleTests {
         }
         let parentMessageId = try #require(fixture.parent.rfc822MessageId)
         let chat: Set<String> = [EmailFilter.normalizeMessageId(parentMessageId)]
-        // Read at once, as the queue write left it: no summary could have landed yet.
+        if inHand != .gated {
+            let wasAsked = await Task.detached { Self.waited(for: asked) }.value
+            #expect(wasAsked, "control: the summary was asked at Send")
+        }
+        // Read while the summary's answer is held: as the queue write left it.
         let atQueue = try await cached()
         let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
         let bubbleText = bubbles.first { $0.id == outboxId }?.textMessage
         switch inHand {
         case .written:
             #expect(atQueue?.userTextMessage == "Tuesday works!", "kept as the user's words with the queue write")
+            #expect(atQueue?.summaryBlurb == nil, "control: read before the summary landed")
             #expect(bubbleText == "Tuesday works!", "the Sending bubble's first value, never Summarizing")
         case .gated:
             #expect(atQueue == nil, "nothing written with the gate closed")
         case .blank:
-            break
+            #expect(atQueue == nil, "nothing kept for a text version that says nothing")
         }
         if inHand != .gated {
+            answer.signal()
             for _ in 0..<100 where try await cached()?.summaryBlurb == nil { try await Task.sleep(for: .milliseconds(100)) }
             let summarized = try await cached()
             #expect(summarized?.summaryBlurb == "A plan.", "the summary is made, words or not")
@@ -985,6 +1005,72 @@ struct ChatSendingBubbleTests {
             let gated = try await cached()
             #expect(gated == nil, "still nothing with the gate closed")
         }
+    }
+
+    /// A send decides once whether it summarizes, when it is queued: its words and its summary
+    /// follow that one answer. The chat view is turned off while the queue write waits for the
+    /// database's writer, after the send has read the gate.
+    @Test("A send keeps its words and gets its summary when the chat view is turned off while its queue write waits")
+    func queueSendDecidesOnce() async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restore = try Self.openGate(except: .none)
+        defer { restore() }
+        let fixture = try await Self.makeFixture(pool)
+        let http = Self.summaryBackend(textMessage: "I said Tuesday works.")
+        defer { http.close() }
+        let service = AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil })
+        try await pool.write { db in
+            var draft = Draft(
+                id: "draft-decides-once", accountId: Self.account, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+                subject: "Re: Lunch plans", body: "Tuesday works for me.", replyToId: nil, isForward: false,
+                editHistoryJSON: nil, createdAt: Date().timeIntervalSince1970, updatedAt: Date().timeIntervalSince1970)
+            draft.instanceEpoch = "E1"
+            try draft.insert(db)
+        }
+        // The database's writer is held, so the queue write waits.
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let (holding, holdingNow) = AsyncStream<Void>.makeStream()
+        let hold = Task.detached {
+            try await pool.writeWithoutTransaction { _ in
+                holdingNow.yield(())
+                _ = release.wait(timeout: .now() + .seconds(30))
+            }
+        }
+        for await _ in holding { break }
+        let parent = fixture.parent
+        let account = fixture.account
+        let sending = Task {
+            try await AccountManager.shared.queueSend(
+                draft: DraftMessage(to: ["sender@example.com"], subject: "Re: Lunch plans", body: "Tuesday works for me.",
+                                    inReplyTo: parent.rfc822MessageId),
+                from: account, replyToHeaderId: parent.id, draftId: "draft-decides-once", instanceEpoch: "E1",
+                textVersion: "Tuesday works!", summaryService: service).outboxId
+        }
+        // Time for the send to read the gate and reach the held writer.
+        try await Task.sleep(for: .milliseconds(500))
+        let queuedWhileHeld = try await pool.read { try OutboxMessage.fetchCount($0) }
+        #expect(queuedWhileHeld == 0, "control: the queue write waits for the writer")
+        UserDefaults.standard.set(false, forKey: ChatViewConfig.enabledKey)
+        let gateNow = SentEmailSummary.mayRun()
+        #expect(!gateNow, "control: the chat view is off before the queue write lands")
+        release.signal()
+        try await hold.value
+        let outboxId = try await sending.value
+
+        let row = try #require(try await pool.read { try OutboxMessage.fetchOne($0, key: outboxId) })
+        let sentMessageId = try #require(row.sentMessageId)
+        let key = try #require(MessageAICache.cacheKey(
+            accountId: Self.account, folderPath: "Sent", rfc822MessageId: EmailFilter.normalizeMessageId(sentMessageId)))
+        func cached() async throws -> MessageAICache? {
+            try await pool.read { try MessageAICache.filter(Column("key") == key).fetchOne($0) }
+        }
+        for _ in 0..<100 where try await cached()?.summaryBlurb == nil { try await Task.sleep(for: .milliseconds(100)) }
+        let landed = try await cached()
+        #expect(landed?.userTextMessage == "Tuesday works!", "the words the send decided to keep")
+        #expect(landed?.summaryBlurb == "A plan.", "and the summary it decided to make: \(landed?.summaryBlurb ?? "none")")
+        #expect(http.recordedCalls().count == 1, "one summary asked")
     }
 
     // MARK: - 6. A send that failed for good

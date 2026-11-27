@@ -48,6 +48,12 @@ struct ChatThread: Equatable {
             if let text = header.summaryTextMessage, !text.isEmpty { return text }
             return header.summaryBlurb == MessageHeader.noContentSummary ? MessageHeader.noContentSummary : nil
         }
+        /// The summary's text message alone, never the user's own words: what the chat's
+        /// "Report a concern" sends for this email (`AISummariesNotice.reportContent`).
+        var summaryTextMessage: String? {
+            guard let text = header.summaryTextMessage, !text.isEmpty else { return nil }
+            return text
+        }
         /// The email did not go to everyone in the chat: who it went to. Nil for an email to
         /// everyone, and on every bubble of a one-to-one chat (`isGroup` false), which shows plain
         /// bubbles.
@@ -232,13 +238,8 @@ struct ChatThread: Equatable {
     }
 
     /// One header per email: copies of one message in two folders share a `copyKey`. Keeps the
-    /// opened copy, else one with the user's own words (the bubble shows them first), else one with
-    /// a text message, else the first.
+    /// opened copy, else one with a text message, else the first.
     static func oneCopyEach(_ headers: [MessageHeader], preferredId: String?) -> [MessageHeader] {
-        func textRank(_ header: MessageHeader) -> Int {
-            if header.userTextMessage != nil { return 2 }
-            return header.summaryTextMessage != nil ? 1 : 0
-        }
         var order: [String] = []
         var chosen: [String: MessageHeader] = [:]
         for header in headers {
@@ -249,7 +250,7 @@ struct ChatThread: Equatable {
                 continue
             }
             if current.id == preferredId { continue }
-            if header.id == preferredId || textRank(header) > textRank(current) {
+            if header.id == preferredId || (current.summaryTextMessage == nil && header.summaryTextMessage != nil) {
                 chosen[key] = header
             }
         }
