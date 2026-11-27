@@ -43,6 +43,25 @@ final class ChatPillState {
         sessions.removeValue(forKey: key)
     }
 
+    /// The open chat of each re-keyed email follows it
+    /// (`MailPointerMoves.publish`, before the views are told). The session is
+    /// reached by the key of the email's new stable id, and the ids and the
+    /// email it names follow. A reply still running holds the old key: it keeps
+    /// reaching the same session (both keys name it until it is idle and
+    /// evicted), and the turns it writes go to the new session id.
+    func followRekeyedEmails(_ records: [HeaderRekeyRecord]) {
+        for record in records {
+            guard let ids = record.stableIds else { continue }
+            let oldKey = ChatStore.messageSessionId(accountId: ids.accountId, stableId: ids.old)
+            guard let session = sessions[oldKey] else { continue }
+            let newKey = ChatStore.messageSessionId(accountId: ids.accountId, stableId: ids.new)
+            if sessions[newKey] == nil {
+                sessions[newKey] = session
+            }
+            session.follow(record, fromSessionId: oldKey, toSessionId: newKey)
+        }
+    }
+
     /// Drop ALL in-memory sessions. Called on demo entry/exit
     /// (`DemoModeService`) so the demo and real chat pills never share
     /// in-memory state (loaded session pages, live turns, reminder buffers).
@@ -141,6 +160,36 @@ final class ChatPillState {
         /// Prevents UUID regeneration on every render which causes flicker.
         var cachedSessionMessages: [String: [ChatMessage]] = [:]
 
+        /// The session ids this chat followed its email from, to the id it has
+        /// now (`follow`). Read by `appendTurn` only.
+        @ObservationIgnored
+        private var followedSessionIds: [String: String] = [:]
+
+        /// This chat follows its email's re-key (`ChatPillState.followRekeyedEmails`):
+        /// its session id moves to the email's new stable id, in both stored forms
+        /// (`ChatStore.storedForms`), and the email it names becomes the new row.
+        /// The saved turns moved in the re-key's transaction
+        /// (`ChatStore.followRekeyedEmails`).
+        func follow(_ record: HeaderRekeyRecord, fromSessionId old: String, toSessionId new: String) {
+            for (oldForm, newForm) in zip(
+                ChatStore.storedForms(ofSessionId: old), ChatStore.storedForms(ofSessionId: new)) {
+                if oldForm != newForm {
+                    if currentSessionId == oldForm { currentSessionId = newForm }
+                    if let context = sessionEmailContexts.removeValue(forKey: oldForm) {
+                        sessionEmailContexts[newForm] = context
+                    }
+                    for (from, to) in followedSessionIds where to == oldForm {
+                        followedSessionIds[from] = newForm
+                    }
+                    followedSessionIds[oldForm] = newForm
+                }
+                if let context = sessionEmailContexts[newForm], context.messageHeaderId == record.oldHeaderId {
+                    sessionEmailContexts[newForm] = EmailContextSnapshot(
+                        messageHeaderId: record.newHeaderId, subject: context.subject, from: context.from)
+                }
+            }
+        }
+
         // --- Local chat history writes ---
 
         /// Shown in this chat when a turn could not be written to the local chat
@@ -162,8 +211,11 @@ final class ChatPillState {
         /// is not a failure: that history is discarded on purpose.
         @discardableResult
         func appendTurn(_ turn: ChatTurn, admission: DemoModeStore.Admission?) async -> [ChatTurn]? {
+            // A reply that started before this chat followed its email names the
+            // old session id; its turns go where the chat now is.
+            let written = turn.sessionId.flatMap { followedSessionIds[$0] }.map(turn.inSession) ?? turn
             do {
-                return try await ChatStore.shared.appendTurn(turn, admission: admission)
+                return try await ChatStore.shared.appendTurn(written, admission: admission)
             } catch is ChatStore.DemoTurnRefused {
                 BackgroundSyncLogger.logDebug("[ChatPillState] Demo turn refused after its demo ended: \(turn.role)")
                 return nil

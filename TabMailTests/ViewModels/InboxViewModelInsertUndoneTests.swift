@@ -314,7 +314,7 @@ struct InboxViewModelInsertUndoneTests {
 
         #expect(vm.lookupMessage(oldId)?.id == newId,
                 "the provider handoff must be visible before slower mirror publication")
-        vm.applyHeaderRekeys([record])
+        vm.applyHeaderRekeys(MailPointerMoves([.row(record)]))
 
         #expect(!vm.loadedMessages.contains { $0.id == oldId })
         #expect(vm.loadedMessages.contains {
@@ -322,7 +322,7 @@ struct InboxViewModelInsertUndoneTests {
         })
         #expect(vm.lookupMessage(newId)?.id == newId,
                 "a second Delete now resolves the provider-proven row immediately")
-        #expect(InboxViewModel.rekeyedHeaderIDs([oldId, "unrelated"], using: [record])
+        #expect(MailPointerMoves([.row(record)]).following(headers: [oldId, "unrelated"])
             == [newId, "unrelated"],
             "dismissed/fading sets must follow the same key so hidden moves stay hidden")
     }
@@ -339,19 +339,16 @@ struct InboxViewModelInsertUndoneTests {
         var dismissed: Set<String> = [oldId]
         var fading: Set<String> = [oldId]
         var selected: String? = oldId
-        var pushed: String? = oldId
 
         HeaderRekeyReceiver.apply(
-            [record],
+            MailPointerMoves([.row(record)]),
             dismissedMessages: &dismissed,
             swipeFadingMessages: &fading,
-            selectedMessageId: &selected,
-            pushedMessageId: &pushed)
+            selectedMessageId: &selected)
 
         #expect(dismissed == [oldId])
         #expect(fading == [oldId])
         #expect(selected == newId)
-        #expect(pushed == newId)
     }
 
     @Test("Provider-proven re-key carries action and navigation state")
@@ -365,18 +362,15 @@ struct InboxViewModelInsertUndoneTests {
         var dismissed: Set<String> = [oldId]
         var fading: Set<String> = [oldId]
         var selected: String? = oldId
-        var pushed: String? = oldId
 
         HeaderRekeyReceiver.apply(
-            [record],
+            MailPointerMoves([.row(record)]),
             dismissedMessages: &dismissed,
             swipeFadingMessages: &fading,
-            selectedMessageId: &selected,
-            pushedMessageId: &pushed)
+            selectedMessageId: &selected)
 
         #expect(dismissed == [newId])
         #expect(fading == [newId])
         #expect(selected == newId)
-        #expect(pushed == newId)
     }
 }

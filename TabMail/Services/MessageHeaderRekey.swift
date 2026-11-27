@@ -108,6 +108,13 @@ struct MoveOutcome: Sendable {
 /// carrier remains `SyncMessagesResult.ftsRekeys`, and it never publishes a
 /// provider-address handoff or a destination epoch.
 ///
+/// Every path that changes a stored row's key builds one and publishes it
+/// after its write commits (`MailPointerMoves`): the move finish, the sync's
+/// UID remap, placeholder replacement, canonicalization and pre-sync inbox
+/// reclaim, the change reader's placeholder dedup, the draft save's
+/// placeholder migration and the body backfill's UID re-key. The saved chats
+/// keyed by the email move inside that write (`ChatStore.followRekeyedEmails`).
+///
 /// ⚠ A consumer tally in prose has no compiler and no test behind it, so it is
 /// correct only until the next consumer appears. The census is regenerated
 /// from the callers of this type
@@ -128,20 +135,50 @@ struct HeaderRekeyRecord: Sendable, Equatable {
     /// the committed row, but optimistic action/dismissal state must not treat
     /// that weaker correlation as mutation authority.
     let carriesProviderAuthority: Bool
+    /// The email's stable id before and after this re-key, taken from the two
+    /// rows the producer holds. Its saved and open chat follow it
+    /// (`ChatStore.followRekeyedEmails`, `ChatPillState.followRekeyedEmails`).
+    /// nil only for a record built without the rows.
+    let stableIds: StableIds?
 
     init(
         oldHeaderId: String,
         newHeaderId: String,
         newProviderMessageId: String,
         newObservedUidValidity: Int? = nil,
-        carriesProviderAuthority: Bool = true
+        carriesProviderAuthority: Bool = true,
+        stableIds: StableIds? = nil
     ) {
         self.oldHeaderId = oldHeaderId
         self.newHeaderId = newHeaderId
         self.newProviderMessageId = newProviderMessageId
         self.newObservedUidValidity = newObservedUidValidity
         self.carriesProviderAuthority = carriesProviderAuthority
+        self.stableIds = stableIds
     }
+}
+
+/// An email's stable id (`MessageHeader.stableId`) before and after a re-key,
+/// with its account. Chat sessions are keyed by it
+/// (`ChatStore.messageSessionId`). It changes when the id it is made of
+/// changes: a Graph id that changes with the folder, a placeholder replaced by
+/// the server's copy, a UID of a message with no Message-ID.
+struct StableIds: Sendable, Equatable {
+    let accountId: String
+    let old: String
+    let new: String
+
+    init(accountId: String, old: String, new: String) {
+        self.accountId = accountId
+        self.old = old
+        self.new = new
+    }
+
+    init(from old: MessageHeader, to new: MessageHeader) {
+        self.init(accountId: new.accountId, old: old.stableId, new: new.stableId)
+    }
+
+    var changed: Bool { old != new }
 }
 
 /// Every local disposition produced while retiring an address-changing move.
@@ -437,6 +474,12 @@ enum MessageHeaderRekey {
     ///    `realId` with `MessageIdentity.headerIdBelongsToFolder`. Pre-existing
     ///    and unchanged by this helper — sync's UID-remap path has re-keyed
     ///    headers out from under it since long before the drain did.
+    ///    ⛔ SUPERSEDED for the pill and chat stores (2026-11-26): every caller
+    ///    of this carrier now publishes its re-key as a `MailPointerMove`
+    ///    (`MailPointerMoves.publish` / `publishRekeys`), the saved chats keyed
+    ///    by the email move in the caller's own write
+    ///    (`ChatStore.followRekeyedEmails`), and the `chatIdMapping` entry and
+    ///    memory.db follow after it (`MailPointerMoves.followOutsideStores`).
     ///
     /// - Returns: `true` when `migrated` was inserted. `false` when a row
     ///   already occupies the new id — in which case the old row is still gone,
@@ -758,11 +801,25 @@ enum MessageHeaderRekey {
             try db.execute(
                 sql: "UPDATE outboxMessage SET originalMessageHeaderId = ? WHERE originalMessageHeaderId = ?",
                 arguments: [newId, oldId])
+            // A saved reply or forward draft names its original the same way, with
+            // the provider id and epoch its send checks the row against
+            // (`Draft.acceptsReplyTargetHit`); all three follow the address the
+            // server proved, for the same reason and on the same evidence only.
+            // The draft table holds only the user's open drafts.
+            try db.execute(
+                sql: """
+                    UPDATE draft SET replyToId = ?, replyToProviderMessageId = ?, replyToUidValidity = ?
+                    WHERE replyToId = ?
+                    """,
+                arguments: [newId, newMessageId, migrated.observedUidValidity, oldId])
             result.applied.append(HeaderRekeyRecord(
                 oldHeaderId: oldId, newHeaderId: newId,
                 newProviderMessageId: newMessageId,
-                newObservedUidValidity: migrated.observedUidValidity))
+                newObservedUidValidity: migrated.observedUidValidity,
+                stableIds: StableIds(from: row, to: migrated)))
         }
+        // The moved emails' saved chats follow them in this transaction.
+        try ChatStore.followRekeyedEmails(result.applied, db: db)
         // ADR-IOS-111 (IMAP reader, exit rule): every folder this retirement
         // leaves possibly wrong ends its tracking, in this transaction, and is
         // owed one self-heal pass before it is tracked again (a message the

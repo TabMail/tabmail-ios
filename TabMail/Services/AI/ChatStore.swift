@@ -32,6 +32,18 @@ struct ChatTurn: Codable, FetchableRecord, PersistableRecord, Sendable {
         let random = String((0..<6).map { _ in "abcdefghijklmnopqrstuvwxyz0123456789".randomElement()! })
         return "\(ts)-\(random)"
     }
+
+    /// This turn under another session id: the chat followed its email to a new
+    /// stable id while the reply that wrote this turn was running
+    /// (`ChatPillState.Session.appendTurn`).
+    func inSession(_ sessionId: String) -> ChatTurn {
+        ChatTurn(
+            id: id, timestamp: timestamp, role: role, content: content,
+            userMessage: userMessage, type: type, chars: chars,
+            renderedContent: renderedContent, sessionId: sessionId,
+            remindersSnapshot: remindersSnapshot, emailContextJSON: emailContextJSON,
+            thinkingContent: thinkingContent)
+    }
 }
 
 // MARK: - ChatHistoryTurn Model (Memory — searchable, never resumable)
@@ -631,6 +643,52 @@ actor ChatStore {
         let stableId = String(after[after.index(after: ci)...])
         guard !accountId.isEmpty, !stableId.isEmpty else { return nil }
         return (accountId, stableId)
+    }
+
+    /// The chat session id of the email with this stable id in this account,
+    /// "msg:{accountId}:{stableId}" (`extractAccountAndStableId` reads it back).
+    /// A demo chat stores it with the "demo:" prefix (`DemoModeStore.scopedSessionId`).
+    static func messageSessionId(accountId: String, stableId: String) -> String {
+        "msg:\(accountId):\(stableId)"
+    }
+
+    /// Both forms a message chat's session id is stored under: the user's own
+    /// and a demo's.
+    static func storedForms(ofSessionId sessionId: String) -> [String] {
+        [sessionId, "demo:\(sessionId)"]
+    }
+
+    /// The saved chat of each re-keyed email follows it, in the re-key's own
+    /// transaction: its turns and history move to the session id of the email's
+    /// new stable id, and the email its turns name becomes the new row. A chat is
+    /// never left on an id no email has, and a crash cannot split the move from
+    /// the chat. Every statement is bounded by `chatTurn_sessionId` or
+    /// `chatHistory_sessionId`. memory.db's copy of the session id moves after
+    /// the commit (`MemoryIndex.followSessions`).
+    static func followRekeyedEmails(_ records: [HeaderRekeyRecord], db: Database) throws {
+        for record in records {
+            guard let ids = record.stableIds else { continue }
+            let old = messageSessionId(accountId: ids.accountId, stableId: ids.old)
+            let new = messageSessionId(accountId: ids.accountId, stableId: ids.new)
+            for (oldForm, newForm) in zip(storedForms(ofSessionId: old), storedForms(ofSessionId: new)) {
+                if ids.changed {
+                    try db.execute(
+                        sql: "UPDATE chatTurn SET sessionId = ? WHERE sessionId = ?",
+                        arguments: [newForm, oldForm])
+                    try db.execute(
+                        sql: "UPDATE chatHistory SET sessionId = ? WHERE sessionId = ?",
+                        arguments: [newForm, oldForm])
+                }
+                // The email a session's first turn names (`EmailContextSnapshot`),
+                // which a resumed session and the eviction check read first.
+                try db.execute(
+                    sql: """
+                        UPDATE chatTurn SET emailContextJSON = json_set(emailContextJSON, '$.messageHeaderId', ?)
+                        WHERE sessionId = ? AND json_extract(emailContextJSON, '$.messageHeaderId') = ?
+                        """,
+                    arguments: [record.newHeaderId, newForm, record.oldHeaderId])
+            }
+        }
     }
 
     // MARK: - Inbox Session Eviction

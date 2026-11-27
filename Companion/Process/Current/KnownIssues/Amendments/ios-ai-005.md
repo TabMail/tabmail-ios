@@ -134,6 +134,35 @@ records neither field per row. The leading benign reading is that the observer w
 different row after a scroll movement, since a moved message sorts by date and lands mid-list rather
 than at the end. Settling it needs the per-row instrumentation named above.
 
+## Amendment (2026-11-26): one carrier for every id change
+
+The `.messageHeadersRekeyed` notification is replaced by `.mailPointersMoved`, which carries
+`MailPointerMoves` (`TabMail/Services/MailPointer.swift`): a stored row's re-key
+(`.row(HeaderRekeyRecord)`) or an outbox send's move to its Sent copy (`.sent`). It is an in-memory
+mapping for live views; nothing durable is written for it. Every path that changes a header's primary
+key now posts it after its write commits, and none of them waits on the views:
+
+- the move drain's finish (`MessageHeaderRekey.finishMove`, through `AccountManager.publishMoveFinish`);
+- the sync's UID-window remap, its placeholder replacement (full sync and the change pass), the
+  canonical re-key of an optimistic-move remnant (`SyncEngine.canonicalizeLocalRows`) and the pre-sync
+  inbox reclaim, all through `SyncMessagesResult.headerRekeys` and `MailPointerMoves.publishRekeys`;
+- a draft upload's move of its Drafts entry (`DraftStore.migrateExactPlaceholder`), from the
+  placeholder and from a replaced uploaded copy;
+- the body queue's UID remap (`BackfillBodyQueue.rekeyRemappedHeader`);
+- the outbox's move to the Sent copy (`.sent`).
+
+The date-window RFC repair of a row with a real id still posts nothing: that correlation is too weak
+for a live view to follow (`dateWindowRepairKeepsViewCarrierEmpty`).
+
+`carriesProviderAuthority` keeps its meaning: only a provider-proven move re-points optimistic action
+and dismissal state (`MailPointerMoves.withProviderAuthority`). The sync's correlations, the reclaim,
+the draft entry and the body-queue remap carry none. The email's saved chat (`chatTurn`,
+`chatHistory`, including the demo form of the session id) moves in the producer's own write
+(`ChatStore.followRekeyedEmails`). After commit, the open chat (`ChatPillState.followRekeyedEmails`),
+the model's message ids (`ChatIdTranslator.remapRealId`) and the chat memory index
+(`MemoryIndex.followSessions`) follow in posting order. `InboxViewModel.applyHeaderRekeys` re-keys the
+same state as before (`pendingAIBatch`, `loadedIds`, the snippet queues), now for every producer.
+
 ## Related
 
 - `IOS-AI-004` — the *separate* gap where AI is never enqueued at all for a local move.

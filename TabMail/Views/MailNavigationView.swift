@@ -1258,25 +1258,78 @@ private struct MessageDetailContainer: View {
 ///   (`pushedMessageId`, i.e. chat email-pill opens). See `pushedMessageId`
 ///   doc comment on `MailNavigationView` for why pill opens use a real
 ///   navigation push instead of riding `selectedMessageId`.
+///
+/// The content keeps the identity it was opened with when its email moves
+/// (`OpenedMessage`), so the open detail, its compose cover and its chat are
+/// never rebuilt by a move.
 private struct MessageDetailResolvedContent: View {
     let messageId: String
     let opensWithSkeletonDwell: Bool
+    @State private var openedMessage = OpenedMessage()
 
     var body: some View {
+        let shownId = openedMessage.currentId(for: messageId)
+        let identity = openedMessage.identity(for: messageId)
         // Check if this message is in a Drafts folder — if so, open ComposeView.
         // Single read transaction for consistency (message could be deleted between reads).
         let draftCheck: (header: MessageHeader, isDraft: Bool)? = try? AppDatabase.dbPool.read { db in
-            guard let h = try MessageHeader.fetchOne(db, key: messageId) else { return nil }
+            guard let h = try MessageHeader.fetchOne(db, key: shownId) else { return nil }
             let f = try Folder.fetchOne(db, key: h.folderId)
             return (h, f?.role == .drafts)
         }
-        if let check = draftCheck, check.isDraft {
-            DraftComposePresenter(source: .header(check.header))
-                .id(messageId)
-        } else {
-            MessageDetailView(messageId: messageId, opensWithSkeletonDwell: opensWithSkeletonDwell)
-                .id(messageId)
+        Group {
+            if let check = draftCheck, check.isDraft {
+                DraftComposePresenter(source: .header(check.header))
+                    .id(identity)
+            } else {
+                MessageDetailView(messageId: shownId, opensWithSkeletonDwell: opensWithSkeletonDwell)
+                    .id(identity)
+            }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .mailPointersMoved)) { notification in
+            guard let moves = MailPointerMoves.posted(in: notification) else { return }
+            openedMessage.follow(moves, input: messageId)
+        }
+    }
+}
+
+/// The email an open detail shows, across moves of its row.
+///
+/// The detail's SwiftUI identity is the id it was OPENED with, not the id its
+/// row has now. A move (`.mailPointersMoved`: a provider move's finish, a UID
+/// repair, the server's copy replacing a sent or saved email's placeholder)
+/// can change the row's id while the user reads, replies or chats, and a
+/// changed identity would rebuild the view and drop that work. The input may
+/// follow the move (the selection, `HeaderRekeyReceiver`) or keep the id it
+/// was opened with (a pushed open); both map to the same identity and the
+/// same current row. A different input is a different open.
+struct OpenedMessage: Equatable {
+    /// The id the detail was opened with, once a move named it.
+    private(set) var opened: String?
+    /// The id its row has after the moves followed since.
+    private(set) var current: String?
+
+    private func names(_ input: String) -> Bool {
+        input == opened || input == current
+    }
+
+    /// The SwiftUI identity of the detail for `input`.
+    func identity(for input: String) -> String {
+        names(input) ? (opened ?? input) : input
+    }
+
+    /// The row to read and show for `input`.
+    func currentId(for input: String) -> String {
+        names(input) ? (current ?? input) : input
+    }
+
+    /// Follows the moves of one post, for the detail open on `input`.
+    mutating func follow(_ moves: MailPointerMoves, input: String) {
+        let shown = currentId(for: input)
+        let next = moves.following(header: shown)
+        guard next != shown else { return }
+        if !names(input) { opened = input }
+        current = next
     }
 }
 

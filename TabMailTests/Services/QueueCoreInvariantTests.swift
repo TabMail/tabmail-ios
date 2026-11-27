@@ -1215,9 +1215,85 @@ struct QueueCoreInvariantTests {
         let moved = try await fixture.pool.read { db in
             try MessageHeader.fetchOne(db, key: newId)
         }
-        #expect(result.applied == [HeaderRekeyRecord(
-            oldHeaderId: old.id, newHeaderId: newId, newProviderMessageId: "graph-new")])
+        let move = HeaderRekeyRecord(
+            oldHeaderId: old.id, newHeaderId: newId, newProviderMessageId: "graph-new",
+            stableIds: StableIds(accountId: fixture.accountId, old: "graph-old", new: "graph-new"))
+        #expect(result.applied == [move])
         #expect(moved?.messageId == "graph-new" && moved?.observedUidValidity == nil)
+    }
+
+    /// A reply draft replying to the moved email.
+    private static func replyDraft(
+        id: String, accountId: String, replyingTo headerId: String, providerId: String, uidValidity: Int?
+    ) -> Draft {
+        var draft = Draft(
+            id: id, accountId: accountId, toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Re: queue core", body: "reply", replyToId: headerId, isForward: false,
+            editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+            serverDraftId: nil, serverPushStatus: nil,
+            rfc822MessageId: nil, attachmentsDirName: nil)
+        draft.instanceEpoch = "E1"
+        draft.replyToProviderMessageId = providerId
+        draft.replyToUidValidity = uidValidity
+        return draft
+    }
+
+    /// The email's saved chat and a reply draft name it by its row, so they move
+    /// with the row in the move's own write: the chat to the session of the
+    /// email's new stable id (a message with no Message-ID is keyed by its UID),
+    /// the draft to the new row with the address the server proved.
+    @Test("A finished move takes the email's saved chat and its reply draft to the new row")
+    func finishedMoveTakesTheChatAndTheReplyDraft() async throws {
+        let fixture = try fixture(accountId: "acc-move-follow")
+        defer { finish(fixture) }
+        let old = try seedHeader(
+            fixture, messageId: "77", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        let newId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
+        let otherOriginal = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: "INBOX", messageId: "78")
+        let replyId = Draft.draftKey(replyTo: old.id, isForward: false, newId: nil)
+        let otherReplyId = Draft.draftKey(replyTo: otherOriginal, isForward: false, newId: nil)
+        try await fixture.pool.write { db in
+            try SavedChatFixture.insert(
+                tag: "moved", sessionId: SavedChatFixture.sessionId(accountId: fixture.accountId, stableId: "77"),
+                namingHeaderId: old.id, db: db)
+            // Stored with no epoch, so the check below sees the move write the
+            // destination's.
+            try Self.replyDraft(
+                id: replyId, accountId: fixture.accountId, replyingTo: old.id, providerId: "77",
+                uidValidity: nil).insert(db)
+            try Self.replyDraft(
+                id: otherReplyId, accountId: fixture.accountId, replyingTo: otherOriginal, providerId: "78",
+                uidValidity: 42).insert(db)
+        }
+        let op = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+
+        let outcome = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [ProvenDestinationAddress(
+                    sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
+                addressChangesOnMove: true, accountScopedIds: false, db: db)
+        }
+
+        #expect(outcome.applied.map(\.newHeaderId) == [newId], "precondition: the move re-keyed the row")
+        let after = try await fixture.pool.read { db in
+            (chat: try SavedChatFixture.read(tag: "moved", db: db),
+             reply: try Draft.fetchOne(db, key: replyId),
+             otherReply: try Draft.fetchOne(db, key: otherReplyId))
+        }
+        let chatFollowed = SavedChatFixture.expected(
+            sessionId: SavedChatFixture.sessionId(accountId: fixture.accountId, stableId: "5"),
+            namingHeaderId: newId)
+        #expect(after.chat == chatFollowed)
+        #expect(after.reply?.replyToId == newId)
+        #expect(after.reply?.replyToProviderMessageId == "5")
+        #expect(after.reply?.replyToUidValidity == 42)
+        #expect(after.otherReply?.replyToId == otherOriginal)
+        #expect(after.otherReply?.replyToProviderMessageId == "78")
     }
 
     // MARK: - T11 — the address space decides where the row is, and who follows it
@@ -1912,7 +1988,7 @@ struct QueueCoreInvariantTests {
                 db: db)
         }
         #expect(finishResult.applied.count == 1)
-        UndoService.shared.applyRekeys(finishResult.applied)
+        UndoService.shared.applyRekeys(MailPointerMoves(finishResult.applied.map(MailPointerMove.row)))
 
         gate.finish()
         await AccountManager.shared.awaitWriteQueueDrain()

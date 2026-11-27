@@ -62,6 +62,9 @@ import GRDB
 struct FolderChangeApplyResult {
     var newHeaders: [MessageHeader] = []
     var removedIds: [String] = []
+    /// Placeholder rows replaced by the server's copy (`placeholderReplacement`),
+    /// posted to open views once this folder's transaction has committed.
+    var headerRekeys: [HeaderRekeyRecord] = []
     var discoveredParents: [String] = []
     var wroteRows = false
     var armedCatchUp = false
@@ -278,6 +281,8 @@ extension SyncEngine {
         if state != before {
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])
         }
+        // The re-keyed emails' saved chats follow them in this transaction.
+        try ChatStore.followRekeyedEmails(result.headerRekeys, db: db)
         result.storedCursor = cursor
         return result
     }
@@ -721,6 +726,9 @@ extension SyncEngine {
                 deferredBody = newBody
             }
             result.removedIds.append(oldId)
+            if let rekey = placeholderReplacement(of: optimistic, by: header) {
+                result.headerRekeys.append(rekey)
+            }
             try optimistic.delete(db)
             if DebugModeManager.isLoggingEnabled() {
                 print("[Sync] change apply dedup: replaced optimistic \(folder.role.rawValue) header \(oldId) with \(header.id)")

@@ -792,9 +792,9 @@ struct InboxThreadAcrossAccountsTests {
                     sql: "UPDATE messageHeader SET id = ?, messageId = ? WHERE id = ?",
                     arguments: [newHeaderId, newMessageId, onOutlook.id])
             }
-            UndoService.shared.applyRekeys([HeaderRekeyRecord(
+            UndoService.shared.applyRekeys(MailPointerMoves([.row(HeaderRekeyRecord(
                 oldHeaderId: onOutlook.id, newHeaderId: newHeaderId,
-                newProviderMessageId: newMessageId)])
+                newProviderMessageId: newMessageId))]))
         }
 
         switch moment {
