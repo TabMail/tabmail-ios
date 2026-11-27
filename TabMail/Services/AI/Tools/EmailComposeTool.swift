@@ -131,35 +131,22 @@ struct EmailComposeTool: AgentTool, Sendable {
     @TaskLocal static var inlineEditOverride: (@Sendable (ComposeEditContext, String) async throws -> InlineEditResult)?
 
     /// The account a new email the assistant writes is sent from: the account of the email open
-    /// where the user asked (`openEmailAccountId`, an email screen's chat), else the primary account.
+    /// where the user asked (`openEmailAccountId`, an email screen's chat), else the primary
+    /// account, else the oldest account. It is picked from the accounts the sidebar lists
+    /// (`Account.sidebarRequest`), so it is always a mail account: never a calendar-only one,
+    /// which has no mail to send with.
     /// Demo boundary (ADR-IOS-038): in demo, compose MUST use the demo account — during
     /// debug-menu coexistence the real primary is ALSO isPrimary, so an unscoped lookup could
-    /// pick (and send via) the real account. Normal mode excludes the demo row symmetrically.
+    /// pick (and send via) the real account. The sidebar's list is the demo account alone in
+    /// demo and never has it otherwise.
     static func sendingAccount(openEmailAccountId: String?, db: any DatabaseReader & Sendable) async -> Account? {
         let demoActive = DemoModeStore.isDemoActive
-        return try? await db.read { db in
-            if demoActive {
-                return try Account
-                    .filter(Column("id") == DemoSeed.demoAccountId && Column("isActive") == true)
-                    .fetchOne(db)
-            }
-            if let openEmailAccountId, let openEmailAccount = try Account
-                .filter(Column("id") == openEmailAccountId && Column("isActive") == true)
-                .filter(Column("id") != DemoSeed.demoAccountId)
-                .fetchOne(db) {
-                return openEmailAccount
-            }
-            if let primary = try Account
-                .filter(Column("isActive") == true && Column("isPrimary") == true)
-                .filter(Column("id") != DemoSeed.demoAccountId)
-                .fetchOne(db) {
-                return primary
-            }
-            return try Account
-                .filter(Column("isActive") == true)
-                .filter(Column("id") != DemoSeed.demoAccountId)
-                .fetchOne(db)
-        }
+        let accounts = ((try? await db.read { db in
+            try Account.sidebarRequest(demoActive: demoActive).fetchAll(db)
+        }) ?? []).filter(\.isActive)
+        return accounts.first { $0.id == openEmailAccountId }
+            ?? accounts.first { $0.isPrimary }
+            ?? accounts.first
     }
 
     /// Shared compose edit flow matching TB's `runComposeEdit()`.

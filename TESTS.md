@@ -1311,15 +1311,26 @@ the tool queues (the card itself is not presented).
     an inactive one), it is the active real account (not the demo row, not an inactive account).
     The rows a lookup filter must skip are inserted before the expected account, so a lookup
     without that filter picks the wrong one.
+  - A calendar-only primary is never the new email's account: the mail account is. With no
+    primary, the oldest account is, though another comes first by insertion and by id. In demo
+    with no demo account, the request has no account and the context no name (never a real
+    account).
   - Asked on an email's screen (run through a `ToolRegistry` with a `ToolInvocation` that names
     the open email's account, as a chat turn runs it): a new email is the open email's account,
-    with the other account as the primary, for either account. In demo it is still the demo
-    account when the open email is a real account's; out of demo an email of the demo row gives
-    the real primary. An open email whose account is not active gives the primary.
+    with the other account as the primary, for either account, with or without a writing
+    request. In demo it is still the demo account when the open email is a real account's; out
+    of demo an email of the demo row gives the real primary. An open email whose account is not
+    active gives the primary. A reply and a forward asked on another account's screen are signed
+    as, and sent from, the email's own account (the work account's; in demo the demo account's,
+    with a real primary coexisting).
 - `AssistantChatOpenEmailAccountWiringTests`: a source fence over the app target, comments and
   strings masked. Exactly one `ToolInvocation` is built with a chat session's `SessionUISink`
   (the chat view's `toolInvocation`, used by every chat turn), and it passes
-  `openEmailAccountId: message?.accountId`.
+  `openEmailAccountId: message?.accountId`. In the chat view, the fresh turn
+  (`TutorialChatScript.response` and `AIService.sendChatMessage`), the resumed turn
+  (`resumeChatMessage`) and the compose edit (`performInlineEdit`) each pass it (`toolInvocation`,
+  or the one local `let invocation = toolInvocation`), since a call without it runs the tools as
+  `.noninteractive`.
 - `AssistantComposeCardAccountWiringTests`: a source fence over every app-target
   `composeViewForAgentRequest` (exactly two: `InboxView`, `MessageDetailView`), comments masked.
   The `.compose` case passes `account: req.account` and no other account argument; the `.reply`

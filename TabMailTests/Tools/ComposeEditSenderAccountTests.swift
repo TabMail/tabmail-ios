@@ -42,30 +42,42 @@ struct ComposeEditSenderAccountTests {
     private static let workAlias = "team@example.com"
 
     /// A database with the home and work accounts and an Inbox for each. `primaryId` is the
-    /// primary account (nil: none is), `inactive` the accounts that are not active, and
-    /// `withDemoRow` adds the demo account as the app seeds it (active and primary).
+    /// primary account (nil: none is), `inactive` the accounts that are not active,
+    /// `calendarOnly` the accounts set up for calendar only, `oldestId` an account created
+    /// before the others, and `withDemoRow` adds the demo account as the app seeds it (active and
+    /// primary) with its own Inbox.
     ///
-    /// Rows are inserted demo first, then home, then work. The account lookups have no order,
-    /// so they read rows in this order: a row a filter must skip comes BEFORE the expected one,
-    /// and a lookup without that filter returns the wrong account.
+    /// Rows are inserted demo first, then home, then work, and created in that order unless
+    /// `oldestId` says otherwise. A lookup without an order reads rows in insertion (and id)
+    /// order, so a row a filter must skip comes BEFORE the expected one, and a lookup without
+    /// that filter returns the wrong account.
     private func makeContext(
         primaryId: String?,
         inactive: Set<String> = [],
+        calendarOnly: Set<String> = [],
+        oldestId: String? = nil,
         withDemoRow: Bool = false
     ) throws -> (ToolContext, DatabaseQueue, MockChatIdTranslator, AgentToolRouter) {
         let db = try TestDatabase.make()
+        let now = Date()
         if withDemoRow {
             var account = Account(emailAddress: Self.demo.email, displayName: Self.demo.name, provider: .imap)
             account.id = Self.demo.id
             account.isActive = true
             account.isPrimary = true
+            account.createdAt = now.addingTimeInterval(-3 * 86_400)
             try db.write { try account.insert($0) }
+            try TestDatabase.insertFolder(db, accountId: Self.demo.id)
         }
-        for seed in [Self.home, Self.work] {
+        for (index, seed) in [Self.home, Self.work].enumerated() {
             var account = Account(emailAddress: seed.email, displayName: seed.name, provider: .gmail)
             account.id = seed.id
             account.isPrimary = seed.id == primaryId
             account.isActive = !inactive.contains(seed.id)
+            account.calendarOnly = calendarOnly.contains(seed.id)
+            account.createdAt = seed.id == oldestId
+                ? now.addingTimeInterval(-10 * 86_400)
+                : now.addingTimeInterval(Double(index - 2) * 86_400)
             try db.write { try account.insert($0) }
             try TestDatabase.insertFolder(db, accountId: seed.id)
         }
@@ -347,18 +359,142 @@ struct ComposeEditSenderAccountTests {
         }
     }
 
+    /// A calendar-only account has no mail to send with, so a new email never goes from it,
+    /// even when it is the primary account (removing the primary can make the oldest account
+    /// primary, calendar-only or not): it goes from the mail account.
+    @Test("email_compose: a calendar-only primary account is never the new email's account")
+    func newEmailNeverUsesACalendarOnlyAccount() async throws {
+        try await withDemoMode(false) {
+            let (ctx, _, _, router) = try makeContext(primaryId: Self.home.id, calendarOnly: [Self.home.id])
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "request": .string("Ask about moving the offsite to Friday"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == Self.work.name)
+            #expect(captured.card?.account?.id == Self.work.id)
+        }
+    }
+
+    /// With no primary account, the new email goes from the oldest account, as the inbox's
+    /// compose does. Work is the oldest, though home comes first by insertion and by id.
+    @Test("email_compose: with no primary account the new email is the oldest account's")
+    func newEmailWithoutPrimaryUsesTheOldestAccount() async throws {
+        try await withDemoMode(false) {
+            let (ctx, _, _, router) = try makeContext(primaryId: nil, oldestId: Self.work.id)
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "request": .string("Ask about moving the offsite to Friday"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == Self.work.name)
+            #expect(captured.card?.account?.id == Self.work.id)
+        }
+    }
+
+    /// Demo boundary (ADR-IOS-038): in demo with no demo account, the new email has no account
+    /// at all; it never goes from a real account.
+    @Test("email_compose: in demo without the demo account the new email never takes a real account")
+    func newEmailInDemoWithoutTheDemoAccountTakesNoRealAccount() async throws {
+        try await withDemoMode(true) {
+            let (ctx, _, _, router) = try makeContext(primaryId: Self.home.id)
+            let tool = EmailComposeTool(context: ctx)
+            let captured = try await captureEditAndRequest(router: router) {
+                try await tool.execute(arguments: [
+                    "to": .array([.string(Self.correspondent)]),
+                    "request": .string("Ask about moving the offsite to Friday"),
+                ])
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName.isEmpty)
+            #expect(captured.contexts[0].senderEmail.isEmpty)
+            #expect(captured.card?.account == nil)
+        }
+    }
+
     /// Runs `email_compose` the way a chat turn does: through a tool registry, with `invocation`.
-    private func composeThroughRegistry(_ ctx: ToolContext, invocation: ToolInvocation) async -> String {
+    /// `arguments` default to a new email with a writing request.
+    private func composeThroughRegistry(
+        _ ctx: ToolContext,
+        invocation: ToolInvocation,
+        arguments: [String: JSONValue]? = nil
+    ) async -> String {
         let registry = ToolRegistry()
         await registry.register(EmailComposeTool(context: ctx))
+        let defaultArguments: [String: JSONValue] = [
+            "to": .array([.string(Self.correspondent)]),
+            "request": .string("Ask about moving the offsite to Friday"),
+        ]
         return await registry.execute(
-            name: "email_compose",
-            arguments: [
-                "to": .array([.string(Self.correspondent)]),
-                "request": .string("Ask about moving the offsite to Friday"),
-            ],
-            invocation: invocation
+            name: "email_compose", arguments: arguments ?? defaultArguments, invocation: invocation
         ).output
+    }
+
+    /// On an email's screen, a new email with the body already written (no writing request) also
+    /// opens with the open email's account.
+    @Test("email_compose: on an email's screen, a new email with a given body opens with the open email's account")
+    func newEmailWithBodyOnAnEmailsScreenIsTheOpenEmailsAccount() async throws {
+        try await withDemoMode(false) {
+            let (ctx, _, _, router) = try makeContext(primaryId: Self.home.id)
+            let captured = try await captureEditAndRequest(router: router) {
+                await self.composeThroughRegistry(
+                    ctx, invocation: ToolInvocation(openEmailAccountId: workAccountId),
+                    arguments: [
+                        "to": .array([.string(Self.correspondent)]),
+                        "body": .string("See you Friday."),
+                    ])
+            }
+            #expect(captured.contexts.isEmpty)
+            #expect(captured.card?.account?.id == Self.work.id)
+        }
+    }
+
+    /// A reply or forward asked on another account's email screen is still sent from, and
+    /// signed as, the replied or forwarded email's account: the open email's account is only for
+    /// a new email. In demo, an email of the demo account is the demo account's, though a real
+    /// primary coexists.
+    @Test("email_reply and email_forward: asked on another account's screen, signed as the email's own account",
+          arguments: ["email_reply", "email_forward"], [false, true])
+    func replyAndForwardOnAnotherScreenSignAsTheEmailsAccount(toolName: String, demoActive: Bool) async throws {
+        try await withDemoMode(demoActive) {
+            let (ctx, db, translator, router) = try makeContext(primaryId: Self.home.id, withDemoRow: demoActive)
+            let source = demoActive ? Self.demo : Self.work
+            let header = try TestDatabase.insertMessageHeader(
+                db, messageId: "screen-\(toolName)", subject: "Offsite",
+                from: Self.correspondent, fromAddress: Self.correspondent, to: Self.workAlias,
+                folderId: "\(source.id):INBOX", accountId: source.id
+            )
+            await translator.seed(header.id, as: 31)
+            let registry = ToolRegistry()
+            await registry.register(EmailReplyTool(context: ctx))
+            await registry.register(EmailForwardTool(context: ctx))
+
+            let captured = try await captureEditAndRequest(router: router) {
+                await registry.execute(
+                    name: toolName,
+                    arguments: [
+                        "unique_id": .int(31),
+                        "to": .array([.string("pat@example.com")]),
+                        "request": .string("Say Friday works"),
+                    ],
+                    invocation: ToolInvocation(openEmailAccountId: homeAccountId)
+                ).output
+            }
+            #expect(captured.contexts.count == 1)
+            guard captured.contexts.count == 1 else { return }
+            #expect(captured.contexts[0].senderName == source.name)
+            #expect(captured.contexts[0].senderEmail == source.email)
+            #expect(captured.card?.replyToAccountId == source.id)
+        }
     }
 
     /// Asked on an email's screen, a new email is sent from, and signed as, that email's
@@ -439,6 +575,55 @@ struct AssistantChatOpenEmailAccountWiringTests {
         #expect(constructions.count == 1, "expected one chat-session invocation builder, found \(constructions.count)")
         for construction in constructions {
             #expect(construction.contains("openEmailAccountId: message?.accountId)"))
+        }
+    }
+
+    /// The argument list of each call that starts with `start` in `code`, up to its closing
+    /// parenthesis.
+    private static func argumentLists(of start: String, in code: String) -> [String] {
+        var lists: [String] = []
+        var searchFrom = code.startIndex
+        while let open = code.range(of: start, range: searchFrom..<code.endIndex) {
+            var depth = 1
+            var index = open.upperBound
+            while index < code.endIndex, depth > 0 {
+                if code[index] == "(" { depth += 1 }
+                if code[index] == ")" { depth -= 1 }
+                index = code.index(after: index)
+            }
+            lists.append(String(code[open.upperBound..<index]))
+            searchFrom = index
+        }
+        return lists
+    }
+
+    /// The chat's turns use that invocation: a fresh turn, a resumed turn and a compose edit each
+    /// pass it to the completion call, which would otherwise run the tools with no open email
+    /// (`invocation` defaults to `.noninteractive`).
+    @Test("Every chat completion call passes the chat session's invocation")
+    func everyChatCompletionCallPassesTheSessionInvocation() throws {
+        let files = try DiagnosticPrintGateTests.appTargetSources()
+            .filter { $0.relativePath.hasSuffix("Views/Inbox/DynamicIslandChatButton.swift") }
+        #expect(files.count == 1)
+        guard files.count == 1 else { return }
+        let code = DiagnosticPrintGateTests.codeOnly(files[0].source)
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+
+        // The one local binding, used by the fresh turn, is the session's invocation.
+        let bindings = code.components(separatedBy: "let invocation =").dropFirst()
+        #expect(bindings.count == 1, "expected one local invocation binding, found \(bindings.count)")
+        for binding in bindings {
+            #expect(binding.hasPrefix(" toolInvocation "))
+        }
+
+        for call in ["AIService.shared.sendChatMessage(", "AIService.shared.resumeChatMessage(",
+                     "AIService.shared.performInlineEdit(", "TutorialChatScript.response("] {
+            let lists = Self.argumentLists(of: call, in: code)
+            #expect(lists.count == 1, "expected one \(call) call, found \(lists.count)")
+            for arguments in lists {
+                #expect(arguments.contains("invocation: toolInvocation") || arguments.contains("invocation: invocation"),
+                        "\(call) does not pass the session's invocation")
+            }
         }
     }
 }
