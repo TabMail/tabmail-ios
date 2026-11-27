@@ -239,7 +239,7 @@ group and unreadable text, the IMAP draft copy read from a named ENVELOPE, a rep
 name, and each provider's wire: the `Email` the app's own SMTP send hands its submission session
 (every address once in the recipient list SwiftMail sends RCPT TO from) and that message built with
 `constructContent` (the names in To and Cc, no Bcc), the IMAP draft, its replacement under a renamed
-recipient (a new UID, the old one gone) and the Sent copy, Gmail send, draft create and update with
+recipient (one copy left, the renamed one) and the Sent copy, Gmail send, draft create and update with
 and without a file, Outlook send, draft create and update, with names holding quotes, a backslash,
 angle brackets, an address, a line break and a long non-ASCII name), `GmailFoldedRecipientReadTests`
 (a folded Bcc and Reply-To stored as one line by sync and by a push, and a reply to that Reply-To

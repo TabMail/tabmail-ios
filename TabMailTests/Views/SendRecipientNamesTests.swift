@@ -416,8 +416,12 @@ struct SendRecipientNamesTests {
             renamed, existingIdentity: .imap(folder: folder, uidValidity: uidValidity, uid: uid),
             draftsFolderPath: "Drafts")
         let replaced = server.snapshotMessagesWithFlags(in: "Drafts")
+        // One copy is left, and it is the replacement (its renamed To is checked
+        // below). The old copy is expunged before the new one is appended, and
+        // this server numbers an APPEND one above its highest UID still present,
+        // so the replacement can get the old copy's UID here.
         let replacedUids = replaced.map(\.message.uid)
-        #expect(replacedUids.count == 1 && !replacedUids.contains(firstUid), "Drafts UIDs \(replacedUids), first \(firstUid)")
+        #expect(replacedUids.count == 1, "Drafts UIDs \(replacedUids), first \(firstUid)")
         guard replaced.count == 1 else { return }
         let replacement = String(decoding: replaced[0].message.raw, as: UTF8.self)
         let replacedTo = Self.written("To", in: replacement)
