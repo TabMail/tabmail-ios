@@ -222,10 +222,11 @@ struct ChatThreadView: View {
         return ChatThread(
             members: members,
             replyAddresses: { newest in
-                let reply = buildReplyAllRecipients(for: newest, allAccounts: accounts)
+                let reply = ChatThread.replyAllAudience(of: newest, accounts: accounts)
                 return reply.to + reply.cc
             },
             ownAddresses: context.ownAddresses,
+            ownNames: context.ownNames,
             draftFolderIds: context.draftFolderIds,
             sentFolderIds: context.sentFolderIds,
             unreadAtOpen: unreadAtOpen,

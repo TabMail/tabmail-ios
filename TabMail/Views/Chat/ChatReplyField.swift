@@ -413,7 +413,7 @@ struct ChatReplyCompose: Equatable {
     /// from the email's own account, exactly (an empty To stays empty: the card never refills it
     /// from the reply's Reply-To). The suggestion slot holds a body for this envelope only.
     static func suggestionEnvelope(for message: MessageHeader, accounts: [Account]) -> ChatReplyCompose {
-        let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
+        let audience = ChatThread.replyAllAudience(of: message, accounts: accounts)
         return ChatReplyCompose(
             isReplyAll: true, to: audience.to, cc: audience.cc, bcc: [],
             subject: ThreadUtils.replySubject(for: message.subject))

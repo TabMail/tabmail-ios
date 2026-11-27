@@ -38,6 +38,17 @@ struct ChatThreadContext {
 
     var ownAddresses: Set<String> { Set(accounts.map { $0.emailAddress.lowercased() }) }
 
+    /// The name of each of the user's addresses whose account has one (`Account.displayName`), for
+    /// a chat whose people are the user's own addresses (`ChatThread.replyPeople`).
+    var ownNames: [String: String] {
+        var names: [String: String] = [:]
+        for account in accounts where !account.displayName.trimmingCharacters(in: .whitespaces).isEmpty {
+            let address = account.emailAddress.lowercased()
+            if names[address] == nil { names[address] = account.displayName }
+        }
+        return names
+    }
+
     static func load(members: [MessageHeader], pool: PrioritizedDatabase) async -> ChatThreadContext {
         let ids = members.map(\.id)
         let accountIds = Set(members.map(\.accountId))
