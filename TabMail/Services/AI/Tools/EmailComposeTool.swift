@@ -96,6 +96,24 @@ struct EmailComposeTool: AgentTool, Sendable {
 
     // MARK: - Compose Edit (TB Parity)
 
+    /// The email an agent reply or forward is about and, when `withBodyText`, the text of that
+    /// email's body, read in one snapshot. The id is an address another email can take after a
+    /// mailbox reset, so the body is never read in a second, separate read, where it could belong to
+    /// a different email than the header the model is told about.
+    ///
+    /// The body of an email the current mode may not touch (`DemoToolGuard.headerAccessible`,
+    /// ADR-IOS-038) is not read; the caller refuses that header. A failed body read leaves the model
+    /// without the body, as a missing body does, and the reply or forward still goes ahead.
+    static func relatedEmail(
+        realId: String, withBodyText: Bool, db: Database
+    ) throws -> (header: MessageHeader, bodyText: String?)? {
+        guard let header = try MessageHeader.fetchOne(db, key: realId) else { return nil }
+        guard withBodyText, DemoToolGuard.headerAccessible(header),
+              let messageBody = try? MessageBody.fetchOne(db, key: header.id),
+              let html = messageBody.htmlContent, !html.isEmpty else { return (header, nil) }
+        return (header, EmailFilter.htmlToPlainText(html))
+    }
+
     /// Per-task replacement for the backend edit call: receives the edit context and
     /// instruction `runComposeEdit` built. `@TaskLocal`, so a test's override reaches only
     /// the tool calls made inside its own `withValue` scope.

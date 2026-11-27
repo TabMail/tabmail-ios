@@ -34,8 +34,18 @@ struct EmailReplyTool: AgentTool, Sendable {
             return ComposeOutcome.failed("Email not found for unique_id \(numericId)").describeForLLM
         }
 
-        guard let header: MessageHeader = try await ctx.db.read({ db in
-            try MessageHeader.fetchOne(db, key: realId)
+        // Parse optional request (compose instruction) and body separately.
+        // TB's "request" goes through runComposeEdit() to generate the actual reply content.
+        let composeRequest: String?
+        if case .string(let s) = arguments["request"], !s.isEmpty {
+            composeRequest = s
+        } else {
+            composeRequest = nil
+        }
+
+        // The body the model reads comes from the same read as the header.
+        guard let (header, relatedBodyText) = try await ctx.db.read({ db in
+            try EmailComposeTool.relatedEmail(realId: realId, withBodyText: composeRequest != nil, db: db)
         }) else {
             return ComposeOutcome.failed("Email with id \(realId) no longer exists").describeForLLM
         }
@@ -65,15 +75,6 @@ struct EmailReplyTool: AgentTool, Sendable {
         let cc = Self.applyRecipientDelta(base: replyAll.cc, adds: addCc, removes: removeCc)
         let bcc = Self.applyRecipientDelta(base: [], adds: addBcc, removes: removeBcc)
 
-        // Parse optional request (compose instruction) and body separately.
-        // TB's "request" goes through runComposeEdit() to generate the actual reply content.
-        let composeRequest: String?
-        if case .string(let s) = arguments["request"], !s.isEmpty {
-            composeRequest = s
-        } else {
-            composeRequest = nil
-        }
-
         let explicitBody: String?
         if case .string(let s) = arguments["body"], !s.isEmpty {
             explicitBody = s
@@ -91,12 +92,6 @@ struct EmailReplyTool: AgentTool, Sendable {
         if let composeRequest {
             let wrappedRequest = "Reply to email with subject \"\(header.subject)\" with request: \(composeRequest)"
             do {
-                // Get related email body text for context
-                let relatedBodyText: String? = try? await ctx.db.read { db in
-                    guard let messageBody = try MessageBody.fetchOne(db, key: header.id),
-                          let html = messageBody.htmlContent, !html.isEmpty else { return nil }
-                    return EmailFilter.htmlToPlainText(html)
-                }
                 let result = try await EmailComposeTool.runComposeEdit(
                     to: to,
                     cc: cc,
