@@ -194,7 +194,8 @@ struct PlaceholderCopyRekeyTests {
         let stored = try f.storedIds()
         #expect(stored == [f.headerId("500")], "precondition: the copy replaced the placeholder")
         #expect(result.uidMigratedOldIds.isEmpty, "precondition: stored as new, not remapped")
-        let storedCopy = try f.pool.read { try MessageHeader.fetchOne($0, key: f.headerId("500")) }
+        let copyId = f.headerId("500")
+        let storedCopy = try await f.pool.read { try MessageHeader.fetchOne($0, key: copyId) }
         let copy = try #require(storedCopy)
         let move = Self.replacement(
             of: placeholder.id, by: f.headerId("500"), providerId: "500",
