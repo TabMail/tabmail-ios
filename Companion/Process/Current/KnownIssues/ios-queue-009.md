@@ -50,6 +50,59 @@
 > `SyncEngineBackfillWalk` also write it), and the accessor is now a further writer. Tests:
 > `RevokedMailGrantSignalTests`.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+> **Current amendment (2026-11-27, tabmail-ios #659): the warning also covers refusals only the user,
+> or their admin, can resolve.** Microsoft `interaction_required` (another sign-in step, such as
+> multi-factor or a Conditional Access step) and `consent_required` (consent from the user or, where
+> the organisation reserves it, an admin), and Google `admin_policy_enforced` (a Workspace admin
+> restricted a requested service), raised no warning: the mail queue, outbox and sync stopped
+> silently. The warning now reads its own code set, `AccountManager.isSignInAgainOAuthFailure`: the
+> three grant-level codes plus those three, same exact match and normalisation, of the top-level
+> `error` field of the token endpoint's answer whatever its HTTP status. Microsoft lists
+> `consent_required` in the token endpoint's error table, which its refresh documentation points to;
+> Google documents `admin_policy_enforced` for the sign-in step, so on a refresh it is matched only if
+> it comes. Like the other codes, the mark also keeps the
+> account's other failures in a sync poll out of the inbox refresh banner's count while it is up
+> (`InboxErrorBanner.countsAsFailure`); a pull still shows its own error.
+>
+> The token accessor in `makeOAuthAccessor` is now the ONLY place a token-endpoint refusal raises the
+> warning. The calendar drain's `isCalendarOAuthReauthRequired` no longer reads
+> `OAuthError.tokenExchangeFailed` at all (it keeps the two post-refresh 401s and
+> `ProviderError.authenticationFailed`): every Google and Microsoft calendar request takes its token
+> from the same accessor, so the drain's raise only repeated it without the generation check. The
+> late-refusal residual in the #534 amendment above is therefore CLOSED for token-endpoint refusals:
+> the accessor's check and the insert run in one turn of the `AccountManager` actor
+> (`markAuthFailed(_:refusedSignIn:store:)`), the actor that also installs a new sign-in
+> (`installOAuthCredentials`) and clears the warning (`connectAccount`), so a token-endpoint refusal
+> of a replaced sign-in, or of a removed account, raises nothing, whichever queue it reaches. Still
+> open, each its own issue: the old sign-in's refresh can also end without a refusal (it succeeds
+> after the sign-in was replaced, the coordinator was invalidated, or the sign-in reads as inactive),
+> and `OAuthRefreshCoordinator.refresh` then throws `ProviderError.authenticationFailed`, which the
+> calendar drain (`isCalendarOAuthReauthRequired`) and `SyncEngineBackfillWalk` still turn into the
+> warning with no sign-in check (#1611); a late grant-level refusal still retires a calendar change as a sign-in failure
+> whose notice asks to sign in again (#1598); the warning clears only when the reconnect after a new
+> sign-in succeeds (#1599); a calendar-only account has no surface that shows the warning (#1600); a
+> refusal of a new sign-in installed while the refresh was on its way to `OAuthRefreshCoordinator`
+> raises no warning until the next token request (#1604).
+>
+> What retires a calendar operation is unchanged: `isCalendarAuthError` still reads
+> `isGrantLevelOAuthFailure` alone, so a calendar change refused with one of the three new codes stays
+> queued (transient arm) and goes through once a sign-in gets a token again. Signing in again is how
+> the user takes the step or gives the consent; an admin restriction or an admin-only consent must
+> first be lifted or given by the admin, and until then a new sign-in can be refused the same way, so
+> the warning stays up and the change stays queued. Tests: `RevokedMailGrantSignalTests`
+> (`revokedSignInWarnsAndKeepsTheWork` over `refusedMailSignIns`, a refused grant and a code that needs
+> the user for each provider, through the real mail queue and outbox;
+> `indeterminateFailureRaisesNoWarning`, including an unknown code containing a known one;
+> `refusedGrantRaisesTheWarning`, `refusalOfAReplacedSignInRaisesNoWarning` and
+> `refusalAfterRemovalRaisesNoWarning` over `warns`; `refusalWarnsOnlyForTheInstalledSignIn`;
+> `refusalCheckAndInsertShareOneActorTurn`, the source check that the accessor's refusal branch makes
+> no check before the hop to the actor;
+> `calendarChangeWaitsForTheUser` over the three codes through the real calendar queue;
+> `calendarRefusalOfAReplacedSignInRaisesNoWarning` over `warns` through the real calendar queue),
+> `CalendarBadRequestClassificationTests` (roster, the drain's signal no longer reading token-endpoint
+> codes, and `reauthSignalCoversWhatTheTerminalArmDoesNot`).
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-QUEUE-009
 
 > Routed from `KNOWN_ISSUES.md` line 1208 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
