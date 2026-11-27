@@ -16,7 +16,7 @@ struct DatabaseUpgradeView: View {
 
     static let noticeTitle = "Database update"
     static let noticeWhat = "For the best experience, TabMail needs to update your database."
-    static let noticeTime = "It takes up to about 5 minutes. Keep TabMail open while it runs."
+    static let noticeTime = "It can take up to 10 minutes. Keep TabMail open while it runs."
     static let upgradeNowTitle = "Update now"
     static let laterTitle = "Later"
     static let upgradingTitle = "Updating your database."
