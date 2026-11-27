@@ -1125,21 +1125,22 @@ struct ChatUndoSendTests {
         func hasUndo() -> Bool {
             HostedAccessibility.identifiers(in: controller.view).contains(ChatUndoSendStatus.undoId)
         }
-        // The bubble's colour low in it (the text's bottom-left corner, beside the round "o") and
-        // at its top (inside the top padding, above the text): where a rising fill arrives first
-        // and where it arrives last.
+        // The bubble's colour low in it (in its bottom padding, under the words and the Details pin,
+        // at the words' leading edge) and at its top (inside the top padding, above the text): where
+        // a rising fill arrives first and where it arrives last.
         func drawn() throws -> (low: String, top: String) {
             let image = UIGraphicsImageRenderer(bounds: controller.view.bounds).image { _ in
                 controller.view.drawHierarchy(in: controller.view.bounds, afterScreenUpdates: true)
             }
             let frame = try #require(Self.bubbleFrame(in: controller.view), "the bubble's text is on screen")
+            let bubble = try #require(Self.unsentBubbleFrame(in: controller.view), "the bubble is on screen")
             func name(at point: CGPoint) -> String {
                 let pixel = Self.color(of: image, at: point)
                 if pixel.isClose(to: Palette.chatUndoSendPendingTint, in: controller.traitCollection) { return "pending" }
                 if pixel.isClose(to: Theme.accent, in: controller.traitCollection) { return "solid" }
                 return "other"
             }
-            return (name(at: CGPoint(x: frame.minX + 1, y: frame.maxY - 1)), name(at: CGPoint(x: frame.midX, y: frame.minY - 5)))
+            return (name(at: CGPoint(x: frame.minX + 1, y: bubble.maxY - 3)), name(at: CGPoint(x: frame.midX, y: frame.minY - 5)))
         }
 
         // Read the bubble over the whole window and a second past its deadline, each reading
@@ -1438,6 +1439,13 @@ struct ChatUndoSendTests {
     private static func bubbleFrame(in view: UIView) -> CGRect? {
         HostedAccessibility.elements(under: view)
             .first { ($0.accessibilityLabel ?? "").contains("Tuesday works") }
+            .map { view.convert($0.accessibilityFrame, from: nil) }
+    }
+
+    /// The whole unsent reply's bubble, its padding included, in `view`'s coordinates.
+    private static func unsentBubbleFrame(in view: UIView) -> CGRect? {
+        HostedAccessibility.elements(under: view)
+            .first { HostedAccessibility.identifier(of: $0) == ChatUnsentReplyBubble.bubbleId }
             .map { view.convert($0.accessibilityFrame, from: nil) }
     }
 
