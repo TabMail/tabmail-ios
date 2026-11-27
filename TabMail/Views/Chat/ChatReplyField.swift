@@ -413,30 +413,10 @@ struct ChatReplyCompose: Equatable {
     /// from the email's own account, exactly (an empty To stays empty: the card never refills it
     /// from the reply's Reply-To). The suggestion slot holds a body for this envelope only.
     static func suggestionEnvelope(for message: MessageHeader, accounts: [Account]) -> ChatReplyCompose {
-        let audience = replyAllAudience(of: message, accounts: accounts)
+        let audience = ChatThread.replyAllAudience(of: message, accounts: accounts)
         return ChatReplyCompose(
             isReplyAll: true, to: audience.to, cc: audience.cc, bcc: [],
             subject: ThreadUtils.replySubject(for: message.subject))
-    }
-
-    /// Who the chat's Reply All to `message` goes to, by role: its Reply All
-    /// (`buildReplyAllRecipients`), which leaves out every address of the user's. An email that
-    /// went only to the user's own addresses (a note to self, a forward to another of their
-    /// accounts) has nobody else to answer, so its audience is those addresses, To then Cc: the
-    /// reply goes to them, and the chat's header names them (`ChatThread.replyPeople`). The
-    /// inbox's and the email screen's Reply All are unchanged.
-    static func replyAllAudience(of message: MessageHeader, accounts: [Account]) -> (to: [String], cc: [String]) {
-        let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
-        guard audience.to.isEmpty, audience.cc.isEmpty else { return audience }
-        let own = Set(accounts.map { $0.emailAddress.lowercased() })
-        var seen = Set<String>()
-        func ownAddresses(in field: String) -> [String] {
-            RecipientEntry(field).addresses
-                .map { $0.lowercased() }
-                .filter { own.contains($0) && seen.insert($0).inserted }
-        }
-        let to = ownAddresses(in: message.to)
-        return (to, ownAddresses(in: message.cc))
     }
 
     /// The fields as compose holds them (`ComposeDraftGuards.Recipients`), so an edit's recipient

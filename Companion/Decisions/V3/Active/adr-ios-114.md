@@ -870,7 +870,7 @@ same AI result, kept as long as the email itself is shown.
    *Amended 2026-11-27 (the user's own addresses):* Reply All leaves out every address of the user's,
    so an email that went only to their own addresses (a note to self, a forward to another of their
    accounts) showed nobody in the header, and a reply from the chat went to nobody. The chat's one
-   Reply All builder (`ChatReplyCompose.replyAllAudience`, under `suggestionEnvelope`) now gives such
+   Reply All builder (`ChatThread.replyAllAudience`, under `ChatReplyCompose.suggestionEnvelope`) now gives such
    an email its own To and Cc addresses, by role, when its Reply All holds nobody; the header reads
    the same builder (`ChatThreadView.thread`), so the header's people and the reply's audience stay
    one list. Those addresses show as ordinary people: the account's name when it has one, else the

@@ -221,7 +221,7 @@ struct ChatThreadView: View {
         return ChatThread(
             members: members,
             replyAddresses: { newest in
-                let reply = ChatReplyCompose.replyAllAudience(of: newest, accounts: accounts)
+                let reply = ChatThread.replyAllAudience(of: newest, accounts: accounts)
                 return reply.to + reply.cc
             },
             ownAddresses: context.ownAddresses,
