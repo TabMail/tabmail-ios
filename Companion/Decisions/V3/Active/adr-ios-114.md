@@ -867,6 +867,19 @@ same AI result, kept as long as the email itself is shown.
    and a name line over the later bubbles. Group chats keep the label unchanged (mock R3). The reply
    field's "Replying only to" line is a separate rule, unchanged. Test:
    `ChatThreadTests.oneToOneCarriesNoOnly`.
+   *Amended 2026-11-27 (the user's own addresses):* Reply All leaves out every address of the user's,
+   so an email that went only to their own addresses (a note to self, a forward to another of their
+   accounts) showed nobody in the header, and a reply from the chat went to nobody. The chat's one
+   Reply All builder (`ChatReplyCompose.replyAllAudience`, under `suggestionEnvelope`) now gives such
+   an email its own To and Cc addresses, by role, when its Reply All holds nobody; the header reads
+   the same builder (`ChatThreadView.thread`), so the header's people and the reply's audience stay
+   one list. Those addresses show as ordinary people: the account's name when it has one, else the
+   address, with initials from the part before the @. An email with anyone else on its Reply All is
+   unchanged (the user's addresses stay hidden), and the user's own addresses never make a chat a
+   group. The rule is per email, as the builder is: a thread whose newest email is such a note shows
+   its addresses even when earlier emails had others. The inbox's and the email screen's Reply All
+   (`buildReplyAllRecipients`) are unchanged. Tests: `ChatThreadTests.ownAddressesOnly`,
+   `ownAddressesHiddenBesideOthers`, `headerIsTheReply`.
    **Product choices of who gets the reply, decided 2026-11-08:** an email that only adds someone new is
    not "only" (the new person joins the chat's people), and an email is never "only" for someone who
    joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
