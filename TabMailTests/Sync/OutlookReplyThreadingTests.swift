@@ -456,12 +456,8 @@ extension OutlookChangeReadingTests {
         NSEStagingDB.stageHeader(
             db: queue, accountId: accountId, accountEmail: "user@example.com", provider: "outlook",
             message: meta, historyId: "1")
-        let stagedRow = try queue.read { db in
-            try Row.fetchOne(db, sql: "SELECT * FROM nse_processed_message WHERE id = ?",
-                             arguments: ["\(accountId):r-1"])
-        }
-        let row = try #require(stagedRow, "the extension staged the message")
-        let staged = NSEDataBridge.StagedMessage(row: row)
+        let stagedMessage = try Self.stagedMessage(queue, id: "\(accountId):r-1")
+        let staged = try #require(stagedMessage, "the extension staged the message")
 
         let main = try TestDatabase.make()
         try TestDatabase.insertAccount(main, id: accountId, email: "user@example.com", provider: .outlook)
@@ -470,30 +466,46 @@ extension OutlookChangeReadingTests {
             let header = try TestDatabase.insertMessageHeader(
                 main, messageId: id, folderId: "\(accountId):\(Self.inbox)", accountId: accountId,
                 folderPath: Self.inbox, rfc822MessageId: "\(id)@example.com")
-            try main.write { db in
+            let headerRowId = header.id
+            try await main.write { db in
                 try db.execute(sql: "UPDATE messageHeader SET computedThreadId = ? WHERE id = ?",
-                               arguments: [thread, header.id])
+                               arguments: [thread, headerRowId])
             }
         }
-        let inserted = try main.write { db in
-            var ftsBatch: [NSEDataBridge.NSEFTSBodyItem] = []
-            return try NSEDataBridge.insertNewHeaderFromStaging(staged, db: db, ftsBatch: &ftsBatch)
-        }
+        let inserted = try Self.mergeStaged(staged, into: main)
         #expect(inserted, "precondition: the merge inserted the reply")
 
         let headerId = MessageIdentity.headerId(
             accountId: accountId, folderPath: staged.folderPath, messageId: staged.messageId)
-        let mergedRow = try main.read { db in try MessageHeader.fetchOne(db, key: headerId) }
+        let mergedRow = try await main.read { db in try MessageHeader.fetchOne(db, key: headerId) }
         let reply = try #require(mergedRow)
         #expect(reply.computedThreadId == "thread-forward", "the reply joins the forward it answers")
         #expect(reply.inReplyTo == "fwd@example.com")
         #expect(reply.references == ["src@example.com", "fwd@example.com"])
-        let linkRows = try main.read { db in
+        let linkRows = try await main.read { db in
             try String.fetchAll(db, sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
                                 arguments: [headerId])
         }
         let links = Set(linkRows)
         #expect(links == ["fwd@example.com", "src@example.com"], "the merge writes the reply's reference rows")
+    }
+
+    /// The message the extension staged. Synchronous, so GRDB's synchronous read
+    /// runs: a `Row` is not `Sendable` and cannot leave an async read.
+    static func stagedMessage(_ queue: DatabaseQueue, id: String) throws -> NSEDataBridge.StagedMessage? {
+        let row = try queue.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM nse_processed_message WHERE id = ?", arguments: [id])
+        }
+        return row.map { NSEDataBridge.StagedMessage(row: $0) }
+    }
+
+    /// The main app's merge of a staged message. Synchronous, so GRDB's synchronous
+    /// write runs: `StagedMessage` is not `Sendable`.
+    static func mergeStaged(_ staged: NSEDataBridge.StagedMessage, into main: DatabaseQueue) throws -> Bool {
+        try main.write { db in
+            var ftsBatch: [NSEDataBridge.NSEFTSBodyItem] = []
+            return try NSEDataBridge.insertNewHeaderFromStaging(staged, db: db, ftsBatch: &ftsBatch)
+        }
     }
 
     /// The fake's own contract, which every test above leans on: Graph serves an
