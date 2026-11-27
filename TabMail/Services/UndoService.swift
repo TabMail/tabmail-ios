@@ -359,15 +359,13 @@ final class UndoService {
     /// deferred successor still stored under that key. Only the in-progress
     /// action is preserved; every stacked action follows the rekey normally.
     func applyRekeys(
-        _ records: [HeaderRekeyRecord],
+        _ moves: MailPointerMoves,
         preservingInProgressMemberIds preservedIds: Set<String> = []
     ) {
-        guard !records.isEmpty else { return }
-        let byOldId = Dictionary(
-            records.map { ($0.oldHeaderId, $0) }, uniquingKeysWith: { first, _ in first })
+        guard !moves.isEmpty else { return }
         for actionIndex in undoStack.indices {
             for messageIndex in undoStack[actionIndex].messages.indices {
-                guard let record = byOldId[undoStack[actionIndex].messages[messageIndex].id]
+                guard let record = moves.row(movedFrom: undoStack[actionIndex].messages[messageIndex].id)
                 else { continue }
                 undoStack[actionIndex].messages[messageIndex].id = record.newHeaderId
                 undoStack[actionIndex].messages[messageIndex].messageId = record.newProviderMessageId
@@ -375,7 +373,7 @@ final class UndoService {
             for commandIndex in undoStack[actionIndex].commands.indices {
                 for memberIndex in undoStack[actionIndex].commands[commandIndex].members.indices {
                     let member = undoStack[actionIndex].commands[commandIndex].members[memberIndex]
-                    guard let record = byOldId[member.originalHeaderId] else { continue }
+                    guard let record = moves.row(movedFrom: member.originalHeaderId) else { continue }
                     undoStack[actionIndex].commands[commandIndex].members[memberIndex].rekey(
                         accountId: undoStack[actionIndex].commands[commandIndex].accountId,
                         newHeaderId: record.newHeaderId,
@@ -397,7 +395,7 @@ final class UndoService {
         if var action = undoInProgressAction {
             for messageIndex in action.messages.indices {
                 guard !preservedIds.contains(action.messages[messageIndex].id) else { continue }
-                guard let record = byOldId[action.messages[messageIndex].id]
+                guard let record = moves.row(movedFrom: action.messages[messageIndex].id)
                 else { continue }
                 action.messages[messageIndex].id = record.newHeaderId
                 action.messages[messageIndex].messageId = record.newProviderMessageId
@@ -406,7 +404,7 @@ final class UndoService {
                 for memberIndex in action.commands[commandIndex].members.indices {
                     let member = action.commands[commandIndex].members[memberIndex]
                     guard !preservedIds.contains(member.originalHeaderId) else { continue }
-                    guard let record = byOldId[member.originalHeaderId] else { continue }
+                    guard let record = moves.row(movedFrom: member.originalHeaderId) else { continue }
                     action.commands[commandIndex].members[memberIndex].rekey(
                         accountId: action.commands[commandIndex].accountId,
                         newHeaderId: record.newHeaderId,

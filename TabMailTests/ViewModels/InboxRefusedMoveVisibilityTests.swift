@@ -455,10 +455,9 @@ struct InboxRefusedMoveVisibilityTests {
                 MessageHeaderRekey.publishAddressHandoffsAfterCommit([record], in: db)
             }
             var selected: String?
-            var pushed: String?
             HeaderRekeyReceiver.apply(
-                [record], dismissedMessages: &dismissed, swipeFadingMessages: &fading,
-                selectedMessageId: &selected, pushedMessageId: &pushed)
+                MailPointerMoves([.row(record)]), dismissedMessages: &dismissed, swipeFadingMessages: &fading,
+                selectedMessageId: &selected)
             #expect(dismissed.contains(newId), "setup: the view follows the re-key with its hide")
         }
 
@@ -504,10 +503,9 @@ struct InboxRefusedMoveVisibilityTests {
 
         // The re-key notification reaches the view after the refusal.
         var selected: String?
-        var pushed: String?
         HeaderRekeyReceiver.apply(
-            [record], dismissedMessages: &result.dismissed, swipeFadingMessages: &result.fading,
-            selectedMessageId: &selected, pushedMessageId: &pushed)
+            MailPointerMoves([.row(record)]), dismissedMessages: &result.dismissed, swipeFadingMessages: &result.fading,
+            selectedMessageId: &selected)
 
         #expect(result.reported.contains(oldId), "the report must name the id the view hides")
         #expect(visibleIds(result.vm, dismissed: result.dismissed).contains(newId),

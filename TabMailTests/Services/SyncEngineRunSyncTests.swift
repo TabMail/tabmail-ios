@@ -1061,11 +1061,14 @@ struct RunSyncUIDRemapFtsRekeyTests {
         #expect(result.ftsRekeys.first?.oldId == "racc:INBOX:100")
         #expect(result.ftsRekeys.first?.newId == "racc:INBOX:200")
         #expect(result.ftsRekeys.first?.newMessageId == "200")
-        #expect(result.headerRekeys == [HeaderRekeyRecord(
+        let remap = HeaderRekeyRecord(
             oldHeaderId: "racc:INBOX:100",
             newHeaderId: "racc:INBOX:200",
             newProviderMessageId: "200",
-            carriesProviderAuthority: false)])
+            carriesProviderAuthority: false,
+            stableIds: StableIds(
+                accountId: "racc", old: "remap-x@example.com", new: "remap-x@example.com"))
+        #expect(result.headerRekeys == [remap])
         // The old id must NOT be removed from FTS or header-only re-indexed.
         #expect(!result.staleIds.contains("racc:INBOX:100"))
         #expect(!result.newHeaders.contains { $0.id == "racc:INBOX:200" })
@@ -1121,12 +1124,12 @@ struct RunSyncUIDRemapFtsRekeyTests {
             return folder
         }
 
-        let published = Mutex<[HeaderRekeyRecord]>([])
+        let published = Mutex<[MailPointerMove]>([])
         let token = NotificationCenter.default.addObserver(
-            forName: .messageHeadersRekeyed, object: nil, queue: nil
+            forName: .mailPointersMoved, object: nil, queue: nil
         ) { notification in
-            guard let records = notification.object as? [HeaderRekeyRecord] else { return }
-            published.withLock { $0.append(contentsOf: records) }
+            guard let moves = MailPointerMoves.posted(in: notification) else { return }
+            published.withLock { $0.append(contentsOf: moves.moves) }
         }
         defer { NotificationCenter.default.removeObserver(token) }
 
@@ -1140,16 +1143,82 @@ struct RunSyncUIDRemapFtsRekeyTests {
         _ = await SyncEngine().listFolder(folder, provider: provider, limit: 50)
 
         let records = published.withLock { $0 }
-        #expect(records == [HeaderRekeyRecord(
+        let remap = HeaderRekeyRecord(
             oldHeaderId: "notify-account:INBOX:301",
             newHeaderId: "notify-account:INBOX:302",
             newProviderMessageId: "302",
-            carriesProviderAuthority: false)])
+            carriesProviderAuthority: false,
+            stableIds: StableIds(
+                accountId: "notify-account",
+                old: "<sync-ui-rekey@example.com>", new: "<sync-ui-rekey@example.com>"))
+        #expect(records == [.row(remap)])
         let migrated = try await pool.read {
             try MessageHeader.fetchOne($0, key: "notify-account:INBOX:302")
         }
         #expect(migrated?.actionTag == .reply)
         #expect(migrated?.summaryBlurb == "AI result survives the key change")
+    }
+
+    /// The sync's re-key also reaches what holds the email outside its row: the
+    /// number the model was given for the email names the new row, and the
+    /// email's saved chat names the new row too (its stable id, the
+    /// Message-ID, did not change, so its session stays).
+    @Test("A committed UID remap moves the model's id for the email and its saved chat")
+    func remapMovesTheModelIdAndTheSavedChat() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: dir.appendingPathComponent("t.sqlite").path)
+        let appDB = try AppDatabase(dbPool: pool)
+        let previous = AppDatabase.shared.withLock { current -> AppDatabase? in
+            let prior = current
+            current = appDB
+            return prior
+        }
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let accountId = "chat-follow-\(UUID().uuidString.prefix(8).lowercased())"
+        let oldId = MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: "401")
+        let newId = MessageIdentity.headerId(accountId: accountId, folderPath: "INBOX", messageId: "402")
+        let rfc = "<sync-chat-rekey@example.com>"
+        let date = Date()
+        let (folder, session) = try await pool.write { db -> (Folder, String) in
+            var account = Account(emailAddress: "chat-follow@example.com", displayName: "Test", provider: .imap)
+            account.id = accountId
+            try account.insert(db)
+            let folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            try folder.insert(db)
+            var header = MessageHeader(
+                messageId: "401", subject: "Chat about this", from: "sender@example.com",
+                fromAddress: "sender@example.com", to: "chat-follow@example.com", date: date,
+                snippet: "Body", folderId: folder.id, accountId: accountId, folderPath: folder.path,
+                isInInbox: true)
+            header.rfc822MessageId = rfc
+            header.headerComplete = true
+            try header.insert(db)
+            let session = SavedChatFixture.sessionId(accountId: accountId, stableId: header.stableId)
+            try SavedChatFixture.insert(tag: "sync-follow", sessionId: session, namingHeaderId: oldId, db: db)
+            return (folder, session)
+        }
+        let numericId = await ChatIdTranslator.shared.toNumericId(oldId)
+
+        let provider = MockEmailProvider(staleWindowMode: .uid)
+        await provider.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "402", rfc822MessageId: rfc, subject: "Chat about this", date: date)
+        ])
+        _ = await SyncEngine().listFolder(folder, provider: provider, limit: 50)
+        // The stores outside the database follow in posting order on their lane.
+        await MailPointerMoves.outsideStoresSettledForTesting()
+
+        let stored = try await pool.read { try MessageHeader.fetchOne($0, key: newId) }
+        #expect(stored != nil, "precondition: the sync re-keyed the row")
+        let realId = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(realId == newId)
+        let chat = try await pool.read { try SavedChatFixture.read(tag: "sync-follow", db: $0) }
+        let chatFollowed = SavedChatFixture.expected(sessionId: session, namingHeaderId: newId)
+        #expect(chat == chatFollowed)
     }
 
     @Test("Date-window RFC repair does not publish an actionable active-view mapping")
@@ -1499,6 +1568,201 @@ struct RunSyncDedupReclaimFtsRoutingTests {
                 """)
         #expect(!result.ftsRekeys.contains { $0.oldId == droppedIds[0] },
                 "and the deleted duplicate must not be re-keyed onto the survivor's address")
+    }
+
+    /// The reclaim gives the row a new key on a match by account and message
+    /// id, not a folder-native proof: it is reported for views and chats to
+    /// follow, with no provider authority, and the email's saved chat names the
+    /// new row once the listing's write commits.
+    @Test("A pre-sync reclaim reports its move without provider authority, and the saved chat follows")
+    func preSyncReclaimMovesTheSavedChat() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "reclaim-chat@example.com"
+        let driftedId = MessageIdentity.headerId(accountId: "racc", folderPath: "NSE-A", messageId: "42")
+        let canonicalId = MessageIdentity.headerId(accountId: "racc", folderPath: "INBOX", messageId: "42")
+        let drifted = try await pool.write { db -> MessageHeader in
+            var acc = Account(emailAddress: "r@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            try Folder(name: "NSE-A", path: "NSE-A", role: .custom, accountId: "racc").insert(db)
+            let row = try Self.insertHeader(
+                db, messageId: "42", folderPath: "NSE-A", folderId: "racc:NSE-A",
+                rfc822: rfc, isInInbox: true)
+            try SavedChatFixture.insert(
+                tag: "reclaim", sessionId: SavedChatFixture.sessionId(accountId: "racc", stableId: row.stableId),
+                namingHeaderId: driftedId, db: db)
+            return row
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:INBOX")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        let found = try await pool.read { try MessageHeader.fetchOne($0, key: canonicalId) }
+        let reclaimed = try #require(found, "precondition: the reclaim produced the canonical inbox row")
+        let move = HeaderRekeyRecord(
+            oldHeaderId: driftedId, newHeaderId: canonicalId, newProviderMessageId: "42",
+            newObservedUidValidity: reclaimed.observedUidValidity, carriesProviderAuthority: false,
+            stableIds: StableIds(from: drifted, to: reclaimed))
+        #expect(result.headerRekeys == [move])
+        let chat = try await pool.read { try SavedChatFixture.read(tag: "reclaim", db: $0) }
+        let chatFollowed = SavedChatFixture.expected(
+            sessionId: SavedChatFixture.sessionId(accountId: "racc", stableId: reclaimed.stableId),
+            namingHeaderId: canonicalId)
+        #expect(chat == chatFollowed)
+    }
+
+    /// The reclaim deletes the old row, and its `messageUserLabel` rows cascade
+    /// with it. A label the user put on the message is not in the listing until
+    /// its op drains, so the new row takes the old row's labels.
+    @Test("A pre-sync reclaim keeps the reclaimed row's user labels on the new row")
+    func preSyncReclaimKeepsTheUserLabels() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "reclaim-labels@example.com"
+        let driftedId = MessageIdentity.headerId(accountId: "racc", folderPath: "NSE-A", messageId: "42")
+        let canonicalId = MessageIdentity.headerId(accountId: "racc", folderPath: "INBOX", messageId: "42")
+        let label = UserLabel(accountId: "racc", providerLabelId: "keep", name: "Keep", isSystem: false)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "r@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            try Folder(name: "NSE-A", path: "NSE-A", role: .custom, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "42", folderPath: "NSE-A", folderId: "racc:NSE-A",
+                rfc822: rfc, isInInbox: true)
+            try label.insert(db)
+            try MessageUserLabel(messageId: driftedId, userLabelId: label.id).insert(db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:INBOX")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        #expect(result.headerRekeys.map(\.oldHeaderId) == [driftedId],
+                "precondition: the reclaim moved the drifted row")
+        let labelsByRow = try await pool.read { db in
+            try MessageUserLabel.fetchAll(db).map { "\($0.messageId) \($0.userLabelId)" }
+        }
+        #expect(labelsByRow == ["\(canonicalId) \(label.id)"])
+    }
+
+    /// The placeholder dedup's collision leg: the server's copy already occupies
+    /// its id, so the placeholder is deleted and nothing is inserted. The label
+    /// the user put on the placeholder goes to the copy, as on the insert leg,
+    /// and the placeholder's move to the copy is reported for its views.
+    @Test("A collided placeholder dedup keeps the placeholder's user labels on the copy")
+    func draftDedupCollisionKeepsTheUserLabels() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "draft-collided-labels@example.com"
+        let placeholderId = MessageIdentity.headerId(
+            accountId: "racc", folderPath: "Drafts", messageId: "draft-local-1")
+        let copyId = MessageIdentity.headerId(accountId: "racc", folderPath: "Drafts", messageId: "42")
+        let label = UserLabel(accountId: "racc", providerLabelId: "keep", name: "Keep", isSystem: false)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "d@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "Drafts", path: "Drafts", role: .drafts, accountId: "racc").insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "draft-local-1", folderPath: "Drafts",
+                folderId: "racc:Drafts", rfc822: rfc, isInInbox: false)
+            // The row at the copy's id is filed under another folder, so the
+            // listing's existence check misses it and the dedup's own read finds
+            // it (the collision leg's reachable shape, as in
+            // `draftDedupCollisionRoutesTheOldIdToStaleIds`).
+            _ = try Self.insertHeader(
+                db, messageId: "42", folderPath: "Drafts", folderId: "racc:INBOX",
+                rfc822: "someone-else@example.com", isInInbox: false)
+            try label.insert(db)
+            try MessageUserLabel(messageId: placeholderId, userLabelId: label.id).insert(db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:Drafts")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        let placeholderLeft = try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) }
+        #expect(placeholderLeft == nil, "precondition: the collision leg deleted the placeholder")
+        let labelsByRow = try await pool.read { db in
+            try MessageUserLabel.fetchAll(db).map { "\($0.messageId) \($0.userLabelId)" }
+        }
+        #expect(labelsByRow == ["\(copyId) \(label.id)"])
+        // A view holding the placeholder is told it now lives at the copy.
+        let moved = result.headerRekeys.map { "\($0.oldHeaderId) -> \($0.newHeaderId)" }
+        #expect(moved == ["\(placeholderId) -> \(copyId)"])
+    }
+
+    /// A Gmail row an optimistic move left keyed by its old folder is re-keyed
+    /// to its canonical key when its folder is listed. That re-key is reported
+    /// for views and chats with no provider authority (a hidden or fading row
+    /// stays as it was), and the email's saved chat names the new row once the
+    /// listing's write commits.
+    @Test("A listing's canonical re-key reports its move without provider authority, and the saved chat follows")
+    func canonicalRekeyMovesTheSavedChat() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let remnantId = MessageIdentity.headerId(accountId: "racc", folderPath: "INBOX", messageId: "g40")
+        let canonicalId = MessageIdentity.headerId(accountId: "racc", folderPath: "TRASH", messageId: "g40")
+        try await pool.write { db in
+            var acc = Account(emailAddress: "r@example.com", displayName: "T", provider: .gmail)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            try Folder(name: "Trash", path: "TRASH", role: .trash, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "g40", folderPath: "INBOX", folderId: "racc:INBOX",
+                rfc822: "canonical-chat@example.com", isInInbox: true)
+            // The optimistic move: shown in Trash, still keyed by its Inbox address.
+            try db.execute(
+                sql: "UPDATE messageHeader SET folderId = ?, folderPath = ?, isInInbox = 0 WHERE id = ?",
+                arguments: ["racc:TRASH", "TRASH", remnantId])
+            try SavedChatFixture.insert(
+                tag: "canonical", sessionId: SavedChatFixture.sessionId(accountId: "racc", stableId: "g40"),
+                namingHeaderId: remnantId, db: db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:TRASH")! }
+        let mock = MockEmailProvider(staleWindowMode: .date)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(
+                messageId: "g40", rfc822MessageId: "canonical-chat@example.com",
+                subject: "fixture", date: Self.syncDate)
+        ])
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        let ids = try await pool.read { db in
+            try MessageHeader.filter(Column("messageId") == "g40").fetchAll(db).map(\.id)
+        }
+        #expect(ids == [canonicalId], "precondition: the listing re-keyed the row")
+        let move = HeaderRekeyRecord(
+            oldHeaderId: remnantId, newHeaderId: canonicalId, newProviderMessageId: "g40",
+            carriesProviderAuthority: false,
+            stableIds: StableIds(accountId: "racc", old: "g40", new: "g40"))
+        #expect(result.headerRekeys == [move])
+        let chat = try await pool.read { try SavedChatFixture.read(tag: "canonical", db: $0) }
+        let chatFollowed = SavedChatFixture.expected(
+            sessionId: SavedChatFixture.sessionId(accountId: "racc", stableId: "g40"),
+            namingHeaderId: canonicalId)
+        #expect(chat == chatFollowed)
     }
 
     /// IOS-PERF-012 group 1 — this probe is destructive: the selected row is

@@ -1201,11 +1201,12 @@ actor BackfillBodyQueue {
             accountId: item.accountId, folderPath: item.folderPath, messageId: newUID
         )
         let outcome: RekeyOutcome
+        let move: HeaderRekeyRecord?
         do {
-            outcome = try await dbPool.write { db -> RekeyOutcome in
+            let written = try await dbPool.write { db -> (RekeyOutcome, HeaderRekeyRecord?) in
                 guard let header = try MessageHeader.fetchOne(db, key: item.headerId) else {
                     // Row already gone (raced with sync/prune) — nothing to migrate.
-                    return .duplicateDropped
+                    return (.duplicateDropped, nil)
                 }
                 var migrated = header
                 migrated.id = newHeaderId
@@ -1242,14 +1243,29 @@ actor BackfillBodyQueue {
                 // survivor. That collision return is exactly `.duplicateDropped`.
                 guard try MessageHeaderRekey.apply(from: header, to: migrated, db: db) else {
                     // The new UID was independently backfilled — old row was a duplicate.
-                    return .duplicateDropped
+                    // As in the sync's UID remap, only a placeholder is followed to
+                    // the copy that already lives at the new id.
+                    let move = SyncEngine.placeholderReplacement(of: header, by: migrated)
+                    if let move { try ChatStore.followRekeyedEmails([move], db: db) }
+                    return (.duplicateDropped, move)
                 }
-                return .migrated(Item(
+                // A view or chat holding the row follows it, with no provider
+                // authority: the same weak mapping the sync's UID remap
+                // publishes. Its saved chats move in this write.
+                let move = HeaderRekeyRecord(
+                    oldHeaderId: item.headerId, newHeaderId: newHeaderId,
+                    newProviderMessageId: newUID,
+                    carriesProviderAuthority: false,
+                    stableIds: StableIds(from: header, to: migrated))
+                try ChatStore.followRekeyedEmails([move], db: db)
+                return (.migrated(Item(
                     headerId: newHeaderId, accountId: item.accountId,
                     folderPath: item.folderPath, messageId: newUID,
                     isInInbox: item.isInInbox
-                ))
+                )), move)
             }
+            outcome = written.0
+            move = written.1
         } catch {
             if !error.isDatabaseSuspensionAbort {
                 BackgroundSyncLogger.logDebug("[BackfillBody] UID remap re-key failed for \(item.messageId)→\(newUID): \(error)")
@@ -1257,6 +1273,9 @@ actor BackfillBodyQueue {
             }
             return .failed
         }
+        // Open views follow the committed re-key; nothing here waits on the
+        // stores outside the main database.
+        await MailPointerMoves.publishRekeys(move.map { [$0] } ?? [])
         // Move the FTS entry to the new id IN PLACE. rekeyHeaders' collision
         // branch drops the old entry when the new id is already indexed — which
         // is exactly the duplicateDropped case.

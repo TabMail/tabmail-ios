@@ -5,7 +5,22 @@
 import Testing
 import Foundation
 import GRDB
+import Observation
+import Synchronization
 @testable import TabMail
+
+private enum Config {
+    /// Main-actor turns a test yields while it waits for the list's deferred
+    /// eviction; the wait ends as soon as the eviction has run.
+    static let evictionSettleYields = 100
+}
+
+/// Set once by an observation `onChange`, read by the test afterwards.
+private final class ChangeFlag: Sendable {
+    private let fired = Mutex(false)
+    func set() { fired.withLock { $0 = true } }
+    var value: Bool { fired.withLock { $0 } }
+}
 
 /// Regression test for commit 00cbdb8: `insertUndoneMessages` must apply the
 /// optimistic overlay before the folder-membership guard.
@@ -69,15 +84,16 @@ struct InboxViewModelInsertUndoneTests {
         messageId: String,
         folderId: String,
         folderPath: String,
-        isInInbox: Bool
+        isInInbox: Bool,
+        subject: String = "Test"
     ) throws -> String {
         var header = MessageHeader(
             messageId: messageId,
-            subject: "Test",
+            subject: subject,
             from: "sender@example.com",
             fromAddress: "sender@example.com",
             to: "me@example.com",
-            date: Date(timeIntervalSince1970: 1_800_000_000),
+            date: Date(),
             snippet: "body",
             folderId: folderId,
             accountId: "acc1",
@@ -274,6 +290,247 @@ struct InboxViewModelInsertUndoneTests {
         #expect(!vm.loadedMessages.contains(where: { $0.id == id }))
     }
 
+    /// The list's rows as "id subject", in list order.
+    @MainActor
+    private func rows(_ vm: InboxViewModel) -> [String] {
+        vm.loadedMessages.map { "\($0.id) \($0.subject)" }
+    }
+
+    /// The ids of every member of every displayed group.
+    @MainActor
+    private func groupMemberIds(_ vm: InboxViewModel) -> [String] {
+        vm.displayGroups.flatMap { $0.members.map(\.id) }
+    }
+
+    private func move(_ from: String, _ to: String) -> MailPointerMove {
+        .row(HeaderRekeyRecord(oldHeaderId: from, newHeaderId: to, newProviderMessageId: to))
+    }
+
+    /// Whether the list or its groups were written while `body` ran.
+    /// Observation calls `onChange` synchronously on the actor that writes.
+    @MainActor
+    private func listWritten(_ vm: InboxViewModel, during body: () -> Void) -> Bool {
+        let flag = ChangeFlag()
+        withObservationTracking {
+            _ = vm.loadedMessages
+            _ = vm.displayGroups
+        } onChange: {
+            flag.set()
+        }
+        body()
+        return flag.value
+    }
+
+    /// A post that names no row the list holds leaves the list and its groups
+    /// unwritten: any write to them re-renders the inbox, also mid-gesture. A
+    /// post that names a shown row does write them.
+    @Test("A post naming no shown row leaves the list and its groups unwritten")
+    @MainActor func postNamingNoShownRowLeavesTheListUnwritten() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        let shownId = try insertHeader(
+            pool, messageId: "601", folderId: inbox.id, folderPath: inbox.path, isInInbox: true)
+        let notShownId = MessageIdentity.headerId(accountId: "acc1", folderPath: inbox.path, messageId: "602")
+        let elsewhereId = MessageIdentity.headerId(accountId: "acc1", folderPath: inbox.path, messageId: "603")
+        let vm = InboxViewModel(folders: [inbox])
+        let before = rows(vm)
+        #expect(before == ["\(shownId) Test"], "setup: the list shows the row")
+
+        let unrelated = MailPointerMoves([
+            move(notShownId, elsewhereId),
+            .sent(outboxId: "outbox-1", copyHeaderId: elsewhereId),
+        ])
+        let writtenByUnrelated = listWritten(vm) { vm.applyHeaderRekeys(unrelated) }
+        #expect(!writtenByUnrelated)
+        let afterUnrelated = rows(vm)
+        #expect(afterUnrelated == before)
+
+        let writtenByRename = listWritten(vm) {
+            vm.applyHeaderRekeys(MailPointerMoves([move(shownId, elsewhereId)]))
+        }
+        #expect(writtenByRename, "control: a post naming a shown row writes the list")
+    }
+
+    /// A move whose new id is a row the list already shows (the server's copy
+    /// stored before its placeholder went) leaves that row once: the list never
+    /// holds one id twice. The shown copy stays as it was, where it was, and
+    /// the groups follow.
+    @Test("A move onto a row the list already shows leaves one row with that id")
+    @MainActor func moveOntoAShownRowLeavesOneRow() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        let movedId = try insertHeader(
+            pool, messageId: "201", folderId: inbox.id, folderPath: inbox.path, isInInbox: true,
+            subject: "Placeholder")
+        let shownId = try insertHeader(
+            pool, messageId: "202", folderId: inbox.id, folderPath: inbox.path, isInInbox: true,
+            subject: "Server copy")
+        let vm = InboxViewModel(folders: [inbox])
+        let before = rows(vm)
+        #expect(before.sorted() == ["\(movedId) Placeholder", "\(shownId) Server copy"].sorted(),
+                "setup: the list shows both rows")
+
+        vm.applyHeaderRekeys(MailPointerMoves([move(movedId, shownId)]))
+
+        let expected = before.filter { $0 != "\(movedId) Placeholder" }
+        let after = rows(vm)
+        #expect(after == expected)
+        let members = groupMemberIds(vm)
+        let membersWithShownId = members.filter { $0 == shownId }.count
+        #expect(membersWithShownId == 1)
+        #expect(!members.contains(movedId))
+    }
+
+    /// The rows a move would collide with are the ones the list holds, not the
+    /// ids it has loaded: a row evicted from the list keeps its id in the
+    /// loaded set, and a move onto that id renames the moved row.
+    @Test("A move onto an evicted row's id renames the moved row")
+    @MainActor func moveOntoAnEvictedRowRenamesTheRow() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        let maxLoaded = SyncConfig.maxLoadedMessages
+        let rowCount = maxLoaded + SyncConfig.inboxPageSize
+        let now = Date()
+        try await pool.write { db in
+            for n in 0..<rowCount {
+                var header = MessageHeader(
+                    messageId: "\(1000 + n)", subject: "Row \(n)",
+                    from: "sender@example.com", fromAddress: "sender@example.com",
+                    to: "me@example.com", date: now.addingTimeInterval(-Double(n) * 60),
+                    snippet: "body", folderId: inbox.id, accountId: "acc1",
+                    folderPath: inbox.path, isInInbox: true)
+                header.headerComplete = true
+                try header.insert(db)
+            }
+        }
+        let vm = InboxViewModel(folders: [inbox])
+        while vm.loadedMessages.count < rowCount, vm.hasMoreMessages {
+            let loaded = vm.loadedMessages.count
+            vm.loadMoreMessages()
+            if vm.loadedMessages.count == loaded { break }
+        }
+        let loadedCount = vm.loadedMessages.count
+        #expect(loadedCount == rowCount, "setup: every page is loaded before the eviction runs")
+        // The eviction trims the newest rows on a later main-actor turn.
+        let evicted = try #require(vm.loadedMessages.first)
+        let moved = try #require(vm.loadedMessages.last)
+        for _ in 0..<Config.evictionSettleYields where vm.loadedMessages.count > maxLoaded {
+            await Task.yield()
+        }
+        let evictedStillShown = vm.loadedMessages.contains { $0.id == evicted.id }
+        #expect(!evictedStillShown, "setup: the eviction removed the newest row")
+        let countBefore = vm.loadedMessages.count
+
+        vm.applyHeaderRekeys(MailPointerMoves([move(moved.id, evicted.id)]))
+
+        let renamed = vm.loadedMessages.filter { $0.id == evicted.id }.map(\.subject)
+        #expect(renamed == [moved.subject])
+        let movedStillShown = vm.loadedMessages.contains { $0.id == moved.id }
+        #expect(!movedStillShown)
+        let countAfter = vm.loadedMessages.count
+        #expect(countAfter == countBefore)
+    }
+
+    /// A move that names its own id keeps the row.
+    @Test("A move onto its own id keeps the row")
+    @MainActor func moveOntoItsOwnIdKeepsTheRow() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        let id = try insertHeader(
+            pool, messageId: "301", folderId: inbox.id, folderPath: inbox.path, isInInbox: true)
+        let vm = InboxViewModel(folders: [inbox])
+        let before = rows(vm)
+        #expect(before == ["\(id) Test"], "setup: the list shows the row")
+
+        vm.applyHeaderRekeys(MailPointerMoves([move(id, id)]))
+
+        let after = rows(vm)
+        #expect(after == before)
+        let members = groupMemberIds(vm)
+        #expect(members == [id])
+    }
+
+    /// Two moves of one post onto one id the list does not show: the first
+    /// row in the list takes the id, the other is dropped.
+    @Test("Two moves of one post onto one new id leave one row with that id")
+    @MainActor func twoMovesOntoOneIdLeaveOneRow() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        let firstId = try insertHeader(
+            pool, messageId: "401", folderId: inbox.id, folderPath: inbox.path, isInInbox: true,
+            subject: "First")
+        let secondId = try insertHeader(
+            pool, messageId: "402", folderId: inbox.id, folderPath: inbox.path, isInInbox: true,
+            subject: "Second")
+        let newId = MessageIdentity.headerId(accountId: "acc1", folderPath: inbox.path, messageId: "403")
+        let vm = InboxViewModel(folders: [inbox])
+        let before = vm.loadedMessages.map(\.id)
+        #expect(before.sorted() == [firstId, secondId].sorted(), "setup: the list shows both rows")
+        let leading = try #require(vm.loadedMessages.first)
+
+        vm.applyHeaderRekeys(MailPointerMoves([move(firstId, newId), move(secondId, newId)]))
+
+        let after = rows(vm)
+        #expect(after == ["\(newId) \(leading.subject)"])
+        let members = groupMemberIds(vm)
+        #expect(members == [newId])
+    }
+
+    /// A post that moves one shown row onto another while that one moves on
+    /// keeps both emails: each takes its new id.
+    @Test("A chain of moves in one post keeps every email")
+    @MainActor func chainOfMovesInOnePostKeepsEveryEmail() async throws {
+        let (pool, inbox, _, dir, previous) = try makeTestDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+            clearOverlay()
+        }
+        clearOverlay()
+        let firstId = try insertHeader(
+            pool, messageId: "501", folderId: inbox.id, folderPath: inbox.path, isInInbox: true,
+            subject: "First")
+        let secondId = try insertHeader(
+            pool, messageId: "502", folderId: inbox.id, folderPath: inbox.path, isInInbox: true,
+            subject: "Second")
+        let lastId = MessageIdentity.headerId(accountId: "acc1", folderPath: inbox.path, messageId: "503")
+        let vm = InboxViewModel(folders: [inbox])
+        let before = vm.loadedMessages.map(\.id)
+        #expect(before.sorted() == [firstId, secondId].sorted(), "setup: the list shows both rows")
+
+        vm.applyHeaderRekeys(MailPointerMoves([move(firstId, secondId), move(secondId, lastId)]))
+
+        let after = rows(vm).sorted()
+        #expect(after == ["\(secondId) First", "\(lastId) Second"].sorted())
+        let members = groupMemberIds(vm).sorted()
+        #expect(members == [secondId, lastId].sorted())
+    }
+
     @Test("Provider re-key immediately updates the visible row and dismissed identity")
     @MainActor func providerRekeyKeepsVisibleRowActionable() async throws {
         let (pool, inbox, _, dir, previous) = try makeTestDB()
@@ -314,7 +571,7 @@ struct InboxViewModelInsertUndoneTests {
 
         #expect(vm.lookupMessage(oldId)?.id == newId,
                 "the provider handoff must be visible before slower mirror publication")
-        vm.applyHeaderRekeys([record])
+        vm.applyHeaderRekeys(MailPointerMoves([.row(record)]))
 
         #expect(!vm.loadedMessages.contains { $0.id == oldId })
         #expect(vm.loadedMessages.contains {
@@ -322,7 +579,12 @@ struct InboxViewModelInsertUndoneTests {
         })
         #expect(vm.lookupMessage(newId)?.id == newId,
                 "a second Delete now resolves the provider-proven row immediately")
-        #expect(InboxViewModel.rekeyedHeaderIDs([oldId, "unrelated"], using: [record])
+        // The list knows the row as loaded under its new id: an undo insert
+        // of that id adds no second row.
+        vm.insertUndoneMessages([newId])
+        let rowsWithNewId = vm.loadedMessages.filter { $0.id == newId }.count
+        #expect(rowsWithNewId == 1)
+        #expect(MailPointerMoves([.row(record)]).following(headers: [oldId, "unrelated"])
             == [newId, "unrelated"],
             "dismissed/fading sets must follow the same key so hidden moves stay hidden")
     }
@@ -339,19 +601,16 @@ struct InboxViewModelInsertUndoneTests {
         var dismissed: Set<String> = [oldId]
         var fading: Set<String> = [oldId]
         var selected: String? = oldId
-        var pushed: String? = oldId
 
         HeaderRekeyReceiver.apply(
-            [record],
+            MailPointerMoves([.row(record)]),
             dismissedMessages: &dismissed,
             swipeFadingMessages: &fading,
-            selectedMessageId: &selected,
-            pushedMessageId: &pushed)
+            selectedMessageId: &selected)
 
         #expect(dismissed == [oldId])
         #expect(fading == [oldId])
         #expect(selected == newId)
-        #expect(pushed == newId)
     }
 
     @Test("Provider-proven re-key carries action and navigation state")
@@ -365,18 +624,15 @@ struct InboxViewModelInsertUndoneTests {
         var dismissed: Set<String> = [oldId]
         var fading: Set<String> = [oldId]
         var selected: String? = oldId
-        var pushed: String? = oldId
 
         HeaderRekeyReceiver.apply(
-            [record],
+            MailPointerMoves([.row(record)]),
             dismissedMessages: &dismissed,
             swipeFadingMessages: &fading,
-            selectedMessageId: &selected,
-            pushedMessageId: &pushed)
+            selectedMessageId: &selected)
 
         #expect(dismissed == [newId])
         #expect(fading == [newId])
         #expect(selected == newId)
-        #expect(pushed == newId)
     }
 }

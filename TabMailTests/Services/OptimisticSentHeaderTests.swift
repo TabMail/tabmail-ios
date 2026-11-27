@@ -2052,4 +2052,158 @@ struct OptimisticSentProductionProbeTests {
         #expect(state.outbox == nil,
                 "provider-send success remains finalizable despite the non-fatal local probe failure")
     }
+
+    // MARK: - The send's filing is announced before its outbox row goes
+
+    /// One `.sent` move posted for a send, and whether its outbox row still
+    /// existed when it was posted.
+    struct Filing: Equatable, Sendable {
+        let copyHeaderId: String?
+        let outboxRowExisted: Bool
+    }
+
+    /// The `.sent` moves posted for `outboxId` while `body` runs. A view that
+    /// holds the send (a chat bubble) tells a finished send from an undone one
+    /// by this post, so it must come while the outbox row still exists.
+    private func filings(
+        of outboxId: String, pool: DatabasePool, during body: () async -> Void
+    ) async -> [Filing] {
+        let filings = Mutex<[Filing]>([])
+        let token = NotificationCenter.default.addObserver(
+            forName: .mailPointersMoved, object: nil, queue: nil
+        ) { notification in
+            guard let moves = MailPointerMoves.posted(in: notification),
+                  case .sent(_, let copyHeaderId)? = moves.move(for: .outbox(outboxId)) else { return }
+            let rowExisted = (try? pool.read { db in
+                try OutboxMessage.fetchOne(db, key: outboxId) != nil
+            }) ?? false
+            filings.withLock { $0.append(Filing(copyHeaderId: copyHeaderId, outboxRowExisted: rowExisted)) }
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+        await body()
+        return filings.withLock { $0 }
+    }
+
+    @Test("a finished send is announced as its Sent copy before its outbox row is deleted",
+          arguments: [true, false])
+    func finishedSendIsAnnouncedFirst(copyRead: Bool) async throws {
+        let accountId = "filed-\(copyRead)"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<filed-\(copyRead)@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId, outboxId: "outbox-filed-\(copyRead)", messageId: messageId)
+        let provider = MockEmailProvider()
+        if copyRead {
+            await provider.setSendResult(SentCopyIdentity(providerMessageId: "gm-filed", threadId: nil))
+            await provider.setFetchMessageHeadersResult([Self.listedCopy(
+                accountId: accountId, id: "gm-filed", threadId: nil, providerDate: Self.providerOrderDate())])
+        }
+
+        let posted = await filings(of: claimed.id, pool: fixture.pool) {
+            await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+        }
+
+        let rowId = "\(accountId):Sent:" + (copyRead ? "gm-filed" : "sent-\(claimed.id)")
+        #expect(posted == [Filing(copyHeaderId: rowId, outboxRowExisted: true)])
+        let outbox = try await fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: claimed.id) }
+        #expect(outbox == nil, "precondition: the send finished and its row was deleted")
+    }
+
+    @Test("a send whose copy the sync stored first is announced as that copy")
+    func syncFirstCopyIsAnnounced() async throws {
+        let accountId = "filed-sync-first"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<filed-sync-first@example.com>"
+        try await fixture.pool.write { db in
+            var synced = MessageHeader(
+                messageId: "server-copy", subject: "Already present", from: "Sender",
+                fromAddress: "\(accountId)@example.com", to: "recipient@example.com",
+                date: Date(), snippet: "from the sync", folderId: "\(accountId):Sent",
+                accountId: accountId, folderPath: "Sent", isInInbox: false)
+            synced.rfc822MessageId = EmailFilter.normalizeMessageId(messageId)
+            try synced.insert(db)
+        }
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId, outboxId: "outbox-filed-sync-first", messageId: messageId)
+
+        let posted = await filings(of: claimed.id, pool: fixture.pool) {
+            await send(claimed, messageId: messageId, accountId: accountId, provider: MockEmailProvider())
+        }
+
+        #expect(posted == [Filing(copyHeaderId: "\(accountId):Sent:server-copy", outboxRowExisted: true)])
+    }
+
+    enum NoCopy: String, CaseIterable, Sendable {
+        /// The account has no Sent folder.
+        case noSentFolder
+        /// The copy's write failed (its existence probe throws).
+        case writeFailed
+    }
+
+    @Test("a send that wrote no Sent copy is announced as filed with no copy, before its row goes",
+          arguments: NoCopy.allCases)
+    func sendWithNoCopyIsAnnounced(_ reason: NoCopy) async throws {
+        let accountId = "filed-none-\(reason.rawValue)"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<filed-none-\(reason.rawValue)@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId,
+            outboxId: "outbox-filed-none-\(reason.rawValue)", messageId: messageId)
+        try await fixture.pool.write { db in
+            switch reason {
+            case .noSentFolder: _ = try Folder.deleteOne(db, key: "\(accountId):Sent")
+            case .writeFailed: try db.execute(sql: "DROP INDEX messageHeader_rfc822MessageId")
+            }
+        }
+
+        let posted = await filings(of: claimed.id, pool: fixture.pool) {
+            await send(claimed, messageId: messageId, accountId: accountId, provider: MockEmailProvider())
+        }
+
+        #expect(posted == [Filing(copyHeaderId: nil, outboxRowExisted: true)],
+                "a holder keeps the send as sent; without the post the delete looks like an Undo")
+    }
+
+    @Test("a send whose Sent append must be retried is announced once; its row stays for the retry")
+    func sendAwaitingItsAppendIsAnnouncedOnce() async throws {
+        let accountId = "filed-append-later"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<filed-append-later@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId, outboxId: "outbox-filed-append-later", messageId: messageId)
+        let provider = MockEmailProvider()
+        await provider.setAppendToSentResult(false)
+
+        let posted = await filings(of: claimed.id, pool: fixture.pool) {
+            await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+        }
+
+        #expect(posted == [Filing(copyHeaderId: "\(accountId):Sent:sent-\(claimed.id)", outboxRowExisted: true)])
+        let outbox = try await fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: claimed.id) }
+        #expect(outbox?.sentAt != nil, "precondition: the row waits, stamped, for the append retry")
+    }
+
+    @Test("a send the provider refused is not announced")
+    func refusedSendIsNotAnnounced() async throws {
+        let accountId = "filed-refused"
+        let fixture = try makePool(accountId: accountId)
+        defer { restore(fixture) }
+        let messageId = "<filed-refused@example.com>"
+        let claimed = try seedClaimedSend(
+            pool: fixture.pool, accountId: accountId, outboxId: "outbox-filed-refused", messageId: messageId)
+        let provider = MockEmailProvider()
+        await provider.setSendThrows(URLError(.notConnectedToInternet))
+
+        let posted = await filings(of: claimed.id, pool: fixture.pool) {
+            await send(claimed, messageId: messageId, accountId: accountId, provider: provider)
+        }
+
+        #expect(posted.isEmpty)
+        let outbox = try await fixture.pool.read { db in try OutboxMessage.fetchOne(db, key: claimed.id) }
+        #expect(outbox != nil, "precondition: the unsent row stays")
+    }
 }
