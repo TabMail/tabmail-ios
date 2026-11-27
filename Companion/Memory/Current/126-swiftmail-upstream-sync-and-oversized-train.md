@@ -133,7 +133,8 @@ Upstream commits pulled in: #236 (ENABLE/QRESYNC), #237 (Outlook `.msg`), #239, 
   `fromAddresses`/`toAddresses`/`ccAddresses`/`bccAddresses` are `[AddressListEntry]`
   (`.mailbox`, `.group`, `.invalid`). Owner decisions 2026-10-03:
   - Sender = first mailbox of `fromAddresses`; no valid mailbox → the raw From text as the name,
-    empty address (`IMAPFetchMapping.sender(from:)`, main app and NSE).
+    empty address (`IMAPFetchMapping.sender(from:)`, main app and NSE; since 2026-11-25
+    `EmailAddress.sender(of:)`, shared with Gmail and raw headers, ADR-IOS-120).
   - To/Cc/Bcc stored one entry per mailbox, groups flattened, invalid entries kept visible
     (`IMAPFetchMapping.addressField`); `isValidEmailAddress` requires `AddressListEntry` to read a
     `.mailbox`, so invalid entries are never offered for reply-all.

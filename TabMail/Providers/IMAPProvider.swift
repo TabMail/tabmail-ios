@@ -7976,7 +7976,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func mapMessageInfo(_ info: MessageInfo, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Shared with the NSE (`NSEIMAPConnection.mapInfoToMetadata`), so both
         // targets list a message under the same sender.
-        let from = IMAPFetchMapping.sender(from: info)
+        let from = EmailAddress.sender(of: info.fromAddresses)
             ?? EmailAddress(name: "Unknown", email: "")
         let fromName = from.name
         let fromAddr = from.email

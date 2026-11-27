@@ -33,28 +33,6 @@ enum IMAPFetchMapping {
 
     // MARK: - Addresses
 
-    /// The sender a message is listed under: the first mailbox of its From
-    /// field, by display name (its address when it has none). A From with no
-    /// valid mailbox is listed under its text with no address, so a malformed
-    /// sender still shows what the sender wrote. `nil` for a message with no From.
-    ///
-    /// Read from SwiftMail's structured `fromAddresses`, never by re-parsing the
-    /// `from` string: that string is RFC 5322 header text, quoted and escaped,
-    /// and joins every author of a multi-author From.
-    static func sender(from info: MessageInfo) -> EmailAddress? {
-        if let mailbox = info.fromAddresses.mailboxes.first {
-            return EmailAddress(name: mailbox.name ?? mailbox.address, email: mailbox.address)
-        }
-        let text = info.fromAddresses.compactMap { entry -> String? in
-            switch entry {
-                case .invalid(let text): return text
-                case .group(let name, _): return name
-                case .mailbox: return nil
-            }
-        }.joined(separator: ", ")
-        return text.isEmpty ? nil : EmailAddress(name: text, email: "")
-    }
-
     /// An address field as the entries TabMail stores, one per mailbox:
     /// `"Name" <address>` (see `mailboxText`), or the bare `address` when there
     /// is no name — the shape SwiftMail's `AddressParser` reads back. A group
