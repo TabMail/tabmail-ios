@@ -14,7 +14,9 @@ import Testing
 ///     without a Message-ID are never copies, whatever their provider ids.
 ///  3. An email is the user's own when it is from one of their addresses or sits in a Sent folder.
 ///  4. The next reply goes to the newest email's Reply All people, never the user; more than one
-///     other person makes a group.
+///     other person makes a group. An email that went only to the user's own addresses has those
+///     addresses as its people, each by its account's name, else the address, and the reply goes
+///     to them: the header's people are exactly who the reply goes to.
 ///  5. A time stamp goes above the first bubble and after every gap of at least the threshold.
 ///  6. The Unread line goes above the first email that was unread at open, once.
 ///  7. An email that left out someone already in the chat (on an earlier email) carries who it went
@@ -374,6 +376,86 @@ struct ChatThreadTests {
         guard group.items.count == 4 else { Issue.record("four bubbles"); return }
         #expect(group.items[1].repliedOnlyTo == ChatThread.OnlyTo(includesYou: true, people: []))
         #expect(group.items[2].repliedOnlyTo?.people.map(\.name) == ["Sam Lee"])
+    }
+
+    // MARK: - 8. The user's own addresses
+
+    /// The user's two accounts: one with a name, one without.
+    private static let home = Account(emailAddress: "me@example.com", displayName: "Robin Lee", provider: .gmail)
+    private static let work = Account(emailAddress: "Work@Example.com", displayName: " ", provider: .imap)
+
+    /// The chat the screen builds for `members`, and the envelope its Reply All sends with.
+    @MainActor
+    private static func screenChat(_ members: [MessageHeader]) -> (chat: ChatThread, envelope: ChatReplyCompose?) {
+        let context = ChatThreadContext(accounts: [home, work])
+        let chat = ChatThreadView.thread(members: members, context: context, unreadAtOpen: [], preferredId: nil)
+        return (chat, chat.newest.map { ChatReplyCompose.suggestionEnvelope(for: $0, accounts: context.accounts) })
+    }
+
+    /// From the user's named account.
+    private static func mine(_ uid: String, to: String, cc: String = "", minutesAgo: Double) -> MessageHeader {
+        header(uid, from: "Robin Lee", fromAddress: me, to: to, cc: cc, minutesAgo: minutesAgo, folder: "Sent")
+    }
+
+    @Test("An email that went only to the user's own addresses: they are its people, and the reply goes to them")
+    @MainActor
+    func ownAddressesOnly() {
+        // A forward from one of the user's accounts to the other, which has no name.
+        let forward = Self.mine("1", to: "work@example.com", minutesAgo: 5)
+        let (chat, envelope) = Self.screenChat([forward])
+        #expect(chat.replyPeople == [ChatThread.Person(address: "work@example.com", name: "work@example.com")],
+                "an account with no name shows its address: \(chat.replyPeople)")
+        #expect(ChatThread.headerTitle(chat.replyPeople) == "work@example.com")
+        #expect(chat.replyPeople.first?.initials == "W", "the letters of the part before the @, as for anyone with no name")
+        #expect(envelope?.to == ["work@example.com"] && envelope?.cc == [] && envelope?.isReplyAll == true,
+                "the reply goes to them: \(String(describing: envelope))")
+        #expect(!chat.isGroup, "the user alone is no group")
+
+        // A note to self, To the named account and Cc the other: by role, the account's name shown.
+        let note = Self.mine("2", to: "Me <me@example.com>", cc: "WORK@example.com", minutesAgo: 1)
+        let (noteChat, noteEnvelope) = Self.screenChat([note])
+        #expect(noteChat.replyPeople.map(\.name) == ["Robin Lee", "work@example.com"])
+        #expect(noteChat.replyPeople.first?.initials == "RL")
+        #expect(noteEnvelope?.to == ["me@example.com"] && noteEnvelope?.cc == ["work@example.com"])
+        #expect(!noteChat.isGroup, "two of the user's own addresses are still the user alone")
+    }
+
+    @Test("Anyone else on the reply: the user's own addresses stay hidden, as before")
+    @MainActor
+    func ownAddressesHiddenBesideOthers() {
+        let toBoth = Self.mine("1", to: "work@example.com, \(Self.sam)", minutesAgo: 5)
+        let (chat, envelope) = Self.screenChat([toBoth])
+        #expect(chat.replyPeople == [ChatThread.Person(address: "sam@example.com", name: "Sam Lee")])
+        #expect(envelope?.to == ["sam@example.com"] && envelope?.cc == [])
+
+        let incoming = Self.header("2", to: "work@example.com", cc: "me@example.com", minutesAgo: 1)
+        let (incomingChat, incomingEnvelope) = Self.screenChat([incoming])
+        #expect(incomingChat.replyPeople.map(\.address) == ["alex@example.com"], "the sender alone, never the user")
+        #expect(incomingEnvelope?.to == ["alex@example.com"] && incomingEnvelope?.cc == [])
+
+        // Sent only by Bcc: nobody in To or Cc, so nobody to show or to answer.
+        let bccOnly = Self.mine("3", to: "", minutesAgo: 1)
+        let (bccChat, bccEnvelope) = Self.screenChat([bccOnly])
+        #expect(bccChat.replyPeople.isEmpty && bccEnvelope?.to == [] && bccEnvelope?.cc == [])
+    }
+
+    @Test("The header's people are exactly who the chat's reply goes to")
+    @MainActor
+    func headerIsTheReply() {
+        let emails = [
+            Self.mine("1", to: "work@example.com", minutesAgo: 9),
+            Self.mine("2", to: "Me <me@example.com>", cc: "work@example.com", minutesAgo: 8),
+            Self.mine("3", to: "work@example.com, \(Self.sam)", cc: Self.priya, minutesAgo: 7),
+            Self.mine("4", to: "", minutesAgo: 6),
+            Self.header("5", to: "work@example.com", minutesAgo: 5),
+            Self.header("6", to: "me@example.com, \(Self.david)", cc: "\(Self.sam), work@example.com", minutesAgo: 4),
+        ]
+        for email in emails {
+            let (chat, envelope) = Self.screenChat([email])
+            let reply = (envelope?.to ?? []) + (envelope?.cc ?? [])
+            #expect(chat.replyPeople.map(\.address) == reply.map { $0.lowercased() },
+                    "email \(email.messageId): header \(chat.replyPeople.map(\.address)), reply \(reply)")
+        }
     }
 
     @Test("The user is one person, whichever of their addresses an email used")

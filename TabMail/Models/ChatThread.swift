@@ -14,9 +14,12 @@ struct ChatThread: Equatable {
         let name: String
 
         /// Up to two letters for the avatar: the first letters of the first two words of the name,
-        /// or of the address when there is no name.
+        /// or of the address when there is no name. A name that is the address itself (one of the
+        /// user's own addresses with no account name) reads its part before the @, as a person
+        /// with no name does.
         var initials: String {
-            let words = name.split(whereSeparator: { $0.isWhitespace || $0 == "." || $0 == "," })
+            let source = name == address ? ChatThread.fallbackName(address) : name
+            let words = source.split(whereSeparator: { $0.isWhitespace || $0 == "." || $0 == "," })
             let letters = words.prefix(2).compactMap { $0.first }
             let text = letters.isEmpty ? String(address.prefix(1)) : String(letters)
             return text.uppercased()
@@ -72,7 +75,8 @@ struct ChatThread: Equatable {
     }
 
     let items: [Item]
-    /// Who the next reply goes to: the newest email's Reply All set.
+    /// Who the next reply goes to, and who the header names: the newest email's Reply All set.
+    /// Never the user, except on an email that went only to their own addresses: those addresses.
     let replyPeople: [Person]
     /// More than one other person: bubbles carry the sender's avatar and name.
     let isGroup: Bool
@@ -81,9 +85,10 @@ struct ChatThread: Equatable {
 
     /// - Parameters:
     ///   - members: the opened email and the rest of its thread, in any order.
-    ///   - replyAddresses: an email's Reply All recipients (`buildReplyAllRecipients`), To then
-    ///     Cc; asked for the newest email.
+    ///   - replyAddresses: an email's Reply All recipients (`ChatReplyCompose.replyAllAudience`),
+    ///     To then Cc; asked for the newest email.
     ///   - ownAddresses: the user's addresses, lowercased.
+    ///   - ownNames: the account's name of each own address that has one, by lowercased address.
     ///   - draftFolderIds / sentFolderIds: folders whose emails are drafts (left out) or the
     ///     user's own.
     ///   - unreadAtOpen: emails that were unread when the chat opened (the Unread line).
@@ -92,6 +97,7 @@ struct ChatThread: Equatable {
         members: [MessageHeader],
         replyAddresses: (MessageHeader) -> [String],
         ownAddresses: Set<String>,
+        ownNames: [String: String] = [:],
         draftFolderIds: Set<String>,
         sentFolderIds: Set<String>,
         unreadAtOpen: Set<String>,
@@ -124,12 +130,21 @@ struct ChatThread: Equatable {
         }
 
         var seen = Set<String>()
-        let replyPeople = (items.last.map { replyAddresses($0.header) } ?? [])
+        let reply = (items.last.map { replyAddresses($0.header) } ?? [])
             .map { $0.lowercased() }
-            .filter { !ownAddresses.contains($0) && seen.insert($0).inserted }
-            .map { Person(address: $0, name: names[$0] ?? Self.fallbackName($0)) }
+            .filter { seen.insert($0).inserted }
+        let othersOnReply = reply.filter { !ownAddresses.contains($0) }
+        // The user is never among the people while anyone else is. An email that went only to
+        // their own addresses has them as its Reply All (`ChatReplyCompose.replyAllAudience`):
+        // shown as people, each by its account's name, else the address, so the header names who
+        // the reply goes to.
+        let replyPeople = (othersOnReply.isEmpty ? reply : othersOnReply).map { address in
+            ownAddresses.contains(address)
+                ? Person(address: address, name: ownNames[address] ?? address)
+                : Person(address: address, name: names[address] ?? Self.fallbackName(address))
+        }
 
-        var others = Set(replyPeople.map(\.address))
+        var others = Set(replyPeople.map(\.address)).subtracting(ownAddresses)
         for item in items where !item.isOwn { others.insert(item.sender.address) }
         let isGroup = others.count > 1
 
