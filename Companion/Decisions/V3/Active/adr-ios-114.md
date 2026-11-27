@@ -682,6 +682,24 @@ same AI result, kept as long as the email itself is shown.
    real card's Send, on the demo account so no request can reach a backend; Undo and send again),
    `ChatSendingBubbleTests.queueSendWritesTheTextVersionInHand`,
    `ComposeSuggestionPersistTests.sentTextVersionOnlyForTheWrittenBody`.
+   *Amended 2026-11-26 (a Sent copy under the provider's own Message-ID; main #1554 merged in):*
+   the send now writes its Sent row as the provider lists the copy it named (ADR-IOS-019 amendment
+   2026-11-26), and Gmail gives that copy a Message-ID of its own, so on Gmail the four reads keyed
+   by the row's `sentMessageId` missed the copy: the bubble never became `filed` and stayed beside
+   the email until the row's cleanup, a new email's chat never became its thread
+   (`ChatNewEmailSend`), and the Sent row showed "Summarizing" (the summary made at Send and the late
+   summary are under the send's Message-ID). The send records the pair before it writes the row,
+   only when the two differ (`SentCopyLink`, in memory for the run of the app: no column, table,
+   query or registry row), and the reads look under the copy's Message-ID: `ChatUnsentReply.fetch`
+   (`filed` and the end of the bubble), `ChatNewEmailSend.sentCopy`, and `SentEmailSummary.write`'s
+   waiting copies. The Sent row's restore reads the summary under the send's Message-ID
+   (`MessageAICache.restoreIfCached(from:)`) and saves the entry under the copy's, so the summary
+   lives with the email; the entry under the send's Message-ID is left to the orphaned-entry purge.
+   Accepted: after a relaunch the pairs are gone, so a send killed between its Sent row and its
+   cleanup keeps its bubble until the next drain removes the row (seconds after launch), as a send
+   whose copy could not be read does. Tests: `ChatSendingBubbleTests` (both copy shapes):
+   `summaryAtSendIsTheEmailsOwn`, `lateSummaryReachesTheSentCopy`, `sentReplyHandsOverToItsCopy`,
+   `newEmailFollowFindsItsCopy`.
    **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
    chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
    instead of the undo-send toast, which is not shown for it. Who offers a send's Undo

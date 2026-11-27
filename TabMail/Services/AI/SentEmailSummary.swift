@@ -165,15 +165,19 @@ enum SentEmailSummary {
                     reminderContent: summary.reminderContent,
                     summaryTextMessage: summary.textMessage,
                     db: db)
-                // A Sent copy that arrived before the summary returned takes it now.
+                // A Sent copy that arrived before the summary returned takes it now, under the
+                // Message-ID the copy carries (its provider's own, when it gave one: `SentCopyLink`).
                 var restored: [String] = []
+                let copyMessageId = SentCopyLink.copyMessageId(
+                    accountId: source.accountId, sentMessageId: source.messageId)
                 let waiting = try MessageHeader
                     .filter(Column("accountId") == source.accountId && Column("folderPath") == source.sentFolderPath)
-                    .filter(Column("rfc822MessageId") == source.messageId && Column("summaryBlurb") == nil)
+                    .filter(Column("rfc822MessageId") == copyMessageId && Column("summaryBlurb") == nil)
                     .fetchAll(db)
                 for var header in waiting {
                     try MessageAICache.restoreIfCached(
-                        into: &header, accountId: source.accountId, folderPath: source.sentFolderPath, db: db)
+                        into: &header, from: source.messageId,
+                        accountId: source.accountId, folderPath: source.sentFolderPath, db: db)
                     try header.update(db)
                     restored.append(header.id)
                 }

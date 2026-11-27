@@ -633,6 +633,49 @@ struct MessageAICachePersistenceTests {
         #expect(header.summaryBlurb == nil)
     }
 
+    @Test("restoreIfCached from another Message-ID restores that entry, keeps it under the header's Message-ID, and leaves the entry it read")
+    func restoreIfCachedFromAnotherMessageId() throws {
+        let db = try TestDatabase.make()
+        try TestDatabase.insertAccount(db)
+        try TestDatabase.insertFolder(db)
+
+        try db.write {
+            try MessageAICache.writeThrough(
+                accountId: "acc1",
+                folderPath: "INBOX",
+                rfc822MessageId: "sent@example.com",
+                summaryBlurb: "Cached blurb",
+                summaryTextMessage: "Cached text",
+                db: $0
+            )
+        }
+
+        var header = try TestDatabase.insertMessageHeader(
+            db,
+            messageId: "100",
+            rfc822MessageId: "copy@example.com"
+        )
+
+        try db.write {
+            try MessageAICache.restoreIfCached(
+                into: &header,
+                from: "sent@example.com",
+                accountId: "acc1",
+                folderPath: "INBOX",
+                db: $0
+            )
+        }
+
+        #expect(header.summaryBlurb == "Cached blurb")
+        #expect(header.summaryTextMessage == "Cached text")
+        let kept = try db.read { try MessageAICache.fetchOne($0, key: "acc1:INBOX:copy@example.com") }
+        #expect(kept?.rfc822MessageId == "copy@example.com")
+        #expect(kept?.summaryBlurb == "Cached blurb")
+        #expect(kept?.summaryTextMessage == "Cached text")
+        let read = try db.read { try MessageAICache.fetchOne($0, key: "acc1:INBOX:sent@example.com") }
+        #expect(read?.summaryBlurb == "Cached blurb")
+    }
+
     // MARK: - Filter by column
 
     @Test("Filter by rfc822MessageId column")

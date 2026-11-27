@@ -654,7 +654,8 @@ struct ChatFieldMessage: Equatable {
 /// and after a send it turns into this bubble.
 ///
 /// The hand-over to the sent email: once the provider takes the email the send stamps `sentAt`, then
-/// writes the optimistic Sent copy under the row's Message-ID. The chat's list of emails is not
+/// writes the optimistic Sent copy under the row's Message-ID, or under the one its provider gave the
+/// copy (Gmail; `SentCopyLink`), which is then the copy's Message-ID here. The chat's list of emails is not
 /// observed, so the row keeps its bubble until its Sent copy is one of the chat's emails; once the
 /// copy is in the database (`filed`) the chat reloads its emails, the copy's Message-ID joins
 /// `messageIds`, and the bubble ends (ending it at the `sentAt` write would leave neither the bubble
@@ -691,7 +692,9 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             guard answers(AccountManager.queuedParentRfc822MessageId(of: row), in: messageIds) else { return nil }
             var filed = false
             if row.sentAt != nil {
-                guard let sentId = row.sentMessageId.map(EmailFilter.normalizeMessageId),
+                // The Sent copy's Message-ID: its provider's own when it gave one (`SentCopyLink`).
+                guard let sentId = row.sentMessageId.map({
+                          SentCopyLink.copyMessageId(accountId: row.accountId, sentMessageId: $0) }),
                       !messageIds.contains(sentId) else { return nil }
                 filed = try MessageHeader
                     .filter(Column("accountId") == row.accountId && Column("rfc822MessageId") == sentId)
