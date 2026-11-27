@@ -197,11 +197,13 @@ struct HeaderCanonicalizeTests {
         #expect(count == 1)
     }
 
-    /// The re-key is proven by the provider's own message id, so it is reported
-    /// as a move with provider authority, and a reply draft that names the row
-    /// follows it. The provider's id did not change, so the draft's reply
-    /// address keeps it; a reply to another email stays where it was.
-    @Test("A re-key reports its move, and a reply draft follows the row")
+    /// The re-key is reported as a move for views and chats, with no provider
+    /// authority (a hidden or fading row stays as it was; undo follows only a
+    /// move's finish). It is proven by the provider's own message id, so a
+    /// reply draft that names the row follows it. The provider's id did not
+    /// change, so the draft's reply address keeps it; a reply to another email
+    /// stays where it was.
+    @Test("A re-key reports its move without provider authority, and a reply draft follows the row")
     func rekeyReportsTheMoveAndTheReplyDraftFollows() throws {
         let db = try makeDB()
         let remnant = try insertRemnant(db, messageId: "g8")
@@ -216,6 +218,7 @@ struct HeaderCanonicalizeTests {
 
         let move = HeaderRekeyRecord(
             oldHeaderId: remnant.id, newHeaderId: "acc1:TRASH:g8", newProviderMessageId: "g8",
+            carriesProviderAuthority: false,
             stableIds: StableIds(accountId: "acc1", old: "g8", new: "g8"))
         #expect(result.rekey == move)
         let drafts = try db.read { dbConn in

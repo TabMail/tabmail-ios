@@ -1154,10 +1154,15 @@ extension SyncEngine {
             try db.execute(
                 sql: "UPDATE draft SET replyToId = ? WHERE replyToId = ?",
                 arguments: [canonicalId, oldId])
+            // Posted for views and chats to follow, with no provider authority:
+            // a hidden or fading row keyed by the old id stays as it was. The
+            // undo stack follows only a move's finish, so a hidden row that
+            // followed this re-key could stay hidden after an Undo.
             rekey = HeaderRekeyRecord(
                 oldHeaderId: oldId, newHeaderId: canonicalId,
                 newProviderMessageId: migrated.messageId,
                 newObservedUidValidity: migrated.observedUidValidity,
+                carriesProviderAuthority: false,
                 stableIds: StableIds(from: survivor, to: migrated))
             survivor = migrated
             ftsRekey = (oldId: oldId, newId: canonicalId)

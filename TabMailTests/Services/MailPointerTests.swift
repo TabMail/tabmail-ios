@@ -139,7 +139,7 @@ struct OpenedMessageTests {
     }
 
     @Test("A selected detail keeps its identity when the selection follows the move")
-    func selectedDetailKeepsItsIdentity() throws {
+    @MainActor func selectedDetailKeepsItsIdentity() throws {
         var opened = OpenedMessage()
         var selected: String? = Self.placeholder
         var dismissed: Set<String> = []
@@ -176,6 +176,19 @@ struct OpenedMessageTests {
         #expect(opened.identity(for: Self.placeholder) == Self.placeholder)
         #expect(opened.currentId(for: Self.placeholder) == Self.moved)
         #expect(opened.identity(for: Self.moved) == Self.placeholder, "the followed selection too")
+    }
+
+    @Test("Opening another email forgets the move; reopening the first id reads that id")
+    func anotherOpenForgetsTheMove() throws {
+        var opened = OpenedMessage()
+        opened.follow(try Self.replaced(), input: Self.placeholder)
+        opened.open(Self.copy)
+        #expect(opened.currentId(for: Self.copy) == Self.copy, "the followed selection stays on its open")
+
+        opened.open("a:INBOX:3")
+        #expect(opened.identity(for: Self.placeholder) == Self.placeholder)
+        #expect(opened.currentId(for: Self.placeholder) == Self.placeholder,
+                "a later open of the first id reads that id, not where it went")
     }
 
     @Test("A move of another email changes nothing; another open is a new detail")

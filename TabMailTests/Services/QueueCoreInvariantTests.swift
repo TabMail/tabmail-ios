@@ -1105,6 +1105,8 @@ struct QueueCoreInvariantTests {
                 newHeaderId: newHeaderId,
                 newProviderMessageId: "5")
         ]))
+        // The pill store follows on its lane; the drain does not wait for it.
+        await MailPointerMoves.outsideStoresSettledForTesting()
 
         #expect(await ChatIdTranslator.shared.toRealId(numericId) == newHeaderId)
         let persistedRealId = try await fixture.pool.read { db in

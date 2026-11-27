@@ -168,8 +168,9 @@ final class MessageDetailViewModel {
     /// reload is wholesale.
     @ObservationIgnored private var pendingThreadRefreshOnRelease = false
 
-    /// Posts of `.mailPointersMoved` that named this view's message or a thread
-    /// member while the `PreviewFreezeGate` was active, in post order. Applied
+    /// Posts of `.mailPointersMoved` delivered while the `PreviewFreezeGate` was
+    /// active, in post order (all of them: one can name a row an earlier one
+    /// moved this view to; a post that names nothing is a no-op). Applied
     /// one post at a time on `.previewFreezeReleased`, so a chain (the
     /// placeholder replaced by the server's copy, then that copy moved) ends on
     /// the last row (same contract as `pendingRefreshIds`).
@@ -733,17 +734,19 @@ final class MessageDetailViewModel {
     /// epoch in place, so no gesture after this names a row that is gone; then
     /// the opened message is re-read from its committed row and the thread read
     /// runs again (both existing reads). A view holding none of the old ids is
-    /// untouched. Under the preview freeze the post waits for its release.
+    /// untouched. Under the preview freeze every post waits for its release,
+    /// whether or not it names this view yet: a later post can move a row an
+    /// earlier buffered post moved this view to.
     /// Internal (not `private`) so tests can drive it without a sync.
     func applyPointerMoves(_ moves: MailPointerMoves) {
-        let opened = moves.row(movedFrom: messageId)
-            ?? message.flatMap { moves.row(movedFrom: $0.id) }
-        let namesMember = threadMessages.contains { moves.row(movedFrom: $0.id) != nil }
-        guard opened != nil || namesMember else { return }
         if PreviewFreezeGate.shared.isFrozen {
             pendingMovesOnRelease.append(moves)
             return
         }
+        let opened = moves.row(movedFrom: messageId)
+            ?? message.flatMap { moves.row(movedFrom: $0.id) }
+        let namesMember = threadMessages.contains { moves.row(movedFrom: $0.id) != nil }
+        guard opened != nil || namesMember else { return }
         if let record = moves.row(movedFrom: messageId) { messageId = record.newHeaderId }
         if var shown = message, let record = moves.row(movedFrom: shown.id) {
             Self.rekey(&shown, to: record)

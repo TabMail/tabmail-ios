@@ -1209,9 +1209,8 @@ struct RunSyncUIDRemapFtsRekeyTests {
             makeHeaderInfo(messageId: "402", rfc822MessageId: rfc, subject: "Chat about this", date: date)
         ])
         _ = await SyncEngine().listFolder(folder, provider: provider, limit: 50)
-        // The stores outside the database follow in posting order; an empty
-        // batch returns once every earlier one has run.
-        await MailPointerMoves.followOutsideStores([])
+        // The stores outside the database follow in posting order on their lane.
+        await MailPointerMoves.outsideStoresSettledForTesting()
 
         let stored = try await pool.read { try MessageHeader.fetchOne($0, key: newId) }
         #expect(stored != nil, "precondition: the sync re-keyed the row")
@@ -1660,10 +1659,11 @@ struct RunSyncDedupReclaimFtsRoutingTests {
     }
 
     /// A Gmail row an optimistic move left keyed by its old folder is re-keyed
-    /// to its canonical key when its folder is listed. That re-key is proven by
-    /// the provider's own id: it is reported with provider authority, and the
-    /// email's saved chat names the new row once the listing's write commits.
-    @Test("A listing's canonical re-key reports its move, and the saved chat follows")
+    /// to its canonical key when its folder is listed. That re-key is reported
+    /// for views and chats with no provider authority (a hidden or fading row
+    /// stays as it was), and the email's saved chat names the new row once the
+    /// listing's write commits.
+    @Test("A listing's canonical re-key reports its move without provider authority, and the saved chat follows")
     func canonicalRekeyMovesTheSavedChat() async throws {
         let (pool, dir) = try makePool()
         defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
@@ -1703,6 +1703,7 @@ struct RunSyncDedupReclaimFtsRoutingTests {
         #expect(ids == [canonicalId], "precondition: the listing re-keyed the row")
         let move = HeaderRekeyRecord(
             oldHeaderId: remnantId, newHeaderId: canonicalId, newProviderMessageId: "g40",
+            carriesProviderAuthority: false,
             stableIds: StableIds(accountId: "racc", old: "g40", new: "g40"))
         #expect(result.headerRekeys == [move])
         let chat = try await pool.read { try SavedChatFixture.read(tag: "canonical", db: $0) }

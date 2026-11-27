@@ -663,8 +663,16 @@ actor ChatStore {
     /// new stable id, and the email its turns name becomes the new row. A chat is
     /// never left on an id no email has, and a crash cannot split the move from
     /// the chat. Every statement is bounded by `chatTurn_sessionId` or
-    /// `chatHistory_sessionId`. memory.db's copy of the session id moves after
-    /// the commit (`MemoryIndex.followSessions`).
+    /// `chatHistory_sessionId`: per re-keyed email, one statement per stored
+    /// form, three when its stable id changed (at most six seeks).
+    /// memory.db's copy of the session id moves after the commit
+    /// (`MemoryIndex.followSessions`).
+    ///
+    /// A re-key no producer posts (the date-window RFC repair of a row with a
+    /// real id, a move's collision arm) is not followed here. For those the
+    /// chat's reopen heal (`DynamicIslandChatButton`) still re-points the pill
+    /// and the first turn's context when the session is found under the
+    /// email's stable id; it does not move a session.
     static func followRekeyedEmails(_ records: [HeaderRekeyRecord], db: Database) throws {
         for record in records {
             guard let ids = record.stableIds else { continue }

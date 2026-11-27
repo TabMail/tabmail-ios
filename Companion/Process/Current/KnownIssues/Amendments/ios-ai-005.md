@@ -140,7 +140,8 @@ The `.messageHeadersRekeyed` notification is replaced by `.mailPointersMoved`, w
 `MailPointerMoves` (`TabMail/Services/MailPointer.swift`): a stored row's re-key
 (`.row(HeaderRekeyRecord)`) or an outbox send's move to its Sent copy (`.sent`). It is an in-memory
 mapping for live views; nothing durable is written for it. Every path that changes a header's primary
-key now posts it after its write commits, and none of them waits on the views:
+key now posts it after its write commits, and none of them waits on the views or on the stores
+outside the main database:
 
 - the move drain's finish (`MessageHeaderRekey.finishMove`, through `AccountManager.publishMoveFinish`);
 - the sync's UID-window remap, its placeholder replacement (full sync and the change pass), the
@@ -155,17 +156,34 @@ The date-window RFC repair of a row with a real id still posts nothing: that cor
 for a live view to follow (`dateWindowRepairKeepsViewCarrierEmpty`).
 
 `carriesProviderAuthority` keeps its meaning: only a provider-proven move re-points optimistic action
-and dismissal state (`MailPointerMoves.withProviderAuthority`). The sync's correlations, the reclaim,
-the draft entry and the body-queue remap carry none. The email's saved chat (`chatTurn`,
-`chatHistory`, including the demo form of the session id) moves in the producer's own write
-(`ChatStore.followRekeyedEmails`). The row's user labels move in the same write:
+and dismissal state (`MailPointerMoves.withProviderAuthority`), and only the move drain's finish
+carries it. Every other producer carries none, the canonical re-key included: its proof by the
+provider's own id moves a held send's and a reply draft's link to the original in its own write, but
+the undo stack follows only a move's finish, so a hidden or fading row that followed it could stay
+hidden after an Undo. The email's saved chat (`chatTurn`, `chatHistory`, including the demo form of
+the session id) moves in the producer's own write (`ChatStore.followRekeyedEmails`): per re-keyed
+email, one indexed statement per stored form of its session id, three when its stable id changed
+(at most six seeks on `chatTurn_sessionId` and `chatHistory_sessionId`). The row's user labels move
+in the same write:
 `MessageHeaderRekey.apply` carries them for the paths that use it, and the sync legs that delete a
 row and insert its replacement themselves (the placeholder dedup in full sync and the change reader,
 and the pre-sync inbox reclaim) carry them through one shared pair, `SyncEngine.userLabelIdsToCarry`
 and `SyncEngine.carryUserLabels`. After commit, the open chat (`ChatPillState.followRekeyedEmails`),
 the model's message ids (`ChatIdTranslator.remapRealId`) and the chat memory index
-(`MemoryIndex.followSessions`) follow in posting order. `InboxViewModel.applyHeaderRekeys` re-keys the
-same state as before (`pendingAIBatch`, `loadedIds`, the snippet queues), now for every producer.
+(`MemoryIndex.followSessions`) follow in posting order on one lane that no producer waits for. A
+memory.db follow that fails is not retried; that chat stays under its old session id in memory
+search. `InboxViewModel.applyHeaderRekeys` re-keys the same state as before (`pendingAIBatch`,
+`loadedIds`, the snippet queues), now for every producer.
+
+A move's collision arm (`finishMove`, where the new id is already occupied) posts nothing: the row
+there is not the moved row, so a view holding the old id stays on a gone row until reopened
+(`IOS-BODY-004`).
+
+Accepted limitation (rare timing race, ios#1580): a chat turn whose write lands between a producer's
+commit and the open chat's follow (`ChatPillState.followRekeyedEmails`, on the main actor in
+`MailPointerMoves.publish`) is stored under the old session id; reopening the chat does not show it.
+It needs a turn written in the milliseconds after a re-key that changes the stable id of the email
+whose chat is open.
 
 ## Related
 

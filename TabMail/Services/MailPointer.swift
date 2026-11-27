@@ -123,7 +123,12 @@ struct MailPointerMoves: Sendable, Equatable {
     /// open chat follows its email first (`ChatPillState.followRekeyedEmails`),
     /// then every holder is told (`post`). The stores in the main database
     /// moved in the producer's own transaction (`ChatStore.followRekeyedEmails`);
-    /// the stores outside it follow after (`followOutsideStores`).
+    /// the stores outside it follow after (`followOutsideStoresInOrder`).
+    ///
+    /// The moves of one post are not chained: each names a row before this
+    /// post, and a lookup takes one step. No producer re-keys one row twice
+    /// in one write, so a chain of moves of one email arrives as one post per
+    /// write, in order.
     @MainActor static func publish(_ moves: MailPointerMoves) {
         guard !moves.isEmpty else { return }
         ChatPillState.shared.followRekeyedEmails(moves.rows)
@@ -156,20 +161,26 @@ struct MailPointerMoves: Sendable, Equatable {
     /// and memory.db's copy of a followed chat session id moves
     /// (`MemoryIndex.followSessions`). Batches run one after another in the
     /// order they were handed over, so a chain of re-keys of one email ends on
-    /// its last row. Returns once this batch has run; with no records, once
-    /// every earlier batch has.
-    static func followOutsideStores(_ records: [HeaderRekeyRecord]) async {
-        await withCheckedContinuation { done in
-            outsideStoresLane.yield(OutsideStoresBatch(records: records, done: done))
-        }
-    }
-
-    /// `followOutsideStores` for a producer that must not wait on those stores
-    /// (a sync pass): the same lane, in the same order, without waiting.
+    /// its last row. No producer waits for them (the move drain, a sync pass,
+    /// a draft save, a body fetch).
+    ///
+    /// A memory.db follow that fails is not retried: `followSessions` logs and
+    /// returns, and that chat stays under its old session id in memory search.
+    /// The lane's buffer is unbounded; it holds at most the re-keys not yet
+    /// followed.
     static func followOutsideStoresInOrder(_ records: [HeaderRekeyRecord]) {
         guard !records.isEmpty else { return }
         outsideStoresLane.yield(OutsideStoresBatch(records: records, done: nil))
     }
+
+    #if DEBUG
+    /// Returns once every batch handed to the lane before this call has run.
+    static func outsideStoresSettledForTesting() async {
+        await withCheckedContinuation { done in
+            outsideStoresLane.yield(OutsideStoresBatch(records: [], done: done))
+        }
+    }
+    #endif
 
     private struct OutsideStoresBatch: Sendable {
         let records: [HeaderRekeyRecord]

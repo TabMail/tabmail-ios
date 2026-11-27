@@ -613,8 +613,9 @@ extension AccountManager {
             // Keep their numeric identity stable across the move; otherwise a
             // cached discussion still renders its baked subject but tapping it
             // resolves the now-deleted source address and appears inert. A moved
-            // chat's memory.db copy follows with them.
-            await MailPointerMoves.followOutsideStores(applied)
+            // chat's memory.db copy follows with them, in order on their lane;
+            // the drain does not wait for it.
+            MailPointerMoves.followOutsideStoresInOrder(applied)
             // The FTS index is a SEPARATE database, so its re-key is two-phase —
             // outside the GRDB write — exactly as the sync path does it. The
             // entry MOVES; it is never removed.

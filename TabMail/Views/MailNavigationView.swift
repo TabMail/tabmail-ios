@@ -1290,6 +1290,9 @@ private struct MessageDetailResolvedContent: View {
             guard let moves = MailPointerMoves.posted(in: notification) else { return }
             openedMessage.follow(moves, input: messageId)
         }
+        .onChange(of: messageId) { _, newInput in
+            openedMessage.open(newInput)
+        }
     }
 }
 
@@ -1330,6 +1333,13 @@ struct OpenedMessage: Equatable {
         guard next != shown else { return }
         if !names(input) { opened = input }
         current = next
+    }
+
+    /// The detail now shows `input`. An input this state does not name is a
+    /// new open, so the moves followed for the earlier one are forgotten: a
+    /// later open of an id that moved away and came back reads that id.
+    mutating func open(_ input: String) {
+        if !names(input) { self = OpenedMessage() }
     }
 }
 

@@ -479,7 +479,7 @@ enum MessageHeaderRekey {
     ///    (`MailPointerMoves.publish` / `publishRekeys`), the saved chats keyed
     ///    by the email move in the caller's own write
     ///    (`ChatStore.followRekeyedEmails`), and the `chatIdMapping` entry and
-    ///    memory.db follow after it (`MailPointerMoves.followOutsideStores`).
+    ///    memory.db follow after it (`MailPointerMoves.followOutsideStoresInOrder`).
     ///
     /// - Returns: `true` when `migrated` was inserted. `false` when a row
     ///   already occupies the new id — in which case the old row is still gone,
@@ -776,7 +776,10 @@ enum MessageHeaderRekey {
                 // The new id was already occupied, so `apply` deleted the old
                 // row and inserted nothing. `oldId` now names no header at all
                 // — report it so the caller can drop it from the stores that
-                // key by header id and live outside this database.
+                // key by header id and live outside this database. No move is
+                // posted for it: the row at the new id is not this row, so a
+                // view or chat holding the old id is not pointed at it (it
+                // shows a row that is gone until reopened, `IOS-BODY-004`).
                 result.removedOldHeaderIds.append(oldId)
                 continue
             }
