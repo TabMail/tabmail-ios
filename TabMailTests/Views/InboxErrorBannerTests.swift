@@ -65,6 +65,7 @@ struct InboxErrorBannerTests {
             OAuthError.cancelled,
             OAuthError.noAuthCode,
             IMAPTransportSecurityError.tlsFloorNotMet(host: m),
+            IMAPTransportSecurityError.noEncryptedConnection(host: m, port: 143, encryptedPort: 993),
             IMAPError.connectionFailed(m),
             IMAPError.selectFailed(m),
             IMAPError.fetchFailed(m),
@@ -101,17 +102,30 @@ struct InboxErrorBannerTests {
 
     private static let host = "imap.example.com"
 
-    @Test("for every error, the re-authentication alert shows a fixed line or nothing")
+    @Test("for every error, the re-authentication alert shows a fixed line, the no-encryption sentence, or nothing")
     func reauthAlertIsAlwaysAFixedLine() {
         let allowed: Set<String> = [AccountReauthAlert.passwordLine, AccountReauthAlert.setupLine,
                                     AccountReauthAlert.oauthLine, AccountReauthAlert.tlsLine(host: Self.host),
                                     AccountReauthAlert.accountChangedLine]
         for error in Self.everyError {
+            // The one line that is not fixed: the no-encryption sentence. The app
+            // builds it only from the account's own host and ports, never from
+            // text a server sent, so it is allowed to name that host.
+            var sentence: String?
+            if let refusal = error as? IMAPTransportSecurityError,
+               case .noEncryptedConnection = refusal {
+                sentence = refusal.description
+            }
             let lines = [AccountReauthAlert.passwordUpdateLine(for: error, host: Self.host),
                          AccountReauthAlert.oauthLine(for: error)].compactMap { $0 }
             for line in lines {
+                if let sentence, line == sentence { continue }
                 #expect(allowed.contains(line), "not a fixed line for \(error)")
                 #expect(!line.contains(Self.marker), "alert carried the error's text for \(error)")
+            }
+            if let sentence {
+                let passwordLine = AccountReauthAlert.passwordUpdateLine(for: error, host: Self.host)
+                #expect(passwordLine == sentence, "the password alert names the refusal for \(error)")
             }
         }
     }

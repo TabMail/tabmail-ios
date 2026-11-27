@@ -2562,11 +2562,22 @@ extension SyncEngine {
                     await AccountManager.shared.markAuthFailed(account.id)
                     return didWork
                 }
-                if Self.isSelectFailedError(error) || Self.isConnectionError(error) {
+                if Self.isSelectFailedError(error) || Self.isConnectionError(error)
+                    || error is IMAPTransportSecurityError {
                     // Treat SELECT failures as transient in backfill — the folder exists
                     // but the connection may be stale. Exponential backoff instead of aborting.
                     // Pool self-heals: dead connections are discarded on checkin(healthy: false),
                     // next checkout creates a fresh one.
+                    //
+                    // A server that refuses an encrypted connection (no STARTTLS where
+                    // `MailTransportPolicy` requires it, or below the TLS floor) is
+                    // NOT a connection error for the classifier, on purpose: it is
+                    // not offline. But it refuses every folder's first read the same
+                    // way, and without this backoff a folder with no walk position
+                    // was picked straight back at network rate, one new connection
+                    // per iteration, and a call with no deadline never returned
+                    // (`BackfillEncryptionRefusalTests`). It waits exactly like an
+                    // unreachable server, with no new exit.
                     consecutiveConnectionFailures += 1
                     BackgroundSyncLogger.logDebug("[Backfill] Connection failure \(consecutiveConnectionFailures) — backing off \(Int(connectionBackoffSeconds))s")
                     BackgroundSyncLogger.logBackfill("[Backfill] \(account.emailAddress)/\(folder.name) connection failure #\(consecutiveConnectionFailures) — backoff \(Int(connectionBackoffSeconds))s")
@@ -2589,6 +2600,10 @@ extension SyncEngine {
                 // would drop a whole folder for the rest of a BGProcessing
                 // budget on one transient blip, and `v2final`'s `catch` is
                 // byte-identical to this one, so there is no reference to port.
+                // One such throw turned out to be steady rather than rare: a
+                // server that refuses an encrypted connection refuses every
+                // `getUidNextWithEpoch`. It now takes the backoff above
+                // (`IMAPTransportSecurityError`).
             }
 
             // Only delay between different folders — same folder continues immediately

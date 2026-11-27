@@ -368,6 +368,45 @@ struct MailTransportEncryptionTests {
                 == AccountReauthAlert.tlsLine(host: "mail.example.com"))
     }
 
+    @Test("Scrolling for older mail on a server that offers no STARTTLS shows the inbox's fixed encryption line")
+    @MainActor
+    func olderMailShowsTheEncryptionLine() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        try server.start()
+        defer { server.stop() }
+        let accountId = "older-mail-encryption-refused"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        let read = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        let inbox = try #require(read)
+        // No test override: the transport comes from the port, as in production.
+        let provider = IMAPProvider(
+            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: MailTransportPolicy.smtpImplicitTLSPort)
+        let engine = await AccountManager.shared.syncEngine
+        await engine.register(
+            accountId: accountId, provider: provider,
+            workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
+
+        // No local mail, so the scroll asks the server for older mail.
+        let vm = InboxViewModel(folders: [inbox])
+        vm.loadMoreMessages()
+        var polls = 0
+        while vm.error == nil, polls < 1000 {
+            try? await Task.sleep(for: .milliseconds(10))
+            polls += 1
+        }
+        let line = vm.error
+        await engine.remove(accountId: accountId)
+        try? await provider.disconnect()
+
+        #expect(line == InboxErrorBanner.encryptionMessage, "got \(String(describing: line))")
+        let commands = server.recordedCommands()
+        #expect(!Self.sentSignIn(commands), "\(commands)")
+    }
+
     // MARK: - Source fence: every construction states its transport
 
     private static var repoRoot: URL {
