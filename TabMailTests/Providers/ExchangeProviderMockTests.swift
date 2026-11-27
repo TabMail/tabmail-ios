@@ -697,8 +697,9 @@ struct ExchangeProviderSelectionWiringTests {
     private static let fullFields = "\(headerFields),body,parentFolderId"
     // The listings, the header reads and the details batch also expand Outlook's
     // last verb and threading ids, right after their `$select`
-    // (`ExchangeGraphMessageRequest.selection`); search, backfill, the full read
-    // and the message delta do not. The expansion is the provider's own constant:
+    // (`ExchangeGraphMessageRequest.selection`), as do the backfill reads
+    // (`fetchSingleBackfill`, the older-mail walk and the catch-up); search, the
+    // full read and the message delta do not. The expansion is the provider's own constant:
     // it names three Graph properties, whose wire form `OutlookLastVerbTests` pins.
     private static let lastVerb = GraphAPI.extendedPropertiesExpandParameter
 

@@ -77,6 +77,9 @@ struct DeltaModel: Sendable {
     /// Per message id, the answer its `$batch` item gets instead of the message:
     /// a status and a raw JSON body (any JSON value), served until cleared.
     var batchItemAnswers: [String: (status: Int, body: String?)] = [:]
+    /// Serve a `$batch`'s item answers in reverse order: Graph documents no
+    /// order for them, so a reader correlates them by item id.
+    var batchResponsesReversed = false
     /// Per message id, selected fields its delta records leave out (Graph may
     /// leave out any field).
     var omittedFields: [String: Set<String>] = [:]
@@ -183,6 +186,17 @@ extension StatefulExchangeActionServer {
             message.lastVerb = verb
             model.messagesByProviderId[providerMessageId] = message
             model.delta.log(folderId: message.folderId, messageId: providerMessageId, kind: .lastVerb)
+        }
+    }
+
+    /// The last verb a message already holds when it is first read (the user
+    /// answered it in another client before TabMail saw it); nothing is logged
+    /// to the delta.
+    func setLastVerbAsDelivered(providerMessageId: String, verb: Int) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.lastVerb = verb
+            model.messagesByProviderId[providerMessageId] = message
         }
     }
 
@@ -324,6 +338,11 @@ extension StatefulExchangeActionServer {
 
     func clearBatchItemAnswers() {
         state.value.withLock { $0.delta.batchItemAnswers = [:] }
+    }
+
+    /// Serve every later `$batch`'s item answers in reverse order (or in order).
+    func reverseBatchResponses(_ reversed: Bool) {
+        state.value.withLock { $0.delta.batchResponsesReversed = reversed }
     }
 
     /// The width of every `$batch` served, in order.
@@ -596,6 +615,7 @@ extension StatefulExchangeActionServer {
                 responses.append(["id": id, "status": 200,
                                   "body": graphRow(message, expanding: expandedPropertyIds(path))])
             }
+            if model.delta.batchResponsesReversed { responses.reverse() }
             let data = (try? JSONSerialization.data(withJSONObject: ["responses": responses])) ?? Data()
             return .bytes(data, contentType: "application/json")
         }

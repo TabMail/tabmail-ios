@@ -35,8 +35,10 @@ import Foundation
 /// pass, out of the allowance left, so they never delay paging or new mail, and
 /// they never hold a page: a message whose verb
 /// was not read (budget, throttle, failed batch, unusable answer) goes on the
-/// re-read list, whose full read carries it. Only the replied and forwarded
-/// marks join the record. A baseline reads none (it lists the folder as it is).
+/// re-read list, whose full read carries it. The replied and forwarded marks
+/// join the record, and the threading ids (In-Reply-To, References; #1559) its
+/// header, which only the apply's insert of a new row reads. A baseline reads
+/// none (it lists the folder as it is).
 ///
 /// **Re-read lists.** Every listed folder's list is read (`reread`): a synced
 /// folder's after its delta, also during its baseline; on a `.all` pass, a folder

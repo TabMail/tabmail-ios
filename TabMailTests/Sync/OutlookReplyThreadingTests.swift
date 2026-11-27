@@ -44,8 +44,15 @@ extension OutlookChangeReadingTests {
         }
     }
 
-    /// The Message-IDs a stored row's reference rows name, sorted.
+    /// The Message-IDs a stored row's reference rows name, each once, sorted.
+    /// `insertMessageReferences` writes In-Reply-To and every References entry,
+    /// so a parent the chain also names has two rows.
     static func referenceIds(of messageId: String, in path: String, w: World) throws -> [String] {
+        Array(Set(try referenceRows(of: messageId, in: path, w: w))).sorted()
+    }
+
+    /// Every reference row of a stored row, duplicates included, sorted.
+    static func referenceRows(of messageId: String, in path: String, w: World) throws -> [String] {
         try w.pool.read { db in
             try String.fetchAll(db, sql: """
                 SELECT r.referencedRfc822Id FROM messageReference r
@@ -137,9 +144,10 @@ extension OutlookChangeReadingTests {
                 inReplyTo: "old-parent@example.com", references: ["old-root@example.com", "old-parent@example.com"],
                 of: "h-1", in: w.inbox, w: w)
             try await w.baselineAll()
-            let beforeLinks = try Self.referenceIds(of: "h-1", in: w.inbox, w: w)
-            #expect(beforeLinks == ["old-parent@example.com", "old-root@example.com"],
+            let linked = try Self.referenceIds(of: "h-1", in: w.inbox, w: w)
+            #expect(linked == ["old-parent@example.com", "old-root@example.com"],
                     "precondition: the stored chain has its reference rows")
+            let beforeLinks = try Self.referenceRows(of: "h-1", in: w.inbox, w: w)
 
             // The server's chain differs from the stored one.
             w.server.setThreadingIds(
@@ -154,8 +162,8 @@ extension OutlookChangeReadingTests {
             #expect(held.computedThreadId == "thread-held")
             #expect(held.inReplyTo == "old-parent@example.com")
             #expect(held.references == ["old-root@example.com", "old-parent@example.com"])
-            let afterLinks = try Self.referenceIds(of: "h-1", in: w.inbox, w: w)
-            #expect(afterLinks == beforeLinks)
+            let afterLinks = try Self.referenceRows(of: "h-1", in: w.inbox, w: w)
+            #expect(afterLinks == beforeLinks, "the reference rows are exactly as they were")
         }
     }
 
@@ -218,10 +226,13 @@ extension OutlookChangeReadingTests {
                 w.server.setThreadingIds(providerMessageId: id, inReplyTo: "<p-1@example.com>")
             }
             w.server.answerBatchItem(providerMessageId: "r-2", status: 500, body: nil)
+            let batchesBefore = w.server.batchWidths().count
             try await w.read()
 
+            let widths = Array(w.server.batchWidths().dropFirst(batchesBefore))
+            #expect(widths == [2], "precondition: both by-id reads went in one batch")
             let batched = w.batchedIds().sorted()
-            #expect(batched == ["r-1", "r-2"], "precondition: both by-id reads went in one batch")
+            #expect(batched == ["r-1", "r-2"])
             let readRow = try w.row("r-1", in: w.inbox)
             let read = try #require(readRow)
             #expect(read.computedThreadId == Self.parentThread, "the message read joins its parent's thread")
@@ -231,6 +242,58 @@ extension OutlookChangeReadingTests {
             #expect(failed.computedThreadId == "conversation-r-2@example.com", "grouped by its conversation, as before")
             let recheck = try w.recheck(w.inbox)
             #expect(recheck == ["r-2"], "its by-id read waits on the re-read list")
+        }
+    }
+
+    /// Graph documents no order for a batch's answers, and a new message in
+    /// another folder whose by-id read fails is read again on a later pass:
+    /// each message still threads under the message it answers.
+    @Test("By-id reads answered out of order, and one read again on a later pass, each thread under their own parent")
+    func batchOrderAndRereadKeepEachChain() async throws {
+        try await Self.withWorld(seeds: [Self.seed("p-1", in: Self.inbox), Self.seed("p-2", in: Self.inbox)]) { w in
+            try w.insertRow("p-1", in: w.inbox)
+            try Self.setThread("thread-one", of: "p-1", in: w.inbox, w: w)
+            try w.insertRow("p-2", in: w.inbox)
+            try Self.setThread("thread-two", of: "p-2", in: w.inbox, w: w)
+            try await w.baselineAll()
+
+            for (id, parent) in [("a-1", "p-1"), ("a-2", "p-2"), ("a-3", "p-1")] {
+                w.server.deliver(Self.seed(id, in: Self.archive, daysAgo: 0))
+                w.server.setThreadingIds(
+                    providerMessageId: id, inReplyTo: "<\(parent)@example.com>",
+                    references: "<root-\(parent)@example.com> <\(parent)@example.com>")
+            }
+            w.server.reverseBatchResponses(true)
+            w.server.answerBatchItem(providerMessageId: "a-3", status: 503, body: nil)
+            let batchesBefore = w.server.batchWidths().count
+            let now = Date()
+            try await w.read(now: now)
+
+            let widths = Array(w.server.batchWidths().dropFirst(batchesBefore))
+            #expect(widths == [3], "precondition: the three by-id reads went in one batch")
+            for (id, parent, thread) in [("a-1", "p-1", "thread-one"), ("a-2", "p-2", "thread-two")] {
+                let stored = try w.row(id, in: w.archive)
+                let reply = try #require(stored, "\(id) is stored in the pass that read it")
+                #expect(reply.computedThreadId == thread, "\(id) joins its own parent's thread")
+                #expect(reply.inReplyTo == "\(parent)@example.com")
+                #expect(reply.references == ["root-\(parent)@example.com", "\(parent)@example.com"])
+            }
+            let waiting = try w.row("a-3", in: w.archive)
+            #expect(waiting == nil, "precondition: the message whose read failed waits")
+            let recheck = try w.recheck(w.archive)
+            #expect(recheck == ["a-3"])
+
+            w.server.clearBatchItemAnswers()
+            try await w.read(now: now.addingTimeInterval(60))
+            let rereadRow = try w.row("a-3", in: w.archive)
+            let reread = try #require(rereadRow, "it lands once the server answers")
+            #expect(reread.computedThreadId == "thread-one", "the re-read message joins its parent's thread")
+            #expect(reread.inReplyTo == "p-1@example.com")
+            #expect(reread.references == ["root-p-1@example.com", "p-1@example.com"])
+            let links = try Self.referenceIds(of: "a-3", in: w.archive, w: w)
+            #expect(links == ["p-1@example.com", "root-p-1@example.com"])
+            let after = try w.recheck(w.archive)
+            #expect(after.isEmpty)
         }
     }
 
@@ -273,6 +336,166 @@ extension OutlookChangeReadingTests {
         }
     }
 
+    /// A full sync's listing reads the threading ids too: a new message it
+    /// stores threads under the one it answers, and a stored row's References
+    /// are written as on every provider while its thread, In-Reply-To and
+    /// reference rows stay.
+    @Test("The full listing threads new mail under its parent and writes a stored row's References, keeping its thread")
+    func listingThreadsNewMailAndKeepsHeldThreads() async throws {
+        try await Self.withWorld(seeds: [
+            Self.seed("p-1", in: Self.archive), Self.seed("h-1", in: Self.inbox),
+            Self.seed("r-1", in: Self.inbox, daysAgo: 0),
+        ]) { w in
+            try w.insertRow("p-1", in: w.archive)
+            try Self.setThread(Self.parentThread, of: "p-1", in: w.archive, w: w)
+            try w.insertRow("h-1", in: w.inbox)
+            try Self.setThread("thread-held", of: "h-1", in: w.inbox, w: w)
+            for id in ["h-1", "r-1"] {
+                w.server.setThreadingIds(
+                    providerMessageId: id, inReplyTo: "<p-1@example.com>",
+                    references: "<root@example.com> <p-1@example.com>")
+            }
+
+            let inboxFolder = try w.folder(w.inbox)
+            let outcome = await SyncEngine().listFolder(
+                inboxFolder, provider: w.provider, limit: SyncConfig.syncMessageLimit)
+            guard case .proven = outcome else {
+                Issue.record("precondition: the listing was proven, got \(outcome)")
+                return
+            }
+
+            let newRow = try w.row("r-1", in: w.inbox)
+            let reply = try #require(newRow, "the listing stores the new message")
+            #expect(reply.computedThreadId == Self.parentThread, "the new reply joins its parent's thread")
+            #expect(reply.inReplyTo == "p-1@example.com")
+            #expect(reply.references == ["root@example.com", "p-1@example.com"])
+            let links = try Self.referenceIds(of: "r-1", in: w.inbox, w: w)
+            #expect(links == ["p-1@example.com", "root@example.com"])
+
+            let heldRow = try w.row("h-1", in: w.inbox)
+            let held = try #require(heldRow)
+            #expect(held.references == ["root@example.com", "p-1@example.com"], "the listing writes the server's References")
+            #expect(held.computedThreadId == "thread-held", "a stored row's thread stays")
+            #expect(held.inReplyTo == nil, "and its In-Reply-To")
+            let heldLinks = try Self.referenceRows(of: "h-1", in: w.inbox, w: w)
+            #expect(heldLinks.isEmpty, "and its reference rows")
+        }
+    }
+
+    /// Scrolling to older mail (`SyncEngine.fetchOlderMessages`) reads it with
+    /// the threading ids, so an older reply threads under the message it answers.
+    @Test("An older reply loaded by scrolling threads under the stored message it answers")
+    func olderMailScrollThreadsUnderItsParent() async throws {
+        try await Self.withWorld(seeds: [
+            Self.seed("p-1", in: Self.archive), Self.seed("anchor", in: Self.inbox, daysAgo: 1),
+            Self.seed("o-1", in: Self.inbox, daysAgo: 5),
+        ]) { w in
+            try w.insertRow("p-1", in: w.archive)
+            try Self.setThread(Self.parentThread, of: "p-1", in: w.archive, w: w)
+            try w.insertRow("anchor", in: w.inbox, date: Self.daysAgo(1))
+            w.server.setThreadingIds(
+                providerMessageId: "o-1", inReplyTo: "<p-1@example.com>",
+                references: "<root@example.com> <p-1@example.com>")
+
+            let engine = SyncEngine()
+            await engine.register(
+                accountId: w.accountId, provider: w.provider,
+                workQueue: ProviderWorkQueue(provider: w.provider, maxConcurrency: 1))
+            let inboxFolder = try w.folder(w.inbox)
+            let older = try await engine.fetchOlderMessages(folders: [inboxFolder])
+            await engine.remove(accountId: w.accountId)
+            #expect(older.inserted >= 1, "precondition: the scroll loaded older mail")
+
+            let loaded = try w.row("o-1", in: w.inbox)
+            let reply = try #require(loaded, "the scroll stored the older reply")
+            #expect(reply.computedThreadId == Self.parentThread, "the older reply joins its parent's thread")
+            #expect(reply.inReplyTo == "p-1@example.com")
+            #expect(reply.references == ["root@example.com", "p-1@example.com"])
+            let links = try Self.referenceIds(of: "o-1", in: w.inbox, w: w)
+            #expect(links == ["p-1@example.com", "root@example.com"])
+        }
+    }
+
+    /// The notification extension reads a new message by id with the threading
+    /// ids (`OutlookNSEClient.fetchSingleMessage`), stages them, and the merge
+    /// into the app's store (`NSEDataBridge.insertNewHeaderFromStaging`) threads
+    /// a reply to a forward under the forward, not under its source, which
+    /// shares its Outlook conversation.
+    @Test("A reply the notification extension stages joins the forward it answers when merged")
+    func notificationStagedReplyJoinsTheForward() async throws {
+        let accountId = "nse-outlook-" + UUID().uuidString
+        let store = ProviderCredentialStore.shared
+        _ = try store.install(accountId: accountId, tokens: .init(
+            accessToken: "synthetic-access", refreshToken: "synthetic-refresh",
+            expiresAt: Date().addingTimeInterval(3_600)))
+        defer { try? store.remove(accountId: accountId) }
+        let server = StatefulExchangeActionServer(messages: [Self.seed("r-1", in: Self.inbox, daysAgo: 0)])
+        defer { server.close() }
+        let shared = "conversation-shared"
+        server.setConversationId(providerMessageId: "r-1", shared)
+        server.setThreadingIds(
+            providerMessageId: "r-1", inReplyTo: "<fwd@example.com>",
+            references: "<src@example.com> <fwd@example.com>")
+
+        let fetched = await AuthedHTTP.$sessionOverride.withValue(server.http.session) {
+            await OutlookNSEClient.fetchSingleMessage(
+                messageId: "r-1", accessToken: "", refreshToken: nil, accountId: accountId)
+        }
+        let meta = try #require(fetched, "the extension read the message")
+        #expect(meta.inReplyTo == "fwd@example.com")
+        #expect(meta.references == ["src@example.com", "fwd@example.com"])
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("nse_staging.sqlite").path
+        #expect(AppDatabase.createNSEStagingDB(atPath: path))
+        let queue = try DatabaseQueue(path: path)
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(queue: queue, directory: dir) }
+        NSEStagingDB.ensureObservedUidValidityColumn(db: queue)
+        NSEStagingDB.ensureProviderDateColumn(db: queue)
+        NSEStagingDB.stageHeader(
+            db: queue, accountId: accountId, accountEmail: "user@example.com", provider: "outlook",
+            message: meta, historyId: "1")
+        let stagedRow = try queue.read { db in
+            try Row.fetchOne(db, sql: "SELECT * FROM nse_processed_message WHERE id = ?",
+                             arguments: ["\(accountId):r-1"])
+        }
+        let row = try #require(stagedRow, "the extension staged the message")
+        let staged = NSEDataBridge.StagedMessage(row: row)
+
+        let main = try TestDatabase.make()
+        try TestDatabase.insertAccount(main, id: accountId, email: "user@example.com", provider: .outlook)
+        try TestDatabase.insertFolder(main, name: "Inbox", path: Self.inbox, role: .inbox, accountId: accountId)
+        for (id, thread) in [("src", shared), ("fwd", "thread-forward")] {
+            let header = try TestDatabase.insertMessageHeader(
+                main, messageId: id, folderId: "\(accountId):\(Self.inbox)", accountId: accountId,
+                folderPath: Self.inbox, rfc822MessageId: "\(id)@example.com")
+            try main.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET computedThreadId = ? WHERE id = ?",
+                               arguments: [thread, header.id])
+            }
+        }
+        let inserted = try main.write { db in
+            var ftsBatch: [NSEDataBridge.NSEFTSBodyItem] = []
+            return try NSEDataBridge.insertNewHeaderFromStaging(staged, db: db, ftsBatch: &ftsBatch)
+        }
+        #expect(inserted, "precondition: the merge inserted the reply")
+
+        let headerId = MessageIdentity.headerId(
+            accountId: accountId, folderPath: staged.folderPath, messageId: staged.messageId)
+        let mergedRow = try main.read { db in try MessageHeader.fetchOne(db, key: headerId) }
+        let reply = try #require(mergedRow)
+        #expect(reply.computedThreadId == "thread-forward", "the reply joins the forward it answers")
+        #expect(reply.inReplyTo == "fwd@example.com")
+        #expect(reply.references == ["src@example.com", "fwd@example.com"])
+        let linkRows = try main.read { db in
+            try String.fetchAll(db, sql: "SELECT referencedRfc822Id FROM messageReference WHERE messageHeaderId = ?",
+                                arguments: [headerId])
+        }
+        let links = Set(linkRows)
+        #expect(links == ["fwd@example.com", "src@example.com"], "the merge writes the reply's reference rows")
+    }
+
     /// The fake's own contract, which every test above leans on: Graph serves an
     /// extended property only to a request whose expand names it.
     @Test("The Graph fake serves exactly the threading ids a request expands")
@@ -312,6 +535,8 @@ extension OutlookCatchUpTests {
             w.server.setThreadingIds(
                 providerMessageId: "o-1", inReplyTo: "<p-1@example.com>",
                 references: "<root@example.com> <p-1@example.com>")
+            // The user answered it in another client before TabMail saw it.
+            w.server.setLastVerbAsDelivered(providerMessageId: "o-1", verb: GraphAPI.lastVerbReplyToSender)
             try await w.baselineAll()
             let early = try w.row("o-1", in: w.archive)
             #expect(early == nil, "precondition: the baseline does not insert below the held range")
@@ -324,6 +549,7 @@ extension OutlookCatchUpTests {
             #expect(reply.computedThreadId == R.parentThread, "the old reply joins its parent's thread")
             #expect(reply.inReplyTo == "p-1@example.com")
             #expect(reply.references == ["root@example.com", "p-1@example.com"])
+            #expect(reply.isReplied == true, "the same read carries its last verb: the reply made elsewhere shows")
         }
     }
 }

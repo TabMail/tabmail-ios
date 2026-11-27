@@ -244,7 +244,9 @@ enum ReplyParentResolver {
     /// normalized (Gmail and RFC 822 parsing through
     /// `EmailFilter.extractFirstMessageId`; IMAP's envelope mapping and the
     /// extension's `IMAPFetchMapping` through `EmailFilter.normalizeMessageId`;
-    /// the optimistic Sent copy; Graph stores none), so the bare form is the only
+    /// the optimistic Sent copy; Graph through `GraphParse.parseMessage`, which
+    /// reads the expanded In-Reply-To with `EmailFilter.extractFirstMessageId`),
+    /// so the bare form is the only
     /// one matched, as `markInsertedParentsOfStoredReplies` matches it.
     static func hasStoredReply(
         toRfc822MessageId rfc822MessageId: String?,
