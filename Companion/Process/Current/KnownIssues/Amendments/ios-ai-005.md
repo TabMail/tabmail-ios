@@ -179,7 +179,9 @@ A move's collision arm (`finishMove`, and the canonical re-key's, where the new 
 occupied) posts nothing: the row there is not the moved row, so a view holding the old id stays on
 a gone row until reopened (`IOS-BODY-004`). A placeholder's collision arms do post: the row already
 at the new id is the server's copy of that email, and the inbox list then drops the moved snapshot
-rather than show the copy twice.
+rather than show the copy twice. The list drops a moved snapshot whenever its new id is held after
+the post (by a row no move names, or by a row an earlier move of the same post renamed), and it
+writes the list only when a row is renamed or dropped.
 
 Accepted limitation (rare timing race, ios#1581): posts and hand-overs follow commit order for one
 producer only. The move drain updates the undo stack before it posts, so a sync re-key of the same
@@ -187,7 +189,8 @@ row that commits in that gap is posted first; a view open on the email, the mode
 the memory index then end on the middle row. Reopening the email recovers the view.
 
 Accepted limitation (ios#1582): the inbox list follows a posted move at once, also during a
-gesture, as it already did for a move's finish and the UID repair; only identity fields change.
+gesture, as it already did for a move's finish and the UID repair. A renamed row changes identity
+fields only; a move onto a row the list already holds removes the moved row at once.
 
 Accepted limitation (rare timing race, ios#1580): a chat turn whose write lands between a producer's
 commit and the open chat's follow (`ChatPillState.followRekeyedEmails`, on the main actor in
