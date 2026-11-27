@@ -111,8 +111,10 @@ enum ThreadUtils {
         guard !L.isEmpty else { return nil }
 
         // (1) Forward: the nearest stored email in L, one id at a time. Exclude
-        // self to handle re-inserts/upserts of the same row. The statement is
-        // compiled once per connection (its cache) and only bound per id.
+        // self to handle re-inserts/upserts of the same row. The statement comes
+        // from the connection's statement cache, so it is compiled once and then
+        // only bound per id (GRDB compiles it again after a schema change, a
+        // failed step or a memory release).
         let nearest = try db.cachedStatement(sql: """
             SELECT computedThreadId FROM messageHeader
             WHERE rfc822MessageId = ?

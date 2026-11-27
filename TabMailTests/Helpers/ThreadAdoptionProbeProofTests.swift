@@ -159,8 +159,10 @@ struct ThreadAdoptionProbeProofTests {
         return found
     }
 
-    /// `ThreadUtils.findAdoptableThreadId` as it was before the nearest-first probe: one `IN` query over the whole
-    /// lookup set with `LIMIT 1` (whichever stored email SQLite returns first), then the reverse and lateral probes.
+    /// `ThreadUtils.findAdoptableThreadId` as main has it before the nearest-first probe: one `IN` query over the
+    /// whole lookup set with `LIMIT 1` (whichever stored email SQLite returns first), then the reverse and lateral
+    /// probes, the In-Reply-To one with main's index name (#1563), so both sides run the same reverse and lateral
+    /// statements and only the forward step differs.
     static func oldProbe(
         myHeaderId: String, rfc822MessageId: String?, inReplyTo: String?, references: [String], isForward: Bool,
         db: Database
@@ -183,7 +185,7 @@ struct ThreadAdoptionProbeProofTests {
             return found
         }
         if let found = try String.fetchOne(db, sql: """
-            SELECT computedThreadId FROM messageHeader
+            SELECT computedThreadId FROM messageHeader INDEXED BY messageHeader_inReplyTo
             WHERE inReplyTo IN (\(placeholders))
               AND id != ?
               AND computedThreadId != ''
