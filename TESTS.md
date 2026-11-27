@@ -515,6 +515,10 @@ delete) ending as the user's last gesture. `DeviceSyncReceiveTests` covers arriv
 re-apply, the connection end dropping everything waiting, the bound (messages plus held parts) renewing
 the connection, and an older `prompt_state` never landing on a newer edit. `DeviceSyncSocketBoundaryTests`
 runs a loopback WebSocket server to show a message read after its connection was replaced is dropped.
+`DeviceSyncConnectPassTests` drives `DeviceSyncService.socketURL` on `FakeHTTP`: the socket's address
+carries only the one-time pass from `POST /ws/pass`, the sign-in token goes only in that request's
+Authorization header, a refused, empty or unreachable pass request gives no address, and no source puts
+a token in a URL query.
 
 ## Gmail thread binding — Send and draft uploads
 

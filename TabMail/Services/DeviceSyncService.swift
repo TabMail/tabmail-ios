@@ -10,8 +10,10 @@ import UIKit
 /// Syncs prompt settings between TabMail instances (iOS ↔ TB) automatically.
 ///
 /// Protocol:
-/// 1. Connect to Device Sync worker via WebSocket (wss://sync.tabmail.ai/ws)
-/// 2. Authenticate with TabMail session JWT token
+/// 1. Ask the Device Sync worker for a one-time pass (HTTPS, TabMail session JWT in the
+///    Authorization header: `BackendClient.requestSyncConnectPass`)
+/// 2. Connect via WebSocket with that pass (wss://sync.tabmail.ai/ws?pass=...); the JWT never
+///    goes in the socket's address
 /// 3. The knowledge base, composition rules and action rules sync as labelled bullets
 ///    (`bullet_state`, `PromptBulletSync`): each is sent on connect, after a local change, and after
 ///    a merge of a peer's state that differed from this device's (DS-SEND, DS-MERGE).
@@ -96,14 +98,28 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
     private var baseURL: String { BackendConfig.syncWebSocketURL }
 
+    /// The socket's address for one connect: the Device Sync endpoint with a fresh one-time pass
+    /// (`BackendClient.requestSyncConnectPass`), never the sign-in token. nil when no pass could be had.
+    nonisolated static func socketURL(
+        token: String,
+        session: URLSession = sharedEphemeralSession
+    ) async -> URL? {
+        guard let pass = await BackendClient.requestSyncConnectPass(token: token, session: session),
+              var components = URLComponents(string: BackendConfig.syncWebSocketURL) else { return nil }
+        components.queryItems = [URLQueryItem(name: "pass", value: pass)]
+        return components.url
+    }
+
     /// Epoch zero — used for new devices that have no per-field timestamps yet.
     private static let epochZero = "1970-01-01T00:00:00.000Z"
 
     /// Log-safe rendering of a transport error. URLSession errors carry the
     /// failing URL in userInfo (`NSErrorFailingURLStringKey`) — for this
-    /// service that URL embeds the auth token as a query parameter
-    /// (`ws?token=JWT`), so interpolating the raw error leaked a live
-    /// credential into the console capture (observed 2026-06-09). Render only
+    /// service that URL once embedded the auth token as a query parameter
+    /// (`ws?token=JWT`), so interpolating the raw error put a live
+    /// credential into the console capture (observed 2026-06-09). The URL now
+    /// carries a one-time connect pass instead (`socketURL`); a query is
+    /// still nothing a log needs. Render only
     /// domain + code + description, with any query string stripped
     /// defensively. Use this for EVERY error originating from the WebSocket /
     /// URLSession layer; never interpolate those errors raw.
@@ -279,24 +295,28 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        // Check if superseded by forceReconnect() / disconnect() during token fetch
-        guard !Task.isCancelled else {
+        // Superseded by forceReconnect() / disconnect() during the token fetch. Whoever cancelled
+        // this connect already reset isConnecting, and forceReconnect() may have started the next
+        // connect since, so this one leaves it alone.
+        guard !Task.isCancelled else { return }
+
+        // A fresh one-time pass for this connect; the token never goes in the socket's address.
+        let socketURL = await Self.socketURL(token: token)
+
+        // Superseded during the pass request: as above (a cancelled request also gives no pass).
+        guard !Task.isCancelled else { return }
+
+        // No pass takes the same path as a failed token refresh.
+        guard let url = socketURL else {
+            BackgroundSyncLogger.logDebug("[DeviceSync] No connect pass, scheduling reconnect")
+            DeviceSyncLogger.log("CONNECT_FAIL no connect pass")
             isConnecting = false
+            scheduleReconnect()
             return
         }
 
         // Initialize per-field timestamps if this is a new device
         initTimestampsIfNeeded()
-
-        guard var components = URLComponents(string: baseURL) else {
-            isConnecting = false
-            return
-        }
-        components.queryItems = [URLQueryItem(name: "token", value: token)]
-        guard let url = components.url else {
-            isConnecting = false
-            return
-        }
 
         BackgroundSyncLogger.logDebug("[DeviceSync] Connecting to \(baseURL)...")
         DeviceSyncLogger.log("CONNECT → \(baseURL)")
