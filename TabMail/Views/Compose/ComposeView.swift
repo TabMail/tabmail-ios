@@ -876,6 +876,74 @@ enum ComposeDraftGuards {
         confirmedBodyHTML
     }
 
+    /// The AI reply suggestion a reply compose shows when it opens with no caller suggestion.
+    ///
+    /// `confirmed` is the stored row of the replied-to email as compose resolved it at open
+    /// (`Draft.resolveReplyQuote`), which accepts the row at `held.id` only on positive proof that it
+    /// is still that email (`Draft.acceptsReplyTargetHit`). Its suggestion is preferred because the
+    /// cached reply may have changed since the caller captured `held` (background AI, sync from
+    /// another device, an earlier edit), and a cleared one stays cleared. `held.id` is an address,
+    /// not an identity: a mailbox reset can seat a different email there. When the row could not be
+    /// confirmed (gone, replaced, or with nothing to prove it), the suggestion the caller captured
+    /// is shown.
+    static func openingSuggestion(confirmed: MessageHeader?, held: MessageHeader) -> String? {
+        guard let confirmed else { return held.cachedReply }
+        return confirmed.cachedReply
+    }
+
+    /// A replied-to or forwarded email: its header, the body read with it, and whether compose
+    /// forwards it. Kept whole so nothing pairs one email's subject and sender with another email's
+    /// body, or writes an answer about one email to another.
+    struct RelatedEmail {
+        let header: MessageHeader
+        /// The body compose resolved with the header at open (`Draft.resolveReplyQuote`); nil when
+        /// it has none stored, and for a header compose could not confirm.
+        let bodyHTML: String?
+        let isForward: Bool
+
+        /// The text the reply model (Recompute) and the inline editor read.
+        var bodyText: String {
+            ComposeDraftGuards.replyContextText(confirmedBodyHTML: bodyHTML, heldSnippet: header.snippet)
+        }
+    }
+
+    /// The email this compose replies to or forwards, chosen once for the reply model, the inline
+    /// editor and the stores of their answers.
+    ///
+    /// The email compose confirmed at open (`Draft.resolveReplyQuote`), when there is one, is used
+    /// whole. It is also the only source when compose reopens a saved reply with no caller header
+    /// (Undo Send). Without it, the header compose was opened with is used with its own snippet; with
+    /// neither, the compose is a new message.
+    static func relatedEmail(
+        confirmed: RelatedEmail?, composeArgument: MessageHeader?, argumentIsForward: Bool
+    ) -> RelatedEmail? {
+        if let confirmed { return confirmed }
+        return composeArgument.map { RelatedEmail(header: $0, bodyHTML: nil, isForward: argumentIsForward) }
+    }
+
+    /// The inline editor's mode: the related email's own reply or forward, else a new message
+    /// (a forward with no email to forward keeps the forward mode, as before).
+    static func editorMode(_ related: RelatedEmail?, argumentIsForward: Bool) -> String {
+        if let related { return related.isForward ? "edit_forward" : "edit_reply" }
+        return argumentIsForward ? "edit_forward" : "edit_new"
+    }
+
+    /// The text of the replied-to email that the reply model (Recompute) and the inline editor read
+    /// (`RelatedEmail.bodyText`).
+    ///
+    /// `confirmedBodyHTML` is the body compose resolved for its reply at open, checked against the
+    /// email in the same read (`Draft.resolveReplyQuote`). Nothing here reads the body again by the
+    /// header's id, which is an address another email can take. With no confirmed body the email's
+    /// own snippet is used.
+    static func replyContextText(confirmedBodyHTML: String?, heldSnippet: String) -> String {
+        if let html = confirmedBodyHTML, !html.isEmpty {
+            // Strip embedded .eml sections so the context is only the primary message body,
+            // not forwarded-as-attachment emails.
+            return EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
+        }
+        return heldSnippet
+    }
+
     /// ⚑ NO REFERENCE — INVENTED. What the PERSISTED `Draft` row says about this
     /// compose's reply/forward parent, once the GUARDED resolver
     /// (`Draft.resolveReplyQuote`, i.e. `Draft.resolveReplyToHeader` plus its body)
@@ -1104,6 +1172,9 @@ struct ComposeView: View {
     @State private var showingSuggestion = false
     @State private var currentSuggestion: String?
     @State private var isRecomputing = false
+    /// The replied-to or forwarded email as resolved and checked when compose opened
+    /// (`Draft.resolveReplyQuote`); read through `relatedEmail`.
+    @State private var confirmedReply: ComposeDraftGuards.RelatedEmail?
     @State private var isApplyingEdit = false
     @State private var aiWorking = false
     @State private var agentToast: String?
@@ -2169,56 +2240,76 @@ struct ComposeView: View {
         .padding(.top, 4)
     }
 
-    // MARK: - Recompute reply (debug — direct LLM, skips Device Sync)
+    // MARK: - The related email and Recompute reply
+
+    /// The email this compose replies to or forwards (`ComposeDraftGuards.relatedEmail`): the reply
+    /// model, the inline editor and the stores of their answers all read this one.
+    private var relatedEmail: ComposeDraftGuards.RelatedEmail? {
+        ComposeDraftGuards.relatedEmail(
+            confirmed: confirmedReply, composeArgument: replyTo, argumentIsForward: isForward)
+    }
 
     private func recomputeReply() {
-        guard let reply = replyTo, let account = resolvedAccount else { return }
+        guard let source = relatedEmail, let account = resolvedAccount else { return }
         isRecomputing = true
 
         Task {
-            let body = try? await dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
-            let bodyText: String
-            if let html = body?.htmlContent, !html.isEmpty {
-                // Strip embedded .eml sections so the reply context is only the
-                // primary message body, not forwarded-as-attachment emails.
-                bodyText = EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
-            } else {
-                bodyText = reply.snippet
-            }
-
             do {
-                let result = try await AIService.shared.processReply(
-                    messageId: reply.messageId,
-                    rfc822MessageId: reply.rfc822MessageId,
-                    accountEmail: account.emailAddress,
-                    subject: reply.subject,
-                    from: reply.from,
-                    fromAddress: reply.fromAddress,
-                    to: reply.to,
-                    date: reply.date,
-                    bodyText: bodyText,
-                    htmlContent: body?.htmlContent,
-                    userName: account.displayName,
-                    kbText: PromptStore.shared.kbText(),
-                    compositionPrompt: PromptStore.shared.compositionMarkdown()
-                )
-                if let result, !result.isEmpty {
-                    currentSuggestion = result
-                    try? await dbPool.write { db in
-                        try db.execute(
-                            sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                            arguments: [result, reply.id]
+                let answered = try await Self.recompute(
+                    source,
+                    model: { reply, bodyText, bodyHTML in
+                        try await AIService.shared.processReply(
+                            messageId: reply.messageId,
+                            rfc822MessageId: reply.rfc822MessageId,
+                            accountEmail: account.emailAddress,
+                            subject: reply.subject,
+                            from: reply.from,
+                            fromAddress: reply.fromAddress,
+                            to: reply.to,
+                            date: reply.date,
+                            bodyText: bodyText,
+                            htmlContent: bodyHTML,
+                            userName: account.displayName,
+                            kbText: PromptStore.shared.kbText(),
+                            compositionPrompt: PromptStore.shared.compositionMarkdown()
                         )
-                    }
-                    BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(reply.messageId)")
+                    },
+                    show: { currentSuggestion = $0 },
+                    store: { await Self.storeRecomputedReply($0, replyTo: $1, db: dbPool) })
+                if answered {
+                    BackgroundSyncLogger.logDebug("[Compose] Recomputed reply for \(source.header.messageId)")
                 } else {
-                    BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(reply.messageId)")
+                    BackgroundSyncLogger.logDebug("[Compose] Recompute returned nil/empty for \(source.header.messageId)")
                 }
             } catch {
                 BackgroundSyncLogger.logDebug("[Compose] Recompute reply failed: \(error)")
             }
             isRecomputing = false
         }
+    }
+
+    /// Recompute's steps, with the model and the store passed in so tests drive them. The model is
+    /// told about one email, `source` (its header and `bodyText`), and a non-empty answer is shown,
+    /// then stored on that same email's header. Returns whether an answer came back.
+    static func recompute(
+        _ source: ComposeDraftGuards.RelatedEmail,
+        model: (_ header: MessageHeader, _ bodyText: String, _ bodyHTML: String?) async throws -> String?,
+        show: (String) -> Void,
+        store: (_ answer: String, _ header: MessageHeader) async -> Void
+    ) async throws -> Bool {
+        guard let answer = try await model(source.header, source.bodyText, source.bodyHTML),
+              !answer.isEmpty else {
+            return false
+        }
+        show(answer)
+        await store(answer, source.header)
+        return true
+    }
+
+    /// Recompute's store: the checked write (`storeCachedReply`) through the app's prioritized writer,
+    /// so it waits its turn behind earlier priority writes.
+    static func storeRecomputedReply(_ text: String, replyTo reply: MessageHeader, db: PrioritizedDatabase) async {
+        try? await db.write { db in try storeCachedReply(text, replyTo: reply, in: db) }
     }
 
     // MARK: - Agent Toast
@@ -2248,14 +2339,8 @@ struct ComposeView: View {
     /// Build the compose edit context for the DynamicIslandChat inline editor.
     private func buildComposeEditContext() -> ComposeEditContext {
         let account = resolvedAccount
-        let mode: String
-        if isForward {
-            mode = "edit_forward"
-        } else if replyTo != nil {
-            mode = "edit_reply"
-        } else {
-            mode = "edit_new"
-        }
+        let related = relatedEmail
+        let mode = ComposeDraftGuards.editorMode(related, argumentIsForward: isForward)
 
         // Build related email info for reply mode
         let relatedDate: String
@@ -2265,7 +2350,8 @@ struct ComposeView: View {
         let relatedCc: String
         let bodyText: String
 
-        if let reply = replyTo {
+        if let related {
+            let reply = related.header
             relatedDate = AIService.formatTimestampForAgent(reply.date)
             relatedSubject = reply.subject
             let fromFormatted = reply.fromAddress.isEmpty ? reply.from : "\(reply.from) <\(reply.fromAddress)>"
@@ -2273,14 +2359,7 @@ struct ComposeView: View {
             relatedTo = reply.to
             relatedCc = reply.cc
 
-            let body = try? dbPool.read { db in try MessageBody.fetchOne(db, key: reply.id) }
-            if let html = body?.htmlContent, !html.isEmpty {
-                // Strip embedded .eml sections — AI edit context is the primary
-                // message body, not forwarded-as-attachment emails.
-                bodyText = EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html))
-            } else {
-                bodyText = reply.snippet
-            }
+            bodyText = related.bodyText
         } else {
             relatedDate = ""
             relatedSubject = ""
@@ -2354,8 +2433,9 @@ struct ComposeView: View {
                     // Only persist to messageHeader.cachedReply in reply mode.
                     // Compose has no source message; forward would write to the
                     // wrong target (the email being forwarded, not the draft).
-                    if replyTo != nil && !isForward {
-                        persistCachedReply(b)
+                    // Stored on the email the editor was told about.
+                    if replyTo != nil && !isForward, let source = relatedEmail {
+                        persistCachedReply(b, to: source.header)
                     }
                 } else {
                     BackgroundSyncLogger.logDebug("[ComposeView] applyInlineEdit: updating body (len=\(b.count))")
@@ -2376,9 +2456,8 @@ struct ComposeView: View {
         }
     }
 
-    /// Write the edited suggestion to `messageHeader.cachedReply` so reopens see it.
-    private func persistCachedReply(_ text: String) {
-        guard let reply = replyTo else { return }
+    /// Write the edited suggestion to `messageHeader.cachedReply` of `reply` so reopens see it.
+    private func persistCachedReply(_ text: String, to reply: MessageHeader) {
         Task { await Self.writeCachedReplyToDB(text, replyTo: reply, db: dbPool.pool) }
     }
 
@@ -2391,14 +2470,19 @@ struct ComposeView: View {
     /// written. The edit stays in the open compose, and the cache is a convenience for reopening, so
     /// a refused write costs that convenience, while the alternative stores it on another email.
     static func writeCachedReplyToDB(_ text: String, replyTo reply: MessageHeader, db: any DatabaseWriter) async {
-        try? await db.write { db in
-            guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return }
-            _ = try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
-                try db.execute(
-                    sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
-                    arguments: [text, reply.id]
-                )
-            }
+        try? await db.write { db in try storeCachedReply(text, replyTo: reply, in: db) }
+    }
+
+    /// The checked write of a reply suggestion, inside the caller's transaction: stored only while the
+    /// row at `reply.id` is still that email (see `writeCachedReplyToDB`). Shared by the edit store
+    /// and Recompute's store.
+    nonisolated static func storeCachedReply(_ text: String, replyTo reply: MessageHeader, in db: Database) throws {
+        guard let target = try AIWriteTarget.capture(message: reply, db: db) else { return }
+        _ = try AccountManager.aiGuardedHeaderWrite(db, target: target) { _, db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?",
+                arguments: [text, reply.id]
+            )
         }
     }
 
@@ -2656,6 +2740,12 @@ struct ComposeView: View {
                 }
                 return
             }
+            // The inline editor reads the reply's header and body from here, never by the
+            // header's id; the forward flag is the one the quote attribution below uses.
+            let resolvedForward = replyTo != nil ? isForward : draft.isForward
+            confirmedReply = quote.map {
+                ComposeDraftGuards.RelatedEmail(header: $0.header, bodyHTML: $0.bodyHTML, isForward: resolvedForward)
+            }
             // D8: the From account is ALREADY bound above, to the exact owner of the
             // row this view read. The two `resolvedAccount ?? navigationStore
             // .accounts.first` assignments that stood here are deliberately gone —
@@ -2681,7 +2771,6 @@ struct ComposeView: View {
             // parent still threads the send (`persistedReplyTargetClaim` above).
             if let quote, !ExternalDraftAdoption.isAdoptedKey(draftId) {
                 let reply = quote.header
-                let resolvedForward = replyTo != nil ? isForward : draft.isForward
                 let dateStr = FixedDateFormat.localized(dateStyle: .medium, timeStyle: .short, timeZone: .current).string(from: reply.date)
                 if resolvedForward {
                     quotedAttribution = "---------- Forwarded message ----------\nFrom: \(reply.from)\nDate: \(dateStr)\nSubject: \(reply.subject)"
@@ -3150,6 +3239,9 @@ struct ComposeView: View {
             attachments = prefillAttachments
         }
 
+        // The replied-to email as resolved at open, when it could be confirmed; the opening
+        // suggestion below reads it.
+        var confirmedAtOpen: ComposeDraftGuards.RelatedEmail?
         if let reply = replyTo {
             if isForward {
                 // Forward mode: empty To (unless prefilled), "Fwd:" subject, quoted body
@@ -3189,6 +3281,10 @@ struct ComposeView: View {
                     expectedUidValidity: reply.observedUidValidity,
                     db: db)
             }
+            confirmedAtOpen = quote.map {
+                ComposeDraftGuards.RelatedEmail(header: $0.header, bodyHTML: $0.bodyHTML, isForward: isForward)
+            }
+            confirmedReply = confirmedAtOpen
             // ONLY a positively identity-confirmed body may populate the OUTBOUND
             // quote. The superseded `else` branch rendered `reply.snippet` — a cached
             // preview of whatever row the PK named — which bypasses the guard, so it
@@ -3227,18 +3323,17 @@ struct ComposeView: View {
         }
 
         // Unified suggestion-bubble setup. Caller-supplied suggestedBody (agent
-        // paths) always wins. For reply mode, fall back to fresh cachedReply
-        // from DB — protects against caller-side staleness when background AI,
-        // P2P sync, or a prior in-place edit updated cachedReply after the
-        // caller's snapshot was captured.
+        // paths) always wins. For reply mode, prefer the cachedReply of the row
+        // confirmed above — protects against caller-side staleness when background
+        // AI, P2P sync, or a prior in-place edit updated cachedReply after the
+        // caller's snapshot was captured. An unconfirmed row is never read for it
+        // (`openingSuggestion`).
         let suggestionToShow: String?
         if let suggestedBody, !suggestedBody.isEmpty {
             suggestionToShow = suggestedBody
         } else if let reply = replyTo, !isForward {
-            let freshHeader = try? dbPool.read { db in
-                try MessageHeader.fetchOne(db, key: reply.id)
-            }
-            suggestionToShow = freshHeader?.cachedReply
+            suggestionToShow = ComposeDraftGuards.openingSuggestion(
+                confirmed: confirmedAtOpen?.header, held: reply)
         } else {
             suggestionToShow = nil
         }

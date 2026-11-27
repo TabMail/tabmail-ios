@@ -16,6 +16,20 @@
 > takes the missing-permission arm here. The residual still holds for an org-policy 403 and for Google.
 > Detail: `Companion/Memory/Current/149-a-full-mailbox-keeps-a-calendar-change-queued.md`.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+
+> **Amendment (2026-11-27, tabmail-ios #659): the drain's signal no longer reads token-endpoint
+> codes.** `isCalendarOAuthReauthRequired` no longer claims `OAuthError.tokenExchangeFailed`; it keeps
+> the two post-refresh 401s and `ProviderError.authenticationFailed`. A token-endpoint refusal is
+> signalled by the token accessor every Google and Microsoft calendar request takes its token from
+> (`AccountManager.makeOAuthAccessor`), for the three grant-level codes and for `interaction_required`,
+> `consent_required` and `admin_policy_enforced` (`isSignInAgainOAuthFailure`), and only while the
+> refused sign-in is still the installed one. The arm lists below therefore now read: signal ∖ terminal
+> = `ProviderError.authenticationFailed`; terminal ∖ signal = `CalDAVError.authFailed` and the three
+> grant-level OAuth codes (signalled one step earlier, by the accessor). What retires an operation is
+> unchanged: `isCalendarAuthError` still claims the three grant-level codes alone; the three new codes
+> keep the change queued. Detail: `ios-queue-009.md`, #659 amendment.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 
 ## Status
 

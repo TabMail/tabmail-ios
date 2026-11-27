@@ -827,6 +827,16 @@ range, by leaving that side of the window unbounded; `MemoryIndexTests` reads a 
 through a window whose upper or lower edge falls past that range. The delete tests check that a fractional id
 in `unique_ids` is dropped, not truncated.
 
+## Agent tool rounds — the thinking signature goes back
+
+`ThinkingSignatureToolRoundTests` drives the tool loop (both `sendCompletionsWithTools` and
+`sendCompletionsWithToolsDirect`) against a fake backend whose first round asks for a client tool and
+keeps the assistant turn in `conversation_state.harmony_messages` with its `thinking` and
+`thinkingSignature`, as the backend does for an Anthropic model that thought before the call. The next
+request carries that assistant turn with the same signature and thinking, plus the tool's result. A
+message with no signature is encoded with no `thinkingSignature` key, so other providers' requests are
+unchanged.
+
 ## CalDAV series edits — moving a series' time
 
 `CalDAVSeriesStartShiftTests` checks what an edit that moves a repeating
@@ -1429,6 +1439,17 @@ archive and Undo of the replacement are legitimate. `replyDraftShapedIdIsJudgedB
 `generationScopeAndReDrive` pin `FolderResetGeneration.refuses(headerId:accountId:)`: an id is judged
 by the folder it names through `MessageIdentity.headerIdBelongsToFolder`, never a hand split, so a
 reply-draft id with extra colons is refused only when its own folder was reset.
+
+## An Undo cancels a waiting move only for its own email
+
+`UndoProviderIdentitySafetyTests.undoCancelsOnlyTheSameEmailsWaitingDelete` and
+`undoCancelsAnUndosWaitingMoveOnlyForItsEmail` run an Undo against a move waiting behind an in-flight
+IMAP move at the same address: a Delete waiting behind a move back to Inbox, and an Undo waiting
+behind its own forward move. Each runs four ways: the Undo names a different email (another
+Message-ID), the same email, or an email with no Message-ID, or the waiting email has no Message-ID
+while the Undo names one. A different email, or a waiting email with no Message-ID, restores nothing
+and leaves the waiting move in place, and that move is queued once the move ahead of it lands; the
+same email, or an Undo with no Message-ID, cancels it as before, and nothing is queued.
 
 ## Database proof harness
 

@@ -470,6 +470,12 @@ actor AccountManager {
         let predecessorDestinationPath: String
         let oldHeaderId: String
         var desiredDestinationPath: String
+        /// The email this successor moves: the Message-ID of its row when the
+        /// successor was recorded, nil when that row has no usable Message-ID.
+        /// An Undo cancels a successor only for the same email; another email
+        /// that later took this address owns its successor (C3). A content
+        /// witness that can only refuse, never an address (ADR-IOS-068/D4).
+        let messageIdentity: ExpectedMessageIdentity?
     }
 
     /// Old source-address header id -> latest successor.
@@ -1440,6 +1446,18 @@ actor AccountManager {
         authFailedAccounts.insert(accountId)
     }
 
+    /// Raise "sign in again" for a token refresh of sign-in `generation` that the
+    /// token endpoint refused, unless the account was removed or another sign-in was
+    /// installed after that refresh began. The check and the insert run in one turn
+    /// of this actor, which is also where a new sign-in is installed
+    /// (`installOAuthCredentials`) and the warning cleared (`connectAccount`), so a
+    /// sign-in installed in between is always seen.
+    func markAuthFailed(_ accountId: String, refusedSignIn generation: String, store: ProviderCredentialStore) {
+        guard !isRuntimeRemoved(accountId),
+              store.activation(accountId: accountId)?.generation == generation else { return }
+        authFailedAccounts.insert(accountId)
+    }
+
     func clearAuthFailed(_ accountId: String) {
         authFailedAccounts.remove(accountId)
     }
@@ -1915,17 +1933,22 @@ actor AccountManager {
                 // Every Gmail API and Graph request (sync, queued actions, sends,
                 // connect, calendar) gets its token here, so this is where a
                 // revoked sign-in tells the user to sign in again (#534). Only
-                // the three grant-level codes the token endpoint itself returns
-                // count; a 5xx, an offline device, `temporarily_unavailable` or
-                // a body without an `error` field says nothing about the grant.
-                // A refusal of a sign-in the user has already replaced is not
-                // reported. The error is rethrown unchanged, so each caller
-                // keeps its own disposition: queued actions and sends are kept.
+                // the top-level `error` code of the token endpoint's answer is
+                // read, whatever the HTTP status, and only the codes for a refused
+                // grant, or for another sign-in step, consent or an admin
+                // restriction (#659), count (`isSignInAgainOAuthFailure`); an
+                // offline device, an answer without an `error` code,
+                // `temporarily_unavailable` or `server_error` says nothing about
+                // the sign-in.
+                // A refusal of a sign-in the user has already replaced, or of a
+                // removed account, is not reported; that check runs on the actor,
+                // in the same turn as the insert. This is the only place a token
+                // refusal raises the warning (the calendar drain does not). The
+                // error is rethrown unchanged, so each caller keeps its own
+                // disposition: queued actions and sends are kept.
                 if case OAuthError.tokenExchangeFailed(let reason) = error,
-                   Self.isGrantLevelOAuthFailure(reason),
-                   !self.isRuntimeRemoved(accountId),
-                   store.activation(accountId: accountId)?.generation == generation {
-                    await self.markAuthFailed(accountId)
+                   Self.isSignInAgainOAuthFailure(reason) {
+                    await self.markAuthFailed(accountId, refusedSignIn: generation, store: store)
                 }
                 throw error
             }

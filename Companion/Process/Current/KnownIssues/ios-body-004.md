@@ -1,5 +1,18 @@
 # IOS-BODY-004
 
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Note (2026-11-26): a live view now follows a posted re-key
+
+Every path that changes a header's primary key posts the old-key to new-key mapping it holds, after
+its write commits (`MailPointerMoves`, `.mailPointersMoved`; the producer list is in `IOS-AI-005`'s
+amendment). The open detail view re-points to the new key (`MessageDetailViewModel.applyPointerMoves`),
+so a view still polling for its body fetches the re-keyed row on its next tick
+(`pollingViewReadsTheRekeyedRow`). The producer records that mapping; nothing finds it by matching, so
+the `DO NOT RE-ADD` rule at the `startBodyPoll` catch stands. It lives only in memory and covers only
+the paths that post it: a view whose key vanished for a reason no producer posts (the date-window RFC
+repair of a row with a real id, or a row a collision deleted with no copy to follow) still needs the
+reopen, which is why this row stays accepted.
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 > Routed from `KNOWN_ISSUES.md` line 1421 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
 
 - Register classification: `accepted`

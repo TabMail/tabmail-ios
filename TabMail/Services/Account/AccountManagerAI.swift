@@ -33,8 +33,9 @@ import UserNotifications
 // recomputable — the queue's own GRDB arbiter (`ActiveAIQueue.readJobOutcome`)
 // sees the field still empty and re-drives the job. This leniency does NOT
 // generalize to any user-intention path (see `Core Philosophy: Never Drop User
-// Intention`). The tenth, `ComposeView.writeCachedReplyToDB`, stores a user's
-// edit of the suggestion, but only into the reopen-time cache; the edit itself
+// Intention`). The tenth, `ComposeView.storeCachedReply`, stores a user's edit
+// of the suggestion (`writeCachedReplyToDB`) or a Recompute answer
+// (`storeRecomputedReply`), but only into the reopen-time cache; the text itself
 // stays in the open compose, so a refused write costs that convenience only.
 
 /// Outcome of a guarded AI header write. `Sendable` because it is produced inside

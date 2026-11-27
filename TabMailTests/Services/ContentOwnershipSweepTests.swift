@@ -732,6 +732,54 @@ struct ContentOwnershipSweepTests {
         await cleanup(accountId: accountId, keys: [oldKey, newKey])
     }
 
+    /// A view or a saved chat holding the row follows the body queue's UID
+    /// remap. The remap is the same weak mapping as the sync's own UID remap,
+    /// so it is posted with no provider authority. A message with no
+    /// Message-ID is keyed by its UID, so its saved chat moves to the new UID's
+    /// session and names the new row.
+    @Test("A backfill UID remap posts its move, and the saved chat follows")
+    func backfillUidRemapPostsTheMoveAndTheChatFollows() async throws {
+        let dir = try Self.makeAssetEnvironment()
+        defer { Self.teardownAssets(dir) }
+        let accountId = "backfill-follow-\(UUID().uuidString.prefix(8).lowercased())"
+        try await seedScope(accountId: accountId, folderPath: "Archive", provider: .imap)
+        let old = try await seedHeader(accountId: accountId, folderPath: "Archive", messageId: "77")
+        let newHeaderId = MessageIdentity.headerId(accountId: accountId, folderPath: "Archive", messageId: "78")
+        let tag = "backfill-chat-\(UUID().uuidString.prefix(8))"
+        try await AppDatabase.dbPool.write { db in
+            try SavedChatFixture.insert(
+                tag: tag, sessionId: SavedChatFixture.sessionId(accountId: accountId, stableId: "77"),
+                namingHeaderId: old.id, db: db)
+        }
+        let posted = PlaceholderCopyRekeyTests.PostedRekeys(accountId: accountId)
+        let token = posted.start()
+
+        let outcome = await BackfillBodyQueue().rekeyRemappedHeader(
+            item: BackfillBodyQueue.Item(
+                headerId: old.id, accountId: accountId,
+                folderPath: "Archive", messageId: "77", isInInbox: false),
+            newUID: "78")
+        NotificationCenter.default.removeObserver(token)
+
+        let migrated: Bool
+        if case .migrated = outcome { migrated = true } else { migrated = false }
+        #expect(migrated, "precondition: the remap must have MIGRATED, got \(outcome)")
+        let move = HeaderRekeyRecord(
+            oldHeaderId: old.id, newHeaderId: newHeaderId, newProviderMessageId: "78",
+            carriesProviderAuthority: false,
+            stableIds: StableIds(accountId: accountId, old: "77", new: "78"))
+        let postedMoves = posted.all
+        #expect(postedMoves == [move])
+        let chat = try await AppDatabase.dbPool.read { try SavedChatFixture.read(tag: tag, db: $0) }
+        let chatFollowed = SavedChatFixture.expected(
+            sessionId: SavedChatFixture.sessionId(accountId: accountId, stableId: "78"),
+            namingHeaderId: newHeaderId)
+        #expect(chat == chatFollowed)
+        try? await AppDatabase.dbPool.write { try SavedChatFixture.delete(tag: tag, db: $0) }
+        await cleanup(
+            accountId: accountId, keys: [ContentKey(rawValue: old.id), ContentKey(rawValue: newHeaderId)])
+    }
+
     /// TWO-SIDED ANCHOR — the other half of the split, and the counterfactual to the
     /// fix above (`MIS-026`). On the `.duplicateDropped` leg the new UID was
     /// independently backfilled and owns its OWN assets; `rekeyRemappedHeader`

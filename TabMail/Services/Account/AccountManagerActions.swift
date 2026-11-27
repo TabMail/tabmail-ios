@@ -408,7 +408,7 @@ extension AccountManager {
 
     /// Post `.messageMovesRefused` for the members a `move` call did not move.
     /// Delivered on the MainActor before `move` returns, as
-    /// `publishMoveFinish` delivers `.messageHeadersRekeyed`, so a list that
+    /// `publishMoveFinish` delivers `.mailPointersMoved`, so a list that
     /// hid those rows at gesture time shows them again in the same step that
     /// settles the action (#441).
     private static func announceMovesRefused(_ ids: Set<String>) async {
@@ -1365,7 +1365,9 @@ extension AccountManager {
                             predecessorOperationId: predecessor.id,
                             predecessorDestinationPath: folderPath,
                             oldHeaderId: message.id,
-                            desiredDestinationPath: destinationPath)
+                            desiredDestinationPath: destinationPath,
+                            messageIdentity: ExpectedMessageIdentity(
+                                capturedRfc822MessageId: message.rfc822MessageId))
                     }
                     outcome.set(.retainedForRetry, ids: msgs.map(\.id))
                     return ([], outcome, successors)
@@ -1653,7 +1655,7 @@ extension AccountManager {
                 + "deferredRegistered=\(deferredSuccessors.count)")
         // Settle the gesture-time hide of every member this call did NOT
         // move, the way a completed move settles it through
-        // `.messageHeadersRekeyed`: a list hid the row when the user acted,
+        // `.mailPointersMoved`: a list hid the row when the user acted,
         // and only this call knows the move never happened.
         let deferredIds = Set(deferredSuccessors.map(\.oldHeaderId))
         let refusedIds = requestedIds
@@ -2198,13 +2200,21 @@ extension AccountManager {
         // This is exact and whole-command: every member must name a successor
         // whose current desired destination is the forward destination and
         // whose predecessor already leaves the message in the undo source.
+        // The successor must also belong to the email the Undo names: another
+        // email that later took this address owns its successor, and the
+        // write path below refuses that member (its row has not reached the
+        // forward destination yet). An Undo whose email has no usable
+        // Message-ID keeps the address check alone.
         let memberHeaderIds = Set(members.map(\.originalHeaderId))
         if memberHeaderIds.count == members.count,
            members.allSatisfy({ member in
                guard let successor = deferredMoveSuccessors[member.originalHeaderId]
                else { return false }
+               let expected = ExpectedMessageIdentity(
+                   capturedRfc822MessageId: member.sourceRfc822MessageId)
                return successor.desiredDestinationPath == forwardDestinationPath
                    && successor.predecessorDestinationPath == sourcePath
+                   && (expected == nil || successor.messageIdentity == expected)
            }) {
             let cancelled = coalesceDeferredMoves(
                 headerIds: memberHeaderIds,
@@ -2335,12 +2345,14 @@ extension AccountManager {
                             + "ids=[\(members.map(\.originalHeaderId).joined(separator: ","))]")
                     return UndoMoveWriteResult(
                         restoredOriginalHeaderIds: members.map(\.originalHeaderId),
-                        deferredSuccessors: members.map { member in
+                        deferredSuccessors: zip(members, currentRows).map { member, row in
                             DeferredMoveSuccessor(
                                 predecessorOperationId: predecessor.id,
                                 predecessorDestinationPath: forwardDestinationPath,
                                 oldHeaderId: member.originalHeaderId,
-                                desiredDestinationPath: sourcePath)
+                                desiredDestinationPath: sourcePath,
+                                messageIdentity: ExpectedMessageIdentity(
+                                    capturedRfc822MessageId: row.rfc822MessageId))
                         })
                 }
 

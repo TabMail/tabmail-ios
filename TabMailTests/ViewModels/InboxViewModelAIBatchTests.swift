@@ -472,8 +472,7 @@ struct InboxViewModelAIBatchTests {
         }
         #expect(applied)
         guard applied else { return }
-        NotificationCenter.default.post(
-            name: .messageHeadersRekeyed, object: [record])
+        MailPointerMoves.post(MailPointerMoves([.row(record)]))
 
         try await Task.sleep(for: .milliseconds(450))
 

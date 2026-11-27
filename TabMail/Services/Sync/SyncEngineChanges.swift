@@ -370,6 +370,10 @@ extension SyncEngine {
                 || changes.cursor != nil || changes.status.changesFolderCoverage else { continue }
             let applying = changes
             let applied = try await dbPool.write { db in try Self.applyFolderChanges(applying, db: db) }
+            // Open views holding a replaced placeholder follow the server's copy
+            // now, right after this folder's write committed: a later folder's
+            // failed write must not skip it.
+            await MailPointerMoves.publishRekeys(applied.headerRekeys)
             if applied.storedCursor != nil || outcome.folderBookmarkLeft[changes.folderId] != nil {
                 outcome.folderBookmarkLeft[changes.folderId] = applied.storedCursor
             }

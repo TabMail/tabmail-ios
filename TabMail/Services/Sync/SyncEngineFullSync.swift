@@ -47,6 +47,56 @@ extension SyncEngine {
         LIMIT 1
         """
 
+    /// The move an open view follows when the sync replaces a sent or saved
+    /// email's placeholder row (`sent-…`, `draft-…`) by the server's copy, in
+    /// the same transaction that deletes the placeholder and stores the copy
+    /// (full sync's dedup and remap legs, and the change reader's
+    /// `optimisticDedupSQL` dedup). Posted after the write commits
+    /// (`MailPointerMoves.publishRekeys`), so a list, a detail or a chat that holds the
+    /// placeholder points at the copy without a reopen.
+    ///
+    /// Only a placeholder: no server holds its id, so following it can never
+    /// move an action on screen from one real message to another. A replaced
+    /// row that has a real provider id stays out, as the date-window RFC
+    /// repair does. Same shape as the UID remap's record: no provider
+    /// authority (the copy is matched by its Message-ID, so action state keyed
+    /// by the old id, a hidden or fading row, does not follow) and no epoch.
+    nonisolated static func placeholderReplacement(
+        of placeholder: MessageHeader, by copy: MessageHeader
+    ) -> HeaderRekeyRecord? {
+        guard isSyntheticPlaceholderId(placeholder.messageId) else { return nil }
+        return HeaderRekeyRecord(
+            oldHeaderId: placeholder.id,
+            newHeaderId: copy.id,
+            newProviderMessageId: copy.messageId,
+            carriesProviderAuthority: false,
+            stableIds: StableIds(from: placeholder, to: copy))
+    }
+
+    /// The user labels of a row the sync replaces by another row, read before
+    /// the old row is deleted: its `messageUserLabel` rows cascade with it, and
+    /// the listing's label set can miss a label whose op has not drained. The
+    /// row that takes its place gets them back with `carryUserLabels`. Used by
+    /// the sync legs that delete a row and insert its replacement themselves:
+    /// the placeholder dedup (full sync and the change reader) and the pre-sync
+    /// inbox reclaim. (`MessageHeaderRekey.apply` carries the labels of the
+    /// rows it re-keys.)
+    nonisolated static func userLabelIdsToCarry(from headerId: String, db: Database) throws -> [String] {
+        try MessageUserLabel
+            .filter(Column("messageId") == headerId)
+            .fetchAll(db)
+            .map(\.userLabelId)
+    }
+
+    /// Writes the labels `userLabelIdsToCarry` read onto the row that replaced
+    /// the old one. Insert-or-ignore: a label the listing already wrote stays once.
+    nonisolated static func carryUserLabels(_ userLabelIds: [String], to headerId: String, db: Database) throws {
+        for carriedUserLabelId in userLabelIds {
+            try MessageUserLabel(messageId: headerId, userLabelId: carriedUserLabelId)
+                .insert(db, onConflict: .ignore)
+        }
+    }
+
     // MARK: - Full-sync MODSEQ fetch-skip (Fix B task 4)
 
     /// Per-folder counter of full syncs since the last deep pass. Forces a DEEP
@@ -349,7 +399,6 @@ extension SyncEngine {
         // Helper: process sync result — FTS indexing, ReplyDetect notifications, collect migrated IDs.
         // Extracted to avoid duplication between initial sync and connection-error retry.
         @Sendable func processSyncResult(_ result: SyncMessagesResult, folder: Folder) async -> [String] {
-            await Self.publishHeaderRekeys(result.headerRekeys)
             // Recount right after the folder's rows are committed, as the
             // `syncMessages` wrapper does: `runSyncMessages` inserts and removes
             // rows and changes their read state, and does not recount. A change
@@ -743,8 +792,6 @@ extension SyncEngine {
             BackgroundSyncLogger.logDebug("[FullSync] listing — UID migrated \(result.uidMigratedOldIds.count) messages")
         }
 
-        await Self.publishHeaderRekeys(result.headerRekeys)
-
         // ReplyDetect: notify UI immediately so tag badges update.
         ReplyParentResolver.postParentNotifications(result.replyDetectIds)
 
@@ -774,17 +821,6 @@ extension SyncEngine {
 
     // MARK: - Background Sync Helpers
 
-    /// Keep active view-local identities coherent with a committed sync re-key.
-    /// Once publication reaches MainActor, delivery is synchronous so the model
-    /// and view-owned bindings apply the same committed transition before the
-    /// publisher returns.
-    private static func publishHeaderRekeys(_ records: [HeaderRekeyRecord]) async {
-        guard !records.isEmpty else { return }
-        await MainActor.run {
-            NotificationCenter.default.post(name: .messageHeadersRekeyed, object: records)
-        }
-    }
-
     /// Result from per-folder message sync. All fields are Sendable for cross-isolation transfer.
     struct SyncMessagesResult: Sendable {
         let newHeaders: [MessageHeader]
@@ -796,9 +832,12 @@ extension SyncEngine {
         /// text + messages_vec embedding) moves to the new id IN PLACE.
         /// `newMessageId` refreshes the FTS msgId column on UID remaps.
         let ftsRekeys: [(oldId: String, newId: String, newMessageId: String?)]
-        /// Exact committed UID-remap mappings for active view-local identities.
-        /// This is intentionally narrower than `ftsRekeys`: canonicalization
-        /// carriers without a new provider id cannot update a visible snapshot.
+        /// Every committed change of a stored row's key this pass made: the UID
+        /// remap, a placeholder replaced by the server's copy
+        /// (`placeholderReplacement`), the canonicalization re-key
+        /// (`canonicalizeLocalRows`) and the pre-sync inbox reclaim. Their
+        /// saved chats moved in the same write; the records are already
+        /// published by `runSyncMessages` right after that write committed.
         let headerRekeys: [HeaderRekeyRecord]
         /// The counters this listing's own selection reported, written with its
         /// rows; nil when the listing proved nothing or the pass was refused
@@ -834,6 +873,8 @@ extension SyncEngine {
     /// re-key the FTS entry IN PLACE via `SearchIndex.rekeyHeaders` — this
     /// preserves the FTS rowid, the indexed body text, and the messages_vec
     /// embedding; the re-keyed old id must NOT ride the staleIds channel).
+    /// `rekey` is the same re-key as a `HeaderRekeyRecord`, which the caller
+    /// posts after its write commits so open views and chats follow the row.
     ///
     /// `bodyComplete` stays truthful per row: the survivor keeps its OWN flag
     /// (no OR-merge from losers — that would claim an FTS body the survivor's
@@ -885,11 +926,11 @@ extension SyncEngine {
         sourceBoundEpoch: Int?,
         incomingRfc822Identity: String?,
         db: Database
-    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool) {
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool, rekey: HeaderRekeyRecord?) {
         let allRows = try MessageHeader
             .filter(Column("messageId") == messageId && Column("folderId") == folderId)
             .fetchAll(db)
-        guard !allRows.isEmpty else { return (nil, [], nil, false) }
+        guard !allRows.isEmpty else { return (nil, [], nil, false, nil) }
 
         let canonicalId = MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: messageId)
 
@@ -948,15 +989,15 @@ extension SyncEngine {
                 }
             }()
             BackgroundSyncLogger.log("[Sync] canonicalize REFUSED at (folderId=\(folderId), msgId=\(messageId)) — no row proves provider-address ownership; the incoming message is \(admitIncomingAsNewRow ? "ADMITTED as a new row (every retained row provably denotes a different message)" : "NOT admitted (no positive evidence of non-identity)")")
-            if admitIncomingAsNewRow { return (nil, [], nil, false) }
-            return (retainedRows.first(where: { $0.id == canonicalId }) ?? retainedRows[0], [], nil, false)
+            if admitIncomingAsNewRow { return (nil, [], nil, false, nil) }
+            return (retainedRows.first(where: { $0.id == canonicalId }) ?? retainedRows[0], [], nil, false, nil)
         }
         // Fast path — a single row already under the canonical PK is the
         // overwhelmingly common case. Return before ANY extra query so the
         // per-message cost of the upsert loop is identical to the plain
         // fetchOne this replaced (ADR-IOS-029 hot-path discipline).
         if rows.count == 1 && rows[0].id == canonicalId {
-            return (rows[0], [], nil, true)
+            return (rows[0], [], nil, true, nil)
         }
 
         var survivor = rows.first(where: { $0.id == canonicalId }) ?? rows[0]
@@ -1013,6 +1054,7 @@ extension SyncEngine {
         }
 
         var ftsRekey: (oldId: String, newId: String)?
+        var rekey: HeaderRekeyRecord?
         if willRekey {
             // Defensive — the canonical PK can be held by a row in ANOTHER
             // folder (a message optimistically moved OUT of this folder keeps
@@ -1023,7 +1065,7 @@ extension SyncEngine {
                     print("[Sync] Canonicalize: SKIPPING re-key \(survivor.id) → \(canonicalId) — id held by another row")
                 }
                 if !removedIds.isEmpty || survivorHadObservedEpoch { try survivor.update(db) }
-                return (survivor, removedIds, nil, true)
+                return (survivor, removedIds, nil, true, nil)
             }
             // Re-key the optimistic-move remnant to the canonical PK. (The FK that
             // used to FORBID a PK `UPDATE` here is gone as of Stage D, but converting
@@ -1085,7 +1127,7 @@ extension SyncEngine {
                     print("[Sync] Canonicalize: re-key \(oldId) → \(canonicalId) COLLIDED — old row is gone")
                 }
                 removedIds.append(oldId)
-                return (try MessageHeader.fetchOne(db, key: canonicalId), removedIds, nil, true)
+                return (try MessageHeader.fetchOne(db, key: canonicalId), removedIds, nil, true, nil)
             }
             // A reply or forward still in the Outbox names its original by header
             // id (#1479), and its completion and an unsent removal's revert read
@@ -1105,6 +1147,23 @@ extension SyncEngine {
             try db.execute(
                 sql: "UPDATE outboxMessage SET originalMessageHeaderId = ? WHERE originalMessageHeaderId = ?",
                 arguments: [canonicalId, oldId])
+            // A saved reply or forward draft names its original the same way and
+            // follows on the same proof. The provider id is unchanged here (this
+            // re-key keeps `messageId`), so only the header key moves. The draft
+            // table holds only the user's open drafts.
+            try db.execute(
+                sql: "UPDATE draft SET replyToId = ? WHERE replyToId = ?",
+                arguments: [canonicalId, oldId])
+            // Posted for views and chats to follow, with no provider authority:
+            // a hidden or fading row keyed by the old id stays as it was. The
+            // undo stack follows only a move's finish, so a hidden row that
+            // followed this re-key could stay hidden after an Undo.
+            rekey = HeaderRekeyRecord(
+                oldHeaderId: oldId, newHeaderId: canonicalId,
+                newProviderMessageId: migrated.messageId,
+                newObservedUidValidity: migrated.observedUidValidity,
+                carriesProviderAuthority: false,
+                stableIds: StableIds(from: survivor, to: migrated))
             survivor = migrated
             ftsRekey = (oldId: oldId, newId: canonicalId)
             if DebugModeManager.isLoggingEnabled() {
@@ -1121,7 +1180,7 @@ extension SyncEngine {
             try rekeyedBody.insert(db)
         }
 
-        return (survivor, removedIds, ftsRekey, true)
+        return (survivor, removedIds, ftsRekey, true, rekey)
     }
 
     /// ⚑ NO REFERENCE — INVENTED: minimum proof that a local row owns the
@@ -1897,6 +1956,11 @@ extension SyncEngine {
                     if DebugModeManager.isLoggingEnabled() {
                         print("[Sync] UID remap: SKIPPING migrate-insert for \(newId) — already present")
                     }
+                    // The placeholder row is gone and the copy already lives at
+                    // `newId`, so a view holding the placeholder follows it.
+                    if let record = Self.placeholderReplacement(of: staleMsg, by: migrated) {
+                        headerRekeys.append(record)
+                    }
                     continue
                 }
                 // Move the FTS entry to the new id IN PLACE (preserves the
@@ -1909,13 +1973,18 @@ extension SyncEngine {
                 // actionable ids, so RFC correlation must not immediately turn
                 // an arbitrary duplicate Message-ID match into UI action state.
                 // Their durable/FTS repair remains unchanged and a normal reload
-                // converges from GRDB.
+                // converges from GRDB. A sent or saved email's placeholder that
+                // this listing replaces is followed on every provider: no server
+                // holds its id (`placeholderReplacement`).
                 if windowMode == .uid {
                     headerRekeys.append(HeaderRekeyRecord(
                         oldHeaderId: oldId,
                         newHeaderId: newId,
                         newProviderMessageId: newMsgId,
-                        carriesProviderAuthority: false))
+                        carriesProviderAuthority: false,
+                        stableIds: StableIds(from: staleMsg, to: migrated)))
+                } else if let record = Self.placeholderReplacement(of: staleMsg, by: migrated) {
+                    headerRekeys.append(record)
                 }
                 uidMigratedRemoteIds.insert(newMsgId)
                 uidMigratedOldMsgIds.append(staleMsg.messageId)
@@ -2021,7 +2090,7 @@ extension SyncEngine {
                 // RFC identity remains metadata/corroboration only. Provider-
                 // address ownership is decided from the bound fetch provenance.
                 let normalizedIncomingRfc822 = Self.normalizedRfc822Identity(info.rfc822MessageId)
-                let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool)
+                let recon: (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool, rekey: HeaderRekeyRecord?)
                 if folder.role == .drafts || folder.role == .sent {
                     let row = try MessageHeader
                         .filter(Column("messageId") == info.messageId && Column("folderId") == folderId)
@@ -2035,7 +2104,7 @@ extension SyncEngine {
                             canonicalId: canonicalId, windowMode: windowMode,
                             sourceBoundEpoch: sourceBoundEpoch)
                     } ?? false
-                    recon = (row, [], nil, sourceAddressProven)
+                    recon = (row, [], nil, sourceAddressProven, nil)
                 } else {
                     recon = try Self.canonicalizeLocalRows(
                         accountId: accountId, folderPath: folderPath,
@@ -2054,6 +2123,9 @@ extension SyncEngine {
                     // FTS entry moves to the new id in place — body text and
                     // embedding ride along. messageId is unchanged here.
                     ftsRekeys.append((oldId: rekey.oldId, newId: rekey.newId, newMessageId: nil))
+                }
+                if let rekey = recon.rekey {
+                    headerRekeys.append(rekey)
                 }
                 if var existing = recon.row {
                     // Pre-mutation snapshot so the write below can be SKIPPED when the
@@ -2270,8 +2342,11 @@ extension SyncEngine {
                        try MessageAICache.fetchOne(db, key: cacheKey) != nil {
                         try db.execute(sql: "UPDATE messageAICache SET key = ? WHERE key = ?", arguments: [newCacheKey, cacheKey])
                     }
+                    // The placeholder's user labels go to the copy (`userLabelIdsToCarry`).
+                    let carriedUserLabelIds = try Self.userLabelIdsToCarry(from: oldId, db: db)
                     try optimistic.delete(db)
                     guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
+                        try Self.carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
                         if folder.role == .drafts || folder.role == .sent {
                             if DebugModeManager.isLoggingEnabled() {
                                 print("[Sync] DraftDedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot). remoteSnippet=\(String(header.snippet.prefix(60)))")
@@ -2287,6 +2362,11 @@ extension SyncEngine {
                         // that no longer exists; without this it rode NEITHER
                         // `ftsRekeys` nor `staleIds` and left a permanent FTS orphan.
                         staleIds.append(oldId)
+                        // The copy already lives at `header.id`, so a view holding
+                        // the placeholder follows it there.
+                        if let record = Self.placeholderReplacement(of: optimistic, by: header) {
+                            headerRekeys.append(record)
+                        }
                         continue
                     }
                     try header.insert(db)
@@ -2304,6 +2384,9 @@ extension SyncEngine {
                     // sets on first success with no production reset — so it
                     // provably cannot run again (`MIS-024`).
                     ftsRekeys.append((oldId: oldId, newId: header.id, newMessageId: header.messageId))
+                    if let record = Self.placeholderReplacement(of: optimistic, by: header) {
+                        headerRekeys.append(record)
+                    }
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     // Insert user label associations
                     for labelId in info.userLabelIds {
@@ -2314,6 +2397,7 @@ extension SyncEngine {
                         try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
+                    try Self.carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
                     newHeaders.append(header)
                     insertedIds.append(header.id)
                     if folder.role == .drafts || folder.role == .sent {
@@ -2448,6 +2532,8 @@ extension SyncEngine {
                     // same assign/keep rule already applied at the `existing` merge
                     // branch and at the orphan reclaim.
                     if normalizedIncomingRfc822 == nil { header.rfc822MessageId = preSync.rfc822MessageId }
+                    // The reclaimed row's user labels go to the new row (`userLabelIdsToCarry`).
+                    let carriedUserLabelIds = try Self.userLabelIdsToCarry(from: oldId, db: db)
                     try preSync.delete(db)
                     try header.insert(db)
                     if let body = deferredBody { try body.insert(db) }
@@ -2457,6 +2543,16 @@ extension SyncEngine {
                     // time. Without this the reclaimed row's indexed text stays filed
                     // under a header id that no longer exists.
                     ftsRekeys.append((oldId: oldId, newId: header.id, newMessageId: header.messageId))
+                    // A view or chat holding the reclaimed row follows it. The
+                    // match is by account and message id, not a folder-native
+                    // proof, so the move carries no provider authority and a
+                    // send's link to its original does not follow it.
+                    headerRekeys.append(HeaderRekeyRecord(
+                        oldHeaderId: oldId, newHeaderId: header.id,
+                        newProviderMessageId: header.messageId,
+                        newObservedUidValidity: header.observedUidValidity,
+                        carriesProviderAuthority: false,
+                        stableIds: StableIds(from: preSync, to: header)))
                     try ThreadUtils.insertMessageReferences(for: header, db: db)
                     for labelId in info.userLabelIds {
                         let labelRow = UserLabel(accountId: accountId, providerLabelId: labelId, name: labelId, isSystem: false)
@@ -2466,6 +2562,7 @@ extension SyncEngine {
                         try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
+                    try Self.carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
                     newHeaders.append(header)
                     // A NEW row under `header.id` (the pre-sync row was deleted
                     // above and re-inserted here), so it is an insert for the
@@ -2705,6 +2802,8 @@ extension SyncEngine {
                 // the folder until a finished walk clears it (#755).
                 try Self.armListingDueIfHeldExceeds(counters.messageCount, folderId: folderId, db: db)
             }
+            // The re-keyed emails' saved chats follow them in this transaction.
+            try ChatStore.followRekeyedEmails(headerRekeys, db: db)
             return (newHeaders, staleIds, replyDetectIds, uidMigratedOldMsgIds, ftsRekeys, headerRekeys, upsertLine, counters, true)
         }
         let writeMs = Int((CFAbsoluteTimeGetCurrent() - writeStart) * 1000)
@@ -2713,6 +2812,9 @@ extension SyncEngine {
         }
         // Reached only when the write above COMMITTED: a rolled-back pass throws
         // past this point and reports nothing (R4-RS-1).
+        // Open views follow the committed re-keys now, before any later
+        // cancellation check of the caller can skip them.
+        await MailPointerMoves.publishRekeys(syncResult.headerRekeys)
         if let upsertLine = syncResult.upsertLine {
             BackgroundSyncLogger.logQueue(upsertLine)
         }

@@ -403,6 +403,27 @@ struct HarmonyMessage: Sendable, Codable {
     let thinking: String?
     let tool_calls: [CompletionsToolCall]?
     let tool_call_id: String?
+
+    /// Opaque provider passthrough. When an Anthropic model thinks before a tool
+    /// call, the backend stores the thinking block's signature on the assistant
+    /// message (`Message.thinkingSignature`) and sends the thinking block back
+    /// only when the signature is present; Anthropic rejects a tool continuation
+    /// whose assistant turn lacks it. iOS decodes and re-encodes
+    /// `conversation_state.harmony_messages` between rounds, so the field must be
+    /// round-tripped as-is, like the Thunderbird add-on, which passes the
+    /// messages through unchanged. We NEVER read into it. Absent for every other
+    /// provider (omitted on encode, so those payloads are byte-identical).
+    let thinkingSignature: String?
+
+    init(role: String, content: String?, thinking: String?, tool_calls: [CompletionsToolCall]?,
+         tool_call_id: String?, thinkingSignature: String? = nil) {
+        self.role = role
+        self.content = content
+        self.thinking = thinking
+        self.tool_calls = tool_calls
+        self.tool_call_id = tool_call_id
+        self.thinkingSignature = thinkingSignature
+    }
 }
 
 /// Record of a tool execution for debugging/tracing.

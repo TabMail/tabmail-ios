@@ -64,6 +64,9 @@ import GRDB
 struct FolderChangeApplyResult {
     var newHeaders: [MessageHeader] = []
     var removedIds: [String] = []
+    /// Placeholder rows replaced by the server's copy (`placeholderReplacement`),
+    /// posted to open views once this folder's transaction has committed.
+    var headerRekeys: [HeaderRekeyRecord] = []
     var discoveredParents: [String] = []
     var wroteRows = false
     var armedCatchUp = false
@@ -280,6 +283,8 @@ extension SyncEngine {
         if state != before {
             try db.execute(sql: "UPDATE folder SET changeState = ? WHERE id = ?", arguments: [state.encoded, folder.id])
         }
+        // The re-keyed emails' saved chats follow them in this transaction.
+        try ChatStore.followRekeyedEmails(result.headerRekeys, db: db)
         result.storedCursor = cursor
         return result
     }
@@ -718,10 +723,7 @@ extension SyncEngine {
            let optimistic = try MessageHeader.fetchOne(
             db, sql: optimisticDedupSQL, arguments: [folder.id, rfc822, header.messageId]) {
             let oldId = optimistic.id
-            carriedUserLabelIds = try MessageUserLabel
-                .filter(Column("messageId") == oldId)
-                .fetchAll(db)
-                .map(\.userLabelId)
+            carriedUserLabelIds = try userLabelIdsToCarry(from: oldId, db: db)
             if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                 var newBody = body
                 newBody.id = ContentKey(rawValue: header.id)
@@ -729,6 +731,9 @@ extension SyncEngine {
                 deferredBody = newBody
             }
             result.removedIds.append(oldId)
+            if let rekey = placeholderReplacement(of: optimistic, by: header) {
+                result.headerRekeys.append(rekey)
+            }
             try optimistic.delete(db)
             if DebugModeManager.isLoggingEnabled() {
                 print("[Sync] change apply dedup: replaced optimistic \(folder.role.rawValue) header \(oldId) with \(header.id)")
@@ -750,10 +755,7 @@ extension SyncEngine {
             try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                 .insert(db, onConflict: .ignore)
         }
-        for carriedUserLabelId in carriedUserLabelIds {
-            try MessageUserLabel(messageId: header.id, userLabelId: carriedUserLabelId)
-                .insert(db, onConflict: .ignore)
-        }
+        try carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
         result.newHeaders.append(header)
         result.wroteRows = true
 

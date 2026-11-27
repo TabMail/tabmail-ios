@@ -669,8 +669,18 @@ extension AccountManager {
             // message appears in the Sent folder immediately (before IMAP APPEND + sync).
             // Written as the provider lists its copy when that copy was read;
             // otherwise sync replaces it by rfc822MessageId.
-            await insertOptimisticSentHeader(
+            let copyHeaderId = await insertOptimisticSentHeader(
                 outboxMessage: current, messageId: messageId, draft: draftWithId, sentCopy: sentCopy)
+
+            // The send is filed: a view holding its outbox item follows it to
+            // the Sent copy (or learns no copy was written) before the outbox
+            // row can be deleted below, so a finished send is never taken for
+            // an undone one. Awaited: the delete follows within milliseconds when the
+            // provider files the copy itself.
+            let filed = MailPointerMoves([.sent(outboxId: current.id, copyHeaderId: copyHeaderId)])
+            await MainActor.run {
+                MailPointerMoves.publish(filed)
+            }
 
             // Attempt Sent folder append. If it fails, the message stays in the
             // outbox with sentAt set — drainPendingSentAppends will retry later.
@@ -876,15 +886,21 @@ extension AccountManager {
     /// it already holds. Otherwise the row is `sent-<outbox id>` and the sync
     /// replaces it when a copy with the pre-generated Message-ID arrives (same
     /// pattern as optimistic drafts).
+    ///
+    /// Returns the Sent copy's header id: the row written here, or the copy a
+    /// sync stored first. nil when no copy was written (no Sent folder, or the
+    /// write failed).
     private func insertOptimisticSentHeader(
         outboxMessage msg: OutboxMessage, messageId: String, draft: DraftMessage, sentCopy: ListedSentCopy?
-    ) async {
+    ) async -> String? {
         do {
-            // Write transaction returns FTS data for post-transaction indexing.
+            // Write transaction returns the copy's header id, and the FTS data
+            // for post-transaction indexing when this write stored the row.
             // Same pattern as queueDraftSave — headerComplete=1 must be set via the real
             // FTS pipeline, not manually, otherwise the body queue / recovery logic misbehaves.
             // `bodyText` is nil when no local body was written.
-            let ftsInfo: (record: FTSHeaderRecord, bodyText: String?)? = try await dbPool.write { db -> (FTSHeaderRecord, String?)? in
+            typealias Written = (copyHeaderId: String, ftsInfo: (record: FTSHeaderRecord, bodyText: String?)?)
+            let written: Written? = try await dbPool.write { db -> Written? in
                 guard let sentFolder = try Folder
                     .filter(Column("accountId") == msg.accountId && Column("role") == FolderRole.sent.rawValue)
                     .fetchOne(db) else {
@@ -899,9 +915,9 @@ extension AccountManager {
                 // Don't insert if a header with this rfc822MessageId already exists (idempotent).
                 // This is also a provider copy a sync stored before this write: it
                 // stays as the sync wrote it, and nothing more is written here.
-                if try MessageHeader.fetchOne(
-                    db, sql: Self.optimisticSentDedupSQL, arguments: [folderId, rfc822]) != nil {
-                    return nil
+                if let stored = try MessageHeader.fetchOne(
+                    db, sql: Self.optimisticSentDedupSQL, arguments: [folderId, rfc822]) {
+                    return (stored.id, nil)
                 }
 
                 let senderAccount = try Account.fetchOne(db, key: msg.accountId)
@@ -943,7 +959,10 @@ extension AccountManager {
                 // sets it on a row it already holds.
                 header.threadId = sentCopy?.identity.threadId
                 // Thread grouping so the sent message appears in the conversation
-                try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: sentCopy?.identity.threadId, db: db)
+                // A forward starts its own thread, even with its subject rewritten
+                // (the send records it); the sync's copy then joins this row.
+                try ThreadUtils.assignComputedThreadId(
+                    to: &header, nativeThreadId: sentCopy?.identity.threadId, sentAsForward: msg.isForward, db: db)
                 try header.insert(db)
                 try ThreadUtils.insertMessageReferences(for: header, db: db)
 
@@ -964,7 +983,7 @@ extension AccountManager {
                     }
                 }
 
-                return (FTSHeaderRecord(
+                return (headerId, (FTSHeaderRecord(
                     contentKey: ContentKey(rawValue: headerId),
                     headerId: headerId,
                     messageId: rowMessageId,
@@ -975,14 +994,14 @@ extension AccountManager {
                     bcc: msg.bcc.joined(separator: ", "),
                     dateMs: Int64(rowDate.timeIntervalSince1970 * 1000),
                     folderId: folderId
-                ), writesLocalBody ? plainText : nil)
+                ), writesLocalBody ? plainText : nil))
             }
 
             // FTS indexing + headerComplete — runs after GRDB write succeeds.
             // Each step independently caught so failure in one doesn't block the others.
             // Without headerComplete=1, the optimistic header is invisible in the Sent folder
             // view (InboxViewModel filters by headerComplete==true).
-            if let ftsInfo {
+            if let ftsInfo = written?.ftsInfo {
                 do {
                     _ = try await SearchIndex.shared.indexHeaders([ftsInfo.record])
                     if let bodyText = ftsInfo.bodyText,
@@ -1015,9 +1034,11 @@ extension AccountManager {
             // Always post reload notification — UI refreshes regardless of FTS/headerComplete success.
             NotificationCenter.default.post(name: .inboxDataDidChange, object: nil)
             BackgroundSyncLogger.logDebug("[Outbox] Inserted optimistic Sent header for \(msg.id)")
+            return written?.copyHeaderId
         } catch {
             // Non-fatal — the message will appear after sync
             BackgroundSyncLogger.logDebug("[Outbox] WARNING: Could not insert optimistic Sent header: \(error)")
+            return nil
         }
     }
 

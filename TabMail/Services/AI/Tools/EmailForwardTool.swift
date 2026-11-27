@@ -34,8 +34,18 @@ struct EmailForwardTool: AgentTool, Sendable {
             return ComposeOutcome.failed("Email not found for unique_id \(numericId)").describeForLLM
         }
 
-        guard let header: MessageHeader = try await ctx.db.read({ db in
-            try MessageHeader.fetchOne(db, key: realId)
+        // Parse compose instruction (TB's "request" field) — goes through runComposeEdit().
+        // TB requires request for forward.
+        let composeRequest: String?
+        if case .string(let s) = arguments["request"], !s.isEmpty {
+            composeRequest = s
+        } else {
+            composeRequest = nil
+        }
+
+        // The body the model reads comes from the same read as the header.
+        guard let (header, relatedBodyText) = try await ctx.db.read({ db in
+            try EmailComposeTool.relatedEmail(realId: realId, withBodyText: composeRequest != nil, db: db)
         }) else {
             return ComposeOutcome.failed("Email with id \(realId) no longer exists").describeForLLM
         }
@@ -51,15 +61,6 @@ struct EmailForwardTool: AgentTool, Sendable {
         let to = EmailComposeTool.parseStringArray(arguments["to"]) ?? EmailComposeTool.parseStringArray(arguments["recipients"]) ?? []
         let cc = EmailComposeTool.parseStringArray(arguments["cc"]) ?? []
         let bcc = EmailComposeTool.parseStringArray(arguments["bcc"]) ?? []
-
-        // Parse compose instruction (TB's "request" field) — goes through runComposeEdit().
-        // TB requires request for forward.
-        let composeRequest: String?
-        if case .string(let s) = arguments["request"], !s.isEmpty {
-            composeRequest = s
-        } else {
-            composeRequest = nil
-        }
 
         let explicitBody: String?
         if case .string(let s) = arguments["body"], !s.isEmpty {
@@ -83,12 +84,6 @@ struct EmailForwardTool: AgentTool, Sendable {
         if let composeRequest {
             let wrappedRequest = "Forward email with subject \"\(header.subject)\" to recipients: \(recipientsFormatted). Content request: \(composeRequest)"
             do {
-                // Get related email body text for context
-                let relatedBodyText: String? = try? await ctx.db.read { db in
-                    guard let messageBody = try MessageBody.fetchOne(db, key: header.id),
-                          let html = messageBody.htmlContent, !html.isEmpty else { return nil }
-                    return EmailFilter.htmlToPlainText(html)
-                }
                 // The forward is sent from the forwarded email's account, so the AI signs as it.
                 let sender: Account? = try? await ctx.db.read { db in
                     try Account.fetchOne(db, key: header.accountId)
