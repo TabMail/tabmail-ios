@@ -160,9 +160,13 @@ struct MailPointerMoves: Sendable, Equatable {
     /// it: a chat pill keeps its number on the moved row (`ChatIdTranslator`),
     /// and memory.db's copy of a followed chat session id moves
     /// (`MemoryIndex.followSessions`). Batches run one after another in the
-    /// order they were handed over, so a chain of re-keys of one email ends on
-    /// its last row. No producer waits for them (the move drain, a sync pass,
-    /// a draft save, a body fetch).
+    /// order they were handed over, so a chain of re-keys of one email handed
+    /// over in commit order ends on its last row. Across producers the
+    /// hand-over can trail the commit (the move drain updates the undo stack
+    /// first), so a re-key of the same row by another producer in that gap
+    /// is followed first and these stores end on the middle row: a rare
+    /// timing race, ios#1581. No producer waits for them (the move drain, a
+    /// sync pass, a draft save, a body fetch).
     ///
     /// A memory.db follow that fails is not retried: `followSessions` logs and
     /// returns, and that chat stays under its old session id in memory search.

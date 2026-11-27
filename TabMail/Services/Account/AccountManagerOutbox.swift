@@ -672,11 +672,10 @@ extension AccountManager {
             let copyHeaderId = await insertOptimisticSentHeader(
                 outboxMessage: current, messageId: messageId, draft: draftWithId, sentCopy: sentCopy)
 
-            // The send is filed: a holder of its outbox item (the chat view's
-            // reply bubble; no other view holds one) follows it to the Sent copy
-            // (or learns no copy was written) before the outbox row can be
-            // deleted below, so a finished send is never taken for an undone
-            // one. Awaited: the delete follows within milliseconds when the
+            // The send is filed: a view holding its outbox item follows it to
+            // the Sent copy (or learns no copy was written) before the outbox
+            // row can be deleted below, so a finished send is never taken for
+            // an undone one. Awaited: the delete follows within milliseconds when the
             // provider files the copy itself.
             let filed = MailPointerMoves([.sent(outboxId: current.id, copyHeaderId: copyHeaderId)])
             await MainActor.run {

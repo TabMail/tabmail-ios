@@ -170,14 +170,24 @@ row and insert its replacement themselves (the placeholder dedup in full sync an
 and the pre-sync inbox reclaim) carry them through one shared pair, `SyncEngine.userLabelIdsToCarry`
 and `SyncEngine.carryUserLabels`. After commit, the open chat (`ChatPillState.followRekeyedEmails`),
 the model's message ids (`ChatIdTranslator.remapRealId`) and the chat memory index
-(`MemoryIndex.followSessions`) follow in posting order on one lane that no producer waits for. A
-memory.db follow that fails is not retried; that chat stays under its old session id in memory
-search. `InboxViewModel.applyHeaderRekeys` re-keys the same state as before (`pendingAIBatch`,
+(`MemoryIndex.followSessions`) follow on one lane that no producer waits for, in the order the
+producers hand them over. A memory.db follow that fails is not retried; that chat stays under its
+old session id in memory search. `InboxViewModel.applyHeaderRekeys` re-keys the same state as before (`pendingAIBatch`,
 `loadedIds`, the snippet queues), now for every producer.
 
-A move's collision arm (`finishMove`, where the new id is already occupied) posts nothing: the row
-there is not the moved row, so a view holding the old id stays on a gone row until reopened
-(`IOS-BODY-004`).
+A move's collision arm (`finishMove`, and the canonical re-key's, where the new id is already
+occupied) posts nothing: the row there is not the moved row, so a view holding the old id stays on
+a gone row until reopened (`IOS-BODY-004`). A placeholder's collision arms do post: the row already
+at the new id is the server's copy of that email, and the inbox list then drops the moved snapshot
+rather than show the copy twice.
+
+Accepted limitation (rare timing race, ios#1581): posts and hand-overs follow commit order for one
+producer only. The move drain updates the undo stack before it posts, so a sync re-key of the same
+row that commits in that gap is posted first; a view open on the email, the model's message id and
+the memory index then end on the middle row. Reopening the email recovers the view.
+
+Accepted limitation (ios#1582): the inbox list follows a posted move at once, also during a
+gesture, as it already did for a move's finish and the UID repair; only identity fields change.
 
 Accepted limitation (rare timing race, ios#1580): a chat turn whose write lands between a producer's
 commit and the open chat's follow (`ChatPillState.followRekeyedEmails`, on the main actor in
