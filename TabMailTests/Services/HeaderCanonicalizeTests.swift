@@ -68,7 +68,7 @@ struct HeaderCanonicalizeTests {
     private func canonicalize(
         _ db: DatabaseQueue,
         messageId: String
-    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool) {
+    ) throws -> (row: MessageHeader?, removedIds: [String], ftsRekey: (oldId: String, newId: String)?, sourceAddressProven: Bool, rekey: HeaderRekeyRecord?) {
         try db.write { dbConn in
             try SyncEngine.canonicalizeLocalRows(
                 accountId: "acc1", folderPath: trashPath,
@@ -224,10 +224,55 @@ struct HeaderCanonicalizeTests {
         let result = try canonicalize(db, messageId: "g3")
 
         #expect(result.ftsRekey == nil)
+        #expect(result.rekey == nil, "a row that kept its key has not moved")
         #expect(result.removedIds.isEmpty)
         #expect(result.row?.id == canonical.id)
         let count = try db.read { try MessageHeader.filter(Column("messageId") == "g3").fetchCount($0) }
         #expect(count == 1)
+    }
+
+    /// The re-key is reported as a move for views and chats, with no provider
+    /// authority (a hidden or fading row stays as it was; undo follows only a
+    /// move's finish). It is proven by the provider's own message id, so a
+    /// reply draft that names the row follows it. The provider's id did not
+    /// change, so the draft's reply address keeps it; a reply to another email
+    /// stays where it was.
+    @Test("A re-key reports its move without provider authority, and a reply draft follows the row")
+    func rekeyReportsTheMoveAndTheReplyDraftFollows() throws {
+        let db = try makeDB()
+        let remnant = try insertRemnant(db, messageId: "g8")
+        let other = try TestDatabase.insertMessageHeader(
+            db, messageId: "g9", folderId: "acc1:INBOX", accountId: "acc1", folderPath: "INBOX", isInInbox: true)
+        try db.write { dbConn in
+            try Self.replyDraft(id: "reply-moved", replyingTo: remnant.id, providerId: "g8").insert(dbConn)
+            try Self.replyDraft(id: "reply-other", replyingTo: other.id, providerId: "g9").insert(dbConn)
+        }
+
+        let result = try canonicalize(db, messageId: "g8")
+
+        let move = HeaderRekeyRecord(
+            oldHeaderId: remnant.id, newHeaderId: "acc1:TRASH:g8", newProviderMessageId: "g8",
+            carriesProviderAuthority: false,
+            stableIds: StableIds(accountId: "acc1", old: "g8", new: "g8"))
+        #expect(result.rekey == move)
+        let drafts = try db.read { dbConn in
+            (moved: try Draft.fetchOne(dbConn, key: "reply-moved"),
+             other: try Draft.fetchOne(dbConn, key: "reply-other"))
+        }
+        #expect(drafts.moved?.replyToId == "acc1:TRASH:g8")
+        #expect(drafts.moved?.replyToProviderMessageId == "g8")
+        #expect(drafts.other?.replyToId == other.id)
+    }
+
+    private static func replyDraft(id: String, replyingTo headerId: String, providerId: String) -> Draft {
+        var draft = Draft(
+            id: id, accountId: "acc1", toJSON: "[]", ccJSON: "[]", bccJSON: "[]",
+            subject: "Re: fixture", body: "reply", replyToId: headerId, isForward: false,
+            editHistoryJSON: nil, createdAt: 1, updatedAt: 1,
+            serverDraftId: nil, serverPushStatus: nil,
+            rfc822MessageId: nil, attachmentsDirName: nil)
+        draft.replyToProviderMessageId = providerId
+        return draft
     }
 
     @Test("No local rows returns nil")
@@ -261,6 +306,7 @@ struct HeaderCanonicalizeTests {
 
         // No re-key (would collide), no data loss — remnant keeps its PK.
         #expect(result.ftsRekey == nil)
+        #expect(result.rekey == nil, "a row that kept its key has not moved")
         #expect(result.row?.id == remnant.id)
         let count = try db.read { try MessageHeader.filter(Column("messageId") == "g7").fetchCount($0) }
         #expect(count == 2)

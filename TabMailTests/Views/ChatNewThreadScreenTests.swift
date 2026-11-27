@@ -673,6 +673,93 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("Through the real send, from the Sending bubble to the sent email's thread, every frame shows the user's words: the send's bubble stays, Sent once filed, until the thread shows the sent email, even once the send's cleanup has deleted its row",
+          arguments: 0..<3)
+    func realSendKeepsTheWordsOnScreen(attempt: Int) async throws {
+        // Each attempt sends once: where the row's delete falls between two frames varies.
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    let frames = OwnWordsFrames(view: screen.view)
+                    frames.start()
+                    let before = frames.frames.first ?? []
+                    let startsShown = !OwnWordsFrames.showsNone(before)
+                    #expect(startsShown, "control: recording starts with the user's words on screen: \(frames.summary)")
+
+                    try await Self.sendThroughTheOutbox(row, fixture: fixture)
+                    let rowGone = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) } == nil
+                    #expect(rowGone, "control: the send's cleanup deleted the row")
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    try await Self.settle()
+                    frames.stop()
+                    print("[OwnWordsFrames] real send attempt=\(attempt) \(frames.summary)")
+
+                    #expect(Self.isThread(screen), "control: the chat ends as the sent email's thread")
+                    let none = frames.frames.filter(OwnWordsFrames.showsNone).count
+                    #expect(none == 0, "every frame shows the user's words; \(none) of \(frames.frames.count) show none: \(frames.summary)")
+                    let apart = frames.frames.filter(OwnWordsFrames.showsTwoApart).count
+                    #expect(apart == 0, "and never twice: \(frames.summary)")
+                }
+            }
+        }
+    }
+
+    @Test("A send filed and its row gone before its Sent copy is in the Sent folder: the bubble stays, Sent, in every frame until the chat is the sent email's thread, which shows the words once")
+    func filedSendKeepsTheWordsUntilTheThread() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let copy = Self.sentFolderHeader("screen-sent-copy-filed", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    let rowId = row.id
+                    @MainActor func bubbleShows() -> Bool {
+                        HostedAccessibility.identifiers(in: screen.view).contains(ChatUnsentReplyBubble.bubbleId)
+                    }
+                    @MainActor func sendingShows() -> Bool {
+                        HostedAccessibility.labels(in: screen.view).contains { $0.contains("Sending") }
+                    }
+                    let frames = OwnWordsFrames(view: screen.view)
+                    frames.start()
+
+                    // The send's steps in the test's order: sent, filed as its copy, the row's cleanup,
+                    // and only then the copy in the Sent folder.
+                    try await fixture.pool.write { db in
+                        try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), rowId])
+                    }
+                    MailPointerMoves.publish(MailPointerMoves([.sent(outboxId: rowId, copyHeaderId: copy.id)]))
+                    _ = try await fixture.pool.write { db in try OutboxMessage.deleteOne(db, key: rowId) }
+                    try await Self.waitUntil { bubbleShows() && !sendingShows() }
+                    // Time for the chat to read the row's going.
+                    try await Self.settle()
+                    let keptSent = bubbleShows() && !sendingShows() && !Self.isThread(screen)
+                    #expect(keptSent, "the row gone, the copy not in yet: the bubble stays, Sent: \(HostedAccessibility.labels(in: screen.view).prefix(20))")
+
+                    try await fixture.pool.write { try copy.insert($0) }
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    try await Self.settle()
+                    frames.stop()
+                    print("[OwnWordsFrames] filed before the copy \(frames.summary)")
+
+                    #expect(Self.isThread(screen), "control: the chat ends as the sent email's thread")
+                    let bubbleLeft = bubbleShows()
+                    #expect(!bubbleLeft, "the thread shows the email, with no bubble beside it")
+                    let none = frames.frames.filter(OwnWordsFrames.showsNone).count
+                    #expect(none == 0, "every frame shows the user's words; \(none) of \(frames.frames.count) show none: \(frames.summary)")
+                    let apart = frames.frames.filter(OwnWordsFrames.showsTwoApart).count
+                    #expect(apart == 0, "and never twice: \(frames.summary)")
+                }
+            }
+        }
+    }
+
     @Test("Once the chat is the sent email's thread, new mail in the Sent folder no longer reads the send: its follow has ended")
     func threadEndsTheSendFollow() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
@@ -885,6 +972,35 @@ struct ChatNewThreadScreenTests {
         }
         try await waitUntil { topPresented(screen) == nil }
         return row
+    }
+
+    /// Sends the card's queued email through the real outbox with a mock provider: its hold is
+    /// ended, the row is claimed and sent, so the send stamps `sentAt`, writes the optimistic Sent
+    /// copy and deletes the row in its own writes, as on a device. The provider's Sent folder lists
+    /// the email under a server id, as after the append, for the send's own Sent folder sync.
+    private static func sendThroughTheOutbox(_ row: OutboxMessage, fixture: Fixture) async throws {
+        try await fixture.pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?",
+                           arguments: [Date().addingTimeInterval(-1), row.id])
+        }
+        let queued = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
+        let current = try #require(queued, "control: the row is queued")
+        let claimedNow = await AccountManager.shared.atomicClaimForTesting(current)
+        #expect(claimedNow, "control: the row is claimed")
+        let claimedRow = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
+        let claimed = try #require(claimedRow)
+        let messageId = try #require(claimed.sentMessageId, "control: the claim names the Message-ID")
+        let provider = MockEmailProvider()
+        let server = sentFolderHeader("4242", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+        await provider.setFetchMessagesResult([MessageHeaderInfo(
+            messageId: server.messageId, rfc822MessageId: server.rfc822MessageId,
+            inReplyTo: nil, references: [], threadId: nil,
+            subject: server.subject, from: server.from, fromAddress: server.fromAddress, to: server.to, cc: "", bcc: "",
+            replyTo: nil, date: server.date, snippet: server.snippet, isRead: true,
+            isFlagged: false, hasAttachments: false, isReplied: false, isForwarded: false, actionTag: nil)])
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.sendClaimedOutboxMessageForTesting(claimed, messageId: messageId)
+        }
     }
 
     /// The Sending bubble's Undo is on screen.
@@ -1697,80 +1813,6 @@ struct ChatNewThreadScreenTests {
     /// Lets the screen apply what just changed.
     private static func settle() async throws {
         try await Task.sleep(for: .milliseconds(300))
-    }
-}
-
-/// Where the chat shows the user's own words, frame by frame: the window frame of each element
-/// VoiceOver reads as "You said: ..." (the user's message bubble, held or writing, and the Sending
-/// bubble's words), read after every Core Animation commit between `start` and `stop`, as
-/// `SwapFrames` reads them.
-@MainActor
-private final class OwnWordsFrames {
-    private let view: UIView
-    private var observer: CFRunLoopObserver?
-    private(set) var frames: [[CGRect]] = []
-
-    init(view: UIView) {
-        self.view = view
-    }
-
-    /// Two of the user's bubbles one above the other, apart: the words twice. One turning into the
-    /// other shares its place, so the two overlap.
-    nonisolated static func showsTwoApart(_ frame: [CGRect]) -> Bool {
-        let drawn = frame.filter { $0.height > 1 }
-        for (index, one) in drawn.enumerated() {
-            for other in drawn[(index + 1)...] where one.maxY <= other.minY || other.maxY <= one.minY {
-                return true
-            }
-        }
-        return false
-    }
-
-    func start() {
-        record()
-        // After Core Animation's own commit observer on the same activities (its order is 2000000).
-        let observer = CFRunLoopObserverCreateWithHandler(
-            kCFAllocatorDefault, CFRunLoopActivity.beforeWaiting.rawValue | CFRunLoopActivity.exit.rawValue,
-            true, CFIndex.max
-        ) { [weak self] _, _ in
-            guard let self else { return }
-            MainActor.assumeIsolated { self.record() }
-        }
-        CFRunLoopAddObserver(CFRunLoopGetMain(), observer, .commonModes)
-        self.observer = observer
-    }
-
-    func stop() {
-        if let observer {
-            CFRunLoopRemoveObserver(CFRunLoopGetMain(), observer, .commonModes)
-            CFRunLoopObserverInvalidate(observer)
-        }
-        observer = nil
-        record()
-    }
-
-    private func record() {
-        let own = HostedAccessibility.elements(under: view)
-            .filter { $0.accessibilityLabel?.hasPrefix("You said:") == true }
-            .map(\.accessibilityFrame)
-        frames.append(own)
-    }
-
-    /// The frames in order, each run of frames showing the same number of the user's bubbles once,
-    /// with its length and its last frame's places.
-    var summary: String {
-        var runs: [(count: Int, length: Int, last: [CGRect])] = []
-        for frame in frames {
-            if let run = runs.last, run.count == frame.count {
-                runs[runs.count - 1] = (run.count, run.length + 1, frame)
-            } else {
-                runs.append((frame.count, 1, frame))
-            }
-        }
-        return runs.map { run in
-            let places = run.last.map { "\(Int($0.minY))-\(Int($0.maxY))" }.joined(separator: ",")
-            return "\(run.count)[\(places)]x\(run.length)"
-        }.joined(separator: " -> ")
     }
 }
 

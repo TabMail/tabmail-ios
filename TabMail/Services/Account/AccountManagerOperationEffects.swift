@@ -602,23 +602,20 @@ extension AccountManager {
             // already-queued cancellation runs; stacked actions and ordinary
             // in-progress Undo members still follow the provider rekey.
             let deferredCancellationIds = Set(deferredMoveSuccessors.keys)
+            let moves = MailPointerMoves(applied.map(MailPointerMove.row))
             await UndoService.shared.applyRekeys(
-                applied,
+                moves,
                 preservingInProgressMemberIds: deferredCancellationIds)
             await MainActor.run {
-                NotificationCenter.default.post(
-                    name: .messageHeadersRekeyed,
-                    object: applied)
+                MailPointerMoves.publish(moves)
             }
             // Persisted chat pills name messages by that same mutable primary key.
             // Keep their numeric identity stable across the move; otherwise a
             // cached discussion still renders its baked subject but tapping it
-            // resolves the now-deleted source address and appears inert.
-            for record in applied {
-                _ = await ChatIdTranslator.shared.remapRealId(
-                    from: record.oldHeaderId,
-                    to: record.newHeaderId)
-            }
+            // resolves the now-deleted source address and appears inert. A moved
+            // chat's memory.db copy follows with them, in order on their lane;
+            // the drain does not wait for it.
+            MailPointerMoves.followOutsideStoresInOrder(applied)
             // The FTS index is a SEPARATE database, so its re-key is two-phase —
             // outside the GRDB write — exactly as the sync path does it. The
             // entry MOVES; it is never removed.

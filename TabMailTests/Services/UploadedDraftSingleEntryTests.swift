@@ -292,6 +292,75 @@ struct UploadedDraftSingleEntryTests {
         #expect(newBody?.contains(edited) == true, "the new search entry holds \(newBody ?? "nothing")")
     }
 
+    /// A view or a saved chat holding the draft's Drafts entry follows each
+    /// upload: from the placeholder to the server's copy, then from that copy to
+    /// the one a replacement upload returns. Each move is posted once its write
+    /// commits, and the saved chat moves to the new row in that write.
+    @Test("Each upload's move of the Drafts entry is posted, and the saved chat follows it")
+    func eachUploadPostsItsMoveAndTheChatFollows() async throws {
+        let fixture = try makeFixture(.imap)
+        defer { finish(fixture) }
+        let mock = MockEmailProvider(saveDraftResult: .created(Kind.imap.created))
+        let draftId = "draft-\(UUID().uuidString)"
+        let cursor = ComposeGenerationCursor(newEpoch: UUID().uuidString, initialExpectedPredecessor: nil)
+        let firstId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: Self.draftsPath, messageId: Kind.imap.serverId)
+        let secondId = MessageIdentity.headerId(
+            accountId: fixture.accountId, folderPath: Self.draftsPath, messageId: Kind.imap.replacementServerId)
+        let posted = PlaceholderCopyRekeyTests.PostedRekeys(accountId: fixture.accountId)
+        let token = posted.start()
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        try await write(fixture, draftId: draftId, body: "First version of the plan.", cursor: cursor)
+        #expect(await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: fixture.accountId))
+        let admitted = try await allDraftsEntries(fixture).map(\.0)
+        try #require(admitted.count == 1, "precondition: the save admitted one entry, got \(admitted.map(\.id))")
+        let placeholder = admitted[0]
+        defer {
+            let keys = [placeholder.id, firstId, secondId].map { ContentKey(rawValue: $0) }
+            Task { try? await SearchIndex.shared.removeMessages(contentKeys: keys) }
+        }
+        let tag = "upload-chat-\(UUID().uuidString.prefix(8))"
+        let session = SavedChatFixture.sessionId(accountId: fixture.accountId, stableId: placeholder.stableId)
+        try await fixture.pool.write { db in
+            try SavedChatFixture.insert(tag: tag, sessionId: session, namingHeaderId: placeholder.id, db: db)
+        }
+        #expect(try await push(fixture, draftId: draftId, mock: mock) == .completed)
+        // The epoch the copy's UID was observed under, as the next Drafts sync records it.
+        try await fixture.pool.write { db in
+            try db.execute(
+                sql: "UPDATE messageHeader SET observedUidValidity = ? WHERE id = ?",
+                arguments: [Self.imapEpoch, firstId])
+        }
+        let storedFirst = try await fixture.pool.read { try MessageHeader.fetchOne($0, key: firstId) }
+        let first = try #require(storedFirst, "precondition: the upload moved the entry to the server's copy")
+
+        try await write(fixture, draftId: draftId, body: "Edited before the replacement upload.", cursor: cursor)
+        #expect(await AccountManager.shared.queueDraftSave(draftId: draftId, accountId: fixture.accountId))
+        let storedBeforeReplacement = try await fixture.pool.read { try MessageHeader.fetchOne($0, key: firstId) }
+        let beforeReplacement = try #require(storedBeforeReplacement, "precondition: the save kept the copy's entry")
+        await mock.setSaveDraftResult(.created(Kind.imap.replacement))
+        #expect(try await push(fixture, draftId: draftId, mock: mock) == .completed)
+        let storedSecond = try await fixture.pool.read { try MessageHeader.fetchOne($0, key: secondId) }
+        let second = try #require(storedSecond, "precondition: the replacement moved the entry to the new copy")
+
+        let moves = [
+            HeaderRekeyRecord(
+                oldHeaderId: placeholder.id, newHeaderId: firstId, newProviderMessageId: Kind.imap.serverId,
+                carriesProviderAuthority: false, stableIds: StableIds(from: placeholder, to: first)),
+            HeaderRekeyRecord(
+                oldHeaderId: firstId, newHeaderId: secondId, newProviderMessageId: Kind.imap.replacementServerId,
+                carriesProviderAuthority: false, stableIds: StableIds(from: beforeReplacement, to: second)),
+        ]
+        let postedMoves = posted.all
+        #expect(postedMoves == moves)
+        let chat = try await fixture.pool.read { try SavedChatFixture.read(tag: tag, db: $0) }
+        let chatFollowed = SavedChatFixture.expected(
+            sessionId: SavedChatFixture.sessionId(accountId: fixture.accountId, stableId: second.stableId),
+            namingHeaderId: secondId)
+        #expect(chat == chatFollowed)
+    }
+
     @Test("After a UIDVALIDITY reset, saving an uploaded draft leaves the message now at its UID unchanged")
     func uidValidityResetLeavesOtherMessageUnchanged() async throws {
         let fixture = try makeFixture(.imap)

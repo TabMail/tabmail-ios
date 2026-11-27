@@ -284,6 +284,28 @@ struct MemoryIndexTests {
         #expect(content == "how is the Q2 budget?")
     }
 
+    @Test("followSessions moves a followed chat's memory rows in both stored forms and nothing else")
+    func followSessions_movesBothFormsOnly() async throws {
+        let (pool, dir) = try await makeIndex()
+        defer { TestDatabaseTeardown.registerForProcessExit(pool: pool, directory: dir) }
+        let old = ChatStore.messageSessionId(accountId: "acc1", stableId: "g-old")
+        let new = ChatStore.messageSessionId(accountId: "acc1", stableId: "g-new")
+        let other = ChatStore.messageSessionId(accountId: "acc1", stableId: "g-other")
+        let dateMs = Int64(Date().timeIntervalSince1970 * 1000)
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "own", sessionId: old, role: "user", dateMs: dateMs, text: "own turn")
+        await DemoRunFixture.indexTurn(chatHistoryId: "demo", sessionId: "demo:\(old)", role: "user", dateMs: dateMs, text: "demo turn")
+        await MemoryIndex.shared.indexTurn(chatHistoryId: "other", sessionId: other, role: "user", dateMs: dateMs, text: "other turn")
+
+        await MemoryIndex.shared.followSessions([(old: old, new: new)])
+
+        let own = await MemoryIndex.shared._testMetaRow(chatHistoryId: "own")
+        let demo = await MemoryIndex.shared._testMetaRow(chatHistoryId: "demo")
+        let kept = await MemoryIndex.shared._testMetaRow(chatHistoryId: "other")
+        #expect(own?.sessionId == new)
+        #expect(demo?.sessionId == "demo:\(new)")
+        #expect(kept?.sessionId == other)
+    }
+
     @Test("indexTurn upsert: same chatHistoryId bumps epoch, clears vec, replaces fts")
     func indexTurn_upsertBumpsEpoch() async throws {
         let (pool, dir) = try await makeIndex()

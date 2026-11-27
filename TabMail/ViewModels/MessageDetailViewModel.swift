@@ -218,6 +218,7 @@ final class MessageDetailViewModel {
     @ObservationIgnored nonisolated(unsafe) private var previewFreezeReleasedObserver: NSObjectProtocol?
     @ObservationIgnored nonisolated(unsafe) private var nseMergeObserver: NSObjectProtocol?
     @ObservationIgnored nonisolated(unsafe) private var messagesStagedObserver: NSObjectProtocol?
+    @ObservationIgnored nonisolated(unsafe) private var pointerMovesObserver: NSObjectProtocol?
     /// Poll task that checks for MessageBody in DB when body is missing.
     /// Catches cases where fetchBody succeeds but the ViewModel missed the read
     /// (e.g., lock contention caused a timeout, but a later retry wrote the body).
@@ -275,6 +276,14 @@ final class MessageDetailViewModel {
     /// replay recomputes from current DB state). A `Bool` (not a set): the
     /// reload is wholesale.
     @ObservationIgnored private var pendingThreadRefreshOnRelease = false
+
+    /// Posts of `.mailPointersMoved` delivered while the `PreviewFreezeGate` was
+    /// active, in post order (all of them: one can name a row an earlier one
+    /// moved this view to; a post that names nothing is a no-op). Applied
+    /// one post at a time on `.previewFreezeReleased`, so a chain (the
+    /// placeholder replaced by the server's copy, then that copy moved) ends on
+    /// the last row (same contract as `pendingRefreshIds`).
+    @ObservationIgnored private var pendingMovesOnRelease: [MailPointerMoves] = []
 
     /// Number of the newest `loadThreadMessagesAsync` scan asked for. A scan
     /// whose display turn starts after a newer one was queued is skipped: the
@@ -512,6 +521,7 @@ final class MessageDetailViewModel {
         startPreviewFreezeReleasedListener()
         startNSEMergeCommitListener()
         startMessagesStagedListener()
+        startPointerMovesListener()
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[DetailRender] VM.init vm=\(ObjectIdentifier(self)) msgId=\(messageId.prefix(40))")
         }
@@ -526,7 +536,8 @@ final class MessageDetailViewModel {
     /// nil` from real merges) would trigger wholesale thread reloads against
     /// the test's seeded state. Tests exercising the merge-commit / refresh
     /// paths pass true — the flag registers ALL of the production init's
-    /// listeners (AI-update, freeze-release, merge-commit) because they form
+    /// listeners (AI-update, freeze-release, merge-commit, staged, pointer
+    /// moves) because they form
     /// one contract: a merge-commit buffered while the global gate is frozen
     /// needs the release listener to replay, and the AI-update listener's
     /// `applyRefresh` shares the preserve/freeze machinery under test.
@@ -557,6 +568,7 @@ final class MessageDetailViewModel {
             startPreviewFreezeReleasedListener()
             startNSEMergeCommitListener()
             startMessagesStagedListener()
+            startPointerMovesListener()
         }
     }
 
@@ -737,6 +749,7 @@ final class MessageDetailViewModel {
         if let obs = previewFreezeReleasedObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = nseMergeObserver { NotificationCenter.default.removeObserver(obs) }
         if let obs = messagesStagedObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = pointerMovesObserver { NotificationCenter.default.removeObserver(obs) }
         bodyPollTask?.cancel()
     }
 
@@ -873,6 +886,80 @@ final class MessageDetailViewModel {
             }
         }
         messagesStagedObserver = obs
+    }
+
+    /// Listen for committed pointer moves (`.mailPointersMoved`): a provider
+    /// move's finish, the sync's UID remap, and the sync's replacement of a
+    /// sent or saved email's placeholder by the server's copy. This view keeps
+    /// its identity (`OpenedMessage` holds the screen's), so it follows the row
+    /// it shows in place: a reply, a move or a thread read after the move names
+    /// the row that exists. Every production poster posts on the main actor;
+    /// `.main` makes delivery synchronous, so the follow is applied before the
+    /// poster returns.
+    private func startPointerMovesListener() {
+        let obs = NotificationCenter.default.addObserver(
+            forName: .mailPointersMoved,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let moves = MailPointerMoves.posted(in: notification) else { return }
+            MainActor.assumeIsolated {
+                self?.applyPointerMoves(moves)
+            }
+        }
+        pointerMovesObserver = obs
+    }
+
+    /// Points this view at the rows `moves` re-keyed. The opened message and
+    /// each thread member named by an old id take the new id, provider id and
+    /// epoch in place, so no gesture after this names a row that is gone; then
+    /// the opened message is re-read from its committed row and the thread read
+    /// runs again (both existing reads). A view holding none of the old ids is
+    /// untouched. Under the preview freeze every post waits for its release,
+    /// whether or not it names this view yet: a later post can move a row an
+    /// earlier buffered post moved this view to.
+    /// Internal (not `private`) so tests can drive it without a sync.
+    func applyPointerMoves(_ moves: MailPointerMoves) {
+        if PreviewFreezeGate.shared.isFrozen {
+            pendingMovesOnRelease.append(moves)
+            return
+        }
+        let opened = moves.row(movedFrom: messageId)
+            ?? message.flatMap { moves.row(movedFrom: $0.id) }
+        let namesMember = threadMessages.contains { moves.row(movedFrom: $0.id) != nil }
+        guard opened != nil || namesMember else { return }
+        // A display read taken before this follow may name a row this post
+        // moved: it reads again, under the ids followed here, before it
+        // publishes (`readUntilSettled`).
+        localChangeEpoch += 1
+        if let record = moves.row(movedFrom: messageId) { messageId = record.newHeaderId }
+        if var shown = message, let record = moves.row(movedFrom: shown.id) {
+            Self.rekey(&shown, to: record)
+            message = shown
+        }
+        if namesMember {
+            for index in threadMessages.indices {
+                if let record = moves.row(movedFrom: threadMessages[index].id) {
+                    Self.rekey(&threadMessages[index], to: record)
+                }
+            }
+            recomputeThreadSplit()
+        }
+        pendingRefreshIds = moves.following(headers: pendingRefreshIds)
+        if let opened {
+            Task { @MainActor [weak self] in
+                await self?.applyRefresh(for: opened.newHeaderId)
+            }
+        }
+        loadThreadMessagesAsync()
+    }
+
+    /// The identity fields a re-key changes, as `InboxViewModel.applyHeaderRekeys`
+    /// changes them on a list row.
+    private static func rekey(_ header: inout MessageHeader, to record: HeaderRekeyRecord) {
+        header.id = record.newHeaderId
+        header.messageId = record.newProviderMessageId
+        header.observedUidValidity = record.newObservedUidValidity
     }
 
     /// Seed the focused header from the just-published staged snapshot when the
@@ -1134,6 +1221,11 @@ final class MessageDetailViewModel {
                 // silently drop the buffered refreshes; leave them for the
                 // next genuine release instead.
                 guard !PreviewFreezeGate.shared.isFrozen else { return }
+                // Moves first, in post order: they move the ids the buffered
+                // refreshes name.
+                let moves = self.pendingMovesOnRelease
+                self.pendingMovesOnRelease.removeAll()
+                for posted in moves { self.applyPointerMoves(posted) }
                 let ids = self.pendingRefreshIds
                 let threadRefresh = self.pendingThreadRefreshOnRelease
                 guard !ids.isEmpty || threadRefresh else { return }
@@ -1539,6 +1631,12 @@ final class MessageDetailViewModel {
                     // it is what shipped `v1.6.38` does. Trading a guaranteed-correct one-gesture
                     // recovery for an automatic one that can show someone else's mail is a bad
                     // trade at any probability. Registered as `IOS-BODY-004`.
+                    //
+                    // A live view no longer needs the reopen when the re-key is posted: the
+                    // path that changed the key posts the old-to-new mapping it holds
+                    // (`MailPointerMoves`), `applyPointerMoves` re-points this view, and the
+                    // next tick fetches the new row. That is a mapping the producer recorded,
+                    // not a match, so the rule above stands.
                 }
             }
         }
@@ -1661,7 +1759,7 @@ final class MessageDetailViewModel {
           (msg, cancelledInitialRead) = await readUntilSettled { () -> (MessageHeader?, Bool) in
             var msg: MessageHeader?
             do {
-                let mid = messageId
+                var mid = messageId
                 // `dbPool.pool` (raw), NOT `dbPool.read`: the async `dbPool.read` awaits
                 // `mergeIfStagingPending()` first (PriorityGate :203), so it BLOCKS this header
                 // resolve behind an in-flight merge — and it runs SEQUENTIALLY before the body
@@ -1670,7 +1768,14 @@ final class MessageDetailViewModel {
                 // staged snapshot; this is the durable refresh, so a nil-fast raw read →
                 // resolveMessageAsync (raw + staged fallback) keeps the open off the merge path.
                 // `.pool` honors a `_dbPoolOverride` test pool.
-                msg = try await dbPool.pool.read { db in try MessageHeader.fetchOne(db, key: mid) }
+                msg = try await dbPool.pool.read { [mid] db in try MessageHeader.fetchOne(db, key: mid) }
+                // The view followed a move of its row during that read
+                // (`applyPointerMoves`): what was read may be the row the move
+                // deleted, so read the row the view follows now.
+                while mid != messageId {
+                    mid = messageId
+                    msg = try await dbPool.pool.read { [mid] db in try MessageHeader.fetchOne(db, key: mid) }
+                }
             } catch is CancellationError {
                 return (nil, true)
             } catch {
@@ -1865,14 +1970,17 @@ final class MessageDetailViewModel {
         // other in-flight body rather than a blank one. The authoritative refusal is in
         // `BodyFetchProcessor.process`.
         //
-        // ⚠️ **The poll does NOT self-heal once the move lands.** It keeps the stale
-        // `resolvedId` and in-memory header, `publishMoveFinish` never refreshes them, and the
-        // catch below deliberately refuses to guess a replacement row (two audit rounds found
-        // a wrong-message hole in every version that tried). So neither the drain's
-        // `finishMove` nor a later sync makes the body appear HERE — the guaranteed recovery
-        // is backing out to the message list and reopening. Registered as `IOS-BODY-004`.
-        // (This comment claimed "the body lands once the move completes, or once the next sync
-        // re-stamps the epoch" until an audit round showed the poll cannot observe either.)
+        // ⚠️ **The poll never guesses a replacement row:** the catch below refuses to (every
+        // version that guessed one had a wrong-message hole). It reads the view's own
+        // `resolvedId` and `message` on every tick, and the view follows a committed move of
+        // the row it shows by the posted move, not by matching (`applyPointerMoves`:
+        // `publishMoveFinish` and the sync's UID remap post one). So after the drain's
+        // `finishMove` the next tick reads the moved row's id and address. Before views
+        // followed posted moves, a detail opened from Search or Reminders kept the stale id and
+        // the only recovery was backing out and reopening (`IOS-BODY-004`); a detail opened
+        // from a list or a chat pill was rebuilt on the new id instead. (This comment once
+        // claimed "the body lands once the move completes, or once the next sync re-stamps the
+        // epoch", which the poll could observe neither of.)
         if await manager.bodyFetchIsBlockedByPendingAddress(for: msg) {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] loadBody — address not corroborated (move in flight), polling for \(rid.prefix(40))") }
             isLoading = true

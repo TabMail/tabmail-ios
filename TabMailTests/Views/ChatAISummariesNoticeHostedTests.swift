@@ -250,11 +250,11 @@ struct ChatAISummariesNoticeHostedTests {
         let content = AISummariesNotice.reportContent(
             items: [item("1", "First email"), item("2", nil), item("3", "Second email")],
             unsent: [ChatUnsentReply(outboxId: "o1", status: .failed, sentAt: nil, holdUntil: nil, draftId: nil,
-                                     instanceEpoch: nil, filed: false, textMessage: "Not sent reply"),
+                                     instanceEpoch: nil, textMessage: "Not sent reply"),
                      ChatUnsentReply(outboxId: "o2", status: .queued, sentAt: nil, holdUntil: nil, draftId: nil,
-                                     instanceEpoch: nil, filed: false, textMessage: nil),
+                                     instanceEpoch: nil, textMessage: nil),
                      ChatUnsentReply(outboxId: "o3", status: .queued, sentAt: nil, holdUntil: nil, draftId: nil,
-                                     instanceEpoch: nil, filed: false, textMessage: "Sending reply")])
+                                     instanceEpoch: nil, textMessage: "Sending reply")])
         #expect(content == "Sending reply\n\nNot sent reply\n\nSecond email\n\nFirst email")
     }
 

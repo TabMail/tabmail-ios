@@ -75,6 +75,9 @@ struct ChatNewThreadView: View {
     @State private var sendKey: ChatNewEmailSend.Key?
     /// That send, as last read.
     @State private var cardSend: ChatNewEmailSend?
+    /// Its bubble (`ChatSendBubbles`): its row while it is in the outbox, kept, "Sent", from its
+    /// filing until the chat is the sent email's thread, though the row goes first.
+    @State private var sends = ChatSendBubbles()
     /// The sent email's thread, read whole (`ChatThreadOpened`): the chat is that thread from then
     /// on, never back.
     @State private var thread: ChatThreadOpened?
@@ -164,6 +167,11 @@ struct ChatNewThreadView: View {
         // Followed only until the chat is the sent email's thread on a row no sync replaces
         // (`followsSend`): then its read of the Sent folder's headers ends (memory 021).
         .task(id: followsSend ? sendKey : nil) { await followSend() }
+        // The send's bubble follows its email to the Sent copy (`ChatSendBubbles.follow`).
+        .onReceive(NotificationCenter.default.publisher(for: .mailPointersMoved)) { notification in
+            guard let moves = MailPointerMoves.posted(in: notification) else { return }
+            sends.follow(moves)
+        }
         .task(id: readingCopy) { await readThread() }
         .onChange(of: newEmailCovered) { _, covered in if !covered { swapToThread() } }
         // A held message whose card sent waits for the send to show, then goes.
@@ -204,7 +212,7 @@ struct ChatNewThreadView: View {
                 // Send puts the user's own message up at once, pulsing while its email is written,
                 // then holds it while its card is up; the card's send turns it into the email's
                 // Sending bubble; then the gap above the field.
-                ChatOutgoingRows(unsentReplies: cardSend?.reply.map { [$0] } ?? [], heldGhost: heldMessage,
+                ChatOutgoingRows(unsentReplies: sends.replies(showing: []), heldGhost: heldMessage,
                                  fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .newEmailChat) {
                     EmptyView()
                 }
@@ -471,6 +479,7 @@ struct ChatNewThreadView: View {
         do {
             for try await found in ChatNewEmailSend.changes(key) {
                 cardSend = found
+                sends.read(found.reply.map { [$0] } ?? [])
                 if let email = found.email, email != key.email {
                     sendKey?.email = email
                     return

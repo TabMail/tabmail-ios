@@ -119,8 +119,9 @@ struct ChatThreadView: View {
     /// A compose card opened for the field's last request, so the agent's closing words open
     /// no sheet.
     @State private var fieldComposeOpened = false
-    /// The chat's replies still in the outbox (`ChatUnsentReply`), read from the database.
-    @State private var unsentReplies: [ChatUnsentReply] = []
+    /// The chat's sends as bubbles (`ChatSendBubbles`): its replies in the outbox, read from the
+    /// database, each kept, "Sent", from its filing until the chat shows its email.
+    @State private var sends = ChatSendBubbles()
     /// Who the next reply goes to; Reply All until changed in Reply to.
     @State private var replyTarget = ChatReplyTarget.replyAll
     @State private var showsReplyTo = false
@@ -244,6 +245,17 @@ struct ChatThreadView: View {
         reopened.map { ObjectIdentifier($0.viewModel) }
     }
 
+    /// The rows the chat shows its emails by (`MessageDetailViewModel.chatRows`): its emails and the
+    /// copies they stand for. A send's bubble ends once its email is one of them.
+    private var chatRowIds: Set<String> {
+        Set(viewModel.chatRows.map(\.id))
+    }
+
+    /// The chat's sends to show, oldest first (`ChatSendBubbles.replies`).
+    private var unsentReplies: [ChatUnsentReply] {
+        sends.replies(showing: chatRowIds)
+    }
+
     /// The Message-IDs of the chat's emails, normalized.
     private var messageIds: Set<String> {
         Set(members.compactMap { $0.rfc822MessageId.map(EmailFilter.normalizeMessageId) })
@@ -258,6 +270,12 @@ struct ChatThreadView: View {
     // MARK: - Body
 
     var body: some View {
+        presentations(on: container)
+    }
+
+    /// The chat with its lifecycle modifiers. Its sheets and covers go on after them, in
+    /// `presentations(on:)`: one chain was more than the compiler type-checks in reasonable time.
+    private var container: some View {
         // Lifecycle modifiers hang on this stable container, never on the branches the load
         // itself flips (ADR-IOS-054).
         ZStack {
@@ -300,23 +318,17 @@ struct ChatThreadView: View {
         }
         .onChange(of: viewModel.threadCopies.map(\.id)) { _, _ in noteCopies() }
         .onChange(of: memberKey) { _, _ in noteMembers() }
+        // A send's email the chat now shows ends its bubble, also if the email leaves it later.
+        .onChange(of: chatRowIds) { _, shown in endSends(shownIn: shown) }
+        // The sends follow their emails, from outbox item to Sent copy to the server's copy
+        // (`ChatSendBubbles.follow`), as the chat's emails do. A send filed: the chat reads its
+        // emails again, after its bubble points at the copy, so the bubble gives way to the copy
+        // in the pass that shows it. The name's type is spelled out: the implicit `.mailPointersMoved`
+        // took this chain past the type checker's limit (memory 163).
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name.mailPointersMoved)) { followMoves($0) }
         .onChange(of: reopenedKey) { _, _ in adoptReopened() }
-        .task(id: messageIds) {
-            // One observation per open chat of its outbox replies, keyed by its Message-IDs.
-            do {
-                for try await found in ChatUnsentReply.changes(answering: messageIds) {
-                    // A sent reply's Sent copy is in the database (`filed`), or its row left the
-                    // outbox (the send's cleanup can delete it before this saw it filed): the chat
-                    // reloads its emails, and a sent reply's bubble ends once its copy is one of
-                    // them (its Message-ID joins `messageIds`).
-                    let left = unsentReplies.contains { shown in !found.contains { $0.id == shown.id } }
-                    unsentReplies = found
-                    if left || found.contains(where: \.filed) { viewModel.reloadThread() }
-                }
-            } catch {
-                BackgroundSyncLogger.logDebug("[Chat] unsent reply observation ended: \(error)")
-            }
-        }
+        // One observation per open chat of its outbox replies, keyed by its Message-IDs.
+        .task(id: messageIds) { await observeSends() }
         // A new newest email has its own people: the next reply is a Reply All to them.
         .onChange(of: thread.newest.map(ChatThread.copyKey)) { _, _ in replyTarget = .replyAll }
         // A held ghost whose card sent waits for the reply to show, then turns into its bubble.
@@ -413,6 +425,11 @@ struct ChatThreadView: View {
             guard didInitialScroll, isOnScreen else { return }
             askForSummaries()
         }
+    }
+
+    /// The chat's sheets and covers, on `content` (the body's `container`) after its lifecycle modifiers.
+    private func presentations(on content: some View) -> some View {
+        content
         .sheet(item: $cardMessage) { msg in
             // Today's detail of that email, from the bottom; swipe down to return.
             NavigationStack {
@@ -794,6 +811,35 @@ struct ChatThreadView: View {
     private func noteCopies() {
         for copy in viewModel.threadCopies where seenIds.insert(copy.id).inserted {
             viewModel.markReadIfNeeded(copy)
+        }
+    }
+
+    // The send bubbles' handlers. Each is a method of its own, called in one line from the body:
+    // the body's chain is at the type checker's limit (memory 163).
+
+    /// Posted pointer moves (`.mailPointersMoved`): the sends follow their emails (`ChatSendBubbles.follow`).
+    private func followMoves(_ notification: Notification) {
+        guard let moves = MailPointerMoves.posted(in: notification) else { return }
+        if sends.follow(moves) { viewModel.reloadThread() }
+        sends.end(shownIn: chatRowIds)
+    }
+
+    /// The chat shows the rows `rowIds`: a send whose email is one of them ends its bubble.
+    private func endSends(shownIn rowIds: Set<String>) {
+        sends.end(shownIn: rowIds)
+    }
+
+    /// The chat's outbox replies, observed by its Message-IDs while the chat is open.
+    private func observeSends() async {
+        do {
+            for try await found in ChatUnsentReply.changes(answering: messageIds) {
+                // A row left the outbox (Undo, a discard, or the send's cleanup): the chat
+                // reloads its emails. A sent reply's bubble stays, "Sent", until its copy is one
+                // of them (`ChatSendBubbles`).
+                if sends.read(found) { viewModel.reloadThread() }
+            }
+        } catch {
+            BackgroundSyncLogger.logDebug("[Chat] unsent reply observation ended: \(error)")
         }
     }
 
