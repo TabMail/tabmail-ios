@@ -410,8 +410,12 @@ extension AccountManager {
     /// Delivered on the MainActor before `move` returns, as
     /// `publishMoveFinish` delivers `.mailPointersMoved`, so a list that
     /// hid those rows at gesture time shows them again in the same step that
-    /// settles the action (#441).
-    private static func announceMovesRefused(_ ids: Set<String>) async {
+    /// settles the action (#441). Also posted, after the commit, for the
+    /// members of a queued move that a UIDVALIDITY reset dropped with no
+    /// provider-confirmed result (exit 4: the reset's step-5 sweep, the
+    /// drain's checkpoint A and the executor's checkpoint B), whose ids the
+    /// resync can hand to different emails (#814).
+    static func announceMovesRefused(_ ids: Set<String>) async {
         guard let payload = movesRefusedPayload(ids) else { return }
         await MainActor.run {
             NotificationCenter.default.post(name: .messageMovesRefused, object: payload)
@@ -430,6 +434,18 @@ extension AccountManager {
         BackgroundSyncLogger.logInbox(
             "[RoleActionTrace] manager.move phase=refusedAnnounced ids=[\(payload.joined(separator: ","))]")
         return payload
+    }
+
+    /// The header ids a `.move` operation's gesture hid: each member's address
+    /// in the operation's source folder, which is the id the optimistic row
+    /// keeps until the drain re-keys it. Empty for any other operation type.
+    /// Only for an operation dropped with no provider-confirmed result; one
+    /// that completed settles its rows through `.mailPointersMoved`.
+    nonisolated static func movedHeaderIds(of op: PendingOperation) -> Set<String> {
+        guard op.type == .move else { return [] }
+        return Set(op.messageIds.map {
+            MessageIdentity.headerId(accountId: op.accountId, folderPath: op.folderPath, messageId: $0)
+        })
     }
 
     // MARK: - T1.3 — an unknown folder epoch fails CLOSED for new gestures
