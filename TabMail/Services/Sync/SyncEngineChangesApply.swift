@@ -34,7 +34,9 @@ import GRDB
 // - a record from a baseline (`FolderChangeStatus.isBaseline`: the folder's
 //   messages as they are, not changes) inserts only a message dated within the
 //   folder's held range (`Folder.oldestSyncedDate`); with no held range yet it
-//   inserts nothing, and mail older than the range is the backfill's. A record
+//   inserts nothing until the folder's backfill has completed (it walked the
+//   folder empty), and then everything (#1363); mail older than the range is
+//   the backfill's. A record
 //   that answers an id on the folder's own re-read list is not a listing but the
 //   server's answer about that one message, and applies whatever the range
 //   (ADR-IOS-111, amendment 2026-11-14 "an explicit re-read answer");
@@ -452,11 +454,17 @@ extension SyncEngine {
         guard let info = record.header else { return true }
         // A baseline lists the folder as it is: a message older than the held
         // range, or any message before the folder has one, is not inserted (the
-        // window listing sets the range, the backfill takes older mail). Not for
+        // window listing sets the range, the backfill takes older mail). A folder
+        // with no range whose backfill has completed (it walked the folder empty)
+        // holds the whole folder, so every message is inserted (#1363). Not for
         // a record answering a listed id: that message's place is put back
         // wherever its date falls (`heldRangeApplies` is false for it).
         if heldRangeApplies {
-            guard let heldSince = folder.oldestSyncedDate, info.providerOrderDate >= heldSince else { return true }
+            if let heldSince = folder.oldestSyncedDate {
+                guard info.providerOrderDate >= heldSince else { return true }
+            } else {
+                guard folder.backfillComplete else { return true }
+            }
         }
         // A record without the read state or the flag would store a default for
         // the one it leaves out: the message is listed instead and read again in
