@@ -715,10 +715,7 @@ extension SyncEngine {
            let optimistic = try MessageHeader.fetchOne(
             db, sql: optimisticDedupSQL, arguments: [folder.id, rfc822, header.messageId]) {
             let oldId = optimistic.id
-            carriedUserLabelIds = try MessageUserLabel
-                .filter(Column("messageId") == oldId)
-                .fetchAll(db)
-                .map(\.userLabelId)
+            carriedUserLabelIds = try userLabelIdsToCarry(from: oldId, db: db)
             if let body = try MessageBody.fetchOne(db, key: ContentKey(rawValue: oldId)) {
                 var newBody = body
                 newBody.id = ContentKey(rawValue: header.id)
@@ -750,10 +747,7 @@ extension SyncEngine {
             try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                 .insert(db, onConflict: .ignore)
         }
-        for carriedUserLabelId in carriedUserLabelIds {
-            try MessageUserLabel(messageId: header.id, userLabelId: carriedUserLabelId)
-                .insert(db, onConflict: .ignore)
-        }
+        try carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
         result.newHeaders.append(header)
         result.wroteRows = true
 

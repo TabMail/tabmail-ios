@@ -158,7 +158,11 @@ for a live view to follow (`dateWindowRepairKeepsViewCarrierEmpty`).
 and dismissal state (`MailPointerMoves.withProviderAuthority`). The sync's correlations, the reclaim,
 the draft entry and the body-queue remap carry none. The email's saved chat (`chatTurn`,
 `chatHistory`, including the demo form of the session id) moves in the producer's own write
-(`ChatStore.followRekeyedEmails`). After commit, the open chat (`ChatPillState.followRekeyedEmails`),
+(`ChatStore.followRekeyedEmails`). The row's user labels move in the same write:
+`MessageHeaderRekey.apply` carries them for the paths that use it, and the sync legs that delete a
+row and insert its replacement themselves (the placeholder dedup in full sync and the change reader,
+and the pre-sync inbox reclaim) carry them through one shared pair, `SyncEngine.userLabelIdsToCarry`
+and `SyncEngine.carryUserLabels`. After commit, the open chat (`ChatPillState.followRekeyedEmails`),
 the model's message ids (`ChatIdTranslator.remapRealId`) and the chat memory index
 (`MemoryIndex.followSessions`) follow in posting order. `InboxViewModel.applyHeaderRekeys` re-keys the
 same state as before (`pendingAIBatch`, `loadedIds`, the snippet queues), now for every producer.

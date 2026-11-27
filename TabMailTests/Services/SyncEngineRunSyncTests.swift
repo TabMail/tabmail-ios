@@ -1619,6 +1619,46 @@ struct RunSyncDedupReclaimFtsRoutingTests {
         #expect(chat == chatFollowed)
     }
 
+    /// The reclaim deletes the old row, and its `messageUserLabel` rows cascade
+    /// with it. A label the user put on the message is not in the listing until
+    /// its op drains, so the new row takes the old row's labels.
+    @Test("A pre-sync reclaim keeps the reclaimed row's user labels on the new row")
+    func preSyncReclaimKeepsTheUserLabels() async throws {
+        let (pool, dir) = try makePool()
+        defer { TestDatabaseTeardown.closeThenUnlinkNow(pool: pool, directory: dir) }
+        let rfc = "reclaim-labels@example.com"
+        let driftedId = MessageIdentity.headerId(accountId: "racc", folderPath: "NSE-A", messageId: "42")
+        let canonicalId = MessageIdentity.headerId(accountId: "racc", folderPath: "INBOX", messageId: "42")
+        let label = UserLabel(accountId: "racc", providerLabelId: "keep", name: "Keep", isSystem: false)
+        try await pool.write { db in
+            var acc = Account(emailAddress: "r@example.com", displayName: "T", provider: .imap)
+            acc.id = "racc"
+            try acc.insert(db)
+            try Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: "racc").insert(db)
+            try Folder(name: "NSE-A", path: "NSE-A", role: .custom, accountId: "racc").insert(db)
+            _ = try Self.insertHeader(
+                db, messageId: "42", folderPath: "NSE-A", folderId: "racc:NSE-A",
+                rfc822: rfc, isInInbox: true)
+            try label.insert(db)
+            try MessageUserLabel(messageId: driftedId, userLabelId: label.id).insert(db)
+        }
+
+        let folder = try await pool.read { try Folder.fetchOne($0, key: "racc:INBOX")! }
+        let mock = MockEmailProvider(staleWindowMode: .uid)
+        await mock.setFetchMessagesResult([
+            makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
+        ])
+        let result = try await SyncEngine.runListing(
+            for: folder, provider: mock, limit: 50, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
+
+        #expect(result.headerRekeys.map(\.oldHeaderId) == [driftedId],
+                "precondition: the reclaim moved the drifted row")
+        let labelsByRow = try await pool.read { db in
+            try MessageUserLabel.fetchAll(db).map { "\($0.messageId) \($0.userLabelId)" }
+        }
+        #expect(labelsByRow == ["\(canonicalId) \(label.id)"])
+    }
+
     /// A Gmail row an optimistic move left keyed by its old folder is re-keyed
     /// to its canonical key when its folder is listed. That re-key is proven by
     /// the provider's own id: it is reported with provider authority, and the

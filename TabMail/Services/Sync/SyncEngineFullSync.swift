@@ -73,6 +73,30 @@ extension SyncEngine {
             stableIds: StableIds(from: placeholder, to: copy))
     }
 
+    /// The user labels of a row the sync replaces by another row, read before
+    /// the old row is deleted: its `messageUserLabel` rows cascade with it, and
+    /// the listing's label set can miss a label whose op has not drained. The
+    /// row that takes its place gets them back with `carryUserLabels`. Used by
+    /// the sync legs that delete a row and insert its replacement themselves:
+    /// the placeholder dedup (full sync and the change reader) and the pre-sync
+    /// inbox reclaim. (`MessageHeaderRekey.apply` carries the labels of the
+    /// rows it re-keys.)
+    nonisolated static func userLabelIdsToCarry(from headerId: String, db: Database) throws -> [String] {
+        try MessageUserLabel
+            .filter(Column("messageId") == headerId)
+            .fetchAll(db)
+            .map(\.userLabelId)
+    }
+
+    /// Writes the labels `userLabelIdsToCarry` read onto the row that replaced
+    /// the old one. Insert-or-ignore: a label the listing already wrote stays once.
+    nonisolated static func carryUserLabels(_ userLabelIds: [String], to headerId: String, db: Database) throws {
+        for carriedUserLabelId in userLabelIds {
+            try MessageUserLabel(messageId: headerId, userLabelId: carriedUserLabelId)
+                .insert(db, onConflict: .ignore)
+        }
+    }
+
     // MARK: - Full-sync MODSEQ fetch-skip (Fix B task 4)
 
     /// Per-folder counter of full syncs since the last deep pass. Forces a DEEP
@@ -2313,20 +2337,11 @@ extension SyncEngine {
                        try MessageAICache.fetchOne(db, key: cacheKey) != nil {
                         try db.execute(sql: "UPDATE messageAICache SET key = ? WHERE key = ?", arguments: [newCacheKey, cacheKey])
                     }
-                    // The placeholder's user-label membership is carried to the copy,
-                    // as the change-apply dedup does: the `messageUserLabel` rows
-                    // cascade with the deleted header, and the listing's label set
-                    // can miss a label whose op has not drained.
-                    let carriedUserLabelIds = try MessageUserLabel
-                        .filter(Column("messageId") == oldId)
-                        .fetchAll(db)
-                        .map(\.userLabelId)
+                    // The placeholder's user labels go to the copy (`userLabelIdsToCarry`).
+                    let carriedUserLabelIds = try Self.userLabelIdsToCarry(from: oldId, db: db)
                     try optimistic.delete(db)
                     guard try MessageHeader.fetchOne(db, key: header.id) == nil else {
-                        for carriedUserLabelId in carriedUserLabelIds {
-                            try MessageUserLabel(messageId: header.id, userLabelId: carriedUserLabelId)
-                                .insert(db, onConflict: .ignore)
-                        }
+                        try Self.carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
                         if folder.role == .drafts || folder.role == .sent {
                             if DebugModeManager.isLoggingEnabled() {
                                 print("[Sync] DraftDedup: SKIPPING insert for id=\(header.id) — already exists (post-snapshot). remoteSnippet=\(String(header.snippet.prefix(60)))")
@@ -2377,10 +2392,7 @@ extension SyncEngine {
                         try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
-                    for carriedUserLabelId in carriedUserLabelIds {
-                        try MessageUserLabel(messageId: header.id, userLabelId: carriedUserLabelId)
-                            .insert(db, onConflict: .ignore)
-                    }
+                    try Self.carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
                     newHeaders.append(header)
                     insertedIds.append(header.id)
                     if folder.role == .drafts || folder.role == .sent {
@@ -2515,6 +2527,8 @@ extension SyncEngine {
                     // same assign/keep rule already applied at the `existing` merge
                     // branch and at the orphan reclaim.
                     if normalizedIncomingRfc822 == nil { header.rfc822MessageId = preSync.rfc822MessageId }
+                    // The reclaimed row's user labels go to the new row (`userLabelIdsToCarry`).
+                    let carriedUserLabelIds = try Self.userLabelIdsToCarry(from: oldId, db: db)
                     try preSync.delete(db)
                     try header.insert(db)
                     if let body = deferredBody { try body.insert(db) }
@@ -2543,6 +2557,7 @@ extension SyncEngine {
                         try MessageUserLabel(messageId: header.id, userLabelId: labelRow.id)
                             .insert(db, onConflict: .ignore)
                     }
+                    try Self.carryUserLabels(carriedUserLabelIds, to: header.id, db: db)
                     newHeaders.append(header)
                     // A NEW row under `header.id` (the pre-sync row was deleted
                     // above and re-inserted here), so it is an insert for the
