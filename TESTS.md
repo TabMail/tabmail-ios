@@ -827,6 +827,16 @@ range, by leaving that side of the window unbounded; `MemoryIndexTests` reads a 
 through a window whose upper or lower edge falls past that range. The delete tests check that a fractional id
 in `unique_ids` is dropped, not truncated.
 
+## Agent tool rounds — the thinking signature goes back
+
+`ThinkingSignatureToolRoundTests` drives the tool loop (both `sendCompletionsWithTools` and
+`sendCompletionsWithToolsDirect`) against a fake backend whose first round asks for a client tool and
+keeps the assistant turn in `conversation_state.harmony_messages` with its `thinking` and
+`thinkingSignature`, as the backend does for an Anthropic model that thought before the call. The next
+request carries that assistant turn with the same signature and thinking, plus the tool's result. A
+message with no signature is encoded with no `thinkingSignature` key, so other providers' requests are
+unchanged.
+
 ## CalDAV series edits — moving a series' time
 
 `CalDAVSeriesStartShiftTests` checks what an edit that moves a repeating
