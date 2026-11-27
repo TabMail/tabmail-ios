@@ -986,7 +986,20 @@ same AI result, kept as long as the email itself is shown.
    agent's reply tool (`EmailReplyTool.reply`) builds its card's envelope with the same
    `ChatReplyCompose.suggestionEnvelope`, on every screen, so its card for an email that went only to
    the user's own addresses now opens with those addresses in To where it opened with none. The To
-   shows on the card before Send and only the user's own mailboxes are involved, so it is kept.
+   shows on the card before Send, and a change from the reply tool or the field's words keeps it
+   only while the change adds nobody else: a change that adds anyone who is not one of the user's
+   addresses (the reply tool's `add_recipients`, `add_cc` or `add_bcc`, or a change the field's
+   words ask for; an entry that names no sendable address counts, as someone the user still has to
+   name) applies to the email's Reply All without them, which is nobody, so the card opens to the
+   people added alone and never shows the user's other addresses to them, as it did before this
+   fallback. It stays a Reply All. An address of the user's that the change itself adds stays, and
+   people the user chose in Reply to stay as chosen. One step applies a change for both the reply
+   tool and the field's Send (`ChatReplyCompose.applying`, tabmail-ios #1627). An edit on the card
+   itself (`ComposeView.applyInlineEdit`), or typing, changes the fields as they show, the user's
+   addresses among them in plain view. (Reworded 2026-11-27; it read "The To shows on the card
+   before Send and only the user's own mailboxes are involved, so it is kept.", which stops holding
+   once someone else is added.) Tests: `EmailReplyToolTests.ownOnlyFallbackWithAChange`,
+   `ChatFieldComposeTests.ownOnlyFallbackWithTheWordsChange`.
    (`ComposeView.suggestionEditTarget` reads the envelope too, but such an email has no AI
    Suggestion: the AI Reply skips self-sent mail.) A copy one of the user's accounts sent to another,
    opened where it was received (a forward from A, received at B), went from B to B alone: the
@@ -1790,7 +1803,10 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
       it is a plain reply, so the send records a reply on the original (`ChatReplyCompose.with`).
       Both sides are read as compose reads its fields: each mailbox as its address, and an entry that
       names no sendable address (a Reply-To's `undisclosed-recipients:;`) as the text written, in any
-      case, so leaving that entry out narrows the audience too.
+      case, so leaving that entry out narrows the audience too. An own-only email's audience is the
+      one start a change can drop (decision 11, amended 2026-11-27): a change that adds someone else
+      applies to that email's empty Reply All, so the card stays a Reply All without the user's own
+      addresses, other than any the change itself adds (`ChatReplyCompose.applying`).
       The reply tool derives one start envelope (`ChatReplyCompose.suggestionEnvelope` with the call's
       recipient changes, or `onlyTo` for people chosen in the field) and uses it for both the model's
       context and the card; the subject is the edit's when it writes one, else the start's.

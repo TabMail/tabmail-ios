@@ -176,8 +176,10 @@ struct ChatThread: Equatable {
     /// header's people (`replyPeople`, through `ChatThreadView.thread`) and the reply's envelope
     /// (`ChatReplyCompose.suggestionEnvelope`), so they stay one list. Through that envelope it is
     /// also the audience of the agent's reply tool (`EmailReplyTool.reply`) on every screen, so its
-    /// card for an own-only email opens with those addresses in To. The Reply All button outside
-    /// the chat (`buildReplyAllRecipients`) is unchanged.
+    /// card for an own-only email opens with those addresses in To. A change from the reply tool or
+    /// the field's words that adds anyone else leaves them out (`ChatReplyCompose.applying`); an
+    /// edit on the card itself, or typing, changes its fields as they show. The Reply All button
+    /// outside the chat (`buildReplyAllRecipients`) is unchanged.
     static func replyAllAudience(of message: MessageHeader, accounts: [Account]) -> (to: [String], cc: [String]) {
         let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
         guard audience.to.isEmpty, audience.cc.isEmpty else { return audience }

@@ -105,8 +105,10 @@ struct InlineEditTurn: Sendable {
 /// Delta for one recipient field (To / Cc / Bcc) extracted from the LLM response.
 /// Applied on top of the current draft's tokens: removals first, then adds.
 struct RecipientDelta: Sendable {
-    /// The field's add items, one mailbox each, read as recipient text like typed text
-    /// (ADR-IOS-092): their mailboxes, with any names the LLM gave.
+    /// The add items, read as recipient text like typed text (ADR-IOS-092): their mailboxes, with
+    /// any names the LLM gave. The field's items are one mailbox each (`AIService.recipientDelta`
+    /// refuses any other); the reply tool's (`EmailReplyTool.delta`) can also be entries that name
+    /// no sendable address, kept as written.
     let adds: RecipientEntry
     /// Lowercased emails to remove. Contains `"*"` (literal) when the LLM asked to clear
     /// the entire field (`"remove_cc": ["*"]`).
