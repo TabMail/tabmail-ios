@@ -14,7 +14,7 @@ import Testing
 struct ChatSendBubblesTests {
     private static func reply(_ id: String, sentAt: Date? = nil, holdUntil: Date? = nil) -> ChatUnsentReply {
         ChatUnsentReply(outboxId: id, status: .queued, sentAt: sentAt, holdUntil: holdUntil,
-                        draftId: "draft-\(id)", instanceEpoch: "epoch-\(id)", filed: false,
+                        draftId: "draft-\(id)", instanceEpoch: "epoch-\(id)",
                         textMessage: "I said Tuesday works.")
     }
 
@@ -89,6 +89,16 @@ struct ChatSendBubblesTests {
         #expect(sends.replies(showing: ["server-a"]).isEmpty, "the server's copy shows: the bubble is hidden")
     }
 
+    @Test("Only a filing that moves one of the chat's sends off its outbox item asks the chat to read its emails again")
+    func followReportsAFiling() {
+        var sends = ChatSendBubbles()
+        sends.read([Self.reply("a")])
+        #expect(!sends.follow(Self.filed("b", copy: "copy-b")), "another chat's send filed: nothing to read")
+        #expect(sends.follow(Self.filed("a", copy: "copy-a")), "this chat's send filed: read the chat's emails")
+        #expect(!sends.follow(Self.rowMove("copy-a", to: "server-a")), "its copy replaced: the chat follows that itself")
+        #expect(!sends.follow(Self.filed("a", copy: "copy-a")), "a repeated post moves nothing more")
+    }
+
     @Test("Once the chat showed its email, the bubble never comes back: not when that email leaves the chat, nor while its row is still read")
     func endedNeverComesBack() {
         var sends = ChatSendBubbles()
@@ -102,6 +112,8 @@ struct ChatSendBubblesTests {
         sends.follow(Self.rowMove("copy-a", to: "trash-a"))
         sends.read([])
         #expect(sends.replies(showing: []).isEmpty, "its email moved out of the chat and its row went: still ended")
+        sends.read([Self.reply("a", sentAt: Date())])
+        #expect(sends.replies(showing: []).isEmpty, "its row read once more after it went (a stale read): still ended")
     }
 
     @Test("Bubbles keep their order: a kept Sent bubble stays where it was, a new row comes after")

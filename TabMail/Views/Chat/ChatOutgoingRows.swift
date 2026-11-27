@@ -73,12 +73,13 @@ struct ChatOutgoingRows<Last: View>: View {
 /// The send's cleanup can delete the row a moment after the filing, before the chat shows the copy
 /// (at once when the provider files the copy itself). A bubble the filing moved therefore stays, with
 /// the user's words, "Sent", until the chat shows its email: in a thread, until the copy is one of
-/// its emails, hidden in the same pass that shows the email, so the words are never off the screen and
-/// never there twice; in a new email's chat, until the chat becomes the sent email's thread. With no
-/// Sent copy written it stays "Sent". A row that goes with no move (Undo, a discard) ends its bubble.
-/// Display state only: nothing here reads or writes the database.
-struct ChatSendBubbles: Equatable {
-    private struct Bubble: Equatable {
+/// its rows, hidden in the same pass that shows it; in a new email's chat, until the chat becomes the
+/// sent email's thread. A thread reads its emails again on the filing itself (`follow` says when), so
+/// the copy comes in only once the bubble points at it, and the words are neither off the screen nor
+/// there twice. With no Sent copy written it stays "Sent". A row that goes with no move (Undo, a
+/// discard) ends its bubble. Display state only: nothing here reads or writes the database.
+struct ChatSendBubbles {
+    private struct Bubble {
         /// The send, as its row was last read.
         var reply: ChatUnsentReply
         /// Where its email is now: its outbox item until the send filed it, then its Sent copy, or
@@ -86,21 +87,24 @@ struct ChatSendBubbles: Equatable {
         var pointer: MailPointer?
         /// Its row was read in the last read.
         var rowShown = true
-        /// The chat showed its email: never shown again, and gone with its row.
-        var ended = false
 
         var filed: Bool { pointer != .outbox(reply.outboxId) }
 
-        func copyShown(in shownIds: Set<String>) -> Bool {
+        func copyShown(in rowIds: Set<String>) -> Bool {
             guard case .header(let id)? = pointer else { return false }
-            return shownIds.contains(id)
+            return rowIds.contains(id)
         }
     }
 
     private var bubbles: [Bubble] = []
+    /// The sends whose email the chat has shown, by outbox id: their bubbles have ended and never
+    /// come back, also when a later read names their row again (the email left the chat while its
+    /// row still waits for its Sent append).
+    private var ended: Set<String> = []
 
     /// The rows read now, oldest first. A row that has gone ends its bubble unless the send filed its
-    /// email; a new row starts one. Returns whether a row of the last read has gone.
+    /// email; a new row starts one, unless its send has ended. Returns whether a row of the last read
+    /// has gone.
     @discardableResult
     mutating func read(_ rows: [ChatUnsentReply]) -> Bool {
         let byId = Dictionary(rows.map { ($0.outboxId, $0) }, uniquingKeysWith: { first, _ in first })
@@ -114,37 +118,44 @@ struct ChatSendBubbles: Equatable {
                 continue
             }
             if bubble.rowShown { left = true }
-            guard bubble.filed, !bubble.ended else { continue }
+            guard bubble.filed else { continue }
             bubble.rowShown = false
             next.append(bubble)
         }
-        let known = Set(bubbles.map(\.reply.outboxId))
+        let known = Set(bubbles.map(\.reply.outboxId)).union(ended)
         next += rows.filter { !known.contains($0.outboxId) }.map { Bubble(reply: $0, pointer: .outbox($0.outboxId)) }
         bubbles = next
         return left
     }
 
-    /// One post of moves: each bubble follows its email.
-    mutating func follow(_ moves: MailPointerMoves) {
+    /// One post of moves: each bubble follows its email. Returns whether a send was filed (a bubble
+    /// moved off its outbox item): its email is now stored, and a thread reads its emails again to
+    /// show it.
+    @discardableResult
+    mutating func follow(_ moves: MailPointerMoves) -> Bool {
+        var filed = false
         for index in bubbles.indices {
             guard let pointer = bubbles[index].pointer else { continue }
-            bubbles[index].pointer = moves.following(pointer)
+            let next = moves.following(pointer)
+            if case .outbox = pointer, next != pointer { filed = true }
+            bubbles[index].pointer = next
         }
+        return filed
     }
 
-    /// The chat shows the emails `shownIds` (their header ids): a bubble whose email is one of them
-    /// has ended, so it does not come back if that email later leaves the chat.
-    mutating func end(shownIn shownIds: Set<String>) {
-        for index in bubbles.indices where bubbles[index].copyShown(in: shownIds) {
-            bubbles[index].ended = true
-        }
+    /// The chat shows the rows `rowIds` (header ids): a bubble whose email is one of them has ended.
+    mutating func end(shownIn rowIds: Set<String>) {
+        let shown = bubbles.filter { $0.copyShown(in: rowIds) }.map(\.reply.outboxId)
+        guard !shown.isEmpty else { return }
+        ended.formUnion(shown)
+        bubbles.removeAll { ended.contains($0.reply.outboxId) }
     }
 
-    /// The bubbles to show, oldest first, while the chat shows the emails `shownIds`: all but those
-    /// whose email it shows, or showed. A filed one reads "Sent".
-    func replies(showing shownIds: Set<String>) -> [ChatUnsentReply] {
+    /// The bubbles to show, oldest first, while the chat shows the rows `rowIds`: all but those whose
+    /// email it shows. A filed one reads "Sent".
+    func replies(showing rowIds: Set<String>) -> [ChatUnsentReply] {
         bubbles.compactMap { bubble in
-            guard !bubble.ended, !bubble.copyShown(in: shownIds) else { return nil }
+            guard !bubble.copyShown(in: rowIds) else { return nil }
             var reply = bubble.reply
             reply.isSent = bubble.filed
             return reply

@@ -825,11 +825,14 @@ struct ChatReplyFieldTests {
         #expect(Self.count("guard case .sent = outcome else { return }", in: ended) == 1)
         #expect(Self.count("ChatFieldWords", in: ended) == 0 && Self.count("fieldFill", in: ended) == 0,
                 "the view never completes the field: the request does, on its own key (ChatFieldWordsRuntimeTests)")
-        // The bubbles are the database's: one observation keyed by the chat's Message-IDs.
+        // The bubbles are the database's rows (one observation keyed by the chat's Message-IDs) and
+        // the moves of their emails (`ChatSendBubbles`).
         #expect(Self.count("for try await found in ChatUnsentReply.changes(answering: messageIds) {", in: text) == 1)
-        // A reply filed or gone reloads the chat's emails, so a sent reply's copy takes its place.
-        #expect(Self.count("unsentReplies = found if left || found.contains(where: \\.filed) { viewModel.reloadThread() }", in: text) == 1)
-        #expect(Self.count("unsentReplies = ", in: text) == 1, "nothing else writes them")
+        // A row gone, or a send filed, reloads the chat's emails, so a sent reply's copy takes its place.
+        #expect(Self.count("if sends.read(found) { viewModel.reloadThread() }", in: text) == 1)
+        #expect(Self.count("if sends.follow(moves) { viewModel.reloadThread() } sends.end(shownIn: chatRowIds)", in: text) == 1)
+        #expect(Self.count(".onChange(of: chatRowIds) { _, shown in sends.end(shownIn: shown) }", in: text) == 1)
+        #expect(Self.count("sends.read(", in: text) == 1 && Self.count("sends.follow(", in: text) == 1, "nothing else feeds them")
         // The bubbles show through the chat's outgoing rows, as on every chat, with this screen's Undo.
         #expect(Self.count("ChatOutgoingRows(unsentReplies: unsentReplies, heldGhost: heldGhost, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .chat) {", in: text) == 1)
         #expect(Self.count("ChatUnsentReplyBubble(", in: text) == 0, "no outbox bubble of its own")
@@ -975,7 +978,7 @@ struct ChatReplyFieldTests {
     func sentMorphIds() {
         func reply(_ id: String) -> ChatUnsentReply {
             ChatUnsentReply(outboxId: id, status: .queued, sentAt: nil, holdUntil: nil, draftId: nil, instanceEpoch: nil,
-                            filed: false, textMessage: nil)
+                            textMessage: nil)
         }
         let older = reply("outbox-1"), newest = reply("outbox-2")
         #expect(ChatOutgoing.sentMorphId(newest, newest: newest) == ChatOutgoing.heldGhostMorphId)

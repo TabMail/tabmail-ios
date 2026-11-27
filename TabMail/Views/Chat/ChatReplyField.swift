@@ -655,11 +655,11 @@ struct ChatFieldMessage: Equatable {
 ///
 /// The hand-over to the sent email: once the provider takes the email the send stamps `sentAt`, then
 /// writes the optimistic Sent copy under the row's Message-ID, or under the one its provider gave the
-/// copy (Gmail; `SentCopyLink`), which is then the copy's Message-ID here. The chat's list of emails is not
-/// observed, so the row keeps its bubble until its Sent copy is one of the chat's emails; once the
-/// copy is in the database (`filed`) the chat reloads its emails, the copy's Message-ID joins
-/// `messageIds`, and the bubble ends (ending it at the `sentAt` write would leave neither the bubble
-/// nor the copy on screen). Undo, a discard or the send's own cleanup deletes the row, and the bubble goes.
+/// copy (Gmail; `SentCopyLink`), which is then the copy's Message-ID here. A sent row whose copy is
+/// one of the chat's emails is not read. The bubble itself is the chat's to keep (`ChatSendBubbles`):
+/// the filing names the copy (`MailPointerMove.sent`), the chat then reloads its emails, and a filed
+/// send's bubble stays, "Sent", after the send's cleanup deletes the row, until the chat shows the
+/// copy. A row that goes with no filing (Undo, a discard) ends its bubble.
 struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     let outboxId: String
     /// The row's state, as the Outbox's own Cancel Send reads it (`OutboxCancellationPolicy`).
@@ -670,8 +670,6 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
     let draftId: String?
     let instanceEpoch: String?
     var failed: Bool { status == .failed }
-    /// The provider took the email and its Sent copy is in the database, not yet in the chat.
-    let filed: Bool
     /// The email's summary as a text message, once made.
     let textMessage: String?
     /// The send filed the email (`ChatSendBubbles`): it went out, and the bubble stays, "Sent",
@@ -693,18 +691,14 @@ struct ChatUnsentReply: Identifiable, Equatable, Sendable {
             .fetchAll(db)
         return try rows.compactMap { row in
             guard answers(AccountManager.queuedParentRfc822MessageId(of: row), in: messageIds) else { return nil }
-            var filed = false
             if row.sentAt != nil {
                 // The Sent copy's Message-ID: its provider's own when it gave one (`SentCopyLink`).
                 guard let sentId = row.sentMessageId.map({
                           SentCopyLink.copyMessageId(accountId: row.accountId, sentMessageId: $0) }),
                       !messageIds.contains(sentId) else { return nil }
-                filed = try MessageHeader
-                    .filter(Column("accountId") == row.accountId && Column("rfc822MessageId") == sentId)
-                    .fetchCount(db) > 0
             }
             return ChatUnsentReply(outboxId: row.id, status: row.outboxStatus, sentAt: row.sentAt, holdUntil: row.holdUntil,
-                                   draftId: row.draftId, instanceEpoch: row.instanceEpoch, filed: filed,
+                                   draftId: row.draftId, instanceEpoch: row.instanceEpoch,
                                    textMessage: try SentEmailSummary.textMessage(of: row, db: db))
         }
     }

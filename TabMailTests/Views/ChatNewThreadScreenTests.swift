@@ -931,11 +931,12 @@ struct ChatNewThreadScreenTests {
             try db.execute(sql: "UPDATE outboxMessage SET holdUntil = ? WHERE id = ?",
                            arguments: [Date().addingTimeInterval(-1), row.id])
         }
-        let current = try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) },
-                                   "control: the row is queued")
+        let queued = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
+        let current = try #require(queued, "control: the row is queued")
         let claimedNow = await AccountManager.shared.atomicClaimForTesting(current)
         #expect(claimedNow, "control: the row is claimed")
-        let claimed = try #require(try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) })
+        let claimedRow = try await fixture.pool.read { try OutboxMessage.fetchOne($0, key: row.id) }
+        let claimed = try #require(claimedRow)
         let messageId = try #require(claimed.sentMessageId, "control: the claim names the Message-ID")
         let provider = MockEmailProvider()
         let server = sentFolderHeader("4242", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))

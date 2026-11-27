@@ -975,7 +975,7 @@ struct ChatUndoSendRoutingTests {
             let messageId = try #require(first.sentMessageId, "control: the row names its Message-ID")
             #expect(found.email == ChatNewEmailSend.Email(
                 accountId: first.accountId, messageId: EmailFilter.normalizeMessageId(messageId)), "the sent email, by the row")
-            #expect(found.sentCopyId == nil && !shown.filed, "control: no Sent copy before the send")
+            #expect(found.sentCopyId == nil, "control: no Sent copy before the send")
             #expect(shown.bubbleUndoSecondsLeft(at: Date(), owner: service.undoOwner(for: first.id)) != nil,
                     "its bubble offers the Undo")
 
@@ -1169,7 +1169,7 @@ struct ChatUndoSendRoutingTests {
         // 4 of the 5 s of the window have passed: a moving fill is 80% up.
         let hold = Date().addingTimeInterval(SyncConfig.outboxClaimBufferSeconds + 1)
         let reply = ChatUnsentReply(outboxId: "o-drawn", status: .queued, sentAt: nil, holdUntil: hold,
-                                    draftId: "d", instanceEpoch: "E1", filed: false, textMessage: nil)
+                                    draftId: "d", instanceEpoch: "E1", textMessage: nil)
         func drawn(reduceMotion: Bool) throws -> Bitmap {
             try Self.render(ChatUndoSendTimelineBody(reply: reply, reduceMotion: reduceMotion) { look, _ in
                 ChatUndoSendFill(look: look) { Self.content($0) }

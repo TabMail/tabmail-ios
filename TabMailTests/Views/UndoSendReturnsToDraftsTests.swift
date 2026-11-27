@@ -136,7 +136,7 @@ struct UndoSendReturnsToDraftsTests {
             let held = try #require(row, "control: the send is held")
             let bubble = ChatUnsentReply(
                 outboxId: held.id, status: held.outboxStatus, sentAt: held.sentAt, holdUntil: held.holdUntil,
-                draftId: held.draftId, instanceEpoch: held.instanceEpoch, filed: false, textMessage: nil)
+                draftId: held.draftId, instanceEpoch: held.instanceEpoch, textMessage: nil)
             while service.reopenSnapshot != nil { service.finishReopen() }
             bubble.undo()
             let snapshot = service.reopenSnapshot

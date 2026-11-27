@@ -9,6 +9,11 @@ import UIKit
 /// VoiceOver reads as "You said: ..." (the user's message bubble, held or writing, the Sending
 /// bubble's words, and an email of the user's in a thread), read after every Core Animation commit
 /// between `start` and `stop`. Shared by the new email's chat and a thread's chat.
+///
+/// What it measures is presence in the view tree, as accessibility reads it, once per run-loop pass
+/// after Core Animation's commit: an element counts as drawn when its accessibility frame is taller
+/// than one point. It reads no pixels, so an element fading in or out counts as drawn for the whole
+/// fade, and a change made and undone within one pass is not seen.
 @MainActor
 final class OwnWordsFrames {
     private let view: UIView

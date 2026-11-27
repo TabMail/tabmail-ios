@@ -55,7 +55,7 @@ struct ChatBubbleWidthTests {
     func sameBubbleThroughTheSend(words: String) async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         let reply = ChatUnsentReply(outboxId: "o-pin", status: .queued, sentAt: nil, holdUntil: nil,
-                                    draftId: "d", instanceEpoch: "E1", filed: false, textMessage: words)
+                                    draftId: "d", instanceEpoch: "E1", textMessage: words)
         let view = VStack(spacing: 20) {
             ChatFieldMessageBubble(text: words)
             ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {})

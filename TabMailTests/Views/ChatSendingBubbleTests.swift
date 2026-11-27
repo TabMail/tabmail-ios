@@ -422,6 +422,130 @@ struct ChatSendingBubbleTests {
         await queue.setDispatchSuppressedForTesting(false)
     }
 
+    /// When the send's Sent copy reaches the database against the filing's move (`MailPointerMove.sent`).
+    enum CopyOrder: String, CaseIterable, Sendable {
+        /// The copy, then the move, then the row's cleanup: the send's own order.
+        case beforeItsMove
+        /// The move, then the copy, then the row's cleanup.
+        case afterItsMove
+    }
+
+    @Test("A sent reply's words show once in the thread's chat in every frame, whether its Sent copy reaches the database before or after the filing's move: the chat shows the copy only once the bubble points at it, and the bubble never comes back after",
+          arguments: CopyOrder.allCases)
+    func copyAndItsMoveShowTheWordsOnce(_ order: CopyOrder) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can read the hosted chat")
+        try await HostedAccessibility.withAutomation { try await copyAndItsMoveShowTheWordsOnceBody(order) }
+    }
+
+    private func copyAndItsMoveShowTheWordsOnceBody(_ order: CopyOrder) async throws {
+        let saved = ChatSummaryQueueTests.SavedChatViewState()
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        let queue = ActiveAIQueue.shared
+        await queue.setDispatchSuppressedForTesting(true)
+        await queue.clearForTesting()
+        defer {
+            saved.restore()
+            InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory)
+        }
+        saved.setChatView(on: true)
+        let fixture = try await Self.makeFixture(pool)
+
+        let scene = try #require(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let controller = UIHostingController(rootView: NavigationStack { ChatThreadView(messageId: fixture.parent.id) }
+            .environment(NavigationStore()))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+        func labels() -> [String] { HostedAccessibility.labels(in: controller.view) }
+        func count(_ words: String) -> Int { labels().filter { $0.contains(words) }.count }
+        func waitFor(tries: Int = 80, _ done: () -> Bool) async throws {
+            for _ in 0..<tries where !done() { try await Task.sleep(for: .milliseconds(100)) }
+        }
+        func bubbleShows() -> Bool {
+            HostedAccessibility.identifiers(in: controller.view).contains(ChatUnsentReplyBubble.bubbleId)
+        }
+        try await waitFor { count("Lunch plans") > 0 }
+
+        // Held, so no drain of the app's own sends it: the test makes the send's database writes and
+        // its post itself, in the order under test.
+        let row = try await Self.queueReply(fixture, draftId: "draft-order-\(order.rawValue)", holdsForUndo: true)
+        let text = "I said Tuesday works."
+        let http = Self.summaryBackend(textMessage: text)
+        defer { http.close() }
+        await SentEmailSummary.summarize(
+            outboxId: row.id,
+            aiService: AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil }))
+        try await waitFor { count(text) == 1 && count("Sending") == 1 }
+        #expect(count(text) == 1 && count("Sending") == 1, "control: the reply's Sending bubble shows its summary: \(labels().prefix(20))")
+
+        // The optimistic Sent copy as the send writes it: in Sent, under the row's Message-ID, answering
+        // the chat's email, with the summary made at Send.
+        var copy = Self.header("copy-\(order.rawValue)", folder: "Sent", from: fixture.account.emailAddress,
+                               inReplyTo: fixture.parent.rfc822MessageId)
+        copy.rfc822MessageId = EmailFilter.normalizeMessageId(try #require(row.sentMessageId))
+        copy.date = Date()
+        copy.summaryBlurb = "A plan."
+        copy.summaryTextMessage = text
+        let sentCopy = copy
+        let filing = MailPointerMoves([.sent(outboxId: row.id, copyHeaderId: sentCopy.id)])
+        let rowId = row.id
+
+        let frames = OwnWordsFrames(view: controller.view)
+        frames.start()
+        try await pool.write { db in
+            try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), rowId])
+        }
+        switch order {
+        case .beforeItsMove:
+            try await pool.write { db in try sentCopy.insert(db) }
+            // Time for a reload of the chat to draw the copy, were one to run before the move.
+            try await waitFor(tries: 15) { count(text) > 1 }
+            #expect(count(text) == 1 && count("Sending") == 1,
+                    "the copy is not shown before its move reaches the bubble: \(labels().prefix(20))")
+            MailPointerMoves.publish(filing)
+            try await waitFor { !bubbleShows() && count(text) == 1 }
+            #expect(!bubbleShows() && count(text) == 1,
+                    "the filing alone shows the email, while its row still waits: \(labels().prefix(20))")
+            _ = try await pool.write { db in try OutboxMessage.deleteOne(db, key: rowId) }
+        case .afterItsMove:
+            MailPointerMoves.publish(filing)
+            try await waitFor { bubbleShows() && count("Sending") == 0 }
+            #expect(bubbleShows() && count(text) == 1 && count("Sending") == 0,
+                    "filed with its copy not in yet: the bubble stays, Sent: \(labels().prefix(20))")
+            try await pool.write { db in try sentCopy.insert(db) }
+            _ = try await pool.write { db in try OutboxMessage.deleteOne(db, key: rowId) }
+            try await waitFor { !bubbleShows() && count(text) == 1 }
+        }
+        // The row's cleanup and the reads after it: the chat stays on the email.
+        try await Task.sleep(for: .milliseconds(300))
+        frames.stop()
+        print("[OwnWordsFrames] copy order=\(order.rawValue) \(frames.summary)")
+
+        #expect(!bubbleShows() && count("Sending") == 0 && count(text) == 1,
+                "control: the chat ends on the sent email: \(labels().prefix(20))")
+        let none = frames.frames.filter(OwnWordsFrames.showsNone).count
+        #expect(none == 0, "every frame shows the user's words; \(none) of \(frames.frames.count) show none: \(frames.summary)")
+        let apart = frames.frames.filter(OwnWordsFrames.showsTwoApart).count
+        #expect(apart == 0, "and never twice: \(frames.summary)")
+
+        // The sent email then leaves the chat (its copy gone, the chat's emails read again): the send's
+        // bubble, ended once the chat showed the email, does not come back.
+        let copyId = sentCopy.id
+        _ = try await pool.write { db in try MessageHeader.deleteOne(db, key: copyId) }
+        NotificationCenter.default.post(name: .nseMergeDidCommit, object: nil)
+        try await waitFor { count(text) == 0 }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(count(text) == 0 && !bubbleShows(),
+                "the email left the chat and its send's bubble stays ended: \(labels().prefix(20))")
+        await queue.clearForTesting()
+        await queue.setDispatchSuppressedForTesting(false)
+    }
+
     // MARK: - 4. Which rows show
 
     @Test("Every reply to an email of the chat shows until the chat shows it, from any account: Sending, or Not sent once failed; a sent reply stays until its Sent copy is one of the chat's emails; a deleted or another chat's reply shows nothing")
@@ -473,8 +597,7 @@ struct ChatSendingBubbleTests {
                 "a deleted reply, another chat's and a sent one that cannot be handed over show nothing")
         #expect(rows[sending.id]?.caption == "Sending" && rows[fromOther.id]?.caption == "Sending")
         #expect(rows[failed.id]?.caption == "Not sent")
-        #expect(rows[sent.id]?.caption == "Sending" && rows[sent.id]?.filed == false,
-                "sent, its Sent copy not written yet: the bubble stays")
+        #expect(rows[sent.id]?.caption == "Sending", "sent, its Sent copy not written yet: the row still shows")
         #expect(rows[sending.id]?.textMessage == "I said Tuesday works.", "the summary made at Send")
         #expect(rows[failed.id]?.textMessage == nil, "Summarizing until its summary is made")
 
@@ -484,12 +607,11 @@ struct ChatSendingBubbleTests {
         copy.rfc822MessageId = sentId
         let ownCopy = copy
         try await pool.write { db in try ownCopy.insert(db) }
-        #expect(try await shown()[sent.id]?.filed == true, "its copy is in the database, not yet in the chat: the chat reloads")
-        #expect(try await shown()[sending.id]?.filed == false, "control: an unsent reply is never filed")
+        #expect(try await shown()[sent.id] != nil, "its copy is in the database, not yet one of the chat's emails: the row still shows")
         #expect(try await shown(chat.union([sentId]))[sent.id] == nil, "once the copy is one of the chat's emails, the bubble ends")
     }
 
-    @Test("A sent reply's bubble hands over to the Sent copy the send wrote, whatever Message-ID the provider gave the copy: filed once the copy is in, ended once the copy is one of the chat's emails",
+    @Test("A sent reply's row shows until the Sent copy the send wrote is one of the chat's emails, whatever Message-ID the provider gave the copy",
           arguments: CopyShape.allCases)
     func sentReplyHandsOverToItsCopy(_ shape: CopyShape) async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
@@ -504,8 +626,7 @@ struct ChatSendingBubbleTests {
         let sent = try await Self.sentHeaders(pool)
         #expect(sent.map(\.rfc822MessageId) == [copyMessageId], "control: the send wrote the copy as its provider keeps it")
         let bubbles = try await pool.read { try ChatUnsentReply.fetch(answering: chat, db: $0) }
-        #expect(bubbles.map(\.id) == [row.id], "control: the sent row waits for its cleanup and shows")
-        #expect(bubbles.first?.filed == true, "its Sent copy is in the database, not yet in the chat: the chat reloads")
+        #expect(bubbles.map(\.id) == [row.id], "the sent row waits for its cleanup and shows: its copy is not one of the chat's emails yet")
         let handedOver = try await pool.read { try ChatUnsentReply.fetch(answering: chat.union([copyMessageId]), db: $0) }
         #expect(handedOver.isEmpty, "once the copy is one of the chat's emails, the bubble ends: the email shows once")
     }
