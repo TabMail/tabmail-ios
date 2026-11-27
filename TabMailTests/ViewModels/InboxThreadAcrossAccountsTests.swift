@@ -800,6 +800,11 @@ struct InboxThreadAcrossAccountsTests {
         switch moment {
         case .beforeUndo:
             try await finishOutlookMove()
+            // The entry's message list (it keeps an undoable message's body
+            // from storage pruning) names the new address too.
+            let listed = Set(UndoService.shared.currentAction?.messages.map(\.id) ?? [])
+            #expect(listed == [onGmail.id, newHeaderId],
+                    "the entry's message list follows the address change")
             await UndoService.shared.undo()
         case .whileUndoIsQueued:
             let gate = await gateWriteQueue()
