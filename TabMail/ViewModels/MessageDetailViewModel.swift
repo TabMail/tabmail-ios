@@ -1532,13 +1532,13 @@ final class MessageDetailViewModel {
             // staged snapshot; this is the durable refresh, so a nil-fast raw read →
             // resolveMessageAsync (raw + staged fallback) keeps the open off the merge path.
             // `.pool` honors a `_dbPoolOverride` test pool.
-            msg = try await dbPool.pool.read { db in try MessageHeader.fetchOne(db, key: mid) }
+            msg = try await dbPool.pool.read { [mid] db in try MessageHeader.fetchOne(db, key: mid) }
             // The view followed a move of its row during that read
             // (`applyPointerMoves`): what was read may be the row the move
             // deleted, so read the row the view follows now.
             while mid != messageId {
                 mid = messageId
-                msg = try await dbPool.pool.read { db in try MessageHeader.fetchOne(db, key: mid) }
+                msg = try await dbPool.pool.read { [mid] db in try MessageHeader.fetchOne(db, key: mid) }
             }
         } catch is CancellationError {
             if DebugModeManager.isLoggingEnabled() { BackgroundSyncLogger.logDebug("[MoveTrace] loadBody — task cancelled during initial DB read, deferring to body poll") }
