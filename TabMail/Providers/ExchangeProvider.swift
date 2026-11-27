@@ -23,10 +23,12 @@ enum ExchangeGraphMessageRequest: CaseIterable, Hashable, Sendable {
     /// `GraphAPI.stateSelection` and never reach the parser.
     case readChanges
 
-    /// The listings and the change reader's message reads also expand
-    /// Outlook's last verb, so a message replied to or forwarded on another
-    /// device shows it (#890), and the threading ids, so a reply threads under
-    /// the message it answers (#1559). The message delta (`readChanges`) cannot.
+    /// The listings, the older-mail and catch-up reads (`fetchSingleBackfill`,
+    /// which store the messages they read) and the change reader's message
+    /// reads also expand Outlook's last verb, so a message replied to or
+    /// forwarded on another device shows it (#890), and the threading ids, so
+    /// a reply threads under the message it answers (#1559). The message delta
+    /// (`readChanges`) cannot.
     var selection: GraphMessageSelection {
         switch self {
         case .search, .readChanges:
@@ -34,7 +36,7 @@ enum ExchangeGraphMessageRequest: CaseIterable, Hashable, Sendable {
         case .fetchMessages, .fetchMessageHeaders, .fetchOlderMessages:
             GraphAPI.headerOnlySelection.withExtendedProperties
         case .fetchSingleBackfill:
-            GraphAPI.backfillSelection
+            GraphAPI.backfillSelection.withExtendedProperties
         case .fetchMessage:
             GraphAPI.fullSelection
         case .fetchMessageDetails:

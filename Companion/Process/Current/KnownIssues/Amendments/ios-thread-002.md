@@ -56,8 +56,9 @@ failing that, a stored email that names it (the reverse and lateral probes, unch
    forward, and the forward's lists the source and the reply. Filed on its own as #1559 (whether
    the Graph sync can carry In-Reply-To, and at what cost).
    *Amended 2026-11-27 (#1559):* the Graph sync now reads In-Reply-To and References from the
-   extended properties `String 0x1042` and `String 0x1039`, which the listings, the change reader's
-   by-id reads and the notification extension's read expand (`GraphAPI.extendedPropertiesExpandParameter`),
+   extended properties `String 0x1042` and `String 0x1039`, which the listings, the older-mail and
+   catch-up reads, the change reader's by-id reads and the notification extension's read expand
+   (`GraphAPI.extendedPropertiesExpandParameter`),
    so a reply to a forward on Outlook threads under the forward as on Gmail and IMAP. No new request.
    Residuals, each keeping the earlier grouping by Outlook's conversation id (display only; the thread
    is set once, at insert):

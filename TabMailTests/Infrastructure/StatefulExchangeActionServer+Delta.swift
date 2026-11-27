@@ -199,6 +199,16 @@ extension StatefulExchangeActionServer {
         }
     }
 
+    /// The Graph conversation the message is filed in, as delivered; nothing is
+    /// logged to the delta.
+    func setConversationId(providerMessageId: String, _ conversationId: String) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.conversationId = conversationId
+            model.messagesByProviderId[providerMessageId] = message
+        }
+    }
+
     /// Another client (Outlook web or desktop) sets the message's categories, the
     /// whole array, as Graph's PATCH does.
     func setCategoriesFromOtherClient(providerMessageId: String, categories: [String]) {

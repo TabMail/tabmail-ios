@@ -861,7 +861,7 @@ struct ExchangeProviderSelectionWiringTests {
             normalizedURL("\(Self.graphBase)/messages/full-route?$select=\(Self.fullFields)"),
             normalizedURL(
                 "\(Self.graphBase)/messages/full-route/attachments?\(GraphAPI.attachmentMetadataQuery)"),
-            normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)"),
+            normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)&\(Self.lastVerb)"),
             normalizedURL(
                 "\(Self.graphBase)/mailFolders/search-route/messages?$select=\(h)"
                     + "&$search=%22route%22&$top=20"),

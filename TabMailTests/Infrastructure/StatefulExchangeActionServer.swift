@@ -70,6 +70,10 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
         /// (e.g. `Integer 0x1081`). A PATCH sets each named property and leaves
         /// the others alone; a move carries them with the message (#915).
         var extendedProperties: [String: String] = [:]
+        /// The Graph conversation the message is filed in; nil = its own
+        /// (`conversation-<Message-ID>`). A forward and the email it forwards
+        /// share one on Outlook.
+        var conversationId: String? = nil
     }
 
     struct State: Sendable {
@@ -945,7 +949,7 @@ final class StatefulExchangeActionServer: @unchecked Sendable {
             "flag": ["flagStatus": message.isFlagged ? "flagged" : "notFlagged"],
             "hasAttachments": false,
             "internetMessageId": "<\(message.rfc822MessageId)>",
-            "conversationId": "conversation-\(message.rfc822MessageId)",
+            "conversationId": message.conversationId ?? "conversation-\(message.rfc822MessageId)",
             "categories": message.categories,
             "bodyPreview": "",
             "body": ["contentType": "text", "content": "Stateful draft body"],

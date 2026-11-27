@@ -603,10 +603,12 @@ out of scope).
 and `String 0x1039` (References), joined with `or`; the names became
 `GraphMessageSelection.expandsExtendedProperties` / `withExtendedProperties` and
 `GraphAPI.extendedPropertiesExpandParameter`, and the notification extension's `messageMetadata` expands
-too. `GraphParse.parseMessage` reads both ids. `readLastVerbs` also copies them onto the record's
-header, which only the apply's insert reads, so a new message threads under the one it answers while a
-stored row's chain and thread stay. No new request. Residuals (allowance cut, Inbox baseline, search) in
-IOS-THREAD-002 case 4.
+too, as do the older-mail and catch-up reads (`fetchSingleBackfill`). `GraphParse.parseMessage` reads
+both ids. `readLastVerbs` also copies them onto the record's header, which only the apply's insert reads,
+so a new message threads under the one it answers, and the change reader never moves a stored row's chain,
+thread or reference rows (`fullRecord`). A full listing's merge of a stored row writes the server's
+References onto it, as on every provider, and keeps its thread, In-Reply-To and reference rows. No new
+request. Residuals (allowance cut, Inbox baseline, search) in IOS-THREAD-002 case 4.
 
 Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`); threading ids:
 `OutlookReplyThreadingTests.swift`.
