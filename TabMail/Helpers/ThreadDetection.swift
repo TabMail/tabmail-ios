@@ -169,9 +169,50 @@ enum ThreadDetection {
 
         if collected.isEmpty { return [] }
 
+        // A forward's thread and its source's stay apart (ADR-IOS-043, forward split).
+        let kept = excludeAcrossForwards(collected, of: msg)
+
         // Deduplicate cross-folder copies, sort by date, cap to limit.
-        let deduped = excludeCopies(collected, of: msg)
+        let deduped = excludeCopies(kept, of: msg)
         return Array(deduped.sorted { $0.date > $1.date }.prefix(SyncConfig.threadQueryLimit))
+    }
+
+    /// The related emails on `msg`'s side of every forward among them.
+    ///
+    /// A forward shares References with the thread it came from (and on Gmail its
+    /// thread id), so the search above reaches across it both ways. Its own thread
+    /// (`ThreadUtils.assignComputedThreadId`: the forward, its copies and replies)
+    /// is told apart by `computedThreadId`:
+    /// - a forward in another thread than `msg`'s: that thread is left out;
+    /// - a forward in `msg`'s thread (`msg` is it, or is a reply to it): the
+    ///   threads of the emails it forwards are left out.
+    /// A forward stored before the split shares its source's thread and shows with
+    /// it; seen from another thread of the conversation it is a forward elsewhere and
+    /// its whole thread is left out (IOS-THREAD-002). An email not stored yet (opened
+    /// from its notification before the merge) has no thread, so nothing is left out.
+    static func excludeAcrossForwards(_ results: [MessageHeader], of msg: MessageHeader) -> [MessageHeader] {
+        let own = msg.computedThreadId
+        guard !own.isEmpty else { return results }
+        let all = [msg] + results
+        var threadByMessageId: [String: String] = [:]
+        for header in all {
+            if let rfc = header.rfc822MessageId, !rfc.isEmpty, threadByMessageId[rfc] == nil {
+                threadByMessageId[rfc] = header.computedThreadId
+            }
+        }
+        var excluded = Set<String>()
+        for forward in all where ThreadUtils.hasForwardPrefix(forward.subject) && !forward.computedThreadId.isEmpty {
+            if forward.computedThreadId != own {
+                excluded.insert(forward.computedThreadId)
+            } else {
+                let sources = (forward.inReplyTo.map { [$0] } ?? []) + forward.references
+                for source in sources {
+                    if let thread = threadByMessageId[source], !thread.isEmpty, thread != own { excluded.insert(thread) }
+                }
+            }
+        }
+        guard !excluded.isEmpty else { return results }
+        return results.filter { !excluded.contains($0.computedThreadId) }
     }
 
     /// Filter out copies of the same email that exist in different folders.

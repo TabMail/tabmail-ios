@@ -148,6 +148,49 @@ struct InboxStagedInsertTests {
     }
 
     @MainActor
+    @Test("a staged forward adopts no on-screen thread: it starts its own (forward split)")
+    func stagedForwardAdoptsNoThread() throws {
+        let (pool, folder, dir, previous) = try makeTestDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        var source = MessageHeader(
+            messageId: "1000", subject: "Parent", from: "Sender", fromAddress: "s@example.com",
+            to: "me@example.com", date: Date().addingTimeInterval(-60), snippet: "p",
+            folderId: folder.id, accountId: "acc1", folderPath: "INBOX", isInInbox: true
+        )
+        source.headerComplete = true
+        source.rfc822MessageId = "<parent@x>"
+        source.threadId = "gm-thread"
+        source.computedThreadId = "thread-A"
+        try pool.writeWithoutTransaction { db in try source.insert(db) }
+
+        let vm = InboxViewModel(folders: [folder])
+        vm.loadInitialPage()
+        guard vm.loadedMessages.count == 1 else {
+            Issue.record("Expected 1 loaded, got \(vm.loadedMessages.count)"); return
+        }
+
+        // A forward of the on-screen email: its In-Reply-To, References and Gmail
+        // thread id all name the source.
+        let base = makeStagedRow(messageId: "m-forward")
+        let forward = StagedInboxRow(
+            accountId: base.accountId, folderPath: base.folderPath, messageId: base.messageId,
+            rfc822MessageId: "<forward@x>", threadId: "gm-thread", inReplyTo: "<parent@x>", references: ["<parent@x>"],
+            subject: "Fwd: Parent", senderName: base.senderName, senderAddress: base.senderAddress,
+            to: base.to, snippet: base.snippet, date: base.date,
+            isRead: base.isRead, isFlagged: base.isFlagged, hasAttachments: base.hasAttachments,
+            isReplied: base.isReplied, isForwarded: base.isForwarded,
+            actionTag: base.actionTag, summaryBlurb: base.summaryBlurb
+        )
+        vm.insertStagedRows([forward])
+
+        #expect(vm.loadedMessages.count == 2)
+        let inserted = vm.loadedMessages.first { $0.messageId == "m-forward" }
+        #expect(inserted != nil)
+        #expect(inserted?.computedThreadId != "thread-A")
+        #expect(vm.displayGroups.count == 2)
+    }
+
+    @MainActor
     @Test("identity dedup: staged row with remapped UID but same rfc822MessageId is NOT double-inserted")
     func identityDedupRfc822() throws {
         let (pool, folder, dir, previous) = try makeTestDB()

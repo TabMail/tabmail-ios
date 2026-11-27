@@ -513,7 +513,10 @@ enum InboxListComposer {
     /// of appearing as a singleton and re-grouping when the durable reload
     /// lands with the real thread id.
     private static func adoptThreadId(for row: StagedInboxRow, from candidates: [MessageSnapshot]) -> String? {
-        candidates.first { snap in
+        // A forward starts its own thread (`ThreadUtils.assignComputedThreadId`),
+        // so it never joins the thread it shares a thread id or References with.
+        guard !ThreadUtils.hasForwardPrefix(row.subject) else { return nil }
+        return candidates.first { snap in
             guard snap.accountId == row.accountId, !snap.computedThreadId.isEmpty else { return false }
             if let tid = row.threadId, tid == snap.threadId { return true }
             if let rfc = snap.rfc822MessageId, !rfc.isEmpty,

@@ -1,5 +1,19 @@
 # IOS-THREAD-001
 
+<!-- KNOWN-ISSUES-AMENDMENT-BEGIN -->
+## Note (2026-11-26, #1555): the first probe now takes the nearest stored ancestor
+
+`findAdoptableThreadId`'s first probe (a stored email whose Message-ID is in the lookup set) now asks
+one id at a time, in nearest order, with `LIMIT 1`: another copy of the email, then its In-Reply-To,
+then its References from the last to the first. Before, one `IN` query took whichever row SQLite
+returned first. The other two probes keep `LIMIT 1` with no `ORDER BY`. The closure below stands:
+the probe still answers with ONE connected thread, not the connected set, so a row connected to two
+fragments can still name the one it already carries. The two shipped repair migrations that call
+the probe (`v47_lateralThreadRepair` and `v54`) therefore give a different answer on a database that
+has not run them yet: a row whose other copy is also keyed to itself now takes that copy's key
+rather than, sometimes, an ancestor's thread. Display only. A forward now looks up only its own
+Message-ID (ADR-IOS-043 amendment, #1555; its residuals are `IOS-THREAD-002`).
+<!-- KNOWN-ISSUES-AMENDMENT-END -->
 > Routed from `KNOWN_ISSUES.md` line 586 during the 2026-08-09 hierarchy split. The exact pre-split source is hash-pinned in [`known-issues-pre-hierarchy-2026-08-09.txt`](../../History/KnownIssues/known-issues-pre-hierarchy-2026-08-09.txt) (`SHA-256 dfa31256dfc43d25d741408ed6e33e2e58ae9984d7cc825a2d59c6c1ae1b6535`).
 
 - Register classification: `closed-decision`
