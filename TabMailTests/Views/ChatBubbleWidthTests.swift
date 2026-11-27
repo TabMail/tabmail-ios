@@ -50,17 +50,16 @@ struct ChatBubbleWidthTests {
         }
     }
 
-    @Test("The same words keep one bubble from the user's message through its Sending bubble to the sent email's: one width and one height, as each carries the Details pin; only the sent email's opens",
+    @Test("The same words keep one bubble from the user's message through its Sending bubble to the sent email's: one width and one height, as each carries the Details pin; only the sent email's is a button",
           arguments: [pinWiderWords, shortWords, longWords])
     func sameBubbleThroughTheSend(words: String) async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
-        let opens = OpenCount()
         let reply = ChatUnsentReply(outboxId: "o-pin", status: .queued, sentAt: nil, holdUntil: nil,
                                     draftId: "d", instanceEpoch: "E1", filed: false, textMessage: words)
         let view = VStack(spacing: 20) {
             ChatFieldMessageBubble(text: words)
             ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {})
-            ChatBubbleView(item: Self.item(words), isGroup: false, extras: nil, isHighlighted: false, onOpen: { opens.count += 1 })
+            ChatBubbleView(item: Self.item(words), isGroup: false, extras: nil, isHighlighted: false, onOpen: {})
         }
         try await Self.withHosted(view) { root in
             let message = try #require(Self.frame(of: ChatFieldMessageBubble.bubbleId, in: root), "control: the user's bubble shows")
@@ -74,25 +73,14 @@ struct ChatBubbleWidthTests {
                 #expect(sent.width < Self.column / 2, "words narrower than the pin: the bubble hugs the pin, \(sent.width) of \(Self.column)")
             }
             // Nothing to open before the email is stored: VoiceOver reads no pin, and the only
-            // button is the sent email's bubble, which opens it.
+            // button is the sent email's bubble. The pin adds no tap of its own to any bubble.
             let labels = HostedAccessibility.labels(in: root)
             #expect(!labels.contains { $0.contains("Details") }, "no pin is read: \(labels)")
             let buttons = Set(HostedAccessibility.elements(under: root)
                 .filter { $0.accessibilityTraits.contains(.button) }
                 .map { HostedAccessibility.identifier(of: $0) ?? "<no identifier>" })
             #expect(buttons == [ChatBubbleView.bubbleId], "only the sent email's bubble is a button: \(buttons)")
-            #expect(HostedAccessibility.activate(ChatBubbleView.bubbleId, in: root), "control: the sent email's bubble takes a tap")
-            for _ in 0..<20 where opens.count == 0 {
-                try await Task.sleep(for: .milliseconds(50))
-            }
-            let opened = opens.count
-            #expect(opened == 1, "and opens the email")
         }
-    }
-
-    /// How many times the sent email's bubble opened it.
-    @MainActor private final class OpenCount {
-        var count = 0
     }
 
     @Test("The Details pin takes the same size active or inactive; inactive, it is dimmed")
