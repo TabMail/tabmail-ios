@@ -323,11 +323,7 @@ struct ChatThreadView: View {
         // (`ChatSendBubbles.follow`), as the chat's emails do. A send filed: the chat reads its
         // emails again, after its bubble points at the copy, so the bubble gives way to the copy
         // in the pass that shows it.
-        .onReceive(NotificationCenter.default.publisher(for: .mailPointersMoved)) { notification in
-            guard let moves = MailPointerMoves.posted(in: notification) else { return }
-            if sends.follow(moves) { viewModel.reloadThread() }
-            sends.end(shownIn: chatRowIds)
-        }
+        .onReceive(NotificationCenter.default.publisher(for: .mailPointersMoved)) { followMoves($0) }
         .onChange(of: reopenedKey) { _, _ in adoptReopened() }
         .task(id: messageIds) {
             // One observation per open chat of its outbox replies, keyed by its Message-IDs.
@@ -825,6 +821,14 @@ struct ChatThreadView: View {
         for copy in viewModel.threadCopies where seenIds.insert(copy.id).inserted {
             viewModel.markReadIfNeeded(copy)
         }
+    }
+
+    /// Posted pointer moves (`.mailPointersMoved`): the sends follow their emails (`ChatSendBubbles.follow`).
+    /// A method of its own, as the body's chain is at the type checker's limit.
+    private func followMoves(_ notification: Notification) {
+        guard let moves = MailPointerMoves.posted(in: notification) else { return }
+        if sends.follow(moves) { viewModel.reloadThread() }
+        sends.end(shownIn: chatRowIds)
     }
 
     /// The hosting screen read this thread again on the row that replaced the opened email: the
