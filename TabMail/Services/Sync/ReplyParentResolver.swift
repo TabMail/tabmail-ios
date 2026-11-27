@@ -212,9 +212,13 @@ enum ReplyParentResolver {
             let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
             var args: [any DatabaseValueConvertible] = [accountId, FolderRole.sent.rawValue]
             for value in slice { args.append(value) }
+            // Named index: where the stored mail has no In-Reply-To (Outlook stores
+            // none), ANALYZE counts all its rows under one value and the planner read
+            // every row of each Sent folder instead (#1563). The index is
+            // migration-built (v13), never deferred or dropped.
             copies += try Row.fetchAll(db, sql: """
                 SELECT DISTINCT r.inReplyTo, r.subject
-                FROM messageHeader r JOIN folder f ON f.id = r.folderId
+                FROM messageHeader r INDEXED BY messageHeader_inReplyTo JOIN folder f ON f.id = r.folderId
                 WHERE r.accountId = ? AND f.role = ? AND r.inReplyTo IN (\(placeholders))
                 """, arguments: StatementArguments(args)).map { SentCopy(inReplyTo: $0["inReplyTo"], subject: $0["subject"]) }
         }
