@@ -122,11 +122,10 @@ struct IMAPWriterEscapedMailboxTests {
     func nseWriter() async throws {
         let server = try startServer()
         defer { server.stop() }
-        let result = try #require(await NSEIMAPConnection.fetch(
+        let result = try #require(await NSEIMAPConnection.fetchFromPlainTextTestServer(
             accountId: "acc1",
             host: "127.0.0.1",
             port: server.port,
-            useTLS: false,
             username: server.username,
             password: server.password,
             rfc822MessageId: Self.messageID

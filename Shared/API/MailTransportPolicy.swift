@@ -10,8 +10,9 @@ import SwiftMail
 /// - The implicit-TLS ports (RFC 8314: 993 for IMAP, 465 for SMTP) speak TLS
 ///   from the first byte.
 /// - Every other port connects and then REQUIRES STARTTLS. A server that does
-///   not offer it is refused before anything else is sent, the password
-///   included (SwiftMail's `.startTLS` is its STARTTLS-required mode).
+///   not offer it is refused before sign-in and before any mail is sent; only
+///   the greeting and the capability exchange that finds STARTTLS missing take
+///   place unencrypted (SwiftMail's `.startTLS` is its STARTTLS-required mode).
 ///
 /// SwiftMail's `.automatic` is never used: it upgrades only when the server
 /// offers STARTTLS on 143 and 587, and for SMTP on any other port it never

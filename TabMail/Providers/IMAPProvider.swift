@@ -116,18 +116,28 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `SyncEngine.isConnectionError` uses for NIO's error families.
     static let tlsProtocolVersionAlert = "TLSV1_ALERT_PROTOCOL_VERSION"
 
-    /// SwiftMail's refusals when a connection that requires STARTTLS
-    /// (`MailTransportPolicy`) finds the server not offering it, before anything
-    /// else is sent: IMAP `IMAPError.connectionFailed("Server did not advertise
-    /// STARTTLS on port N")` (`IMAPConnection.applyPostGreetingTLSPolicy`) and
-    /// SMTP `SMTPError.tlsFailed("STARTTLS required but not advertised by
-    /// server")` (`SMTPServer.applyPostEHLOTLSPolicy`). Matched in the rendered
-    /// description, like the floor token; the end-to-end tests against servers
-    /// that offer no STARTTLS pin both against the pinned library.
-    static let startTLSNotOfferedSignatures = [
-        "did not advertise STARTTLS",
-        "STARTTLS required but not advertised",
-    ]
+    /// Whether `error` is SwiftMail's own refusal when a connection that requires
+    /// STARTTLS (`MailTransportPolicy`) finds the server not offering it, before
+    /// sign-in or any mail: IMAP `IMAPError.connectionFailed("Server did not
+    /// advertise STARTTLS on port N")` (`IMAPConnection.applyPostGreetingTLSPolicy`)
+    /// and SMTP `SMTPError.tlsFailed("STARTTLS required but not advertised by
+    /// server")` (`SMTPServer.applyPostEHLOTLSPolicy`).
+    ///
+    /// Only the library's exact case with its complete reason counts, never text
+    /// that merely contains these words: other errors of the same cases carry the
+    /// server's own reply (a rejected EHLO, a refused STARTTLS command), and a
+    /// reply that repeated the words would otherwise turn a passing failure into
+    /// a permanent one. The end-to-end tests against servers that offer no
+    /// STARTTLS pin both reasons against the pinned library.
+    nonisolated static func isStartTLSNotOffered(_ error: Error, port: Int) -> Bool {
+        if case IMAPError.connectionFailed(let reason) = error {
+            return reason == "Server did not advertise STARTTLS on port \(port)"
+        }
+        if case SMTPError.tlsFailed(let reason) = error {
+            return reason == "STARTTLS required but not advertised by server"
+        }
+        return false
+    }
 
     /// Return an actionable transport-security error when — and ONLY when — the
     /// failure was the server refusing the TLS version floor, or the server not
@@ -152,7 +162,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         if rendered.contains(tlsProtocolVersionAlert) {
             return IMAPTransportSecurityError.tlsFloorNotMet(host: host)
         }
-        if startTLSNotOfferedSignatures.contains(where: { rendered.contains($0) }) {
+        if isStartTLSNotOffered(error, port: port) {
             return IMAPTransportSecurityError.noEncryptedConnection(
                 host: host, port: port, encryptedPort: encryptedPort)
         }
@@ -1047,14 +1057,19 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         return SMTPServer(
             host: smtpHost,
             port: smtpPort,
-            transportSecurity: MailTransportPolicy.smtpSecurity(port: smtpPort)
+            transportSecurity: smtpTransportSecurity
         )
+    }
+
+    /// The transport of every send this provider makes (`makeSMTPSession`).
+    nonisolated var smtpTransportSecurity: MailTransportSecurity {
+        MailTransportPolicy.smtpSecurity(port: smtpPort)
     }
 
     /// The transport of every IMAP connection this provider opens: always an
     /// encrypted connection (`MailTransportPolicy`). Only a DEBUG build honours
     /// the test override that reaches the plain-TCP `FakeIMAPServer`.
-    private nonisolated var imapTransportSecurity: MailTransportSecurity {
+    nonisolated var imapTransportSecurity: MailTransportSecurity {
         #if DEBUG
         if useTLS == false { return MailTransportSecurity.plainText }
         #endif

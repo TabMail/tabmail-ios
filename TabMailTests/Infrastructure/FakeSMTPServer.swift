@@ -80,10 +80,16 @@ final class FakeSMTPServer: @unchecked Sendable {
     private func acceptClient() {
         let fd = accept(listenFd, nil, nil)
         guard fd >= 0 else { return }
+        // A late reply written after `stop()` shut the socket down fails with
+        // EPIPE instead of raising SIGPIPE in the test host.
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         lock.lock()
         clientFds.append(fd)
         lock.unlock()
-        DispatchQueue.global().async { [weak self] in self?.serve(fd) }
+        // Strong: only `serve` closes a connection's descriptor (`stop()` shuts
+        // it down), so it must run even if the server is released first.
+        DispatchQueue.global().async { self.serve(fd) }
     }
 
     private func serve(_ fd: Int32) {
