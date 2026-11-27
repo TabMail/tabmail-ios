@@ -942,7 +942,10 @@ enum MessageHeaderRekey {
             // re-key on Message-ID evidence, and the Message-ID never chooses a
             // message to change (ADR-IOS-068 D4). So after an IMAP or Graph move
             // without proven destination evidence, once sync re-keys the row the
-            // send finds no original. Neither does one moved in another client,
+            // send finds no original; on IMAP, when the server copied something,
+            // the row is dropped at the retirement itself (the arm with no
+            // proven destination, `copiedNothing`), and the send finds no
+            // original from then on. Neither does one moved in another client,
             // which sync stores as a new row (`IOS-OUTBOX-012`).
             // outboxMessage holds only unsent, failed and unfinalized sends.
             try db.execute(

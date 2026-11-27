@@ -732,9 +732,12 @@ actor ChatIdTranslator {
     /// The in-memory half of retiring the pills of rows a move dropped without
     /// proof (`MessageHeaderRekey.finishMove` rewrites the stored rows to
     /// `retiredRealId` in its own write). The stored rewrite is repeated here,
-    /// so a mapping created for the old id in between is retired too. No
-    /// Message-ID-based path can later bind such a pill to a message that may
-    /// not be the moved one.
+    /// so a mapping created for the old id in between is retired too, and so
+    /// is one a pill follow bound to the dropped row after that write: the
+    /// drain runs this on the outside-stores lane
+    /// (`MailPointerMoves.retireOutsideStoresInOrder`), after every follow
+    /// handed over before it. No Message-ID-based path can later bind such a
+    /// pill to a message that may not be the moved one.
     func retireMappings(realIds: [String]) {
         ensureLoadedFromDB()
         do {

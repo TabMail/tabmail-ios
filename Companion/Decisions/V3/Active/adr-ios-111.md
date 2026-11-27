@@ -1787,7 +1787,10 @@ space (`accountScopedIds` false), when the provider reports that the move copied
    key: nothing is kept), and any copy a sync already stored in that folder with the same rfc822
    Message-ID gets them through `MessageAICache.restoreIfCached` (first-compute-wins; one indexed lookup);
 2. its body, and its chat-pill mapping (retired to a stand-in that names no row, so the pill greys out and
-   its number is never reused or rebound by Message-ID), are removed with it;
+   its number is never reused or rebound by Message-ID), are removed with it; the translator's half of the
+   retire runs after the commit on the outside-stores lane (`MailPointerMoves.retireOutsideStoresInOrder`),
+   after every pill follow handed over before it, so a follow still waiting to bind a pill to the dropped
+   row is retired too (amended 2026-11-27, after the rebase onto #1588's lane);
 3. the bookmark drops of item 11 are unchanged (both folders), so the owed check of the #1062 amendment
    still lists them; `MoveFinishResult.droppedRemnants` carries the dropped rows for the entered-inbox AI
    recorder, and `publishCommittedEffects` withdraws each dropped row's rfc822 key from the 30-second

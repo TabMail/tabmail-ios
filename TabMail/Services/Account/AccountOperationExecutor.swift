@@ -284,11 +284,12 @@ final class AccountOperationExecutor {
         // the moved message back (see `releaseRecentlyCompleted`).
         manager.releaseRecentlyCompleted(
             messageIds: result.droppedRemnants.compactMap(\.rfc822MessageId))
-        // The retire write deleted the dropped rows' persisted pill mappings;
-        // drop the translator's in-memory half too (see `finishMove`).
-        if !result.droppedRemnants.isEmpty {
-            await ChatIdTranslator.shared.retireMappings(realIds: result.droppedRemnants.map(\.headerId))
-        }
+        // The retire write rewrote the dropped rows' persisted pill mappings to
+        // their retired stand-ins (see `finishMove`). The translator's half
+        // runs on the outside-stores lane, after every pill follow handed over
+        // before it, so a follow still waiting to bind a pill to a dropped row
+        // cannot land after the retirement.
+        MailPointerMoves.retireOutsideStoresInOrder(realIds: result.droppedRemnants.map(\.headerId))
         await manager.publishMoveFinish(result)
         await manager.retireConfirmedGoneMemberHeaders(retired, memberIds: confirmedGoneMembers)
         await manager.materializeDeferredMoveSuccessors(after: retired, result: result)

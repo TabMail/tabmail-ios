@@ -748,6 +748,8 @@ struct FinishTheMoveLocallyTests {
 
         await AccountManager.shared.move([seeded], to: "Archive")
         try await drainToQuiescence(f)
+        // The pill's in-memory retirement runs on the outside-stores lane.
+        await MailPointerMoves.outsideStoresSettledForTesting()
         return (server, f, provider, numericId, seeded.id)
     }
 
@@ -933,6 +935,69 @@ struct FinishTheMoveLocallyTests {
         let afterReload = await ChatIdTranslator.shared.toRealId(numeric)
         #expect(afterReload != other)
         await ChatIdTranslator.shared.clearAll()
+        await finish(f)
+    }
+
+    /// **THE PROPERTY: a pill whose row was re-keyed just before a move dropped
+    /// it ends retired, even when the re-key's pill follow had not run yet.**
+    /// A producer (a sync UID repair, a placeholder replacement) re-keys the
+    /// row and hands the pill's follow to the outside-stores lane; the user
+    /// moves the message before the lane reaches it, on a server that names no
+    /// destination. When the follow then runs it must not leave the pill bound
+    /// to the dropped row, which a later reopen heal could rebind to another
+    /// message by Message-ID.
+    @Test("A pill whose re-key follow is still waiting when its row is dropped ends retired")
+    @MainActor
+    func aPillFollowWaitingWhenItsRowIsDroppedEndsRetired() async throws {
+        let target = "pill-lane@example.com"
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 88, id: target)],
+            "Archive": [],
+            "Trash": [],
+        ])
+        for mailbox in ["INBOX", "Archive", "Trash"] { server.setUidValidity(10, for: mailbox) }
+        server.withholdCopyUID(forSourceUIDs: [88])
+        server.withholdMoveCOPYUID(forSourceUIDs: [88])
+        server.expectMutation(rfc822MessageId: target)
+        try server.start()
+        defer { server.stop() }
+
+        let f = try fixture(accountId: "address-pill-lane")
+        await ChatIdTranslator.shared.clearAll()
+        let provider = try await registeredIMAPProvider(server: server, fixture: f)
+        let seeded = try seedHeader(f, uid: 88, rfc: target)
+        // The pill was made under the row's earlier id; the re-key to the row's
+        // id has committed and its pill follow waits on the lane.
+        let earlierId = MessageIdentity.headerId(accountId: f.accountId, folderPath: "INBOX", messageId: "87")
+        let numericId = await ChatIdTranslator.shared.toNumericId(earlierId)
+        let release = MailPointerMoves.holdOutsideStoresForTesting()
+        defer { release() }
+        MailPointerMoves.followOutsideStoresInOrder([HeaderRekeyRecord(
+            oldHeaderId: earlierId, newHeaderId: seeded.id,
+            newProviderMessageId: seeded.messageId, newObservedUidValidity: 10)])
+
+        await AccountManager.shared.move([seeded], to: "Archive")
+        try await drainToQuiescence(f)
+        // NON-VACUITY: the move dropped the row while the follow still waited.
+        let remnantKept = try rows(f).contains { $0.id == seeded.id }
+        #expect(!remnantKept, "the remnant row was not dropped")
+        let waiting = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(waiting == earlierId, "the lane was not held: the follow ran before the drop")
+
+        release()
+        await MailPointerMoves.outsideStoresSettledForTesting()
+        let realId = await ChatIdTranslator.shared.toRealId(numericId)
+        #expect(realId == ChatIdTranslator.retiredRealId(numericId: numericId, realId: seeded.id),
+                "the follow left the pill bound to \(String(describing: realId)) after the drop")
+        let stored = try await AppDatabase.dbPool.read { db in
+            try String.fetchOne(db, sql: "SELECT realId FROM chatIdMapping WHERE numericId = ?", arguments: [numericId])
+        }
+        #expect(stored == ChatIdTranslator.retiredRealId(numericId: numericId, realId: seeded.id),
+                "the stored mapping names \(String(describing: stored))")
+        let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId)
+        #expect(detail == nil, "a tap on the pill must open nothing")
+        await ChatIdTranslator.shared.clearAll()
+        try? await provider.disconnect()
         await finish(f)
     }
 
