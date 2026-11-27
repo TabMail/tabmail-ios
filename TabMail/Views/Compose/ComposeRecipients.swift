@@ -136,4 +136,12 @@ extension ComposeDraftGuards {
 extension ComposeDraftGuards.RecipientField {
     /// No address, no rejected entry and no text in the input line.
     var isEmpty: Bool { tokens.isEmpty && rejected.isEmpty && input.isEmpty }
+
+    /// The field's addresses, each under the display name its chip shows
+    /// (`"Sam Lee" <sam@example.com>`, `RecipientEntry.text`), or bare when it
+    /// has none: what Send sends and a draft stores, so the sent To, Cc and Bcc
+    /// headers carry the names, as the Thunderbird add-on's do (#1031).
+    var namedTokens: [String] {
+        tokens.map { RecipientEntry.text(name: displayNames[$0], address: $0) }
+    }
 }

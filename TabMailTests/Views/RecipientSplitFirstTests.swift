@@ -183,12 +183,12 @@ struct RecipientSplitFirstTests {
     ])
     func legacyMixedRecipientIsRefused(raw: String) {
         do {
-            let sendable = try IMAPProvider.sendableRecipients([raw])
+            let sendable = try OutgoingRecipients.sendableRecipients([raw])
             Issue.record("Part of \(raw) was dropped and the rest sent: \(sendable)")
         } catch {
             #expect(AccountManager.isFatalSendError(error))
         }
-        #expect(throws: Never.self) { _ = try IMAPProvider.sendableRecipients(["to@example.com"]) }
+        #expect(throws: Never.self) { _ = try OutgoingRecipients.sendableRecipients(["to@example.com"]) }
     }
 
     @Test("A stored recipient with an empty group beside an address is never submitted, in any field",
@@ -243,7 +243,7 @@ struct RecipientSplitFirstTests {
         }
         try await provider.send(draft: DraftMessage(to: to, cc: cc, bcc: bcc, subject: "Test", body: "Body text"))
         #expect(http.recordedCalls().count == 1)
-        #expect((role == .to ? to : role == .cc ? cc : bcc).contains("joined@example.com"))
+        #expect((role == .to ? to : role == .cc ? cc : bcc).contains(#""First, Second" <joined@example.com>"#))
     }
 
     // MARK: - AI edits

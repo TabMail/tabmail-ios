@@ -85,23 +85,25 @@ struct AgentAutoSaveRecipientsTests {
             return header
         }
 
-        // Recipients changed after the turn began, as the user or the agent's edit does.
-        fields.to = ["to@example.com", "added@example.com"]
-        fields.cc = ["cc@example.com"]
-        fields.bcc = ["bcc@example.com"]
+        // Recipients changed after the turn began, as the user or the agent's edit
+        // does, each named one as compose stores it (#1031).
+        let firstTo = [#""Sam Lee" <to@example.com>"#, "added@example.com"]
+        let firstCc = [#""Lee, Ann" <cc@example.com>"#]
+        let firstBcc = [#""Zoë Kim" <bcc@example.com>"#]
+        fields.to = firstTo
+        fields.cc = firstCc
+        fields.bcc = firstBcc
         #expect(await chat.autoSaveDraft(draftKey: draftKey, subject: "Subject", body: "First body") == nil)
-        try await expectSaved(
-            to: ["to@example.com", "added@example.com"], cc: ["cc@example.com"], bcc: ["bcc@example.com"],
-            body: "First body")
+        try await expectSaved(to: firstTo, cc: firstCc, bcc: firstBcc, body: "First body")
 
-        // A later save rewrites them, uncommitted input text included.
-        fields.to = ["added@example.com"]
+        // A later save rewrites them, a renamed recipient and uncommitted input text included.
+        let secondTo = [#""Renamed Person" <added@example.com>"#]
+        let secondBcc = [#""Zoë Kim" <bcc@example.com>"#, "other@example.com", "still typing"]
+        fields.to = secondTo
         fields.cc = []
-        fields.bcc = ["bcc@example.com", "other@example.com", "still typing"]
+        fields.bcc = secondBcc
         #expect(await chat.autoSaveDraft(draftKey: draftKey, subject: "Subject", body: "Second body") == nil)
-        try await expectSaved(
-            to: ["added@example.com"], cc: [], bcc: ["bcc@example.com", "other@example.com", "still typing"],
-            body: "Second body")
+        try await expectSaved(to: secondTo, cc: [], bcc: secondBcc, body: "Second body")
 
         // Two rejected entries in To and two in Cc that, read as one text, would
         // name a mailbox: one nobody listed, and the Bcc recipient. Reply All on

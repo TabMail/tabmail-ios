@@ -278,18 +278,28 @@ enum GmailParse {
         return found
     }
 
-    /// Read a raw header value directly from the Gmail message JSON.
-    /// Callers that need the raw RFC 2822 header (e.g. GmailProvider storing
-    /// `to`/`cc`/`bcc` verbatim) use this to bypass the parsed EmailAddress list.
+    /// Read a header value directly from the Gmail message JSON.
+    /// Callers that need the RFC 2822 header text (e.g. GmailProvider storing
+    /// `to`/`cc`/`bcc` with their names) use this to bypass the parsed
+    /// EmailAddress list. The value is unfolded (`unfolded`), not verbatim:
+    /// compose splits recipients at line breaks, so a fold inside one long name
+    /// would split it in two (#1031).
     static func rawHeader(_ json: [String: Any], name: String) -> String? {
         let payload = json["payload"] as? [String: Any] ?? [:]
         let headers = payload["headers"] as? [[String: Any]] ?? []
         for h in headers {
             if let n = h["name"] as? String, n.caseInsensitiveCompare(name) == .orderedSame {
-                return h["value"] as? String
+                return (h["value"] as? String).map(unfolded)
             }
         }
         return nil
+    }
+
+    /// A header value as one line (RFC 5322 §2.2.3): each line break followed
+    /// by a space or tab is removed and the space or tab kept. A value with no
+    /// fold is returned unchanged.
+    static func unfolded(_ value: String) -> String {
+        value.replacingOccurrences(of: "\r?\n(?=[ \t])", with: "", options: .regularExpression)
     }
 
     private static func findPartBody(_ part: [String: Any], wantedMime: String) -> String? {
