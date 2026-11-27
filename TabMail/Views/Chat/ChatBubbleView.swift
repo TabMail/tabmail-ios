@@ -66,8 +66,9 @@ struct ChatBubbleView: View {
 
     private var bubble: some View {
         Button(action: onOpen) {
-            // As wide as the wider of the words and the Details pin (`ChatBubbleStack`).
-            ChatBubbleStack(spacing: 6) {
+            // As wide as the wider of the words and the Details pin (`ChatBubbleStack`); the pin is
+            // active, as the bubble opens the email.
+            ChatBubbleStack(spacing: ChatViewLayout.detailsPinGap) {
                 VStack(alignment: .leading, spacing: 6) {
                     if let text = item.textMessage {
                         Text(text)
@@ -89,12 +90,9 @@ struct ChatBubbleView: View {
                         }
                     }
                 }
-                HStack(spacing: 2) {
-                    Text("Details")
-                    Image(systemName: "chevron.right")
-                }
-                .font(.caption2)
-                .foregroundStyle(item.isOwn ? Color.white.opacity(0.75) : Theme.textSecondary)
+                ChatDetailsPin(
+                    isActive: true,
+                    color: item.isOwn ? ChatDetailsPin.ownColor(on: Color.white) : Theme.textSecondary)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
@@ -300,7 +298,9 @@ struct ChatAlternativeLink: View {
 /// their own blue bubble where the reply lands once sent. While the field's Send runs, the line
 /// under it, where "Sent" goes on a sent email, says what is happening ("Writing your email",
 /// `status`). It pulses softly while the email that says them is written, after a short wait
-/// (`pulseOpacity`); still once it is written and while its compose card is up. Nothing to tap.
+/// (`pulseOpacity`); still once it is written and while its compose card is up. Nothing to tap: its
+/// Details pin is there, inactive, so the bubble keeps its look as it turns into the Sending bubble
+/// and the email's own (`ChatDetailsPin`).
 struct ChatFieldMessageBubble: View {
     let text: String
     var pulses = false
@@ -313,17 +313,20 @@ struct ChatFieldMessageBubble: View {
         VStack(alignment: .trailing, spacing: 4) {
             // Paused, the timeline draws once and the bubble is at full opacity.
             TimelineView(.animation(minimumInterval: ChatSuggestionConfig.dotFrameInterval, paused: !pulses)) { context in
-                Text(text)
-                    .font(.body)
-                    .foregroundStyle(Color.white)
-                    .multilineTextAlignment(.leading)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .background(
-                        RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
-                            .fill(Theme.accent)
-                    )
-                    .opacity(pulses ? Self.pulseOpacity(sinceShown: context.date.timeIntervalSince(shownAt)) : 1)
+                ChatBubbleStack(spacing: ChatViewLayout.detailsPinGap) {
+                    Text(text)
+                        .font(.body)
+                        .foregroundStyle(Color.white)
+                        .multilineTextAlignment(.leading)
+                    ChatDetailsPin(isActive: false, color: ChatDetailsPin.ownColor(on: Color.white))
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(
+                    RoundedRectangle(cornerRadius: ChatViewLayout.bubbleCornerRadius)
+                        .fill(Theme.accent)
+                )
+                .opacity(pulses ? Self.pulseOpacity(sinceShown: context.date.timeIntervalSince(shownAt)) : 1)
             }
             if let status {
                 Text(status)
@@ -408,8 +411,8 @@ struct ChatSuggestionWorkingBubble: View {
 }
 
 /// A reply in the outbox that has not gone out yet (`ChatUnsentReply`): a blue bubble with the
-/// email's summary once it is made ("Summarizing" until then), and under it "Sending", as under
-/// every email of the user's. A send that failed for good reads "Not sent", with the red mark beside
+/// email's summary once it is made ("Summarizing" until then) and its Details pin, inactive (there is
+/// nothing to open yet, `ChatDetailsPin`), and under it "Sending", as under every email of the user's. A send that failed for good reads "Not sent", with the red mark beside
 /// the bubble as in Messages; touch and hold offers Retry and Delete, which are the Outbox's own
 /// Retry and Discard for the same row.
 struct ChatUnsentReplyBubble: View {
@@ -443,6 +446,8 @@ struct ChatUnsentReplyBubble: View {
     }
 
     static let notSentMarkId = "chat.unsentReply.notSent"
+    /// The bubble itself, without its status line, as tests find it.
+    static let bubbleId = "chat.unsentReply.bubble"
 
     @ViewBuilder
     private var failedSendMenu: some View {
@@ -454,28 +459,36 @@ struct ChatUnsentReplyBubble: View {
         ChatUndoSendTimeline(reply: reply) { look, secondsLeft in
             VStack(alignment: .trailing, spacing: 4) {
                 ChatUndoSendFill(look: look) { textColor in
-                    Group {
-                        // Each branch says what it shows, so VoiceOver reads what is on screen.
-                        if let text = reply.textMessage {
-                            Text(text)
-                                .font(.body)
-                                .foregroundStyle(textColor)
-                                .multilineTextAlignment(.leading)
-                                .accessibilityLabel("You said: \(text)")
-                        } else {
-                            HStack(spacing: 6) {
-                                ProgressView().controlSize(.mini).tint(textColor)
-                                Text("Summarizing")
-                                    .font(.caption)
-                                    .foregroundStyle(textColor.opacity(0.8))
+                    // The words, then the Details pin, inactive while the email is sending, as the
+                    // email's own bubble lays them out, so it keeps the bubble's size when it takes
+                    // its place.
+                    ChatBubbleStack(spacing: ChatViewLayout.detailsPinGap) {
+                        Group {
+                            // Each branch says what it shows, so VoiceOver reads what is on screen.
+                            if let text = reply.textMessage {
+                                Text(text)
+                                    .font(.body)
+                                    .foregroundStyle(textColor)
+                                    .multilineTextAlignment(.leading)
+                                    .accessibilityLabel("You said: \(text)")
+                            } else {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.mini).tint(textColor)
+                                    Text("Summarizing")
+                                        .font(.caption)
+                                        .foregroundStyle(textColor.opacity(0.8))
+                                }
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel("You said: summarizing")
                             }
-                            .accessibilityElement(children: .ignore)
-                            .accessibilityLabel("You said: summarizing")
                         }
+                        ChatDetailsPin(isActive: false, color: ChatDetailsPin.ownColor(on: textColor))
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 9)
                 }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier(Self.bubbleId)
                 ChatUndoSendStatus(reply: reply, secondsLeft: secondsLeft, undo: undo)
             }
         }

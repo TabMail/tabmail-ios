@@ -5,9 +5,10 @@
 import SwiftUI
 
 /// An email bubble's content: its words, then its Details pin under them at the bubble's trailing
-/// edge. As wide as the wider of the two and no wider, so a short email's bubble hugs its words as
-/// a Sending bubble does, and a long one wraps at the width it is offered. A stack with a spacer
-/// before the pin would take every bubble to that whole width.
+/// edge (`ChatDetailsPin`). As wide as the wider of the two and no wider, so a short email's bubble
+/// hugs its words, and a long one wraps at the width it is offered. The user's message, its Sending
+/// bubble and the email's own bubble all lay out with it, so the same words keep one bubble through
+/// the send. A stack with a spacer before the pin would take every bubble to that whole width.
 ///
 /// The first subview is the words, at the leading edge; the last is the pin, at the trailing edge.
 struct ChatBubbleStack: Layout {
