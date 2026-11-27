@@ -1660,7 +1660,8 @@ struct RunSyncDedupReclaimFtsRoutingTests {
 
     /// The placeholder dedup's collision leg: the server's copy already occupies
     /// its id, so the placeholder is deleted and nothing is inserted. The label
-    /// the user put on the placeholder goes to the copy, as on the insert leg.
+    /// the user put on the placeholder goes to the copy, as on the insert leg,
+    /// and the placeholder's move to the copy is reported for its views.
     @Test("A collided placeholder dedup keeps the placeholder's user labels on the copy")
     func draftDedupCollisionKeepsTheUserLabels() async throws {
         let (pool, dir) = try makePool()
@@ -1695,7 +1696,7 @@ struct RunSyncDedupReclaimFtsRoutingTests {
         await mock.setFetchMessagesResult([
             makeHeaderInfo(messageId: "42", rfc822MessageId: rfc, subject: "fixture", date: Self.syncDate)
         ])
-        _ = try await SyncEngine.runListing(
+        let result = try await SyncEngine.runListing(
             for: folder, provider: mock, limit: 1, dbPool: PrioritizedDatabase(pool: pool)).requireResult()
 
         let placeholderLeft = try await pool.read { try MessageHeader.fetchOne($0, key: placeholderId) }
@@ -1704,6 +1705,9 @@ struct RunSyncDedupReclaimFtsRoutingTests {
             try MessageUserLabel.fetchAll(db).map { "\($0.messageId) \($0.userLabelId)" }
         }
         #expect(labelsByRow == ["\(copyId) \(label.id)"])
+        // A view holding the placeholder is told it now lives at the copy.
+        let moved = result.headerRekeys.map { "\($0.oldHeaderId) -> \($0.newHeaderId)" }
+        #expect(moved == ["\(placeholderId) -> \(copyId)"])
     }
 
     /// A Gmail row an optimistic move left keyed by its old folder is re-keyed
