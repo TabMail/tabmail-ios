@@ -213,7 +213,8 @@ enum MessageHeaderRekey {
     /// its provider-proven destination key but slower in-memory mirrors have
     /// not caught up yet. A gesture Task admitted under the old key can run in
     /// that gap. Process death also kills that Task, so this is intentionally
-    /// not durable state.
+    /// not durable state. A folder's UIDVALIDITY reset forgets every link with
+    /// an end in that folder (`forgetAddressHandoffs`).
     private static let addressHandoffs = Mutex(AddressHandoffState())
     private static let addressHandoffLimit = 512
 
@@ -246,6 +247,28 @@ enum MessageHeaderRekey {
                 state.aliases.removeValue(forKey: oldId)
             }
             state.insertionOrder.removeFirst(overflow)
+        }
+    }
+
+    /// Forget every link that starts or ends in `(accountId, folderPath)`.
+    /// A link joins one message's old and new header ids, and a header id is
+    /// an address (`account:folder:UID`). After the folder's UIDVALIDITY reset
+    /// the resync can seat a different email at either end, so a surviving
+    /// link would join two different messages: a pending change of one could
+    /// be read as the other's, or a lookup of one could reach the other.
+    /// Called by the reset reaction in the write that stamps the new epoch.
+    static func forgetAddressHandoffs(accountId: String, folderPath: String) {
+        addressHandoffs.withLock { state in
+            let forgotten = Set(state.aliases.compactMap { oldId, newId -> String? in
+                let endsInFolder = MessageIdentity.headerIdBelongsToFolder(
+                    oldId, accountId: accountId, folderPath: folderPath)
+                    || MessageIdentity.headerIdBelongsToFolder(
+                        newId, accountId: accountId, folderPath: folderPath)
+                return endsInFolder ? oldId : nil
+            })
+            guard !forgotten.isEmpty else { return }
+            for oldId in forgotten { state.aliases.removeValue(forKey: oldId) }
+            state.insertionOrder.removeAll { forgotten.contains($0) }
         }
     }
 
