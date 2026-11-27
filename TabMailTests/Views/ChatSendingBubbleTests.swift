@@ -555,6 +555,14 @@ struct ChatSendingBubbleTests {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
         let fixture = try await Self.makeFixture(pool)
+        // The test checks the read alone, so no drain may finish a row under it. In the test host the
+        // app's own launch work can connect this account earlier in the process (it connects the
+        // accounts of the installed database when the sidebar's account list fills, after a
+        // `backgroundDataDidChange` post), and the connect keeps the account's work queue; with a queue,
+        // a drain appends a sent row's Sent copy and deletes the row between two reads here. So the
+        // account has no queue, and the deleted row goes through Undo's database half, which starts no
+        // drain and posts nothing.
+        await AccountManager.shared.unregisterProviderForTesting(accountId: Self.account)
         let parentId = try #require(fixture.parent.rfc822MessageId)
         let chat: Set<String> = [EmailFilter.normalizeMessageId(parentId)]
         func shown(_ messageIds: Set<String> = chat) async throws -> [String: ChatUnsentReply] {
@@ -586,7 +594,9 @@ struct ChatSendingBubbleTests {
         try await set("UPDATE outboxMessage SET status = ? WHERE id = ?", [OutboxStatus.failed.rawValue, failed.id])
         try await set("UPDATE outboxMessage SET sentAt = ? WHERE id = ?", [Date(), sent.id])
         try await set("UPDATE outboxMessage SET sentAt = ?, sentMessageId = NULL WHERE id = ?", [Date(), sentWithoutId.id])
-        #expect(AccountManager.shared.discardOutboxMessageConfirmed(deleted.id), "control: Undo deleted the row")
+        let deletedId = deleted.id
+        let undone = try await pool.write { db in try AccountManager.cancelHeldOutboxRow(db: db, messageId: deletedId) }
+        #expect(undone.deleted, "control: Undo deleted the row")
         try await pool.write { db in
             try MessageAICache.writeThrough(
                 accountId: Self.account, folderPath: "Sent",
