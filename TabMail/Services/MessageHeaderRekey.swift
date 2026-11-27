@@ -861,7 +861,8 @@ enum MessageHeaderRekey {
                     // the destination is the copy, so no later path (the chat
                     // session's Message-ID fallback included) may rebind the pill
                     // to a message by its Message-ID. The in-memory half is
-                    // dropped by `publishCommittedEffects`.
+                    // retired on the outside-stores lane, handed over by
+                    // `publishCommittedEffects` (`retireOutsideStoresInOrder`).
                     try ChatIdTranslator.retireStoredMappings(db, realId: oldId)
                     try row.delete(db)
                     result.removedOldHeaderIds.append(oldId)

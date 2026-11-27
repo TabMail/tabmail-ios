@@ -1786,11 +1786,13 @@ space (`accountScopedIds` false), when the provider reports that the move copied
 1. its AI fields are written to `MessageAICache` under the destination folder (no rfc822 Message-ID, no
    key: nothing is kept), and any copy a sync already stored in that folder with the same rfc822
    Message-ID gets them through `MessageAICache.restoreIfCached` (first-compute-wins; one indexed lookup);
-2. its body, and its chat-pill mapping (retired to a stand-in that names no row, so the pill greys out and
-   its number is never reused or rebound by Message-ID), are removed with it; the translator's half of the
-   retire runs after the commit on the outside-stores lane (`MailPointerMoves.retireOutsideStoresInOrder`),
-   after every pill follow handed over before it, so a follow still waiting to bind a pill to the dropped
-   row is retired too (amended 2026-11-27, after the rebase onto #1588's lane);
+2. its body is removed with it, and its chat-pill mapping is retired in the same write to a stand-in that
+   names no row, so the pill greys out and its number is never reused or rebound by Message-ID; the
+   translator's half of the retire runs after the commit on the outside-stores lane
+   (`MailPointerMoves.retireOutsideStoresInOrder`), after every pill follow already handed over, so a follow
+   still waiting to bind a pill to the dropped row is retired too (amended 2026-11-27, after the rebase onto
+   #1588's lane). A follow whose hand-over trails its producer's commit can still land after it (ios#1581).
+   Until the lane runs, the stored stand-in alone makes a reopen heal's re-point miss;
 3. the bookmark drops of item 11 are unchanged (both folders), so the owed check of the #1062 amendment
    still lists them; `MoveFinishResult.droppedRemnants` carries the dropped rows for the entered-inbox AI
    recorder, and `publishCommittedEffects` withdraws each dropped row's rfc822 key from the 30-second
@@ -1822,10 +1824,10 @@ too and stays hidden in its source until the 30-second store expires and the sou
 again (its AI content is recomputed when needed).
 
 Tests: `FinishTheMoveLocallyTests` (no remnant row, the lost-reply retry and the large move after the
-catch-up, AI content kept and filled, the inbox AI enqueue, a refused move, the five pill tests),
+catch-up, AI content kept and filled, the inbox AI enqueue, a refused move, the eight pill tests),
 `QueueCoreInvariantTests` (the drop, the account-scoped and `copiedNothing` controls, the inbox record),
 `ChatIdTranslatorTests`, `ChatPillChipHostingTests`.
 
 Keywords: placeholder, remnant, optimistic row, copiedNothing, droppedRemnants, DroppedRemnant, no proven
-destination, COPYUID withheld, retireStoredMappings, retired pill, releaseRecentlyCompleted, MessageAICache,
+destination, COPYUID withheld, retireStoredMappings, retireOutsideStoresInOrder, retired pill, releaseRecentlyCompleted, MessageAICache,
 restoreIfCached, IOS-MOVE-002, #537, #1062, #963, #964.

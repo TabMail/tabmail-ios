@@ -286,9 +286,10 @@ final class AccountOperationExecutor {
             messageIds: result.droppedRemnants.compactMap(\.rfc822MessageId))
         // The retire write rewrote the dropped rows' persisted pill mappings to
         // their retired stand-ins (see `finishMove`). The translator's half
-        // runs on the outside-stores lane, after every pill follow handed over
-        // before it, so a follow still waiting to bind a pill to a dropped row
-        // cannot land after the retirement.
+        // runs on the outside-stores lane, after every pill follow already
+        // handed over, so such a follow waiting to bind a pill to a dropped
+        // row cannot land after the retirement. A follow whose hand-over
+        // trails its producer's commit (ios#1581) still can.
         MailPointerMoves.retireOutsideStoresInOrder(realIds: result.droppedRemnants.map(\.headerId))
         await manager.publishMoveFinish(result)
         await manager.retireConfirmedGoneMemberHeaders(retired, memberIds: confirmedGoneMembers)
