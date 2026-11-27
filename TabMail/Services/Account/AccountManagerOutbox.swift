@@ -966,10 +966,17 @@ extension AccountManager {
                 let rfc822 = sentCopy?.rfc822MessageId ?? sentMessageId
 
                 // Don't insert if a header with this rfc822MessageId already exists (idempotent).
-                // This is also a provider copy a sync stored before this write: it
-                // stays as the sync wrote it, and nothing more is written here.
-                if let stored = try MessageHeader.fetchOne(
+                // This is also a provider copy a sync stored before this write: that row is
+                // kept, and takes the AI cache entry the send wrote under its own Message-ID, as
+                // a row written here does. The sync's restore looked under the copy's Message-ID
+                // (the provider's own, when it gave one) and found nothing there yet.
+                if var stored = try MessageHeader.fetchOne(
                     db, sql: Self.optimisticSentDedupSQL, arguments: [folderId, rfc822]) {
+                    let original = stored
+                    try MessageAICache.restoreIfCached(
+                        into: &stored, from: sentMessageId, accountId: msg.accountId, folderPath: sentFolder.path, db: db)
+                    // Only the fields the restore set, by the row's key.
+                    _ = try stored.updateChanges(db, from: original)
                     return (stored.id, nil)
                 }
 

@@ -421,6 +421,57 @@ struct ChatSendingBubbleTests {
         #expect(storedAgain == words, "and its bubble shows them")
     }
 
+    @Test("A Sent copy a sync stored before the send filed it shows the user's words and the summary made at Send once the send files it, the summary having landed before the copy existed, whatever Message-ID the provider gave the copy",
+          arguments: CopyShape.allCases)
+    func copyASyncStoredFirstGetsTheWords(_ shape: CopyShape) async throws {
+        let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: directory) }
+        let restore = try Self.openGate(except: .none)
+        defer { restore() }
+        let fixture = try await Self.makeFixture(pool)
+        let words = "Tuesday works!"
+        let row = try await Self.queueReply(
+            fixture, draftId: "draft-synced-first-\(shape.rawValue)", holdsForUndo: false, textVersion: words)
+        // The summary made at Send lands, and finds no Sent copy to hand itself to.
+        let http = Self.summaryBackend(textMessage: "I said Tuesday works.")
+        defer { http.close() }
+        await SentEmailSummary.summarize(
+            outboxId: row.id,
+            aiService: AIService(backendClient: BackendClient(llmSession: http.session), peerProbe: { _ in nil }))
+        #expect(http.recordedCalls().count == 1, "control: the summary was made")
+        #expect(try await Self.sentHeaders(pool).isEmpty, "control: no Sent copy yet")
+
+        // A sync lists the provider's copy before the send's filing write, and stores it as it
+        // stores any listed email: under the Message-ID the copy carries, restored from there.
+        let copyMessageId = try Self.copyMessageId(of: row, shape)
+        let serverId = shape == .providersMessageId ? "gm-\(row.id)" : "server-\(row.id)"
+        let synced = try await pool.write { db -> MessageHeader in
+            var copy = Self.header(serverId, folder: "Sent", from: "me@example.com",
+                                   inReplyTo: row.inReplyTo.map(EmailFilter.normalizeMessageId))
+            copy.rfc822MessageId = copyMessageId
+            copy.subject = row.subject
+            try MessageAICache.restoreIfCached(into: &copy, accountId: Self.account, folderPath: "Sent", db: db)
+            try copy.insert(db)
+            return copy
+        }
+        if shape == .providersMessageId {
+            #expect(synced.userTextMessage == nil && synced.summaryBlurb == nil,
+                    "control: nothing is kept under the provider's Message-ID before the send files the copy")
+        }
+
+        _ = try await Self.send(row, shape: shape)
+        let sent = try await Self.sentHeaders(pool)
+        #expect(sent.map(\.id) == [synced.id], "control: the send filed the copy onto the row the sync stored")
+        guard sent.count == 1 else { return }
+        #expect(sent[0].userTextMessage == words, "the copy keeps the user's words")
+        #expect(sent[0].summaryTextMessage == "I said Tuesday works.", "and the summary made at Send")
+        let sentFolderId = MessageIdentity.folderId(accountId: Self.account, folderPath: "Sent")
+        let thread = ChatThread(
+            members: [fixture.parent] + sent, replyAddresses: { _ in [] },
+            ownAddresses: [], draftFolderIds: [], sentFolderIds: [sentFolderId], unreadAtOpen: [], preferredId: nil)
+        #expect(thread.items.first { $0.isOwn }?.textMessage == words, "the chat's bubble shows the words the user typed")
+    }
+
     @Test("The Sending bubble of an email sent with the user's own words shows them from the queue write, while its summary is made, and after the summary lands")
     func sendingBubbleKeepsTheUserWords() async throws {
         let (pool, directory, previous) = try FolderEpochTestFixture.makeAppDB()

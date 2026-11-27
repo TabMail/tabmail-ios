@@ -772,13 +772,16 @@ same AI result, kept as long as the email itself is shown.
    does not, since the words are kept only under the Sent folder's key. The 2026-11-25 Accepted item
    (other readers of a Sent copy's summary get the text version as its blurb) no longer holds for new
    sends. Earlier sends whose text version stood in as their summary keep it; nothing converts them.
-   Accepted (P4): a Gmail copy that a sync stored before the send's own filing write (tabmail-ios
-   #1628), or whose read right after the send failed (#1629), does not get the words, and its bubble
-   shows the summary's text message.
+   A Gmail copy that a sync stored before the send's own filing write takes the words when the send
+   files it: the filing write's existing-row branch restores from the send's Message-ID as its insert
+   does (`AccountManager.insertOptimisticSentHeader`, tabmail-ios #1628).
+   Accepted (P4): a Gmail copy whose read right after the send failed (tabmail-ios #1629) does not
+   get the words, and its bubble shows the summary's text message.
    Tests: `ChatSendingBubbleTests.ownWordsKeepTheSummarysTodosAndReminder` (both copy shapes; a
    summary that lands before or after the copy arrives puts its to-dos and reminder on the copy, a
    failed one leaves the words, the chat shows the words on the copy throughout, and a copy a sync
-   stores again under its own Message-ID gets them all back), `ChatSendingBubbleTests.sendingBubbleKeepsTheUserWords`,
+   stores again under its own Message-ID gets them all back), `ChatSendingBubbleTests.copyASyncStoredFirstGetsTheWords`
+   (both copy shapes), `ChatSendingBubbleTests.sendingBubbleKeepsTheUserWords`,
    `ChatSendingBubbleTests.newEmailKeepsTheUserWords`,
    `ChatSendingBubbleTests.queueSendWritesTheTextVersionInHand`,
    `ChatSendingBubbleTests.queueSendDecidesOnce` (the chat view turned off, or on, while the queue
