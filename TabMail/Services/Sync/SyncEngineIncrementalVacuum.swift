@@ -44,6 +44,13 @@ import GRDB
 //   a step that started in the background, and its checkpoint, can still hold the
 //   writer for their few milliseconds after the app comes forward. Measured on a Mac
 //   at 1 GB with 190 MB empty: 24 steps of 2,048 pages, 35 ms each (median).
+// - The Optimize Storage tap (`StorageOptimizer`, #1448): the same steps, run at once
+//   from Settings, the one run in the foreground. Its check (`optimizeStorageMayRun`)
+//   needs the app in the foreground and the databases not suspended. Sync is not
+//   paused: the run's writes are at the background tier, and a sync write that
+//   arrives waits for at most one of the run's writer holds: a step, one throttled
+//   PASSIVE checkpoint (about 0.6 to 2 s), or the final TRUNCATE (about 0.4 to 1.1 s
+//   at 1 GB with 190 MB empty).
 //
 // No TRUNCATE follows a switch that failed or a database with nothing to give back:
 // whatever the WAL holds then is left to the database's later checkpoints
@@ -195,6 +202,19 @@ extension SyncEngine {
         !isSuspended
     }
 
+    /// The Optimize Storage tap's check (`StorageOptimizer`, #1448): the one run of the
+    /// steps in the foreground. Its steps start only while the app is in the foreground
+    /// and the databases are not suspended; the app leaving stops them between two, and
+    /// the rest waits for the background job. Sync is not paused: a sync write waits for
+    /// at most one step, one throttled checkpoint or the final TRUNCATE, as behind any
+    /// batch writer (ADR-IOS-121 decision 5).
+    nonisolated static func optimizeStorageMayRun(
+        isSuspended: Bool = DatabaseSuspension.isSuspended,
+        isAppActive: Bool = DatabaseSuspension.isAppActive
+    ) -> Bool {
+        !isSuspended && isAppActive
+    }
+
     /// The email and search databases, in the order the upgrade and the background
     /// processing job work on them. The search database only once it can be opened.
     /// `emailPool` is the app database's pool, whose inbox banner observer the
@@ -232,14 +252,17 @@ extension SyncEngine {
         return values?.volumeAvailableCapacity.map(Int64.init)
     }
 
-    /// The background processing job's last step (`SyncScheduler`): for each
-    /// upgraded target in turn, gives its empty pages back in steps (see the top of
-    /// this file). A target still on NONE gets no step.
+    /// The background processing job's last step (`SyncScheduler`), and the Optimize
+    /// Storage tap's run (`StorageOptimizer`): for each upgraded target in turn, gives
+    /// its empty pages back in steps (see the top of this file). A target still on
+    /// NONE gets no step.
     ///
-    /// Starts no further step and no TRUNCATE after the steps while the app is in
-    /// the foreground or the databases are suspended (`shouldRun`, asked before
-    /// each); the job runs this in a detached task, so its end reaches the run
-    /// through the suspension, not through cancellation. A target that fails leaves
+    /// Starts no further step and no TRUNCATE after the steps once `shouldRun`, asked
+    /// before each, says no. The job's default check says no while the app is in the
+    /// foreground or the databases are suspended; the tap passes its own
+    /// (`optimizeStorageMayRun`, plus its cancellation). The job runs this in a
+    /// detached task, so its end reaches the run through the suspension, not through
+    /// cancellation. A target that fails leaves
     /// its database as it was, and the next target still runs; a stop ends the run.
     /// Returns what it did with each database.
     ///

@@ -104,7 +104,8 @@ final class DatabaseUpgrade {
     var showsSpaceMessage: Bool { bytesNeeded > 0 && (bytesToFree > 0 || ranOutOfSpace) }
 
     /// Reads both databases' mode (their headers; no table) and sets `needsUpgrade`.
-    /// Settings calls it after a reset, which leaves both databases upgraded.
+    /// Settings calls it after a reset, which leaves both databases upgraded, and
+    /// `StorageOptimizer` calls it when Settings measures its Optimize Storage row.
     func refresh() async {
         let states = await readStates()
         needsUpgrade = states.contains { $0.state?.autoVacuum == DatabaseVacuum.noneMode }
