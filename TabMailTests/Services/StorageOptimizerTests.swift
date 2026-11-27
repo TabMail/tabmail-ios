@@ -286,7 +286,7 @@ struct StorageOptimizerTests {
         #expect(canDropTo == "Can drop to 1.2 GB")
         #expect(ready == "TabMail does this overnight. Tap to do it now.")
         #expect(failed == "Could not finish now. Nothing was lost. TabMail will try again overnight.")
-        #expect(upgradeFirst == "Needs a one-time database upgrade first. Tap to start.")
+        #expect(upgradeFirst == "Needs a one-time database update first. Tap to start.")
         #expect(optimizing == nil)
         #expect(OptimizeStorageRow.optimizingTitle == "Optimizing…")
     }

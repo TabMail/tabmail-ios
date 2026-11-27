@@ -27,7 +27,7 @@ struct OptimizeStorageRow: View {
 
     static let title = "Optimize"
     static let overnightLine = "TabMail does this overnight. Tap to do it now."
-    static let upgradeFirstLine = "Needs a one-time database upgrade first. Tap to start."
+    static let upgradeFirstLine = "Needs a one-time database update first. Tap to start."
     static let failedLine = "Could not finish now. Nothing was lost. TabMail will try again overnight."
     static let optimizingTitle = "Optimizing…"
 

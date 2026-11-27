@@ -14,16 +14,16 @@ struct DatabaseUpgradeView: View {
 
     @Environment(\.scenePhase) private var scenePhase
 
-    static let noticeTitle = "Database upgrade"
-    static let noticeWhat = "TabMail needs a one-time upgrade of its mail database. After it, TabMail can give unused storage back to your phone and keep to its storage limits."
-    static let noticeTime = "It takes a minute or so, longer for a large mailbox. Keep TabMail open while it runs."
-    static let upgradeNowTitle = "Upgrade now"
+    static let noticeTitle = "Database update"
+    static let noticeWhat = "For the best experience, TabMail needs to update your database."
+    static let noticeTime = "It takes up to about 5 minutes. Keep TabMail open while it runs."
+    static let upgradeNowTitle = "Update now"
     static let laterTitle = "Later"
-    static let upgradingTitle = "Upgrading your mail database."
+    static let upgradingTitle = "Updating your database."
     static let upgradingHint = "Keep TabMail open."
-    static let doneTitle = "Upgrade complete"
-    static let doneMessage = "TabMail can now give unused storage back to your phone."
-    static let failedTitle = "The upgrade could not finish"
+    static let doneTitle = "Update complete"
+    static let doneMessage = "Your database is up to date."
+    static let failedTitle = "The update could not finish"
     static let failedMessage = "Nothing was lost. You can try again later from the banner in your inbox."
     static let powerMessage = "Plug in your phone first: the battery is low."
 

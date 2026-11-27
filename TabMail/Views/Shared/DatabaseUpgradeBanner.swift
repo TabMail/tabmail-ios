@@ -12,9 +12,9 @@ import SwiftUI
 struct DatabaseUpgradeBanner: View {
     let onOpen: () -> Void
 
-    static let title = "Database upgrade"
-    static let message = "A one-time upgrade lets TabMail give unused storage back to your phone."
-    static let actionTitle = "Upgrade"
+    static let title = "Database update"
+    static let message = "For the best experience, TabMail needs to update your database."
+    static let actionTitle = "Update"
 
     var body: some View {
         HStack(spacing: 8) {
