@@ -13,8 +13,10 @@ import UIKit
 /// its Details pin, and no wider. A short email's bubble hugs its words as the user's own message
 /// and Sending bubbles do, so the user's bubble keeps its width when the sent email takes its
 /// place; long words wrap at the bubble column as they do there. The pin sits under the words at
-/// the bubble's trailing edge. Hosted for real in a `UIWindow`, read back from the accessibility
-/// frames.
+/// the bubble's trailing edge. Every bubble of the user's email carries the pin, inactive while
+/// there is nothing to open (the user's message, the Sending bubble), so the same words keep one
+/// bubble, width and height, through the send. Hosted for real in a `UIWindow`, read back from the
+/// accessibility frames.
 @Suite("Chat bubble width", .serialized)
 @MainActor
 struct ChatBubbleWidthTests {
@@ -22,6 +24,8 @@ struct ChatBubbleWidthTests {
     private static var column: CGFloat { screenWidth * ChatViewLayout.bubbleMaxWidthFraction }
     nonisolated private static let shortWords = "Lunch on Friday?"
     nonisolated private static let longWords = "Lunch on Friday works for me, and I can bring the slides for the planning meeting afterwards if that helps."
+    /// Narrower than the Details pin.
+    nonisolated private static let pinWiderWords = "Ok"
 
     @Test("A sent email's bubble is as wide as the user's own bubble of the same words: hugging short words, wrapping long ones at the column",
           arguments: [shortWords, longWords])
@@ -46,19 +50,52 @@ struct ChatBubbleWidthTests {
         }
     }
 
-    @Test("Words narrower than the Details pin: the bubble is as wide as the pin, still hugging")
-    func pinWiderThanTheWords() async throws {
+    @Test("The same words keep one bubble from the user's message through its Sending bubble to the sent email's: one width and one height, as each carries the Details pin; only the sent email's is a button",
+          arguments: [pinWiderWords, shortWords, longWords])
+    func sameBubbleThroughTheSend(words: String) async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        let reply = ChatUnsentReply(outboxId: "o-pin", status: .queued, sentAt: nil, holdUntil: nil,
+                                    draftId: "d", instanceEpoch: "E1", filed: false, textMessage: words)
         let view = VStack(spacing: 20) {
-            ChatFieldMessageBubble(text: "Ok")
-            ChatBubbleView(item: Self.item("Ok"), isGroup: false, extras: nil, isHighlighted: false, onOpen: {})
+            ChatFieldMessageBubble(text: words)
+            ChatUnsentReplyBubble(reply: reply, retry: {}, delete: {}, undo: {})
+            ChatBubbleView(item: Self.item(words), isGroup: false, extras: nil, isHighlighted: false, onOpen: {})
         }
         try await Self.withHosted(view) { root in
             let message = try #require(Self.frame(of: ChatFieldMessageBubble.bubbleId, in: root), "control: the user's bubble shows")
+            let sending = try #require(Self.frame(of: ChatUnsentReplyBubble.bubbleId, in: root), "control: the Sending bubble shows")
             let sent = try #require(Self.frame(of: ChatBubbleView.bubbleId, in: root), "control: the sent email's bubble shows")
-            #expect(sent.width > message.width, "the pin is wider than \"Ok\", so the bubble takes the pin's width: \(sent.width) vs \(message.width)")
-            #expect(sent.width < Self.column / 2, "and hugs it: \(sent.width) of \(Self.column)")
+            #expect(abs(sending.width - message.width) <= 1 && abs(sent.width - sending.width) <= 1,
+                    "one width: message \(message.width), Sending \(sending.width), sent \(sent.width)")
+            #expect(abs(sending.height - message.height) <= 1 && abs(sent.height - sending.height) <= 1,
+                    "one height, the pin under the words in each: message \(message.height), Sending \(sending.height), sent \(sent.height)")
+            if words == Self.pinWiderWords {
+                #expect(sent.width < Self.column / 2, "words narrower than the pin: the bubble hugs the pin, \(sent.width) of \(Self.column)")
+            }
+            // Nothing to open before the email is stored: VoiceOver reads no pin, and the only
+            // button is the sent email's bubble. The pin adds no tap of its own to any bubble.
+            let labels = HostedAccessibility.labels(in: root)
+            #expect(!labels.contains { $0.contains("Details") }, "no pin is read: \(labels)")
+            let buttons = Set(HostedAccessibility.elements(under: root)
+                .filter { $0.accessibilityTraits.contains(.button) }
+                .map { HostedAccessibility.identifier(of: $0) ?? "<no identifier>" })
+            #expect(buttons == [ChatBubbleView.bubbleId], "only the sent email's bubble is a button: \(buttons)")
         }
+    }
+
+    @Test("The Details pin takes the same size active or inactive; inactive, it is dimmed")
+    func pinKeepsItsSize() {
+        let fit = CGSize(width: Self.screenWidth, height: .greatestFiniteMagnitude)
+        for color in [ChatDetailsPin.ownColor(on: Color.white), Theme.textSecondary] {
+            let active = UIHostingController(rootView: ChatDetailsPin(isActive: true, color: color)).sizeThatFits(in: fit)
+            let inactive = UIHostingController(rootView: ChatDetailsPin(isActive: false, color: color)).sizeThatFits(in: fit)
+            #expect(active.width > 0 && active.height > 0, "control: the pin has a size: \(active)")
+            #expect(active == inactive, "same size: active \(active), inactive \(inactive)")
+        }
+        let activeOpacity = ChatDetailsPin.opacity(isActive: true)
+        let inactiveOpacity = ChatDetailsPin.opacity(isActive: false)
+        #expect(activeOpacity == 1, "active: full")
+        #expect(inactiveOpacity > 0 && inactiveOpacity < activeOpacity, "inactive: dimmed, still seen: \(inactiveOpacity)")
     }
 
     @Test("The stack is as wide as the wider of its words and its pin; the words at the leading edge, the pin under them at the trailing edge",

@@ -2275,6 +2275,17 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
        bubbles hug theirs, so a sent email keeps its bubble's width when its Sending bubble gives way
        to it; long words wrap at the bubble column (`ChatViewLayout.bubbleMaxWidthFraction`).
        *Superseded:* a spacer before the pin, which took every email's bubble to the whole column.
+     - *Every bubble of an email carries its Details pin (amended 2026-11-27, ios#1565).* The user's
+       message from the field (`ChatFieldMessageBubble`), its Sending bubble (`ChatUnsentReplyBubble`)
+       and the email's own bubble (`ChatBubbleView`) all lay out their words and the pin with
+       `ChatBubbleStack`; the pin (`ChatDetailsPin(isActive:color:)`) is active only on the email's
+       own bubble, whose tap opens the email, and inactive (dimmed, `ChatViewLayout.detailsPinInactiveOpacity`,
+       not hit-testable, hidden from VoiceOver) while there is nothing to open. Active and inactive
+       take the same size, so the same words keep one bubble, width and height, from the message
+       through the Sending bubble to the sent email (`ChatBubbleWidthTests`). The AI Suggestion and
+       its "Writing" dots carry no pin: a suggestion, not the user's email, with its own caption and
+       tap. *Superseded:* the pin only on a stored email's bubble, so the bubble grew when the email's
+       own bubble took the Sending bubble's place.
      - Its Undo is on the bubble with the chat view on (`ComposeScreen.newEmailChat`;
        `sendHasBubbleUndo` is true for that screen with no In-Reply-To), and the toast is not shown
        for it. The compose the bubble's Undo reopens records the bubble's screen

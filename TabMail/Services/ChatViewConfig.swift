@@ -77,6 +77,11 @@ enum ChatViewLayout {
     static let bubbleCornerRadius: CGFloat = 18
     static let bubbleMaxWidthFraction: CGFloat = 0.78
     static let bubbleSpacing: CGFloat = 6
+    /// An email bubble's Details pin (`ChatDetailsPin`): its gap under the words, its opacity on
+    /// the user's blue bubbles, and how far it dims while inactive.
+    static let detailsPinGap: CGFloat = 6
+    static let detailsPinOwnOpacity: Double = 0.75
+    static let detailsPinInactiveOpacity: Double = 0.4
     /// The bottom bar's height until the reply field is measured: the bar is a slot of the
     /// collapsed field's measured height, and its inset keeps the last bubble above the field.
     static let pillStartHeight: CGFloat = 98
