@@ -211,7 +211,12 @@ struct OutboxStrandedClaimTests {
             #expect(await provider.sentDrafts.count == 1, "the drain sends the queued row only")
             let retried = AccountManager.shared.retryOutboxMessage(failedId)
             #expect(retried)
+            // Retry starts its own drain in an unawaited task. When that drain
+            // takes the outbox first, this call returns at once
+            // (`isDrainingOutbox`) while the send is still on its way, so the
+            // sends are read only once no drain owns the outbox.
             await AccountManager.shared.drainOutbox()
+            try #require(await OutboxDrainLatch.waitForClear(), "the drain after Retry never let the outbox go")
             let sent = await provider.sentDrafts
             #expect(sent.count == 2)
             guard sent.count == 2 else { return }

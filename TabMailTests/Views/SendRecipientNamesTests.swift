@@ -99,6 +99,37 @@ struct SendRecipientNamesTests {
         #expect(reopened.stored.to == stored.to && reopened.stored.cc == stored.cc && reopened.stored.bcc == stored.bcc)
     }
 
+    /// Reopening a draft reads its stored text through `RecipientEntry`'s own
+    /// splitter (quotes, escapes, angle brackets) before any address parser, so
+    /// the hard names must come back from it as the same recipients under the
+    /// same names, and saving again writes the same text. A line break in a name
+    /// is written as a space, so names and text are compared white space aside.
+    @Test("A saved draft with hard names reopens to the same recipients and names")
+    func draftKeepsHardNames() {
+        let roles: [(ComposeDraftGuards.RecipientRole, [[String]])] = [(.to, Self.hardTo), (.cc, Self.hardCc), (.bcc, Self.hardBcc)]
+        var fields = ComposeDraftGuards.Recipients()
+        for (role, pairs) in roles {
+            for pair in pairs { fields = fields.picking(pair[1], name: pair[0], to: role) }
+        }
+        let stored = fields.stored
+        let reopened = ComposeDraftGuards.Recipients().filling(
+            to: RecipientEntry(stored.to), cc: RecipientEntry(stored.cc), bcc: RecipientEntry(stored.bcc))
+        for (role, pairs) in roles {
+            let addresses = pairs.map { $0[1] }
+            let names = Dictionary(uniqueKeysWithValues: pairs.map { ($0[1], Self.spaced($0[0])) })
+            let picked = fields[role].tokens
+            let reread = reopened[role].tokens
+            let rereadNames = reopened[role].displayNames.mapValues { Self.spaced($0) }
+            #expect(picked == addresses, "\(role)")
+            #expect(reread == addresses, "\(role)")
+            #expect(rereadNames == names, "\(role)")
+        }
+        let again = reopened.stored
+        let savedAgain = [again.to, again.cc, again.bcc].map { $0.map { Self.spaced($0) } }
+        let savedFirst = [stored.to, stored.cc, stored.bcc].map { $0.map { Self.spaced($0) } }
+        #expect(savedAgain == savedFirst)
+    }
+
     /// Send queues the message as an Outbox row, and the send made later (a
     /// retry too) is read back from that row.
     @Test("A queued send keeps every name until it is sent")
@@ -246,8 +277,11 @@ struct SendRecipientNamesTests {
             """
         let message = try JSONDecoder().decode(GraphMessage.self, from: Data(json.utf8))
         let provider = ExchangeProvider(userEmail: "me@example.com", accessToken: { _ in "tok" })
-        let parsed = await provider.parseGraphMessage(
-            message, selection: GraphAPI.headerOnlySelection, keepRecipientNames: draftCopy)
+        // Header sync and every read but a draft copy's call it with no
+        // `keepRecipientNames`, so the other row relies on its default.
+        let parsed = await draftCopy
+            ? provider.parseGraphMessage(message, selection: GraphAPI.headerOnlySelection, keepRecipientNames: true)
+            : provider.parseGraphMessage(message, selection: GraphAPI.headerOnlySelection)
         let info = try #require(parsed)
         let to = RecipientEntry(info.to).recipients
         let cc = RecipientEntry(info.cc).recipients

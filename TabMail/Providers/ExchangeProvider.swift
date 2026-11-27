@@ -2007,7 +2007,10 @@ actor ExchangeProvider: EmailProvider {
     /// recipient as `"Name" <address>` (`IMAPFetchMapping.mailboxText`), or its bare
     /// address when it has no name or Graph gives the address itself as the name
     /// (as it does for a recipient saved without one). A recipient with no address
-    /// is left out, as the address-only read leaves it empty.
+    /// is left out, as the address-only read leaves it empty. It does not reuse
+    /// `formatRecipient` (an attached email's envelope), which keeps a recipient
+    /// with a name and no address as the name alone: a draft field holds only
+    /// mailboxes, as compose reads each entry back as one.
     nonisolated static func draftRecipientText(_ recipients: [GraphRecipient]?) -> String {
         (recipients ?? []).compactMap { recipient -> String? in
             guard let address = recipient.emailAddress?.address, !address.isEmpty else { return nil }

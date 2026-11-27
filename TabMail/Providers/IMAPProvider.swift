@@ -7159,7 +7159,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             .map { $0.hasPrefix("<") ? $0 : "<\($0)>" }
     }
 
-
     private static func buildEmail(
         from draft: DraftMessage,
         senderEmail: String,

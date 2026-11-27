@@ -232,7 +232,8 @@ collapsed; ios#1603, P5). A Gmail sender name holding an escaped quote keeps its
 reply (ios#1606, P5).
 
 Tests: `SendRecipientNamesTests` (the three ways a field gets a name, Send, the Outbox model a queued
-send is encoded to and read back from, the draft round trip, the toast and the Outbox row, the Outlook
+send is encoded to and read back from, the draft round trip (the hard names below too, through
+compose's own splitter), the toast and the Outbox row, the Outlook
 draft read and every other Outlook read keeping addresses only, Outlook's reading of a stored list,
 group and unreadable text, the IMAP draft copy read from a named ENVELOPE, a reply to a sender with no
 name, and each provider's wire: the `Email` the app's own SMTP send hands its submission session
