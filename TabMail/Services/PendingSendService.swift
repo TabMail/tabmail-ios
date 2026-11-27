@@ -223,7 +223,8 @@ final class PendingSendService {
         /// The screen the reopened compose records as opened on (`ComposeView.openedOn`), from
         /// the Undo that cancelled the send: the bubble's screen after its Undo (a chat, or a new
         /// email's chat), so a send again from this compose has its Undo on the bubble again; nil
-        /// after the toast's Undo, so it keeps the toast (`sendHasBubbleUndo`).
+        /// after the toast's Undo, and after a bubble's Undo made in Search, which closes for it
+        /// and leaves no chat under the compose, so it keeps the toast (`sendHasBubbleUndo`).
         let openedOn: ComposeScreen?
         /// The undone send's text version, when it had one: sent again with its body unchanged,
         /// the reopened compose's email keeps it (`ComposeView.writtenEmail`).
@@ -285,15 +286,33 @@ final class PendingSendService {
     /// presenter at a time, so it never stalls under a modal and nothing waits behind it.
     private(set) var chatModals: [UUID] = []
 
+    /// The open chat modals that close for an Undo's outcome rather than present it over
+    /// themselves: the Search sheet (`chatModalSheet`). A compose an Undo made in one of them
+    /// reopens with no chat under it.
+    private var modalsClosingForOutcome: Set<UUID> = []
+
     var openChatModals: Int { chatModals.count }
 
-    /// The screen `id` opened (again: it moves to the top).
-    func chatModalOpened(_ id: UUID) {
+    /// The screen `id` opened (again: it moves to the top). `closesForOutcome`: it closes for an
+    /// Undo's outcome (Search) rather than presenting it over itself (a new email's chat).
+    func chatModalOpened(_ id: UUID, closesForOutcome: Bool) {
         chatModals.removeAll { $0 == id }
         chatModals.append(id)
+        if closesForOutcome { modalsClosingForOutcome.insert(id) } else { modalsClosingForOutcome.remove(id) }
     }
 
-    func chatModalClosed(_ id: UUID) { chatModals.removeAll { $0 == id } }
+    func chatModalClosed(_ id: UUID) {
+        chatModals.removeAll { $0 == id }
+        modalsClosingForOutcome.remove(id)
+    }
+
+    /// Whether the compose an Undo reopens now stays over the screen it was made on: true unless
+    /// the chat modal on top closes for the outcome (Search), when RootView presents the compose
+    /// with no chat under it.
+    private var reopenStaysOverTheUndo: Bool {
+        guard let top = chatModals.last else { return true }
+        return !modalsClosingForOutcome.contains(top)
+    }
 
     /// An Undo's outcome waits for RootView: a compose to reopen, or the notice that it did not take.
     /// Set only once the outcome is known, never by the tap itself.
@@ -495,10 +514,14 @@ final class PendingSendService {
             clearToast(ifShowing: p.id)
             // The Undo is the toast's only when the toast owns this send (`undoOwners`, still
             // set here; `endUndone` clears it after). Any other Undo is the bubble's, made on
-            // the screen that shows it, so the compose it reopens is that screen's.
+            // the screen that shows it, so the compose it reopens is that screen's, as long as
+            // that screen stays under it: an Undo made in Search closes the sheet, and a send
+            // again from the compose RootView then shows has no bubble on screen, so it keeps
+            // the toast (never two Undos for one send, never none).
+            let bubbleStaysUnder = undoOwners[p.id] != .toast && reopenStaysOverTheUndo
             return .reopen(ReopenSnapshot(
                 id: p.id, authority: authority, returnedToDrafts: outcome.returnedToDrafts,
-                openedOn: undoOwners[p.id] == .toast ? nil : bubbleScreen, sentTextVersion: sentTextVersion))
+                openedOn: bubbleStaysUnder ? bubbleScreen : nil, sentTextVersion: sentTextVersion))
         }
     }
 

@@ -800,6 +800,15 @@ same AI result, kept as long as the email itself is shown.
    over it, one Undo on screen, checked on the hold Send gave the email; a compose built again with
    another origin), `UndoSendReturnsToDraftsTests` (the return to Drafts from the toast and from
    the bubble).
+   *Amended 2026-11-27 (an Undo made in Search, tabmail-ios #1463):* the compose a bubble's Undo
+   reopens records the bubble's screen, so its send again keeps the bubble. But a bubble's Undo made
+   in a chat in the Search sheet closes the sheet for its outcome, and the compose reopens at
+   RootView with no chat under it: its send again put its Undo on a bubble no screen showed, so it
+   had none. A reopen now records the bubble's screen only when the chat modal on top presents the
+   outcome over itself (a new email's chat), or none is open; under the Search sheet it records
+   none, and the send again keeps the toast (`PendingSendService.chatModalOpened(_:closesForOutcome:)`,
+   `reopenStaysOverTheUndo`). Never two Undos for one send, and never none. Test:
+   `ChatUndoSendRoutingTests.searchReopenedComposeHasTheToast`.
    **Superseded by the rebuild (2026-11-09), kept for history:**
    **The Sending bubble follows its queued email (decided 2026-11-07):** a reply sent from
    the chat (the ready AI Reply, or an agent compose) reports its queued email's outbox row
@@ -925,6 +934,20 @@ same AI result, kept as long as the email itself is shown.
    its addresses even when earlier emails had others. The inbox's and the email screen's Reply All
    (`buildReplyAllRecipients`) are unchanged. Tests: `ChatThreadTests.ownAddressesOnly`,
    `ownAddressesHiddenBesideOthers`, `headerIsTheReply`.
+   *Amended 2026-11-27 (later; the agent's reply tool, and a copy received at another own account,
+   tabmail-ios #1614):* "unchanged" above holds for the Reply All button outside the chat only. The
+   agent's reply tool (`EmailReplyTool.reply`) builds its card's envelope with the same
+   `ChatReplyCompose.suggestionEnvelope`, on every screen, so its card for an email that went only to
+   the user's own addresses now opens with those addresses in To where it opened with none. The To
+   shows on the card before Send and only the user's own mailboxes are involved, so it is kept.
+   (`ComposeView.suggestionEditTarget` reads the envelope too, but such an email has no AI
+   Suggestion: the AI Reply skips self-sent mail.) A copy one of the user's accounts sent to another,
+   opened where it was received (a forward from A, received at B), went from B to B alone: the
+   fallback read only To and Cc. It now puts the email's own reply target (Reply-To, else From)
+   first when that is an address of the user's other than the holding account's
+   (`MessageHeader.accountId`), so the reply from B goes to A, then B; a Sent copy, held by the
+   account it came from, is unchanged. Test: `ChatThreadTests.receivedOwnCopyAnswersItsSender`
+   (header == envelope; the Sent copy unchanged).
    **Product choices of who gets the reply, decided 2026-11-08:** an email that only adds someone new is
    not "only" (the new person joins the chat's people), and an email is never "only" for someone who
    joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
