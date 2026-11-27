@@ -373,6 +373,11 @@ struct CalendarBadRequestClassificationTests {
             ("OAuth endpoint 5xx", OAuthError.tokenExchangeFailed("server_error"), false),
             ("OAuth body carried no error code at all", OAuthError.tokenExchangeFailed("unknown"), false),
             ("OAuth wrong scope requested — our bug, not a dead grant", OAuthError.tokenExchangeFailed("invalid_scope"), false),
+            // Ask the user (or their admin) to act, so the change waits for a sign-in
+            // that gets a token again (#659).
+            ("OAuth another sign-in step needed", OAuthError.tokenExchangeFailed("interaction_required"), false),
+            ("OAuth consent needed again", OAuthError.tokenExchangeFailed("consent_required"), false),
+            ("OAuth Workspace admin restriction", OAuthError.tokenExchangeFailed("admin_policy_enforced"), false),
             ("credential could not be read", ProviderError.authenticationFailed, false),
             // — Transport / storage, on the same path —
             ("connection lost", URLError(.networkConnectionLost), false),
@@ -386,7 +391,7 @@ struct CalendarBadRequestClassificationTests {
         // MIS-030: anchor the roster's own cardinality, so a future edit that
         // silently empties or truncates it cannot make every assertion below
         // pass over nothing.
-        #expect(roster.count == 35,"the roster lost or gained entries — re-derive it from the call graph")
+        #expect(roster.count == 38,"the roster lost or gained entries — re-derive it from the call graph")
         for (label, error, terminal) in roster {
             #expect(
                 claimedByATerminalArm(error) == terminal,
@@ -535,11 +540,29 @@ struct CalendarBadRequestClassificationTests {
         for (label, error) in [
             ("Google post-refresh 401", GoogleCalendarError.httpError(401, nil) as Error),
             ("Exchange post-refresh 401", ExchangeCalendarError.httpError(401, nil)),
-            ("revoked grant", OAuthError.tokenExchangeFailed("invalid_grant")),
             ("credential could not be read", ProviderError.authenticationFailed),
         ] {
             #expect(AccountManager.isCalendarOAuthReauthRequired(error),
                     "\(label): the user is never told to sign in again, so nothing they can do clears the failure — that is what turns a fail-closed stop into an unrecoverable wedge")
+        }
+
+        // A token-endpoint refusal is signalled by the token accessor, which checks
+        // that the refused sign-in is still the installed one (#659), never again by
+        // the drain: the drain's own raise put the warning back up when a refusal of
+        // the old sign-in arrived after the user had signed in again. The drain-level
+        // property is pinned in `RevokedMailGrantSignalTests`.
+        for code in ["invalid_grant", "invalid_client", "unauthorized_client",
+                     "interaction_required", "consent_required", " Admin_Policy_Enforced "] {
+            #expect(AccountManager.isCalendarOAuthReauthRequired(OAuthError.tokenExchangeFailed(code)) == false,
+                    "\(code): the calendar drain raises the warning for a token refusal itself, without checking the refused sign-in is still installed")
+        }
+
+        // The three codes that ask the user to act are not terminal (#659): the
+        // queued change waits for a sign-in that gets a token again instead of being
+        // retired.
+        for code in ["interaction_required", "consent_required", "admin_policy_enforced"] {
+            #expect(claimedByATerminalArm(OAuthError.tokenExchangeFailed(code)) == false,
+                    "\(code): a step the user can take retired the queued calendar change unexecuted")
         }
 
         // 🚨 THE ASYMMETRY THIS FIX RESTS ON. `ProviderError.authenticationFailed`
