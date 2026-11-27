@@ -1329,6 +1329,39 @@ struct IncrementalVacuumTests {
         #expect(emailLog.steps.isEmpty && searchLog.steps.isEmpty, "the upgrade takes no step")
     }
 
+    /// The upgrade screen's bar (#1583) learns of each database's end from the loop
+    /// itself, not from a read of the databases.
+    @Test("Each database's step is told as soon as it ends, before the next database starts, the step that ends the upgrade included")
+    func eachStepIsToldAsItEnds() async {
+        let emailLog = StepLog()
+        let searchLog = StepLog()
+        let told = Lines()
+        let steps = await SyncEngine.runDatabaseUpgrade(
+            targets: [
+                Self.fakeTarget("email", autoVacuum: DatabaseVacuum.noneMode, freePages: 10, log: emailLog),
+                Self.fakeTarget("search", autoVacuum: DatabaseVacuum.noneMode, freePages: 10, log: searchLog),
+            ],
+            availableBytes: { _ in Self.plentyOfSpace }, shouldRun: { true },
+            finished: { step in told.add("\(step): email \(emailLog.switchCount), search \(searchLog.switchCount)") })
+        let shortLog = StepLog()
+        let toldShort = Lines()
+        let short = await SyncEngine.runDatabaseUpgrade(
+            targets: [
+                Self.fakeTarget("email", autoVacuum: DatabaseVacuum.incrementalMode, freePages: 10, log: StepLog()),
+                Self.fakeTarget("search", autoVacuum: DatabaseVacuum.noneMode, freePages: 10, log: shortLog),
+            ],
+            availableBytes: { _ in 0 }, shouldRun: { true },
+            finished: { step in toldShort.add("\(step)") })
+
+        #expect(steps == [.upgraded("email"), .upgraded("search")], "\(steps)")
+        #expect(told.all == [
+            "\(SyncEngine.UpgradeStep.upgraded("email")): email 1, search 0",
+            "\(SyncEngine.UpgradeStep.upgraded("search")): email 1, search 1",
+        ], "each step told once, after its own switch and before the next: \(told.all)")
+        #expect(toldShort.all == short.map { "\($0)" }, "every step told, in order, the one that ends the upgrade included: \(toldShort.all)")
+        #expect(short.count == 2, "precondition: one step for each database: \(short)")
+    }
+
     @Test("A database already upgraded is left alone, its free space not read, and the next one is upgraded")
     func anUpgradedDatabaseIsLeftAlone() async {
         let emailLog = StepLog()
@@ -1480,7 +1513,7 @@ struct IncrementalVacuumTests {
     private static let expectedSpaceReturnCalls = [
         "DatabaseUpgrade.swift: let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.dbPool)",
         "DatabaseUpgrade.swift: let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.dbPool)",
-        "DatabaseUpgrade.swift: return await SyncEngine.runDatabaseUpgrade(targets: targets)",
+        "DatabaseUpgrade.swift: return await SyncEngine.runDatabaseUpgrade(targets: targets, finished: finished)",
         "StorageOptimizer.swift: let targets = await SyncEngine.appSpaceReturnTargets(emailPool: AppDatabase.backgroundPool)",
         "StorageOptimizer.swift: return await SyncEngine.runOvernightSpaceReturn(targets: targets, shouldRun: shouldRun)",
         "SyncScheduler.swift: await SyncEngine.runOvernightSpaceReturn(targets: targets)",
@@ -1498,10 +1531,15 @@ struct IncrementalVacuumTests {
         let stop = upgrade.firstIndex(of: "scheduler.stopPolling()")
         let resume = upgrade.firstIndex(of: "defer { if DatabaseSuspension.isAppActive { scheduler.startForegroundPolling() } }")
         let queues = upgrade.firstIndex(of: "await SyncScheduler.cancelAllInFlightQueues(inboxOnly: false)")
-        let rewrite = upgrade.firstIndex(of: "let steps = await upgradeDatabases()")
+        let rewrite = upgrade.firstIndex(of: "let steps = await upgradeDatabases { step in await self.databaseFinished(step) }")
+        // The progress bar's data (#1583): read once paused, just before the rewrite.
+        let sizes: Int? = {
+            guard let run else { return nil }
+            return upgrade[run...].firstIndex(of: "let states = await readStates()")
+        }()
         let inOrder: Bool = {
-            guard let run, let stop, let resume, let queues, let rewrite else { return false }
-            return run < stop && stop + 1 == resume && resume < queues && queues < rewrite
+            guard let run, let stop, let resume, let queues, let sizes, let rewrite else { return false }
+            return run < stop && stop + 1 == resume && resume < queues && queues < sizes && sizes < rewrite
         }()
         let otherFunction: [String] = {
             guard let run, let rewrite, run < rewrite else { return ["(not found)"] }
@@ -1510,7 +1548,7 @@ struct IncrementalVacuumTests {
         let appDefaults = [
             "static let shared = DatabaseUpgrade()",
             "scheduler: SyncScheduler = .shared,",
-            "upgradeDatabases: @escaping @Sendable () async -> [SyncEngine.UpgradeStep] = DatabaseUpgrade.upgradeTheAppsDatabases,",
+            "upgradeDatabases: @escaping @Sendable (StepFinished) async -> [SyncEngine.UpgradeStep] = DatabaseUpgrade.upgradeTheAppsDatabases,",
             "readStates: @escaping @Sendable () async -> [DatabaseState] = DatabaseUpgrade.readTheAppsStates,",
             "readBattery: @escaping @MainActor () -> (level: Float, state: UIDevice.BatteryState) = DatabaseUpgrade.theDevicesBattery",
         ].filter { !upgrade.contains($0) }
@@ -1519,7 +1557,7 @@ struct IncrementalVacuumTests {
         let persisted = upgrade.filter { $0.contains("UserDefaults.standard.set(") }
 
         #expect(calls == Self.expectedSpaceReturnCalls, "the production callers, with the app's targets and the default checks: \(calls)")
-        #expect(inOrder, "stop polling, set the exit that starts it, empty the queues, upgrade (run \(String(describing: run)), stop \(String(describing: stop)), exit \(String(describing: resume)), queues \(String(describing: queues)), upgrade \(String(describing: rewrite)))")
+        #expect(inOrder, "stop polling, set the exit that starts it, empty the queues, read the data for the progress, upgrade (run \(String(describing: run)), stop \(String(describing: stop)), exit \(String(describing: resume)), queues \(String(describing: queues)), data \(String(describing: sizes)), upgrade \(String(describing: rewrite)))")
         #expect(otherFunction.isEmpty, "inside run's own function: \(otherFunction)")
         #expect(appDefaults.isEmpty, "the shared upgrade uses the app's scheduler, rewrite and states: missing \(appDefaults)")
         #expect(pollingCalls == ["scheduler.stopPolling()", "defer { if DatabaseSuspension.isAppActive { scheduler.startForegroundPolling() } }"], "one stop, and one exit that turns polling back on while the app is active: \(pollingCalls)")

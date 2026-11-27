@@ -55,30 +55,40 @@ struct DatabaseUpgradeTests {
         let databaseBytes: Int64
         /// How much of each database's size is empty pages.
         let emptyBytes: Int64
+        /// The search database's mode and pages cannot be read.
+        private let searchUnreadable: Bool
 
         /// `userLeaves`: the user leaves the app during the first rewrite.
         /// `emailStartsUpgraded`: only the search database is left to upgrade.
         init(
             answers: [[SyncEngine.UpgradeStep]], databaseBytes: Int64 = 4_096, emptyBytes: Int64 = 0,
-            userLeaves: Bool = false, emailStartsUpgraded: Bool = false
+            userLeaves: Bool = false, emailStartsUpgraded: Bool = false, searchUnreadable: Bool = false
         ) {
             self.answers = Mutex(answers)
             self.databaseBytes = databaseBytes
             self.emptyBytes = emptyBytes
             self.leaves = Mutex(userLeaves)
             self.emailStartsUpgraded = emailStartsUpgraded
+            self.searchUnreadable = searchUnreadable
         }
 
+        /// Each database's data, as the upgrade counts it: its pages less its empty pages.
+        var liveBytes: Int64 { (databaseBytes / 4_096 - emptyBytes / 4_096) * 4_096 }
+
         /// The fake rewrite: records whether polling was on, lets the user leave the
-        /// app when told, gives its next answer, and upgrades both databases when every
-        /// step of that answer upgraded its database or found it upgraded.
-        func rewrite(_ scheduler: SyncScheduler) async -> [SyncEngine.UpgradeStep] {
+        /// app when told, gives its next answer, telling `finished` each of its steps in
+        /// turn, and upgrades both databases when every step of that answer upgraded its
+        /// database or found it upgraded.
+        func rewrite(_ scheduler: SyncScheduler, finished: DatabaseUpgrade.StepFinished) async -> [SyncEngine.UpgradeStep] {
             let pollingOn = await MainActor.run { scheduler.foregroundPollingIsOn }
             pollingDuringRewrite.withLock { $0.append(pollingOn) }
             if leaves.withLock({ leaves in defer { leaves = false }; return leaves }) {
                 DatabaseSuspension.setAppActiveForTesting(false)
             }
             let answer = answers.withLock { $0.isEmpty ? [] : $0.removeFirst() }
+            for step in answer {
+                await finished(step)
+            }
             let allUpgraded = !answer.isEmpty && answer.allSatisfy {
                 switch $0 {
                 case .upgraded, .alreadyUpgraded: true
@@ -107,10 +117,10 @@ struct DatabaseUpgradeTests {
             }
             let all = upgraded.withLock { $0 }
             let path = FileManager.default.temporaryDirectory.path
-            return [all || emailStartsUpgraded, all].map { isUpgraded in
+            return [(all || emailStartsUpgraded, false), (all, searchUnreadable)].map { isUpgraded, unreadable in
                 DatabaseUpgrade.DatabaseState(
                     path: path,
-                    state: DatabaseVacuum.SpaceState(
+                    state: unreadable ? nil : DatabaseVacuum.SpaceState(
                         autoVacuum: isUpgraded ? DatabaseVacuum.incrementalMode : DatabaseVacuum.noneMode,
                         pageCount: databaseBytes / 4_096, freePages: emptyBytes / 4_096, pageSize: 4_096))
             }
@@ -150,7 +160,7 @@ struct DatabaseUpgradeTests {
     ) async -> DatabaseUpgrade {
         let upgrade = DatabaseUpgrade(
             scheduler: scheduler,
-            upgradeDatabases: { await databases.rewrite(scheduler) },
+            upgradeDatabases: { finished in await databases.rewrite(scheduler, finished: finished) },
             readStates: { await databases.states() },
             readBattery: { battery })
         await upgrade.openNotice()
@@ -404,6 +414,57 @@ struct DatabaseUpgradeTests {
         await expectEverythingBackOn(scheduler, works)
         #expect(upgrade.screen == .done)
         #expect(!upgrade.needsUpgrade, "the banner goes")
+    }
+
+    @Test("The notice's minutes come from the data of the databases still to upgrade, empty pages not counted; a database that cannot be read leaves them unset (the notice's fallback)")
+    func theNoticeMinutesComeFromTheData() async throws {
+        let works = Works()
+        let scheduler = try await makeScheduler(works)
+        defer { tearDown(scheduler) }
+        let databaseBytes: Int64 = 3_000_000_000
+        let emptyBytes: Int64 = 600_000_000
+        let both = FakeDatabases(answers: [], databaseBytes: databaseBytes, emptyBytes: emptyBytes)
+        let searchOnly = FakeDatabases(answers: [], databaseBytes: databaseBytes, emptyBytes: emptyBytes, emailStartsUpgraded: true)
+        let unreadable = FakeDatabases(answers: [], databaseBytes: databaseBytes, emptyBytes: emptyBytes, searchUnreadable: true)
+
+        let bothMinutes = await makeUpgrade(scheduler, both).noticeMinutes
+        let searchOnlyMinutes = await makeUpgrade(scheduler, searchOnly).noticeMinutes
+        let unreadableUpgrade = await makeUpgrade(scheduler, unreadable)
+
+        #expect(bothMinutes == DatabaseUpgradeProgress.noticeMinutes(dataBytes: 2 * both.liveBytes), "both databases' data: \(String(describing: bothMinutes))")
+        #expect(bothMinutes == 10, "4.8 GB of data: up to 10 minutes: \(String(describing: bothMinutes))")
+        #expect(searchOnlyMinutes == DatabaseUpgradeProgress.noticeMinutes(dataBytes: searchOnly.liveBytes), "only the database left to upgrade: \(String(describing: searchOnlyMinutes))")
+        #expect(searchOnlyMinutes == 5, "2.4 GB of data: up to 5 minutes: \(String(describing: searchOnlyMinutes))")
+        #expect(unreadableUpgrade.needsUpgrade, "precondition: the email database still needs the upgrade")
+        #expect(unreadableUpgrade.noticeMinutes == nil, "a database that cannot be read: no estimate")
+    }
+
+    @Test("The running screen's progress: the data of the databases still on NONE, in order, read for the run; each upgraded database records its finish, so the bar is full at the end; one found upgraded is not counted")
+    func theRunRecordsItsProgress() async throws {
+        let works = Works()
+        let scheduler = try await makeScheduler(works)
+        defer { tearDown(scheduler) }
+        let both = FakeDatabases(answers: [[.upgraded("email"), .upgraded("search")]], databaseBytes: 8 * 4_096, emptyBytes: 4_096)
+        let searchOnly = FakeDatabases(answers: [[.alreadyUpgraded("email"), .upgraded("search")]], databaseBytes: 8 * 4_096, emptyBytes: 4_096, emailStartsUpgraded: true)
+        let bothUpgrade = await makeUpgrade(scheduler, both)
+        let searchOnlyUpgrade = await makeUpgrade(scheduler, searchOnly)
+        let beforeRun = bothUpgrade.progress
+
+        await bothUpgrade.upgradeNow()
+        await settle()
+        await searchOnlyUpgrade.upgradeNow()
+
+        let bothRun = try #require(bothUpgrade.progress, "the run recorded its progress")
+        let searchOnlyRun = try #require(searchOnlyUpgrade.progress, "the run recorded its progress")
+        let bothAtTheEnd = bothRun.progress(at: ContinuousClock.now)
+        #expect(beforeRun == nil, "no progress before a run")
+        #expect(bothRun.dataBytes == [both.liveBytes, both.liveBytes], "both databases' data, email first: \(bothRun.dataBytes)")
+        #expect(bothRun.finishedAfter.count == 2, "each upgraded database recorded its finish: \(bothRun.finishedAfter)")
+        #expect(bothAtTheEnd == DatabaseUpgradeProgress(fraction: 1, remaining: .almostDone), "the bar is full at the end: \(bothAtTheEnd)")
+        #expect(bothUpgrade.screen == .done)
+        #expect(searchOnlyRun.dataBytes == [searchOnly.liveBytes], "only the database still on NONE: \(searchOnlyRun.dataBytes)")
+        #expect(searchOnlyRun.finishedAfter.count == 1, "the database found upgraded records no finish: \(searchOnlyRun.finishedAfter)")
+        #expect(searchOnlyUpgrade.screen == .done)
     }
 
     @Test("A return with no stopped upgrade starts nothing")
