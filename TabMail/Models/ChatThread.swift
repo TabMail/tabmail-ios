@@ -39,12 +39,20 @@ struct ChatThread: Equatable {
         /// Written by the user: a blue bubble on the right.
         let isOwn: Bool
         let sender: Person
-        /// The bubble's text message; nil while it is being summarized. An email with
-        /// nothing to summarize is done without one (`MessageHeader.noContentSummary`): its bubble
-        /// says so, never "Summarizing".
+        /// The bubble's text message: the user's own words for an email sent from the chat with
+        /// them (`MessageHeader.userTextMessage`), else the summary's; nil while it is being
+        /// summarized. An email with nothing to summarize is done without one
+        /// (`MessageHeader.noContentSummary`): its bubble says so, never "Summarizing".
         var textMessage: String? {
+            if let words = header.userTextMessage, !words.isEmpty { return words }
             if let text = header.summaryTextMessage, !text.isEmpty { return text }
             return header.summaryBlurb == MessageHeader.noContentSummary ? MessageHeader.noContentSummary : nil
+        }
+        /// The summary's text message alone, never the user's own words: what the chat's
+        /// "Report a concern" sends for this email (`AISummariesNotice.reportContent`).
+        var summaryTextMessage: String? {
+            guard let text = header.summaryTextMessage, !text.isEmpty else { return nil }
+            return text
         }
         /// The email did not go to everyone in the chat: who it went to. Nil for an email to
         /// everyone, and on every bubble of a one-to-one chat (`isGroup` false), which shows plain

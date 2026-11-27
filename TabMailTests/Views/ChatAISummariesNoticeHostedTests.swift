@@ -250,12 +250,37 @@ struct ChatAISummariesNoticeHostedTests {
         let content = AISummariesNotice.reportContent(
             items: [item("1", "First email"), item("2", nil), item("3", "Second email")],
             unsent: [ChatUnsentReply(outboxId: "o1", status: .failed, sentAt: nil, holdUntil: nil, draftId: nil,
-                                     instanceEpoch: nil, textMessage: "Not sent reply"),
+                                     instanceEpoch: nil, textMessage: "Not sent reply", summaryTextMessage: "Not sent reply"),
                      ChatUnsentReply(outboxId: "o2", status: .queued, sentAt: nil, holdUntil: nil, draftId: nil,
                                      instanceEpoch: nil, textMessage: nil),
                      ChatUnsentReply(outboxId: "o3", status: .queued, sentAt: nil, holdUntil: nil, draftId: nil,
-                                     instanceEpoch: nil, textMessage: "Sending reply")])
+                                     instanceEpoch: nil, textMessage: "Sending reply", summaryTextMessage: "Sending reply")])
         #expect(content == "Sending reply\n\nNot sent reply\n\nSecond email\n\nFirst email")
+    }
+
+    @Test("The report sends the AI's summaries, never the user's own words a bubble shows instead")
+    func reportSendsSummariesNotTheUsersWords() {
+        func item(_ id: String, words: String?, summary: String?) -> ChatThread.Item {
+            var header = MessageHeader(
+                messageId: id, subject: Self.subject, from: "Me", fromAddress: "me@example.com",
+                to: "alex@example.com", date: Date(), snippet: "", folderId: "acc:Sent",
+                accountId: "acc", folderPath: "Sent", isInInbox: false)
+            header.userTextMessage = words
+            header.summaryTextMessage = summary
+            return ChatThread.Item(header: header, isOwn: true, sender: .init(address: "me@example.com", name: "Me"),
+                                   repliedOnlyTo: nil, showsTimeStamp: false, showsUnreadLine: false)
+        }
+        let filed = item("1", words: "Tuesday works!", summary: "I said Tuesday works.")
+        let filedBeforeItsSummary = item("2", words: "Running late", summary: nil)
+        let queued = ChatUnsentReply(outboxId: "o1", status: .queued, sentAt: nil, holdUntil: nil, draftId: nil,
+                                     instanceEpoch: nil, textMessage: "See you there!", summaryTextMessage: "I said I will be there.")
+        let queuedBeforeItsSummary = ChatUnsentReply(outboxId: "o2", status: .queued, sentAt: nil, holdUntil: nil, draftId: nil,
+                                                     instanceEpoch: nil, textMessage: "On my way")
+        #expect(filed.textMessage == "Tuesday works!" && queued.textMessage == "See you there!",
+                "control: the bubbles show the user's words")
+        let content = AISummariesNotice.reportContent(
+            items: [filed, filedBeforeItsSummary], unsent: [queued, queuedBeforeItsSummary])
+        #expect(content == "I said I will be there.\n\nI said Tuesday works.", "only the summaries: \(content)")
     }
 
     @Test("The long-press report is unchanged: no extra line, the pressed content")

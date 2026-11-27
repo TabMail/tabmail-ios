@@ -109,8 +109,9 @@ extension AccountManager {
     /// `AIService.shared`; tests pass one built on a `FakeHTTP` session (AIService's own seam).
     ///
     /// `textVersion`: the email's text version already in hand (written with its body, sent
-    /// unchanged; ADR-IOS-114 decision 10). Where the Send-time summary would run, it is written
-    /// with the queue write instead (`SentEmailSummary.writeTextVersion`), and no summary is made.
+    /// unchanged; ADR-IOS-114 decision 10). Where the Send-time summary would run, it is kept as the
+    /// user's words with the queue write (`SentEmailSummary.writeTextVersion`), apart from the
+    /// summary, which is made all the same.
     @discardableResult
     nonisolated func queueSend(
         draft: DraftMessage,
@@ -129,7 +130,15 @@ extension AccountManager {
         summaryService: AIService = .shared
     ) async throws -> (outboxId: String, holdUntil: Date?) {
         let isDemo = account.id == DemoSeed.demoAccountId
-        let writtenTextVersion = await SentEmailSummary.textVersionToWrite(textVersion, isDemo: isDemo)
+        // Whether this send summarizes its email now, read once: the words and the summary follow
+        // the one answer, and a setting changed meanwhile applies to the next send.
+        let summarizes: Bool
+        if isDemo {
+            summarizes = true
+        } else {
+            summarizes = await SentEmailSummary.mayRun()
+        }
+        let writtenTextVersion = SentEmailSummary.textVersionToWrite(textVersion, summarizes: summarizes)
         let result = try await Self.persistQueuedSend(
             draft: draft,
             accountId: account.id,
@@ -167,17 +176,17 @@ extension AccountManager {
         if !result.deduped {
             Task { await AppDatabase.checkpointForDurability() }
             // The chat view summarizes the email now, for its Sending bubble and its Sent copy,
-            // unless its text version went in with the queue write. The demo account's sends (the
-            // tutorial's practice reply) are summarized on the device.
+            // its user's words or not (those stay apart and the bubbles show them first). The demo
+            // account's sends (the tutorial's practice reply) are summarized on the device.
             let outboxId = result.outboxId
-            Task {
-                guard writtenTextVersion == nil else { return }
-                if isDemo {
-                    await SentEmailSummary.summarizeLocally(outboxId: outboxId)
-                    return
+            if summarizes {
+                Task {
+                    if isDemo {
+                        await SentEmailSummary.summarizeLocally(outboxId: outboxId)
+                    } else {
+                        await SentEmailSummary.summarize(outboxId: outboxId, aiService: summaryService)
+                    }
                 }
-                guard await SentEmailSummary.mayRun() else { return }
-                await SentEmailSummary.summarize(outboxId: outboxId, aiService: summaryService)
             }
         }
         Task { await self.drainOutbox() }
@@ -334,8 +343,9 @@ extension AccountManager {
                 row.sentMessageId = AccountManager.generateMessageId(senderEmail: senderEmail ?? "user@tabmail.local")
                 let changedOriginalHeaderId = try Self.markOriginalAtQueue(&row, db: db)
                 try row.insert(db)
-                // The text version already in hand goes in with the row, so the chat's Sending
-                // bubble never reads "Summarizing" for it (`SentEmailSummary.writeTextVersion`).
+                // The text version already in hand goes in with the row as the user's words, so
+                // the chat's Sending bubble never reads "Summarizing" for it
+                // (`SentEmailSummary.writeTextVersion`).
                 if let textVersion {
                     try SentEmailSummary.writeTextVersion(textVersion, outboxId: row.id, db: db)
                 }
@@ -956,10 +966,17 @@ extension AccountManager {
                 let rfc822 = sentCopy?.rfc822MessageId ?? sentMessageId
 
                 // Don't insert if a header with this rfc822MessageId already exists (idempotent).
-                // This is also a provider copy a sync stored before this write: it
-                // stays as the sync wrote it, and nothing more is written here.
-                if let stored = try MessageHeader.fetchOne(
+                // This is also a provider copy a sync stored before this write: that row is
+                // kept, and takes the AI cache entry the send wrote under its own Message-ID, as
+                // a row written here does. The sync's restore looked under the copy's Message-ID
+                // (the provider's own, when it gave one) and found nothing there yet.
+                if var stored = try MessageHeader.fetchOne(
                     db, sql: Self.optimisticSentDedupSQL, arguments: [folderId, rfc822]) {
+                    let original = stored
+                    try MessageAICache.restoreIfCached(
+                        into: &stored, from: sentMessageId, accountId: msg.accountId, folderPath: sentFolder.path, db: db)
+                    // Only the fields the restore set, by the row's key.
+                    _ = try stored.updateChanges(db, from: original)
                     return (stored.id, nil)
                 }
 

@@ -583,7 +583,8 @@ final class PendingSendService {
     /// work was done (`MIS-018`'s tell).
     private enum RetainedAuthorityOutcome {
         /// Both rows read, and this toast's generation matches them exactly. `sentTextVersion`:
-        /// the send's text version, when it has one yet (`SentEmailSummary.textMessage`).
+        /// the user's own words the send was queued with, when it had them
+        /// (`SentEmailSummary.textVersion`); never its summary's text message.
         case verified(RetainedDraftAuthority, sentTextVersion: String?)
         /// The rows read, and the identity PROVABLY differs — or the row is absent.
         case mismatchOrAbsent
@@ -606,7 +607,7 @@ final class PendingSendService {
                 }
                 // Read with the row it belongs to, before the Undo deletes it. Not part of the
                 // authority: a failed read of it only means the reopened compose has none.
-                let sentTextVersion = (try? SentEmailSummary.textMessage(of: outbox, db: db)) ?? nil
+                let sentTextVersion = (try? SentEmailSummary.textVersion(of: outbox, db: db)) ?? nil
                 return .verified(RetainedDraftAuthority(
                     draftId: draft.id,
                     accountId: draft.accountId,

@@ -46,9 +46,9 @@ import UIKit
 ///     words go and the answer hands nothing back; the bubble's Undo and the send again from the
 ///     compose it reopens keep the words typed since.
 ///  1h. The sent reply's text in the chat is the text version already in hand: the AI Suggestion's
-///     card sent as written shows the suggestion's text version from the queue write, with no
-///     summary; undone and sent again with the body unchanged, it keeps the undone send's text
-///     version; with words typed into the body it is summarized instead.
+///     card sent as written shows the suggestion's text version from the queue write, and still once
+///     its summary has landed; undone and sent again with the body unchanged, it keeps the undone
+///     send's text version; with words typed into the body it shows the summary of the email as sent.
 ///  2. Drawn: the solid blue rises from the bottom edge, inside the bubble's shape; in light mode the
 ///     text is the pending text colour over the tint and white over the solid; under Reduce Motion
 ///     there is no rising fill; a mounted bubble drops its Undo when its deadline passes.
@@ -1051,21 +1051,30 @@ struct ChatUndoSendRoutingTests {
     /// What the chat shows for `row`, its Sending bubble and then its Sent copy: the email's text
     /// version under its Sent folder and Message-ID.
     private static func sentText(_ row: OutboxMessage, _ fixture: Fixture) async throws -> String? {
-        try await fixture.pool.read { try SentEmailSummary.textMessage(of: row, db: $0) }
+        try await fixture.pool.read { try SentEmailSummary.texts(of: row, db: $0).shown }
     }
 
-    /// Sent from the demo account, which makes no AI request at Send whatever the gate: an email
-    /// sent without a text version is summarized on the device in its own words
-    /// (`SentEmailSummary.summarizeLocally`), so the two are told apart with no backend.
-    /// Waits long enough for a summary at Send to have landed, then expects `row`'s text to be the
-    /// written suggestion's text version still.
+    /// Sent from the demo account, which makes no AI request at Send whatever the gate: every send
+    /// of it is summarized on the device in the email's own words (`SentEmailSummary.summarizeLocally`),
+    /// which differ from the suggestion's text version, so the two are told apart with no backend.
+    /// Waits for the summary at Send to land (in the email's own words, not the text version), then
+    /// expects `row`'s text to be the written suggestion's text version still.
     private static func expectNoSummaryReplaces(_ row: OutboxMessage, _ fixture: Fixture) async throws {
-        try await Task.sleep(for: .seconds(1))
+        func summary() async throws -> String? {
+            try await fixture.pool.read { try SentEmailSummary.texts(of: row, db: $0).summary }
+        }
+        var landed = try await summary()
+        for _ in 0..<50 where landed == nil {
+            try await Task.sleep(for: .milliseconds(100))
+            landed = try await summary()
+        }
+        #expect(landed != nil && landed != Self.writtenSuggestion.textMessage,
+                "control: the summary made at Send landed, in the email's own words: \(landed ?? "nil")")
         let later = try await Self.sentText(row, fixture)
         #expect(later == Self.writtenSuggestion.textMessage, "no summary replaced it")
     }
 
-    @Test("The AI Suggestion's card sent as written shows the text version written with it from the queue write, with no summary")
+    @Test("The AI Suggestion's card sent as written shows the text version written with it from the queue write, and still once its summary has landed")
     func sentReplyShowsItsTextVersion() async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
         try await withSendEnvironment(accountId: DemoSeed.demoAccountId) { fixture, saved in
@@ -1085,7 +1094,7 @@ struct ChatUndoSendRoutingTests {
     /// The compose an Undo reopens holds the undone send's body in its editor, with that send's text
     /// version (`ReopenSnapshot.sentTextVersion`). The card's suggestion box cannot be tapped in a
     /// hosted test (tabmail-ios#1124), so the words a user types into a body are typed here.
-    @Test("A reply undone on its bubble and sent again keeps the undone send's text version with its body unchanged, with no summary; with words typed into its body it is summarized from the email as sent",
+    @Test("A reply undone on its bubble and sent again keeps the undone send's text version with its body unchanged, over its summary; with words typed into its body it shows the summary of the email as sent",
           arguments: [false, true])
     func sendAgainAfterUndo(typedInto: Bool) async throws {
         #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")

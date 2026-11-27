@@ -62,9 +62,12 @@ enum TestDatabase {
 
     /// Insert `record` with only the columns the table has at this (older) schema, so a
     /// migration test can seed a database stopped before a later migration added columns.
-    static func insertAtOldSchema<R: EncodableRecord & TableRecord>(_ record: R, _ db: Database) throws {
+    /// A caller inserting many rows passes the table's `columns`, read once.
+    static func insertAtOldSchema<R: EncodableRecord & TableRecord>(
+        _ record: R, _ db: Database, columns known: Set<String>? = nil
+    ) throws {
         let table = R.databaseTableName
-        let columns = Set(try Row.fetchAll(db, sql: "PRAGMA table_info(\(table))").map { $0["name"] as String })
+        let columns = try known ?? Set(Row.fetchAll(db, sql: "PRAGMA table_info(\(table))").map { $0["name"] as String })
         let values = try record.databaseDictionary.filter { columns.contains($0.key) }
         let names = values.keys.sorted()
         try db.execute(
@@ -73,6 +76,10 @@ enum TestDatabase {
     }
 
     /// Insert a test message header and return it.
+    ///
+    /// Writes only the columns the live schema has, as `insertFolder` does, so a migration
+    /// test can seed a header on a database stopped before a later migration added a
+    /// `messageHeader` column. On a fully migrated database this is exactly `header.insert`.
     @discardableResult
     static func insertMessageHeader(
         _ db: DatabaseQueue,
@@ -110,7 +117,7 @@ enum TestDatabase {
         if let tag = actionTag {
             header.tagSortOrder = tag.sortOrder
         }
-        try db.write { try header.insert($0) }
+        try db.write { try insertAtOldSchema(header, $0) }
         return header
     }
 

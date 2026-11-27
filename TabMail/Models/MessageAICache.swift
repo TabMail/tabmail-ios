@@ -25,6 +25,9 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     var reminderContent: String?
     /// The summary's text message (`MessageHeader.summaryTextMessage`).
     var summaryTextMessage: String?
+    /// The words the user wrote for an email sent from the chat (`MessageHeader.userTextMessage`):
+    /// not an AI result, kept here so the email's Sent copy takes them as it takes its summary.
+    var userTextMessage: String?
 
     // Action field (matches TB's action cache — plain ActionTag enum)
     var actionTag: ActionTag?
@@ -95,6 +98,13 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
             header.summaryTextMessage = cached.summaryTextMessage
         }
 
+        // The user's own words for a sent email, on their own: they are written at the queue
+        // write, before any summary, and a Sent copy that arrives before its summary takes them
+        // now and the summary later (`SentEmailSummary`).
+        if header.userTextMessage == nil, let words = cached.userTextMessage, !words.isEmpty {
+            header.userTextMessage = words
+        }
+
         // Restore action ONLY if header doesn't already have one from server
         // (IMAP keywords/Gmail labels take precedence — first-compute-wins)
         if header.actionTag == nil, let cachedTag = cached.actionTag {
@@ -129,6 +139,8 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
     /// text messages, which belong to their result: a new summary (`summaryBlurb` given) sets
     /// `summaryTextMessage` to the one passed, nil included, and a new reply (`reply` given)
     /// sets the whole suggestion (`reply`, one value), so a result without one never keeps an older result's.
+    /// `userTextMessage`, the user's own words for a sent email, is written only when given and
+    /// belongs to no result: no summary or reply write changes it.
     /// No-op if rfc822MessageId is nil (skip cache for messages without Message-ID). An existing
     /// entry without a Message-ID takes this one; a stored one is never replaced.
     static func writeThrough(
@@ -141,6 +153,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         reminderTime: String? = nil,
         reminderContent: String? = nil,
         summaryTextMessage: String? = nil,
+        userTextMessage: String? = nil,
         actionTag: ActionTag? = nil,
         reply: ReplyResult? = nil,
         replyGeneratedAt: Date? = nil,
@@ -169,6 +182,7 @@ struct MessageAICache: Codable, FetchableRecord, PersistableRecord, Identifiable
         if let reminderDate { cache.reminderDate = reminderDate }
         if let reminderTime { cache.reminderTime = reminderTime }
         if let reminderContent { cache.reminderContent = reminderContent }
+        if let userTextMessage { cache.userTextMessage = userTextMessage }
         if let actionTag { cache.actionTag = actionTag }
         if let reply { cache.storeSuggestion(reply) }
         if let replyGeneratedAt { cache.replyGeneratedAt = replyGeneratedAt }

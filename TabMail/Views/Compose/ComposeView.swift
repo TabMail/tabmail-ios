@@ -1184,7 +1184,8 @@ struct ComposeView: View {
     /// The email a writer last put in this card, with the text version written with it: the
     /// suggestion it opened with (the chat's field composition, the AI Suggestion), a recompute, an
     /// edit; or, reopened by Undo, the undone send's. Sent with exactly that body, its text version
-    /// is the reply's text in the chat and no summary is made (`ComposeDraftGuards.sentTextVersion`).
+    /// is kept as the user's words, which the chat's bubbles show; the summary is made all the same
+    /// (`ComposeDraftGuards.sentTextVersion`, `SentEmailSummary`).
     @State private var writtenEmail: ReplyResult?
     @State private var isRecomputing = false
     /// The card's running recompute: only the card closing cancels it (`cardClosed`); the compose

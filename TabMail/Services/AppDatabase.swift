@@ -4791,6 +4791,24 @@ final class AppDatabase: Sendable {
                 t.add(column: "originalChangesAtQueue", .integer)
             }
         }
+
+        // Chat view: the words the user wrote for an email sent from the chat (its text version
+        // in hand at the queue write), kept apart from the AI summary, on the header and in the
+        // AI cache (`userTextMessage`). The chat's bubbles show them instead of the summary's
+        // text message; nothing else reads them. NULLABLE and NO BACKFILL: every existing row,
+        // and every email sent without such words, keeps NULL and shows its summary as before.
+        // No index: read only from a row already fetched by its key. Numbered after main's
+        // newest, v117_addOutboxOriginalChangesAtQueue.
+        migrator.registerTimedMigration(
+            "v118_addUserTextMessage", foreignKeyChecks: .immediate
+        ) { db in
+            try db.alter(table: "messageHeader") { t in
+                t.add(column: "userTextMessage", .text)
+            }
+            try db.alter(table: "messageAICache") { t in
+                t.add(column: "userTextMessage", .text)
+            }
+        }
     }
 
     /// Move per-email chat turns to their thread's key (v107). Shared by the migration and its
