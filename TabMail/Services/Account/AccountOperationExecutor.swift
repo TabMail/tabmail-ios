@@ -739,9 +739,15 @@ final class AccountOperationExecutor {
                         try Self.deleteRetiringOperation(currentOp, db: db)
                     }
                     manager.dropDeferredMoveSuccessors(for: currentOp.id)
+                    // A dropped move has no provider-confirmed result: usually
+                    // its source stays, though a COPY, or after a lost response
+                    // the whole move, may already have landed, which the
+                    // folders' sync then shows. Release the rows its gesture
+                    // hid, as the other two exit-4 sites do (#814).
+                    await AccountManager.announceMovesRefused(AccountManager.movedHeaderIds(of: currentOp))
                     return .completed
                 } catch {
-                    // The provider wrote nothing. If retiring the refused op
+                    // The provider completed nothing. If retiring the refused op
                     // fails, preserve the exact original bundle for retry.
                     //
                     // ⚠️ `.blockedOnCommit`, not a deferral. The failure is the DELETE,

@@ -73,6 +73,14 @@
 > An Undo naming a row this record refuses now shows the "Couldn't undo" alert ("Nothing was moved
 > back."), like every other refused move Undo. The refusal itself is unchanged, and
 > `IOS-EPOCH-001` D6(a) (no dialog, no toast) still holds for new gestures.
+>
+> **AMENDMENT (2026-11-25, tabmail-ios #814) — an admitted move that a reset drops is reported
+> too.** The 2026-11-11 report covered only a move refused before admission. A move admitted under
+> the old epoch and then dropped by the reset with no provider-confirmed result (exit 4: the step-5
+> sweep, checkpoint A or checkpoint B) now posts the same `.messageMovesRefused` report after its delete commits, so
+> its row shows again instead of hiding whatever email the resync re-seats at that id. Detail:
+> ADR-IOS-069 item 5. The report assertion in `IdResetDispositionMatrixTests` now expects the
+> report in every reset phase for archive and delete, and none for the executed positive control.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-MOVE-002
 

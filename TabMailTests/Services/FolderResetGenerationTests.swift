@@ -545,6 +545,105 @@ struct FolderResetGenerationTests {
         await finish(env)
     }
 
+    // MARK: - A queued move the reset drops
+
+    /// Where the queued move is dropped unexecuted (exit 4).
+    enum MoveDrop: String, CaseIterable, CustomStringConvertible {
+        /// The reset's own sweep, in the write that stamps the new epoch.
+        case resetSweep
+        /// The drain's checkpoint A, when the folder's recorded epoch moved
+        /// without the sweep running.
+        case drainCheckpoint
+        /// The executor's checkpoint B, when the recorded epoch is still the
+        /// old one and the provider's own SELECT finds the new one.
+        case executorCheckpoint
+        var description: String { rawValue }
+    }
+
+    @Test("""
+    An inbox archive queued before the folder's UIDVALIDITY reset and dropped unexecuted is \
+    reported as not moved, so the list stops hiding the id the reset can re-seat a different \
+    email at
+    """, arguments: MoveDrop.allCases)
+    func moveDroppedByTheResetReleasesItsHiddenRow(drop: MoveDrop) async throws {
+        let env = try makeEnv(accountId: "frg-dropped-move-\(drop)")
+        UserDefaults.standard.set(false, forKey: AccountManager.markReadOnArchiveDeleteKey)
+        clearOverlay()
+
+        // The user archives the shown email. No provider is registered, so the
+        // move stays queued under the old epoch, and the list hides its row.
+        let vm = InboxViewModel(folders: [try #require(try await env.pool.read {
+            try Folder.fetchOne($0, key: env.inboxFolderId) })])
+        #expect(vm.archive(env.headerId), "fixture: the inbox did not record the gesture")
+        await AccountManager.shared.awaitWriteQueueDrain()
+        // Let the archive's own drain finish before a provider is registered,
+        // so the move cannot run ahead of the drop below.
+        var quiescent = false
+        for _ in 0..<300 {
+            if await AccountManager.shared.pendingQueueIsQuiescentForTesting() { quiescent = true; break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(quiescent, "fixture: the archive's own drain did not go idle")
+        let queued = try #require(try await ops(env).first { $0.type == .move },
+                                  "fixture: the archive was not queued")
+        #expect(queued.observedUidValidity == Self.oldEpoch,
+                "fixture: the move was not recorded under the old epoch")
+        var dismissed: Set<String> = [env.headerId]
+        var fading: Set<String> = []
+
+        let tap = MoveRefusalTap(watching: [env.headerId])
+        defer { tap.stop() }
+        switch drop {
+        case .resetSweep:
+            try await runReset(env)
+            let live = try await env.pool.read {
+                try Folder.fetchOne($0, key: env.inboxFolderId)?.lastKnownUidValidity }
+            #expect(live == Self.newEpoch, "fixture: the reset did not stamp the new epoch")
+        case .drainCheckpoint:
+            let folderId = env.inboxFolderId
+            let newEpoch = Self.newEpoch
+            try await env.pool.write { db in
+                _ = try Folder.filter(Column("id") == folderId)
+                    .updateAll(db, Column("lastKnownUidValidity").set(to: newEpoch))
+            }
+            try await drainToWire(env)
+        case .executorCheckpoint:
+            // `makeEnv` already serves INBOX under the new epoch; the recorded
+            // epoch stays the old one, so checkpoint A passes the move.
+            try await drainToWire(env)
+        }
+        // The report hops to the main actor.
+        for _ in 0..<200 where tap.snapshot.isEmpty { await Task.yield() }
+
+        // Non-vacuity: the move was dropped, and it never reached the server.
+        #expect(try await ops(env).filter { $0.type == .move }.isEmpty,
+                "\(drop): fixture: the queued move was not dropped")
+        #expect(env.server.messageIDs(in: "Archive").isEmpty && inboxUids(env) == [Self.uid],
+                "\(drop): fixture: the move reached the server, so nothing was dropped unexecuted")
+
+        MoveRefusalReceiver.apply(tap.snapshot, dismissedMessages: &dismissed, swipeFadingMessages: &fading)
+        #expect(!dismissed.contains(env.headerId),
+                "\(drop): the dropped move was not reported, so the list keeps hiding its id")
+        await finish(env)
+    }
+
+    @Test("""
+    A dropped move reports every member's id in its source folder, the ids its gesture hid (a \
+    thread archive moves several); an operation that is not a move hid nothing and reports nothing
+    """)
+    func droppedMoveReportsEveryMemberAtItsSource() {
+        let move = PendingOperation(
+            type: .move, messageIds: ["101", "102"], accountId: "frg-ids",
+            folderPath: "INBOX", destinationPath: "Archive")
+        let reported = AccountManager.movedHeaderIds(of: move)
+        #expect(reported == ["frg-ids:INBOX:101", "frg-ids:INBOX:102"],
+                "a dropped two-member move must report both source ids")
+        let read = PendingOperation(
+            type: .markRead, messageIds: ["101", "102"], accountId: "frg-ids", folderPath: "INBOX")
+        let readReported = AccountManager.movedHeaderIds(of: read)
+        #expect(readReported.isEmpty, "a read change hid no row, so it reports nothing")
+    }
+
     @Test("""
     Work queued behind an earlier admission is stamped when it is requested, not when the wait \
     ends: a reset during the wait refuses it; requested after the reset, it is admitted
