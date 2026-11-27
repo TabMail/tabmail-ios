@@ -61,9 +61,10 @@ enum IMAPTransportSecurityError: Error, Equatable, CustomStringConvertible, Loca
     var description: String {
         switch self {
         case .noEncryptedConnection(let host, let port, let encryptedPort):
-            // ⚠️ Keep the words "connection" and "timeout" out of this sentence:
-            // `isTransientSendError` and `SyncEngine.isConnectionError` read the
-            // rendered text, and either word would make a refusal that can never
+            // ⚠️ Keep the words "connection" and "timeout" out of this sentence.
+            // `isTransientSendError` and `SyncEngine.isConnectionError` check this
+            // type before reading any text, but other consumers classify by the
+            // rendered text, where either word would make a refusal that can never
             // succeed look like a passing network problem.
             return """
                 \(host) does not offer encryption on port \(port). TabMail always encrypts your \

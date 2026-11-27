@@ -290,6 +290,8 @@ struct MailTransportEncryptionTests {
             IMAPError.connectionFailed("Server did not advertise STARTTLS on port 1143"),
             // A server's own text, carried by the same cases or by others.
             IMAPError.connectionFailed("Server rejected connection: did not advertise STARTTLS"),
+            // The whole phrase, same port, inside a longer server-carried reason.
+            IMAPError.connectionFailed("Server responded: Server did not advertise STARTTLS on port 143"),
             IMAPError.commandFailed("Server did not advertise STARTTLS on port 143"),
             SMTPError.connectionFailed("STARTTLS required but not advertised by server"),
             SMTPError.tlsFailed("STARTTLS upgrade failed: STARTTLS required but not advertised by server"),
@@ -424,25 +426,86 @@ struct MailTransportEncryptionTests {
             """
         #expect(Self.callArguments(of: "IMAPServer", in: source)
                 == ["host: h, port: p, transportSecurity: MailTransportPolicy.imapSecurity(port: p))"])
+
+        let parsed = Self.topLevelArguments("host: h, port: p, transportSecurity: MailTransportPolicy.imapSecurity(port: p))")
+        let labels = parsed.map { $0.label }
+        #expect(labels == ["host", "port", "transportSecurity"])
+        #expect(parsed.last?.value == "MailTransportPolicy.imapSecurity(port: p)")
+
+        // The exact list passes; an added argument or a rewritten transport does not.
+        let provider = "TabMail/IMAPProvider.swift"
+        let limit = "responseBufferLimit: IMAPFetchMapping.responseBufferLimit"
+        let exact = "host: host, port: port, transportSecurity: imapTransportSecurity, \(limit))"
+        let extra = "host: host, port: port, transportSecurity: imapTransportSecurity, \(limit), minimumTLSVersion: .tlsv10)"
+        let rewritten = "host: host, port: port, transportSecurity: imapTransportSecurity == .implicitTLS ? .startTLS : imapTransportSecurity, \(limit))"
+        let otherProtocol = "host: host, port: port, transportSecurity: MailTransportPolicy.smtpSecurity(port: port), \(limit))"
+        #expect(Self.statesItsTransport("IMAPServer", exact, path: provider))
+        #expect(!Self.statesItsTransport("IMAPServer", extra, path: provider))
+        #expect(!Self.statesItsTransport("IMAPServer", rewritten, path: provider))
+        #expect(!Self.statesItsTransport("IMAPServer", otherProtocol, path: "Shared/Example.swift"))
     }
 
-    /// The transport each construction may pass: the policy for its own
-    /// protocol, or a named property or parameter that carries it (pinned by
-    /// `providerTransportForStandardPorts` and the notification service checks).
-    private static func statesItsTransport(_ name: String, _ arguments: String, path: String) -> Bool {
-        if arguments.contains("useTLS:") { return false }
+    /// A call's top-level arguments as `(label, value)`, from `callArguments`'
+    /// text (which ends with the call's closing parenthesis). Commas inside
+    /// nested parentheses or brackets do not split an argument.
+    static func topLevelArguments(_ arguments: String) -> [(label: String, value: String)] {
+        var inner = Substring(arguments)
+        if inner.last == ")" { inner = inner.dropLast() }
+        var pieces: [String] = []
+        var current = ""
+        var depth = 0
+        for character in inner {
+            if character == "(" || character == "[" { depth += 1 }
+            if character == ")" || character == "]" { depth -= 1 }
+            if character == ",", depth == 0 {
+                pieces.append(current)
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        pieces.append(current)
+        var result: [(label: String, value: String)] = []
+        for piece in pieces {
+            let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty { continue }
+            guard let colon = trimmed.firstIndex(of: ":") else {
+                result.append((label: "", value: trimmed))
+                continue
+            }
+            result.append((
+                label: trimmed[..<colon].trimmingCharacters(in: .whitespaces),
+                value: trimmed[trimmed.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)))
+        }
+        return result
+    }
+
+    /// The exact argument list each construction may pass: the server's host and
+    /// port, its own protocol's encrypted transport (the policy, or the named
+    /// property or parameter that carries it, pinned by
+    /// `providerTransportForStandardPorts` and the notification service check),
+    /// and for IMAP the shared response buffer limit. Nothing else, so no added
+    /// argument can lower the TLS floor or the certificate checks, and no
+    /// rewritten expression can swap the transport.
+    static func statesItsTransport(_ name: String, _ arguments: String, path: String) -> Bool {
+        let parsed = topLevelArguments(arguments)
+        let labels = parsed.map { $0.label }
+        let transport = parsed.first { $0.label == "transportSecurity" }?.value
         switch name {
         case "IMAPServer":
-            return arguments.contains("transportSecurity: MailTransportPolicy.imapSecurity(port: ")
-                || (path.hasSuffix("IMAPProvider.swift") && arguments.contains("transportSecurity: imapTransportSecurity"))
-                || (path.hasSuffix("NSEIMAPConnection.swift") && arguments.contains("transportSecurity: transportSecurity"))
+            guard labels == ["host", "port", "transportSecurity", "responseBufferLimit"],
+                  parsed.last?.value == "IMAPFetchMapping.responseBufferLimit" else { return false }
+            if path.hasSuffix("IMAPProvider.swift") { return transport == "imapTransportSecurity" }
+            if path.hasSuffix("NSEIMAPConnection.swift") { return transport == "transportSecurity" }
+            return transport == "MailTransportPolicy.imapSecurity(port: port)"
         default:
-            return arguments.contains("transportSecurity: MailTransportPolicy.smtpSecurity(port: ")
-                || (path.hasSuffix("IMAPProvider.swift") && arguments.contains("transportSecurity: smtpTransportSecurity"))
+            guard labels == ["host", "port", "transportSecurity"] else { return false }
+            if path.hasSuffix("IMAPProvider.swift") { return transport == "smtpTransportSecurity" }
+            return transport == "MailTransportPolicy.smtpSecurity(port: port)"
         }
     }
 
-    @Test("Every IMAP and SMTP server the app builds takes its own protocol's encrypted transport, never the port-guessing init")
+    @Test("Every IMAP and SMTP server the app builds passes exactly its host, port and its own protocol's encrypted transport")
     func everyServerStatesItsTransport() throws {
         var sites: [String] = []
         var violations: [String] = []
