@@ -925,14 +925,24 @@ struct ResolveMessageHeaderIdTests {
 
 // MARK: - ChatIdTranslator remap on IMAP MOVE
 
-@Suite("ChatIdTranslator remap on message move")
+/// The translator stores every mapping in the shared `chatIdMapping` table,
+/// where `realId` is unique and a remap onto an id another pill already names
+/// retires the moved pill instead of moving it. So each test names addresses
+/// of its own, and the suite takes the process-global lock that the suites
+/// which clear the table hold.
+@Suite("ChatIdTranslator remap on message move", .processGlobalState)
 struct ChatIdTranslatorRemapTests {
+
+    /// An old and a new address no other test names.
+    private static func addresses() -> (old: String, new: String) {
+        let account = "acc-\(UUID().uuidString)"
+        return ("\(account):INBOX:uid100", "\(account):Archive:uid200")
+    }
 
     @Test("remapRealId updates mapping from old PK to new PK")
     func remapUpdatesMapping() async {
         let translator = ChatIdTranslator.createIsolated()
-        let oldPK = "acc1:INBOX:uid100"
-        let newPK = "acc1:Archive:uid200"
+        let (oldPK, newPK) = Self.addresses()
 
         // Register the old PK
         let numericId = await translator.toNumericId(oldPK)
@@ -965,8 +975,7 @@ struct ChatIdTranslatorRemapTests {
     @Test("After remap, old PK no longer resolves")
     func oldPKGoneAfterRemap() async {
         let translator = ChatIdTranslator.createIsolated()
-        let oldPK = "acc1:INBOX:uid100"
-        let newPK = "acc1:Archive:uid200"
+        let (oldPK, newPK) = Self.addresses()
 
         let numericId = await translator.toNumericId(oldPK)
         _ = await translator.remapRealId(from: oldPK, to: newPK)
@@ -980,8 +989,7 @@ struct ChatIdTranslatorRemapTests {
     @Test("Remap preserves pill consistency across session reload")
     func remapPreservesPillConsistency() async {
         let translator = ChatIdTranslator.createIsolated()
-        let oldPK = "acc1:INBOX:uid100"
-        let newPK = "acc1:Archive:uid200"
+        let (oldPK, newPK) = Self.addresses()
 
         // Simulate: user chats about email, gets [Email](N) pills
         let numericId = await translator.toNumericId(oldPK)

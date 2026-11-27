@@ -672,7 +672,10 @@ actor ChatStore {
     /// real id, a move's collision arm) is not followed here. For those the
     /// chat's reopen heal (`DynamicIslandChatButton`) still re-points the pill
     /// and the first turn's context when the session is found under the
-    /// email's stable id; it does not move a session.
+    /// email's stable id; it does not move a session. A row a move dropped
+    /// with no proven destination is not re-keyed at all: its pill is retired
+    /// (`ChatIdTranslator.retireMappings`), and the heal's re-point of a
+    /// retired pill is refused (`ChatIdTranslator.remapRealId`).
     static func followRekeyedEmails(_ records: [HeaderRekeyRecord], db: Database) throws {
         for record in records {
             guard let ids = record.stableIds else { continue }

@@ -859,7 +859,9 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    (`ChangePassOutcome.folderBookmarkLeft`), whatever the read returned (a first read, a "nothing
    changed" read). A retirement whose row is no longer at its key drops the source too. Nothing is deleted and no queued operation is touched:
    removing the placeholder would drop queued user actions that name it, which the never-drop rule
-   forbids. The window listing reaches only the newest messages, and the IMAP older-mail catch-up
+   forbids. *(Amended 2026-11-25 (#537), see the amendment of that date at the end: on IMAP the
+   placeholder of a retired move that copied something and named no destination is deleted; no queued
+   operation can name it, and no queued operation is touched. The bookmark drops above are unchanged.)* The window listing reaches only the newest messages, and the IMAP older-mail catch-up
    only updates or removes rows it holds, so a message such a move left in a folder below the window
    (a move that retired with no effect, its source message older than the window, with backfill
    complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
@@ -1767,3 +1769,65 @@ new and an older moved-in message land, the run's first read inserts both).
 Keywords: #1363, walked empty, empty folder, no held range, held whole, oldestSyncedDate nil, backfillComplete,
 olderMailComplete, needsHeader, heldRangeApplies, first read, baseline gate, older-mail walk completed, moved in
 with an older date, other-folder run, IMAP heldRangeStart rule.
+
+### Amendment 2026-11-25 (#537): a move that copied with no proven destination drops its placeholder
+
+**Context.** Item 11 kept the optimistic row of an IMAP move member that retired without a proven
+destination UID, because removing it "would drop queued user actions that name it". That row keeps the
+SOURCE primary key and UID with a nil epoch: no proof can ever stamp it, every gesture on it is refused, and
+the destination's listing takes it as the owner of that numeric UID there, so it hides a different message at
+that UID or stays as a permanent inert duplicate (`IOS-MOVE-002`). Only Delete All Index Data or a
+UIDVALIDITY turnover removed it.
+
+**Decision.** In `MessageHeaderRekey.finishMove`, the arm with no proven destination, on a mailbox-local UID
+space (`accountScopedIds` false), when the provider reports that the move copied something
+(`MoveOutcome.copiedNothing` false), deletes the placeholder in the retiring transaction:
+
+1. its AI fields are written to `MessageAICache` under the destination folder (no rfc822 Message-ID, no
+   key: nothing is kept), and any copy a sync already stored in that folder with the same rfc822
+   Message-ID gets them through `MessageAICache.restoreIfCached` (first-compute-wins; one indexed lookup);
+2. its body is removed with it, and its chat-pill mapping is retired in the same write to a stand-in that
+   names no row, so the pill greys out and its number is never reused or rebound by Message-ID; the
+   translator's half of the retire runs after the commit on the outside-stores lane
+   (`MailPointerMoves.retireOutsideStoresInOrder`), after every pill follow already handed over, so a follow
+   still waiting to bind a pill to the dropped row is retired too (amended 2026-11-27, after the rebase onto
+   #1588's lane). A follow whose hand-over trails its producer's commit can still land after it (ios#1581).
+   Until the lane runs, the stored stand-in alone makes a reopen heal's re-point miss;
+3. the bookmark drops of item 11 are unchanged (both folders), so the owed check of the #1062 amendment
+   still lists them; `MoveFinishResult.droppedRemnants` carries the dropped rows for the entered-inbox AI
+   recorder, and `publishCommittedEffects` withdraws each dropped row's rfc822 key from the 30-second
+   recently-completed store before the destination syncs (the bare source-UID key stays).
+
+`copiedNothing` is true only for the two `IMAPProvider.move` results where nothing was copied (the
+mailbox-absent arm and a permanent refusal), and for every retirement with no provider result
+(`AccountOperationExecutor.deleteRetiringOperation`); those, a chained move (the row moved on), a proven
+destination under an epoch the folder does not share, and every account-scoped provider keep the row
+exactly as before.
+
+**Why no queued operation can name the placeholder.** (1) The optimistic move sets its epoch to nil and
+admission (`admittedOrdinaryActionTargets`) runs before any `PendingOperation` insert, so no gesture after
+the move queues an op on it. (2) The annihilation of a never-attempted opposite predecessor retires through
+`deleteRetiringOperation` (`copiedNothing` true: row kept); a deferred successor is materialized only for a
+member the provider re-keyed (`result.applied`), and a dropped member is never in it. (3) Ops queued before
+the move address the source (folder, UID, epoch on the op); no code removes or keeps an op by reading the
+header row. (4) `readdressQueuedOperations` rewrites ops only on account-scoped providers. So deleting the
+row drops no user action, and no queued operation is touched.
+
+**Recovery.** The drain syncs every move destination; its listing inserts the copy at its real UID with its
+epoch (a moved copy takes a UID at or above the destination's UIDNEXT). A copy the window does not reach is
+loaded by the owed catch-up listing (#1062 amendment: every missing UID at or above the load floor). All
+sync insert paths restore the AI fields from the cache. Accepted: the copy is missing from its folder until that
+listing (no Message-ID matching, #963); a copy given the same UID it had in the source stays hidden until
+the 30-second store expires (#964); after a MOVE that failed part-way
+(`moveFailedAfterPartialCompletion`) on such a server, a member the server did not actually move is dropped
+too and stays hidden in its source until the 30-second store expires and the source's listing stores it
+again (its AI content is recomputed when needed).
+
+Tests: `FinishTheMoveLocallyTests` (no remnant row, the lost-reply retry and the large move after the
+catch-up, AI content kept and filled, the inbox AI enqueue, a refused move, the eight pill tests),
+`QueueCoreInvariantTests` (the drop, the account-scoped and `copiedNothing` controls, the inbox record),
+`ChatIdTranslatorTests`, `ChatPillChipHostingTests`.
+
+Keywords: placeholder, remnant, optimistic row, copiedNothing, droppedRemnants, DroppedRemnant, no proven
+destination, COPYUID withheld, retireStoredMappings, retireOutsideStoresInOrder, retired pill, releaseRecentlyCompleted, MessageAICache,
+restoreIfCached, IOS-MOVE-002, #537, #1062, #963, #964.

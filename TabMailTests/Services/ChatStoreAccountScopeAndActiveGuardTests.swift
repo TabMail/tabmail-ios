@@ -143,11 +143,16 @@ struct ChatStoreAccountScopedResolutionTests {
         #expect(resolved != inB.id)
     }
 
-    @Test("A stale primary key still resolves onto the same account's moved message")
+    /// The session's CONTEXT still follows its message by Message-ID within the
+    /// account (reindex, reset, re-add). This never binds a PILL that a move
+    /// retired without proof of where it landed: `MessageHeaderRekey.finishMove`
+    /// retires that row's pill mapping, so remapping from it is a no-op
+    /// (`FinishTheMoveLocallyTests.aResumedSessionDoesNotRebindADroppedRowsPill`).
+    @Test("A stale primary key resolves the session context onto the same account's message")
     func resolveStillFollowsTheMoveWithinTheAccount() throws {
         let db = try makeDB()
-        // The message moved INBOX → Archive inside account A (its PK changed), and
-        // account B happens to hold the same Message-ID.
+        // The message's PK changed inside account A, and account B happens to
+        // hold the same Message-ID.
         let moved = try TestDatabase.insertMessageHeader(
             db, messageId: "20", folderId: "acc1:Archive", accountId: "acc1",
             folderPath: "Archive", isInInbox: false, rfc822MessageId: "shared@example.com")

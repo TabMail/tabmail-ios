@@ -788,6 +788,21 @@ actor AccountManager {
         }
     }
 
+    /// Withdraw protection keys whose protected local row no longer exists.
+    ///
+    /// Used for the rfc822 key of a move remnant `MessageHeaderRekey.finishMove`
+    /// deleted (`IOS-MOVE-002`): that key exists to keep a sync from
+    /// overwriting the optimistically moved row in its destination, and with
+    /// the row gone it would instead stop the destination sync from inserting
+    /// the message at its real address for the whole TTL. The bare source-UID
+    /// key is not passed here; it keeps guarding the source folder (#106).
+    func releaseRecentlyCompleted(messageIds: [String]) {
+        guard !messageIds.isEmpty else { return }
+        recentlyCompletedStore.withLock { store in
+            for id in messageIds { store.removeValue(forKey: id) }
+        }
+    }
+
     func pruneRecentlyCompleted() {
         let now = Date()
         recentlyCompletedStore.withLock { $0 = $0.filter { $0.value > now } }
@@ -807,9 +822,10 @@ actor AccountManager {
     /// (`IOS-TEST-006`). Production keeps the unscoped key deliberately: the
     /// map's OTHER leg is the RFC 822 Message-ID, which is folder-agnostic by
     /// construction and is what protects an optimistically-moved row at its
-    /// destination, and every consumer uses the map only to SKIP a delete or an
-    /// overwrite — so an over-broad match costs at most one sync pass and never
-    /// removes protection. Scoping the key would narrow it, which is the
+    /// destination, and every consumer uses the map only to SKIP a delete, an
+    /// overwrite or an insert — so an over-broad match delays one message by at
+    /// most the TTL and never removes protection (a same-UID message landing in
+    /// the destination of a no-`COPYUID` move waits out that TTL, IOS-MOVE-002). Scoping the key would narrow it, which is the
     /// dangerous direction. The leak is therefore closed in the test harness:
     /// `ProcessGlobalTestState.withLock` calls this on entry to every scoped
     /// test, which is the only boundary that composes across suites

@@ -928,6 +928,7 @@ struct InboxThreadAcrossAccountsTests {
                     destinations: [proven],
                     addressChangesOnMove: true,
                     accountScopedIds: false,
+                    copiedNothing: false,
                     db: db)
                 _ = try PendingOperation.deleteOne(db, key: imapForward.id)
                 MessageHeaderRekey.publishAddressHandoffsAfterCommit(result.applied, in: db)

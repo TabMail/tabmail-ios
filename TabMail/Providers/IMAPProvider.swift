@@ -6300,8 +6300,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // every member is reported complete and the whole op retires.
             //
             // No destination address: nothing was copied anywhere, so there is
-            // nothing to re-key.
-            return MoveOutcome(provenIds: ids, provenDestinations: [])
+            // nothing to re-key, and the local row must stay (`copiedNothing`).
+            return MoveOutcome(provenIds: ids, provenDestinations: [], copiedNothing: true)
         } catch is IMAPActionPermanentlyRefused {
             // GitHub #115 round 3b — OWNER DECISION 2026-09-05. The atomic
             // `UID MOVE` was refused with a response code from the permanent set
@@ -6323,7 +6323,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // above: that type means "an exact LIST proved the mailbox gone" and
             // is thrown from two other call sites in this file, so widening it
             // would change their dispositions too.
-            return MoveOutcome(provenIds: ids, provenDestinations: [])
+            return MoveOutcome(provenIds: ids, provenDestinations: [], copiedNothing: true)
         }
     }
 

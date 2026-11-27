@@ -234,7 +234,7 @@ struct UndoProviderIdentitySafetyTests {
                 // Every fixture in this suite is IMAP (numeric UIDs, a positive
                 // `destinationEpoch`), which is the folder-qualified address space.
                 accountScopedIds: false,
-                db: db)
+                copiedNothing: false, db: db)
             _ = try PendingOperation.deleteOne(db, key: operation.id)
             MessageHeaderRekey.publishAddressHandoffsAfterCommit(
                 result.applied, in: db)
@@ -500,7 +500,7 @@ struct UndoProviderIdentitySafetyTests {
                 destinationProviderId: "901",
                 destinationUidValidity: 52)],
             addressChangesOnMove: true,
-            context: AccountOperationExecutor.DrainContext())
+            copiedNothing: false, context: AccountOperationExecutor.DrainContext())
         await AccountManager.shared.awaitWriteQueueDrain()
 
         let ops = try await fixture.pool.read { db in

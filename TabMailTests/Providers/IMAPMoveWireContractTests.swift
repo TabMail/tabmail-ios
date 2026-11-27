@@ -1310,8 +1310,12 @@ struct IMAPMoveWireContractTests {
 
         // TERMINAL: returns normally. Throwing here would pin the lane forever
         // behind a COPY into a mailbox that cannot be recreated by retrying.
-        try await provider.move(
+        let outcome = try await provider.move(
             ids: ["51"], from: "INBOX", to: "Archive", admittedUidValidity: Self.epoch)
+        // Nothing left the source, so the drain must keep the local row
+        // (`MessageHeaderRekey.finishMove` drops only a remnant of a move that
+        // happened).
+        #expect(outcome.copiedNothing)
 
         #expect(Self.commands(server, containing: "UID COPY").isEmpty)
         #expect(Self.deletedStores(server).isEmpty)

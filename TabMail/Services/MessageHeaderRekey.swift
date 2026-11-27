@@ -84,17 +84,27 @@ struct MoveOutcome: Sendable {
     /// their confirmed-gone local headers; see
     /// `ExecutedOperation.confirmedGoneMembers`.
     let confirmedGoneIds: [String]
+    /// The server answered INSTEAD of moving anything (a refused move, or a
+    /// destination or source mailbox that is absent): every member retires,
+    /// and no member was copied anywhere. `MessageHeaderRekey.finishMove` must then keep the local
+    /// row rather than drop it as an unproven remnant: the message is not in
+    /// the destination, so a destination sync has nothing to bring back. It is
+    /// a whole-outcome flag, set only by the arms that know NO member was
+    /// copied; an outcome that moved some members leaves it false.
+    let copiedNothing: Bool
 
     init(
         provenIds: [String],
         provenDestinations: [ProvenDestinationAddress],
         requiresSourceReconciliation: Bool = false,
-        confirmedGoneIds: [String] = []
+        confirmedGoneIds: [String] = [],
+        copiedNothing: Bool = false
     ) {
         self.provenIds = provenIds
         self.provenDestinations = provenDestinations
         self.requiresSourceReconciliation = requiresSourceReconciliation
         self.confirmedGoneIds = confirmedGoneIds
+        self.copiedNothing = copiedNothing
     }
 }
 
@@ -197,8 +207,24 @@ struct MoveFinishResult: Sendable, Equatable {
     /// `IOS-QUEUE-008` lesson is that a serialization fact nobody can read back
     /// out of an exported log gets misdiagnosed for a month.
     var readdressedOperationIds: [String] = []
+    /// The optimistic rows G4 DELETED on a mailbox-local UID space because the
+    /// wire named no destination for them (`IOS-MOVE-002`). Each id is also in
+    /// `removedOldHeaderIds`; this keeps what the row said about itself, so a
+    /// consumer that used to read it after the commit (the entered-inbox AI
+    /// recorder) still can.
+    var droppedRemnants: [DroppedRemnant] = []
 
     static let empty = MoveFinishResult()
+}
+
+/// What a deleted move remnant said about itself, captured before the delete.
+struct DroppedRemnant: Sendable, Equatable {
+    let headerId: String
+    let accountId: String
+    let messageId: String
+    let rfc822MessageId: String?
+    let folderPath: String
+    let isInInbox: Bool
 }
 
 // MARK: - The re-key itself
@@ -539,6 +565,18 @@ enum MessageHeaderRekey {
         return true
     }
 
+    /// The copies of a dropped row's message that a sync already stored in its
+    /// folder. Hinted, like `MessageContentStore.ownersSQL` and
+    /// `ChatStore.findByStableIdSQL`: without the hint SQLite picks
+    /// `messageHeader_folderId_uidInt (folderId=?)` while the table has no
+    /// statistics (a fresh install, or after a migration until the background
+    /// `ANALYZE`) and walks the whole folder inside the retiring write. Named
+    /// so the plan fence checks production's own statement.
+    static let storedCopiesSQL = """
+        SELECT * FROM messageHeader INDEXED BY messageHeader_rfc822MessageId
+        WHERE rfc822MessageId = ? AND folderId = ? AND id != ?
+        """
+
     /// FINISH THE MOVE LOCALLY: re-key each member for which the provider
     /// returned one unambiguous destination address, from its source address to
     /// the destination address the server itself assigned.
@@ -587,10 +625,16 @@ enum MessageHeaderRekey {
     /// of mirrors that still name the old id. GRDB's single writer serializes
     /// this against concurrent sync.
     ///
-    /// **G4 — missing evidence is provider-sensitive.** An address-changing
-    /// provider with no safe destination evidence retains the optimistic row;
-    /// its stale-address undo member is separately discarded so it can never
-    /// mutate a bystander. Gmail's label-based move keeps a stable provider id,
+    /// **G4 — missing evidence is provider-sensitive.** On IMAP (a
+    /// mailbox-local UID space) a member with no safe destination evidence has
+    /// its optimistic row DELETED and reported as removed: it could never be
+    /// proven, and it would block sync from inserting the real message at that
+    /// UID. The post-drain destination sync brings the message back at its real
+    /// address. An account-scoped provider, and a move the server refused
+    /// outright (`copiedNothing`, the message never left), retain the row.
+    /// Either way the
+    /// stale-address undo member is discarded so it can never mutate a
+    /// bystander. Gmail's label-based move keeps a stable provider id,
     /// so `addressChangesOnMove == false` bypasses address repair entirely.
     ///
     /// **`accountScopedIds` SELECTS THE ADDRESS SPACE, and it is not cosmetic.**
@@ -619,6 +663,7 @@ enum MessageHeaderRekey {
         destinations: [ProvenDestinationAddress],
         addressChangesOnMove: Bool,
         accountScopedIds: Bool,
+        copiedNothing: Bool,
         db: Database
     ) throws -> MoveFinishResult {
         guard op.type == .move, addressChangesOnMove,
@@ -744,17 +789,94 @@ enum MessageHeaderRekey {
             }
 
             guard let destination = safeDestinations[sourceProviderId] else {
-                result.unsafeUndoOldHeaderIds.append(oldId)
-                // The row stays under its source UID in the folder it sits in
-                // (ADR-IOS-073 consequence 3: recovered by ordinary sync). For a
-                // folder the change reader tracks, ordinary sync is that reader,
-                // which never removes the row: drop its bookmark (below) so the
-                // listing runs again. The source too: a refused move, or one whose
-                // folder is gone, left the message there while the optimistic
-                // move took it out of the local view. Nothing is deleted; no
-                // queued op is touched.
-                possiblyWrongFolderIds.insert(row.folderId)
-                possiblyWrongFolderIds.insert(sourceFolderId)
+                if accountScopedIds || copiedNothing {
+                    result.unsafeUndoOldHeaderIds.append(oldId)
+                    // The row stays under its source UID in the folder it sits in
+                    // (ADR-IOS-073 consequence 3: recovered by ordinary sync). For a
+                    // folder the change reader tracks, ordinary sync is that reader,
+                    // which never removes the row: drop its bookmark (below) so the
+                    // listing runs again. The source too: a refused move, or one whose
+                    // folder is gone, left the message there while the optimistic
+                    // move took it out of the local view. Nothing is deleted; no
+                    // queued op is touched.
+                    possiblyWrongFolderIds.insert(row.folderId)
+                    possiblyWrongFolderIds.insert(sourceFolderId)
+                } else {
+                    // G4 on a mailbox-local UID space: DROP THE UNPROVEN REMNANT.
+                    // The move retired on the wire, so the message now lives in
+                    // the destination at an address the server did not name. The
+                    // optimistic row still spells the SOURCE UID with a nil
+                    // epoch: no proof can ever stamp it, every gesture on it is
+                    // refused, and sync treats it as the owner of that numeric
+                    // UID in the destination, which blocks the real message from
+                    // being inserted (`IOS-MOVE-002`). The drain syncs the
+                    // destination after every move, and that pass inserts the
+                    // moved message at its real address with its epoch
+                    // (`publishCommittedEffects` first withdraws this row's
+                    // rfc822 shield key); a copy below that pass's window is
+                    // loaded by the owed catch-up listing, which loads every
+                    // missing UID at or above its load floor (ADR-IOS-111
+                    // item 11). Callers drop the old id's undo member,
+                    // FTS entry and body assets, and the entered-inbox AI
+                    // recorder reads `droppedRemnants`.
+                    //
+                    // The row's AI state is the one thing the server does not
+                    // hold. The COPYUID path keeps it by re-keying the row in
+                    // place; here it is written to the AI cache under the row's
+                    // DESTINATION folder in this same write, and both sync
+                    // insert paths restore it into the row they create
+                    // (`MessageAICache.restoreIfCached`). A row with no rfc822
+                    // Message-ID has no cache key and keeps nothing.
+                    try MessageAICache.writeThrough(
+                        accountId: row.accountId, folderPath: row.folderPath,
+                        rfc822MessageId: row.rfc822MessageId,
+                        summaryBlurb: row.summaryBlurb, summaryTodos: row.summaryTodos,
+                        reminderDate: row.reminderDate, reminderTime: row.reminderTime,
+                        reminderContent: row.reminderContent, actionTag: row.actionTag,
+                        cachedReply: row.cachedReply, db: db)
+                    // A copy a sync already stored in this folder (a lost reply,
+                    // a sync, then the retry) was inserted before the cache held
+                    // this row's AI state, so no insert will restore it: fill it
+                    // here, in the same write, from the entry just written. The
+                    // lookup is hinted onto `messageHeader_rfc822MessageId`
+                    // (`storedCopiesSQL`); the restore keeps first-compute-wins,
+                    // so a field the copy already has is never overwritten.
+                    if let rfc822 = row.rfc822MessageId, !rfc822.isEmpty {
+                        let storedCopies = try MessageHeader.fetchAll(
+                            db, sql: storedCopiesSQL,
+                            arguments: [rfc822, row.folderId, oldId])
+                        for original in storedCopies {
+                            var copy = original
+                            try MessageAICache.restoreIfCached(
+                                into: &copy, accountId: row.accountId,
+                                folderPath: row.folderPath, db: db)
+                            _ = try copy.updateChanges(db, from: original)
+                        }
+                    }
+                    _ = try MessageBody.deleteOne(db, key: ContentKey(rawValue: oldId))
+                    // A chat pill that named this row is retired with it (kept
+                    // as a stand-in that names no row, so its number is never
+                    // handed to another message), in this
+                    // same write: nothing the server said proves which message in
+                    // the destination is the copy, so no later path (the chat
+                    // session's Message-ID fallback included) may rebind the pill
+                    // to a message by its Message-ID. The in-memory half is
+                    // retired on the outside-stores lane, handed over by
+                    // `publishCommittedEffects` (`retireOutsideStoresInOrder`).
+                    try ChatIdTranslator.retireStoredMappings(db, realId: oldId)
+                    try row.delete(db)
+                    result.removedOldHeaderIds.append(oldId)
+                    // Drop both folders' change-reader bookmarks so the next
+                    // listing re-reads them: the destination to insert the
+                    // moved message at its real address, the source because
+                    // without proof the message may still sit there.
+                    possiblyWrongFolderIds.insert(row.folderId)
+                    possiblyWrongFolderIds.insert(sourceFolderId)
+                    result.droppedRemnants.append(DroppedRemnant(
+                        headerId: oldId, accountId: row.accountId,
+                        messageId: row.messageId, rfc822MessageId: row.rfc822MessageId,
+                        folderPath: row.folderPath, isInInbox: row.isInInbox))
+                }
                 continue
             }
 
@@ -821,7 +943,10 @@ enum MessageHeaderRekey {
             // re-key on Message-ID evidence, and the Message-ID never chooses a
             // message to change (ADR-IOS-068 D4). So after an IMAP or Graph move
             // without proven destination evidence, once sync re-keys the row the
-            // send finds no original. Neither does one moved in another client,
+            // send finds no original; on IMAP, when the server copied something,
+            // the row is dropped at the retirement itself (the arm with no
+            // proven destination, `copiedNothing`), and the send finds no
+            // original from then on. Neither does one moved in another client,
             // which sync stores as a new row (`IOS-OUTBOX-012`).
             // outboxMessage holds only unsent, failed and unfinalized sends.
             try db.execute(
