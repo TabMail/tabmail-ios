@@ -4,8 +4,8 @@
 
 import SwiftUI
 
-/// The bottom of a chat, where the user's own words show (ADR-IOS-114 decision 10): the replies
-/// still in the outbox; the bubble held while its compose card is up, which turns into the newest
+/// The bottom of a chat, where the user's own words show (ADR-IOS-114 decision 10): the sends whose
+/// email the chat does not show yet (`ChatSendBubbles`); the bubble held while its compose card is up, which turns into the newest
 /// of them as the hold ends; else the user's message while the field's Send writes its email; else
 /// the chat's own last row (a thread's AI Suggestion); then the gap above the field. A thread and a
 /// new email's chat both show their sends through these rows, so a send looks the same in both:
@@ -28,7 +28,7 @@ struct ChatOutgoingRows<Last: View>: View {
     @ViewBuilder let last: () -> Last
 
     var body: some View {
-        // Replies still in the outbox. Not while a bubble is held: the reply its card sent shows as
+        // The sends the chat does not show as emails yet. Not while a bubble is held: the reply its card sent shows as
         // the hold ends, the held bubble turning into its bubble.
         if heldGhost == nil {
             ForEach(unsentReplies) { reply in

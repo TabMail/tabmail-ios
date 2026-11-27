@@ -93,10 +93,14 @@ struct ChatSendBubblesTests {
     func followReportsAFiling() {
         var sends = ChatSendBubbles()
         sends.read([Self.reply("a")])
-        #expect(!sends.follow(Self.filed("b", copy: "copy-b")), "another chat's send filed: nothing to read")
-        #expect(sends.follow(Self.filed("a", copy: "copy-a")), "this chat's send filed: read the chat's emails")
-        #expect(!sends.follow(Self.rowMove("copy-a", to: "server-a")), "its copy replaced: the chat follows that itself")
-        #expect(!sends.follow(Self.filed("a", copy: "copy-a")), "a repeated post moves nothing more")
+        let otherFiled = sends.follow(Self.filed("b", copy: "copy-b"))
+        #expect(!otherFiled, "another chat's send filed: nothing to read")
+        let ownFiled = sends.follow(Self.filed("a", copy: "copy-a"))
+        #expect(ownFiled, "this chat's send filed: read the chat's emails")
+        let copyReplaced = sends.follow(Self.rowMove("copy-a", to: "server-a"))
+        #expect(!copyReplaced, "its copy replaced: the chat follows that itself")
+        let repeated = sends.follow(Self.filed("a", copy: "copy-a"))
+        #expect(!repeated, "a repeated post moves nothing more")
     }
 
     @Test("Once the chat showed its email, the bubble never comes back: not when that email leaves the chat, nor while its row is still read")

@@ -708,6 +708,58 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("A send filed and its row gone before its Sent copy is in the Sent folder: the bubble stays, Sent, in every frame until the chat is the sent email's thread, which shows the words once")
+    func filedSendKeepsTheWordsUntilTheThread() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation {
+            try await Self.withChatView(true) {
+                try await withCardSend { fixture, _, screen in
+                    let row = try await Self.sendFromTheCard("Lunch on Friday?", screen: screen, fixture: fixture)
+                    try await Self.waitUntil { Self.hasUndo(screen) }
+                    #expect(Self.hasUndo(screen), "control: the Sending bubble shows")
+                    let messageId = try #require(row.sentMessageId, "control: the row names its Message-ID")
+                    let copy = Self.sentFolderHeader("screen-sent-copy-filed", rfc822MessageId: EmailFilter.normalizeMessageId(messageId))
+                    let rowId = row.id
+                    func bubbleShows() -> Bool {
+                        HostedAccessibility.identifiers(in: screen.view).contains(ChatUnsentReplyBubble.bubbleId)
+                    }
+                    func sendingShows() -> Bool {
+                        HostedAccessibility.labels(in: screen.view).contains { $0.contains("Sending") }
+                    }
+                    let frames = OwnWordsFrames(view: screen.view)
+                    frames.start()
+
+                    // The send's steps in the test's order: sent, filed as its copy, the row's cleanup,
+                    // and only then the copy in the Sent folder.
+                    try await fixture.pool.write { db in
+                        try db.execute(sql: "UPDATE outboxMessage SET sentAt = ? WHERE id = ?", arguments: [Date(), rowId])
+                    }
+                    MailPointerMoves.publish(MailPointerMoves([.sent(outboxId: rowId, copyHeaderId: copy.id)]))
+                    _ = try await fixture.pool.write { db in try OutboxMessage.deleteOne(db, key: rowId) }
+                    try await Self.waitUntil { bubbleShows() && !sendingShows() }
+                    // Time for the chat to read the row's going.
+                    try await Self.settle()
+                    let keptSent = bubbleShows() && !sendingShows() && !Self.isThread(screen)
+                    #expect(keptSent, "the row gone, the copy not in yet: the bubble stays, Sent: \(HostedAccessibility.labels(in: screen.view).prefix(20))")
+
+                    try await fixture.pool.write { try copy.insert($0) }
+                    try await Self.waitUntil { Self.isThread(screen) }
+                    try await Self.settle()
+                    frames.stop()
+                    print("[OwnWordsFrames] filed before the copy \(frames.summary)")
+
+                    #expect(Self.isThread(screen), "control: the chat ends as the sent email's thread")
+                    let bubbleLeft = bubbleShows()
+                    #expect(!bubbleLeft, "the thread shows the email, with no bubble beside it")
+                    let none = frames.frames.filter(OwnWordsFrames.showsNone).count
+                    #expect(none == 0, "every frame shows the user's words; \(none) of \(frames.frames.count) show none: \(frames.summary)")
+                    let apart = frames.frames.filter(OwnWordsFrames.showsTwoApart).count
+                    #expect(apart == 0, "and never twice: \(frames.summary)")
+                }
+            }
+        }
+    }
+
     @Test("Once the chat is the sent email's thread, new mail in the Sent folder no longer reads the send: its follow has ended")
     func threadEndsTheSendFollow() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")

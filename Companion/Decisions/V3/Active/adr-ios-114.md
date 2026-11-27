@@ -721,17 +721,30 @@ same AI result, kept as long as the email itself is shown.
    memory 021's exception for it with it: that reload could draw the copy before the move reached the
    bubble, beside a bubble still "Sending", and the words showed twice. No query, column, observation
    or registry row is added: the bubbles follow the moves every holder of an email already follows
-   (`.mailPointersMoved`). Accepted: (1) a send with no Sent copy written (the move names no copy)
-   stays "Sent" until the chat closes; if the server's copy then arrives by sync while that chat is
-   open, the words show twice for the chat's life. (2) A chat opened between the filing's post and the
-   row's cleanup reads the row with no move to follow: the row's going ends its bubble and reloads the
-   chat, and until that reload shows the copy a frame can show none of the words. Tests:
-   `ChatSendBubblesTests` (the rule), `ChatSendingBubbleTests.sentReplyKeepsTheWordsOnScreen` and
+   (`.mailPointersMoved`). A chat's send bubbles are display state and follow a move at once, also
+   while the preview freeze holds the chat's reloads (the view model buffers its own moves and
+   reloads, not the bubbles): the caption can turn "Sent" during a swipe, and a bubble is hidden only
+   when the chat shows its own email, which no reload does while the freeze holds. Accepted: (1) a
+   send with no Sent copy written (the move names no copy) stays "Sent" in a thread's chat until the
+   chat closes; if the server's copy then arrives by sync while that chat is open, the words show
+   twice for the chat's life. A new email's chat finds that copy in Sent by the send's Message-ID and
+   ends the bubble at its swap to the thread. (2) A chat opened between the filing's post and the
+   row's cleanup reads the row with no move to follow, as does a chat showing a send finished in an
+   earlier run (`drainPendingSentAppends`, the outbox reconcile), which posts no move: the row's going
+   ends its bubble and reloads the chat, and until the reload and the outbox observation catch up,
+   frames can show none of the words, or twice (the copy beside the row's "Sending" bubble). (3) Two
+   rare timing races, each recovered by closing and reopening the chat: the server's copy replacing
+   the Sent copy while the chat's read after the filing is under way (tabmail-ios #1591), and the
+   copy's replacement posted before the filing's move, which goes out after the copy's indexing
+   (tabmail-ios #1592). Tests: `ChatSendBubblesTests` (the rule),
+   `ChatSendingBubbleTests.sentReplyKeepsTheWordsOnScreen` and
    `ChatNewThreadScreenTests.realSendKeepsTheWordsOnScreen` (every frame through the real send shows
-   the user's words, never twice), `ChatSendingBubbleTests.copyAndItsMoveShowTheWordsOnce` (the copy
-   in the database before, or after, the filing's move reaches the chat; the bubble stays ended once
-   the email leaves the chat), `ChatSendingBubbleTests.sendingBubbleHandsOver` (the bubble goes as the
-   email shows).
+   the user's words, never twice), `ChatNewThreadScreenTests.filedSendKeepsTheWordsUntilTheThread`
+   (a new email's chat keeps the "Sent" bubble from the filing until it is the sent email's thread,
+   every frame showing the words once), `ChatSendingBubbleTests.copyAndItsMoveShowTheWordsOnce` (the
+   copy in the database before, or after, the filing's move reaches the chat; the bubble stays ended
+   once the email leaves the chat), `ChatSendingBubbleTests.sendingBubbleHandsOver` (the bubble goes
+   as the email shows).
    **Undo on the Sending bubble (tabmail-ios #986, 2026-11-21):** a reply sent from a compose the
    chat opened offers its Undo on its Sending bubble ("Sending · Undo", the seconds left under it)
    instead of the undo-send toast, which is not shown for it. Who offers a send's Undo
