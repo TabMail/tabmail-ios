@@ -945,6 +945,33 @@ struct ChatUndoSendRoutingTests {
         }
     }
 
+    /// Search's sheet closes for an Undo's outcome (`chatModalSheet`), and RootView presents the
+    /// reopened compose with no chat under it. Before the fix that compose still recorded the chat,
+    /// so its send again had its Undo on a bubble no screen showed: no Undo at all for its hold.
+    @Test("A reply undone on its bubble in a chat opened from Search, and sent again from the compose the Undo reopened, has the toast: the sheet closed for the Undo, so no chat shows a bubble")
+    func searchReopenedComposeHasTheToast() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: the test can tap the hosted compose")
+        try await withSendEnvironment { fixture, saved in
+            let service = PendingSendService.shared
+            saved.setChatView(on: true)
+            // The chat is open in the Search sheet, the chat modal on top.
+            let search = UUID()
+            service.chatModalOpened(search, closesForOutcome: true)
+            defer { service.chatModalClosed(search) }
+            let reopen = try await Self.sendFromTheChatAndUndoOnTheBubble(fixture)
+            let sheetCloses = service.closesForOutcome(search)
+            #expect(sheetCloses, "control: Search, on top, closes for the reopen")
+            #expect(reopen.openedOn == nil, "the compose RootView reopens records no screen: no chat is under it")
+            // The sheet has closed; RootView presents the compose.
+            service.chatModalClosed(search)
+            #expect(service.topLevelReopen?.id == reopen.id, "control: RootView presents the reopened compose")
+            let again = try await Self.send(UndoReopenCompose(snapshot: reopen), fixture: fixture)
+            #expect(again.inReplyTo != nil, "control: still a reply to the chat's email")
+            #expect(service.undoOwner(for: again.id) == .toast, "its Undo is on the toast")
+            #expect(service.visibleToast?.id == again.id, "RootView shows its toast, its one Undo")
+        }
+    }
+
     /// A new email's chat (`ChatNewThreadView`) opens its own new email's card on a draft the chat
     /// names (`ChatNewThreadModel.card`) and finds the send by it (`ChatNewEmailSend`): a new email
     /// has no In-Reply-To to find it by.

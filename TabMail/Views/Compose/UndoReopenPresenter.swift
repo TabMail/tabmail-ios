@@ -52,7 +52,7 @@ private struct ChatModalSheet<Sheet: View>: ViewModifier {
         content
             .sheet(isPresented: $isPresented) {
                 sheet()
-                    .onAppear { service.chatModalOpened(id) }
+                    .onAppear { service.chatModalOpened(id, closesForOutcome: true) }
                     .onDisappear { service.chatModalClosed(id) }
             }
             .onChange(of: service.closesForOutcome(id)) { _, closes in
@@ -87,7 +87,7 @@ private struct UndoOutcomesPresenter: ViewModifier {
             } message: {
                 Text(service.undoFailureMessage(presentedBy: id) ?? "")
             }
-            .onAppear { service.chatModalOpened(id) }
+            .onAppear { service.chatModalOpened(id, closesForOutcome: false) }
             .onDisappear { service.chatModalClosed(id) }
     }
 }

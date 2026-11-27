@@ -556,8 +556,8 @@ struct ChatUndoSendTests {
         service.present(outboxId: email.id, draftId: "draft-new-email-chat", instanceEpoch: "E1",
                         toSummary: "To: sender@example.com", holdUntil: hold, owner: .bubble)
         // Search open, and a new email's chat over it.
-        service.chatModalOpened(search)
-        service.chatModalOpened(chat)
+        service.chatModalOpened(search, closesForOutcome: true)
+        service.chatModalOpened(chat, closesForOutcome: false)
         #expect(service.chatModals == [search, chat])
         #expect(service.reopen(presentedBy: chat) == nil && !service.closesForOutcome(search), "control: nothing waits yet")
 
@@ -580,9 +580,9 @@ struct ChatUndoSendTests {
         #expect(service.topLevelReopen?.id == email.id, "with none open, RootView presents it")
 
         // A screen that opens again goes to the top.
-        service.chatModalOpened(chat)
-        service.chatModalOpened(search)
-        service.chatModalOpened(chat)
+        service.chatModalOpened(chat, closesForOutcome: false)
+        service.chatModalOpened(search, closesForOutcome: true)
+        service.chatModalOpened(chat, closesForOutcome: false)
         #expect(service.chatModals == [search, chat])
     }
 
@@ -599,6 +599,11 @@ struct ChatUndoSendTests {
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         #expect(inbox.contains(".chatModalSheet(isPresented: $showSearch) {"),
                 "the Search sheet, which can hold a chat, closes for an Undo's outcome")
+        let presenters = try Self.source("TabMail/Views/Compose/UndoReopenPresenter.swift")
+        #expect(presenters.contains(".onAppear { service.chatModalOpened(id, closesForOutcome: true) }"),
+                "the Search sheet closes for the outcome, so a compose an Undo there reopens records no screen")
+        #expect(presenters.contains(".onAppear { service.chatModalOpened(id, closesForOutcome: false) }"),
+                "a new email's chat presents the outcome over itself")
     }
 
     @Test("A chat records itself for a compose only when its target is one of the chat's own emails")

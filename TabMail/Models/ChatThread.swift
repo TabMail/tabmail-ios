@@ -161,22 +161,29 @@ struct ChatThread: Equatable {
     /// Who the chat's Reply All to `message` goes to, by role: its Reply All
     /// (`buildReplyAllRecipients`), which leaves out every address of the user's. An email that
     /// went only to the user's own addresses (a note to self, a forward to another of their
-    /// accounts) has nobody else to answer, so its audience is those addresses, To then Cc. The
-    /// one source of both the header's people (`replyPeople`, through `ChatThreadView.thread`) and
-    /// the reply's envelope (`ChatReplyCompose.suggestionEnvelope`), so they stay one list. The
-    /// inbox's and the email screen's Reply All are unchanged.
+    /// accounts) has nobody else to answer, so its audience is those addresses, To then Cc. A copy
+    /// another of the user's accounts sent to the one holding it (a forward from A, received at B)
+    /// answers its sender first: its own reply target (Reply-To, else From), when that is an
+    /// address of the user's other than the holding account's. The one source of both the
+    /// header's people (`replyPeople`, through `ChatThreadView.thread`) and the reply's envelope
+    /// (`ChatReplyCompose.suggestionEnvelope`), so they stay one list. Through that envelope it is
+    /// also the audience of the agent's reply tool (`EmailReplyTool.reply`) on every screen, so its
+    /// card for an own-only email opens with those addresses in To. The Reply All button outside
+    /// the chat (`buildReplyAllRecipients`) is unchanged.
     static func replyAllAudience(of message: MessageHeader, accounts: [Account]) -> (to: [String], cc: [String]) {
         let audience = buildReplyAllRecipients(for: message, allAccounts: accounts)
         guard audience.to.isEmpty, audience.cc.isEmpty else { return audience }
         let own = Set(accounts.map { $0.emailAddress.lowercased() })
+        let holder = accounts.first { $0.id == message.accountId }?.emailAddress.lowercased()
         var seen = Set<String>()
-        func ownAddresses(in field: String) -> [String] {
-            RecipientEntry(field).addresses
+        func ownAddresses(in addresses: [String], except skipped: String? = nil) -> [String] {
+            addresses
                 .map { $0.lowercased() }
-                .filter { own.contains($0) && seen.insert($0).inserted }
+                .filter { $0 != skipped && own.contains($0) && seen.insert($0).inserted }
         }
-        let to = ownAddresses(in: message.to)
-        return (to, ownAddresses(in: message.cc))
+        let sender = ownAddresses(in: RecipientEntry.reply(to: message).addresses, except: holder)
+        let to = sender + ownAddresses(in: RecipientEntry(message.to).addresses)
+        return (to, ownAddresses(in: RecipientEntry(message.cc).addresses))
     }
 
     /// Stands for the user in an audience, whichever of their addresses an email used.

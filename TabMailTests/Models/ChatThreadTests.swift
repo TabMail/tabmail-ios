@@ -392,9 +392,11 @@ struct ChatThreadTests {
         return (chat, chat.newest.map { ChatReplyCompose.suggestionEnvelope(for: $0, accounts: context.accounts) })
     }
 
-    /// From the user's named account.
+    /// From the user's named account: its Sent copy, held by that account.
     private static func mine(_ uid: String, to: String, cc: String = "", minutesAgo: Double) -> MessageHeader {
-        header(uid, from: "Robin Lee", fromAddress: me, to: to, cc: cc, minutesAgo: minutesAgo, folder: "Sent")
+        var sent = header(uid, from: "Robin Lee", fromAddress: me, to: to, cc: cc, minutesAgo: minutesAgo, folder: "Sent")
+        sent.accountId = home.id
+        return sent
     }
 
     @Test("An email that went only to the user's own addresses: they are its people, and the reply goes to them")
@@ -418,6 +420,26 @@ struct ChatThreadTests {
         #expect(noteChat.replyPeople.first?.initials == "RL")
         #expect(noteEnvelope?.to == ["me@example.com"] && noteEnvelope?.cc == ["work@example.com"])
         #expect(!noteChat.isGroup, "two of the user's own addresses are still the user alone")
+    }
+
+    @Test("A copy one of the user's accounts sent to another, opened where it was received, answers the account it came from first; the header shows exactly who the reply goes to")
+    @MainActor
+    func receivedOwnCopyAnswersItsSender() {
+        // A forward from the named account, received at the other.
+        var received = Self.header("1", from: "Robin Lee", fromAddress: Self.me, to: "work@example.com", minutesAgo: 5)
+        received.accountId = Self.work.id
+        let (chat, envelope) = Self.screenChat([received])
+        #expect(envelope?.to == ["me@example.com", "work@example.com"] && envelope?.cc == [],
+                "the account it came from first, never the holding account alone: \(String(describing: envelope))")
+        #expect(chat.replyPeople.map(\.address) == ["me@example.com", "work@example.com"],
+                "the header is the reply: \(chat.replyPeople.map(\.address))")
+        #expect(chat.replyPeople.first?.name == "Robin Lee", "the account's name shown")
+
+        // Its Sent copy, held by the account it came from, still answers the other account alone.
+        let sentCopy = Self.mine("2", to: "work@example.com", minutesAgo: 4)
+        let (sentChat, sentEnvelope) = Self.screenChat([sentCopy])
+        #expect(sentEnvelope?.to == ["work@example.com"] && sentEnvelope?.cc == [], "control: the Sent copy is unchanged")
+        #expect(sentChat.replyPeople.map(\.address) == ["work@example.com"])
     }
 
     @Test("Anyone else on the reply: the user's own addresses stay hidden, as before")

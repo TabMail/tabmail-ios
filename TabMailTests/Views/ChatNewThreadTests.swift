@@ -606,6 +606,26 @@ struct ChatNewThreadTests {
         #expect(registry.contains("(5 production files:"), "the registry's census names the chat as a producer")
     }
 
+    /// The only delete of a sent new email's draft (`ChatNewThreadModel.discardSavedDraft`, which
+    /// can delete its server copy for good) has one caller: the card's close, only once the card's
+    /// email is durably queued (`.sent`), and on the sent chat's own model. What the discard does is
+    /// pinned against a real database in `ChatNewDraftSaveTests`; a hosted test cannot drive the
+    /// card's Send and close here, so the wiring is pinned in the source.
+    @Test("The sent chat's draft is discarded only by the card's close after its durable send, on the sent chat's own model")
+    func sentDraftDiscardWiring() throws {
+        let view = try Self.source("TabMail/Views/Chat/ChatNewThreadView.swift")
+        #expect(Self.count("guard case .sent = outcome else { return } heldMessage?.sent = true cardSent = true", in: view) == 1,
+                "only a durable send marks the card sent")
+        #expect(Self.count("cardSent = true", in: view) == 1, "nothing else marks it")
+        let closed = try Self.body(of: "private func cardClosed() {", in: view)
+        #expect(Self.count("guard cardSent else { return } cardSent = false let sent = model", in: closed) == 1,
+                "the close discards only after a send")
+        #expect(Self.count("await sent.discardSavedDraft()", in: closed) == 1, "the sent chat's own model, never the next one")
+        #expect(Self.count("discardSavedDraft()", in: view) == 1, "its one caller")
+        let model = try Self.source("TabMail/Views/Chat/ChatNewThread.swift")
+        #expect(Self.count("discardSavedDraft()", in: model) == 1, "declared once, called nowhere else in the model")
+    }
+
     /// The new email's field takes a thread's drag up (`ChatReplyFieldTests.fieldDragWiring` pins the
     /// thread's). A hosted test cannot move the pan (memory 128), so its wiring is pinned here; the
     /// open, the VoiceOver action and the swap's wait are pinned on screen in
@@ -1427,6 +1447,200 @@ struct ChatNewDraftSaveTests {
         #expect(outcome == .saved)
         #expect(loadedNames == ["photo_1.png"])
         #expect(model.failedImports == failures)
+    }
+
+    // MARK: - The sent chat's draft, discarded after the card's Send (`discardSavedDraft`)
+
+    /// The card's own draft, as compose saved it under its plain id (`newCardDraftId`): the words
+    /// the card sent, which an Undo reopens.
+    private func cardDraft(_ fixture: Fixture, serverUid: Int? = nil) async throws -> Draft {
+        let updatedAt = Date().addingTimeInterval(-30).timeIntervalSince1970
+        var draft = Draft(
+            id: ChatNewThreadModel.newCardDraftId(), accountId: Self.accountId,
+            toJSON: Draft.encodeStringArray(["maria@example.com"]), ccJSON: "[]", bccJSON: "[]",
+            subject: "Lunch", body: "Words the card sent", replyToId: nil,
+            isForward: false, editHistoryJSON: nil, createdAt: updatedAt, updatedAt: updatedAt,
+            serverDraftId: serverUid.map(String.init), serverPushStatus: serverUid == nil ? nil : "pushed",
+            rfc822MessageId: nil, attachmentsDirName: nil)
+        draft.instanceEpoch = "card-generation"
+        if serverUid != nil {
+            draft.serverDraftFolderPath = "Drafts"
+            draft.serverDraftUidValidity = Self.draftsEpoch
+        }
+        let toInsert = draft
+        let serverHeader = serverUid.map { Self.draftsHeader(uid: $0) }
+        try await fixture.pool.write { db in
+            if let serverHeader { try serverHeader.insert(db) }
+            try toInsert.insert(db)
+        }
+        return draft
+    }
+
+    /// The row of a server draft in Drafts, as the sync lists it.
+    private static func draftsHeader(uid: Int) -> MessageHeader {
+        MessageHeader(
+            messageId: String(uid), subject: "Lunch", from: "Me", fromAddress: "me@example.com",
+            to: "maria@example.com", date: Date(), snippet: "Lunch on Friday?",
+            folderId: "\(accountId):Drafts", accountId: accountId, folderPath: "Drafts", isInInbox: false)
+    }
+
+    /// The `MessageHeader` ids in Drafts.
+    private func draftsHeaders(_ fixture: Fixture) async throws -> [String] {
+        try await fixture.pool.read { db in
+            try MessageHeader.filter(Column("folderPath") == "Drafts").fetchAll(db).map(\.messageId).sorted()
+        }
+    }
+
+    nonisolated private static let draftsEpoch = 830_001
+
+    private static func draftsServer(_ messages: [(uid: Int, messageId: String)]) throws -> FakeIMAPServer {
+        let server = FakeIMAPServer(mailboxes: [
+            "Drafts": messages.map { message in
+                FakeIMAPServer.makeMessage(uid: message.uid, rfc822Text: """
+                From: Me <me@example.com>\r
+                To: Maria <maria@example.com>\r
+                Subject: Lunch\r
+                Message-ID: <\(message.messageId)>\r
+                Content-Type: text/plain\r
+                \r
+                Lunch on Friday?\r
+
+                """)
+            },
+        ])
+        server.setUidValidity(Self.draftsEpoch, for: "Drafts")
+        try server.start()
+        return server
+    }
+
+    private static func drainUntilSettled(_ pool: DatabasePool) async {
+        for _ in 0..<60 {
+            await AccountManager.shared.drainPendingQueue()
+            let remaining = (try? await pool.read { try PendingOperation.fetchCount($0) }) ?? 1
+            let quiescent = await AccountManager.shared.pendingQueueIsQuiescentForTesting()
+            if remaining == 0, quiescent { return }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    @Test("After the card's Send the chat's own saved draft is discarded, never the card's draft, which holds the sent words")
+    func sentChatDiscardsOnlyItsOwnDraft() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let draft = try await savedDraft(fixture, attachments: [])
+        let card = try await cardDraft(fixture)
+        #expect(Draft.isNewEmailKey(draft.id) && !Draft.isNewEmailKey(card.id), "control: the chat's key and the card's plain id")
+        let recorder = QueueRecorder()
+        let sent = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        let outcome = await sent.discardSavedDraft()
+        let chatRow = try await row(fixture, draft.id)
+        let cardRow = try await row(fixture, card.id)
+        #expect(outcome == .dismiss)
+        #expect(chatRow == nil, "the chat's own draft is gone")
+        #expect(cardRow?.body == "Words the card sent", "the card's draft stays")
+        #expect(cardRow?.instanceEpoch == "card-generation")
+    }
+
+    @Test("A sent chat's draft on the server is deleted there too, and only it: the card's server copy stays")
+    func sentChatDeletesOnlyItsOwnServerDraft() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        try FolderEpochTestFixture.insertFolder(
+            accountId: Self.accountId, path: "Drafts", role: .drafts, pool: fixture.pool,
+            lastKnownUidValidity: Self.draftsEpoch)
+        var saved = try await savedDraft(fixture, attachments: [])
+        saved.serverDraftId = "42"
+        saved.serverPushStatus = "pushed"
+        saved.serverDraftFolderPath = "Drafts"
+        saved.serverDraftUidValidity = Self.draftsEpoch
+        let pushed = saved
+        let chatHeader = Self.draftsHeader(uid: 42)
+        try await fixture.pool.write { db in
+            try chatHeader.insert(db)
+            try pushed.update(db)
+        }
+        let card = try await cardDraft(fixture, serverUid: 43)
+        let headersBefore = try await draftsHeaders(fixture)
+        #expect(headersBefore == ["42", "43"], "control: both server drafts are listed")
+        let server = try Self.draftsServer([(42, "chat-draft@example.com"), (43, "card-draft@example.com")])
+        defer { server.stop() }
+        server.expectMutation(rfc822MessageId: "chat-draft@example.com")
+        await AccountManager.shared.registerProviderForTesting(
+            accountId: Self.accountId,
+            provider: IMAPProvider(
+                host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+                smtpHost: "127.0.0.1", smtpPort: 587, useTLS: false))
+        let recorder = QueueRecorder()
+        let sent = ChatNewThreadModel(reopening: pushed, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+
+        let outcome = await sent.discardSavedDraft()
+        let queued = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }
+        await Self.drainUntilSettled(fixture.pool)
+        await AccountManager.shared.unregisterProviderForTesting(accountId: Self.accountId)
+
+        #expect(outcome == .dismiss)
+        #expect(queued.map(\.type) == [.deleteDraft], "one server delete queued")
+        let chatRow = try await row(fixture, pushed.id)
+        let cardRow = try await row(fixture, card.id)
+        let headersAfter = try await draftsHeaders(fixture)
+        #expect(chatRow == nil)
+        #expect(cardRow?.serverDraftId == "43", "the card's draft and its server copy are untouched")
+        #expect(headersAfter == ["43"], "only the chat's server draft left the Drafts list")
+        #expect(server.messageIDs(in: "Drafts") == ["<card-draft@example.com>"], "only the chat's server draft is gone")
+        #expect(server.wrongMessageViolations().isEmpty)
+    }
+
+    @Test("The sent chat's draft is discarded only after a save of it in flight has landed, never beside it")
+    func discardWaitsForTheSaveInFlight() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let recorder = QueueRecorder()
+        let model = makeModel(fixture, recorder)
+        model.words = "Lunch on Friday?"
+        // The database's writer is held, so the save is still running when the discard starts.
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        let (holding, holdingNow) = AsyncStream<Void>.makeStream()
+        let pool = fixture.pool
+        let hold = Task.detached {
+            try await pool.writeWithoutTransaction { _ in
+                holdingNow.yield(())
+                release.wait()
+            }
+        }
+        for await _ in holding { break }
+        let save = await Self.startedSave(model)
+        let saving = model.isSaving
+        #expect(saving, "control: the save is running, held at the database")
+        let discard = Task { @MainActor in await model.discardSavedDraft() }
+        try await Task.sleep(for: .milliseconds(100))
+        release.signal()
+        try await hold.value
+        let saved = await save.value
+        let outcome = await discard.value
+        let left = try await row(fixture, model.draftId)
+        #expect(saved == .saved, "the save landed")
+        #expect(recorder.calls == ["\(model.draftId)|\(Self.accountId)"], "control: its push was queued first")
+        #expect(outcome == .dismiss, "the discard ran once the save was done: \(outcome)")
+        #expect(left == nil, "and the saved draft is gone")
+    }
+
+    @Test("A sent chat whose reopened draft's attachments could not be read keeps that draft: the discard is refused and nothing is queued")
+    func unreadableAttachmentsKeepTheDraft() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let draft = try await savedDraft(fixture, readable: false)
+        let recorder = QueueRecorder()
+        let sent = ChatNewThreadModel(reopening: draft, account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
+        #expect(sent.attachmentLoadFailed, "control: its files could not be read")
+        let outcome = await sent.discardSavedDraft()
+        let afterRow = try await row(fixture, draft.id)
+        let after = try #require(afterRow, "the draft is kept")
+        let queued = try await fixture.pool.read { db in try PendingOperation.fetchCount(db) }
+        #expect(outcome == .refused(ChatNewThreadModel.attachmentLoadMessage))
+        #expect(after.attachmentsDirName == draft.attachmentsDirName, "it still names its files")
+        #expect(after.body == draft.body)
+        #expect(queued == 0, "no server delete")
     }
 
     @Test("Back and the background saving at once write the draft once")
