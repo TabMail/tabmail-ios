@@ -47,6 +47,13 @@ rewritten), typecheck it, restore the file, and repeat. A variant that passes in
 that passes only near the failing time has no headroom. `-debug-time-expression-type-checking` adds timings per
 expression. Restore the file after every variant (check `git diff`) before committing.
 
+The same check works for the test target: take the test target's failed command from the log (its `-module-name` is
+`TabMailTests`) and pass a test file as `-primary-file`. With `-emit-sil` in place of `-typecheck` (and one
+`-o /dev/null` for the primary file) it also runs the SIL diagnostic passes, where Swift 6's region-based isolation
+checks (sending a non-`Sendable` value across an isolation boundary) are reported; `-typecheck` stops before them.
+Checking every changed test file both ways before a build takes about 10 s per file per mode (2026-11-27: a test
+compile error, a call to a main-actor helper from a nonisolated local function, cost a build that this check finds).
+
 ## The rule
 
 - In such a body, a new modifier carries no logic inline: its closure calls a private method
