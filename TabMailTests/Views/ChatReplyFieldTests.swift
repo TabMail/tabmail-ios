@@ -831,7 +831,11 @@ struct ChatReplyFieldTests {
         // A row gone, or a send filed, reloads the chat's emails, so a sent reply's copy takes its place.
         #expect(Self.count("if sends.read(found) { viewModel.reloadThread() }", in: text) == 1)
         #expect(Self.count("if sends.follow(moves) { viewModel.reloadThread() } sends.end(shownIn: chatRowIds)", in: text) == 1)
-        #expect(Self.count(".onChange(of: chatRowIds) { _, shown in sends.end(shownIn: shown) }", in: text) == 1)
+        #expect(Self.count(".onChange(of: chatRowIds) { _, shown in endSends(shownIn: shown) }", in: text) == 1)
+        #expect(Self.count("private func endSends(shownIn rowIds: Set<String>) { sends.end(shownIn: rowIds) }", in: text) == 1)
+        // Each handler is wired from the body in one line (the body's chain is at the type checker's limit).
+        #expect(Self.count(".task(id: messageIds) { await observeSends() }", in: text) == 1)
+        #expect(Self.count(".onReceive(NotificationCenter.default.publisher(for: .mailPointersMoved)) { followMoves($0) }", in: text) == 1)
         #expect(Self.count("sends.read(", in: text) == 1 && Self.count("sends.follow(", in: text) == 1, "nothing else feeds them")
         // The bubbles show through the chat's outgoing rows, as on every chat, with this screen's Undo.
         #expect(Self.count("ChatOutgoingRows(unsentReplies: unsentReplies, heldGhost: heldGhost, fieldMessage: fieldMessage, morph: sentMorph, undoScreen: .chat) {", in: text) == 1)
