@@ -70,6 +70,24 @@ final class FakeSMTPServer: @unchecked Sendable {
         return upgradeBytes
     }
 
+    /// How often `bytesAfterSTARTTLS(count:within:)` looks again.
+    private static let upgradeCapturePollInterval: Duration = .milliseconds(10)
+
+    /// `bytesAfterSTARTTLS()` once `count` accepted upgrades are kept, or once
+    /// `seconds` pass. A connection's bytes are kept when the client hangs up,
+    /// which can come after the client's own call has returned.
+    func bytesAfterSTARTTLS(count: Int, within seconds: Double) async -> [[UInt8]] {
+        let deadline = Date().addingTimeInterval(seconds)
+        while bytesAfterSTARTTLS().count < count, Date() < deadline {
+            do {
+                try await Task.sleep(for: Self.upgradeCapturePollInterval)
+            } catch {
+                break
+            }
+        }
+        return bytesAfterSTARTTLS()
+    }
+
     func start() throws {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw ServerError.setup("socket() failed: \(errno)") }

@@ -40,10 +40,13 @@ extension MailTransportEncryptionTests {
     /// The first byte of a TLS handshake record (content type 22).
     private static let tlsHandshakeRecordType: UInt8 = 0x16
 
+    /// How long a test waits for the fake to keep every upgraded connection's bytes.
+    private static let upgradeCaptureWaitSeconds = 5.0
+
     /// After each accepted STARTTLS the client sent only TLS: its bytes begin
     /// with a handshake record and carry no plain-text AUTH or MAIL FROM.
-    private static func expectOnlyTLSAfterUpgrade(_ smtp: FakeSMTPServer, connections: Int) {
-        let sessions = smtp.bytesAfterSTARTTLS()
+    private static func expectOnlyTLSAfterUpgrade(_ smtp: FakeSMTPServer, connections: Int) async {
+        let sessions = await smtp.bytesAfterSTARTTLS(count: connections, within: upgradeCaptureWaitSeconds)
         #expect(sessions.count == connections, "\(sessions.count) upgraded connections")
         for bytes in sessions {
             #expect(bytes.first == tlsHandshakeRecordType, "\(Array(bytes.prefix(8)))")
@@ -70,7 +73,7 @@ extension MailTransportEncryptionTests {
         let lines = smtp.receivedLines()
         #expect(Self.askedForSTARTTLS(lines) == 3, "\(lines)")
         #expect(!Self.signedInOrSent(lines), "\(lines)")
-        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 3)
+        await Self.expectOnlyTLSAfterUpgrade(smtp, connections: 3)
     }
 
     /// Stands in for a certificate that does not verify, which needs a real
@@ -90,7 +93,7 @@ extension MailTransportEncryptionTests {
         #expect(message.contains("WRONG_VERSION_NUMBER"), "\(message)")
         #expect(last?.sentAt == nil)
         #expect(!Self.signedInOrSent(smtp.receivedLines()))
-        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 3)
+        await Self.expectOnlyTLSAfterUpgrade(smtp, connections: 3)
     }
 
     @Test("A server that hangs up during the STARTTLS handshake costs the send a strike, as on port 465")
@@ -106,7 +109,7 @@ extension MailTransportEncryptionTests {
         #expect(message.hasPrefix(Self.stored("handshakeFailed(")), "\(message)")
         #expect(message.contains("EOF during handshake"), "\(message)")
         #expect(Self.askedForSTARTTLS(smtp.receivedLines()) == 1)
-        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 1)
+        await Self.expectOnlyTLSAfterUpgrade(smtp, connections: 1)
     }
 
     // MARK: - Failures that can clear stay queued with no strike
@@ -169,7 +172,7 @@ extension MailTransportEncryptionTests {
         let lines = smtp.receivedLines()
         #expect(Self.askedForSTARTTLS(lines) == 1, "\(lines)")
         #expect(!Self.signedInOrSent(lines), "\(lines)")
-        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 1)
+        await Self.expectOnlyTLSAfterUpgrade(smtp, connections: 1)
     }
 
     // MARK: - The classifier on SwiftMail's exact wording
@@ -186,6 +189,8 @@ extension MailTransportEncryptionTests {
             "STARTTLS upgrade failed: SMTP connection failed: STARTTLS timeout",
             "STARTTLS upgrade failed: SMTP TLS failed: STARTTLS failed: " + Self.temporaryRefusal,
             "STARTTLS upgrade failed: SMTP connection failed: Connection closed",
+            // The server closed after accepting STARTTLS, before any TLS byte.
+            "STARTTLS upgrade failed: SMTP connection failed: Connection closed before the TLS handshake started",
             "STARTTLS upgrade failed: IOError: Connection reset by peer (errno: 54)",
             // Not an upgrade failure: the bare refusal keeps today's reading.
             "Server rejected STARTTLS",
@@ -199,10 +204,34 @@ extension MailTransportEncryptionTests {
                 + "error:1000007d:SSL routines:OPENSSL_internal:CERTIFICATE_VERIFY_FAILED at "
                 + "/tmp/tabmail-dd/SourcePackages/checkouts/swift-nio-ssl/Sources/CNIOBoringSSL/ssl/handshake.cc:288]))",
             "STARTTLS upgrade failed: handshakeFailed(NIOSSL.BoringSSLError.sslError([Error:  EOF during handshake]))",
+            // A certificate for another name: the expected host holds the marker words.
+            "STARTTLS upgrade failed: " + Self.hostnameMismatch("connection.example.com"),
+            "STARTTLS upgrade failed: " + Self.hostnameMismatch("smtp-timeout.example.com"),
         ]
         for reason in permanent {
             #expect(!AccountManager.isTransientSendError(SMTPError.tlsFailed(reason)), "\(reason)")
             #expect(!AccountManager.isFatalSendError(SMTPError.tlsFailed(reason)), "\(reason)")
         }
+    }
+
+    /// NIOSSL's text for a certificate that does not name `host`
+    /// (`NIOSSLExtraError.failedToValidateHostname(expectedName:)`).
+    private static func hostnameMismatch(_ host: String) -> String {
+        "NIOSSLExtraError.failedToValidateHostname: Couldn't find \(host) in certificate from peer"
+    }
+
+    /// The same error on port 465, where it reaches the Outbox bare.
+    private struct BareTransportError: Error, CustomStringConvertible {
+        let description: String
+    }
+
+    @Test("A certificate for another name takes the strikes on port 465 too, whatever the host is called")
+    func hostnameMismatchOnImplicitTLSIsNotTransient() {
+        for host in ["connection.example.com", "smtp-timeout.example.com", "Connection.example.com"] {
+            let error = BareTransportError(description: Self.hostnameMismatch(host))
+            #expect(!AccountManager.isTransientSendError(error), "\(error)")
+        }
+        // A connection problem still reads as one.
+        #expect(AccountManager.isTransientSendError(BareTransportError(description: "IOError: Connection reset by peer (errno: 54)")))
     }
 }

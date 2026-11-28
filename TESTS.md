@@ -1573,4 +1573,4 @@ on port 465; a 454 refusal and an unanswered STARTTLS stay queued with no strike
 `FakeSMTPServer.bytesAfterSTARTTLS` shows that after every accepted STARTTLS the client sent only a TLS
 handshake record, never a plain-text AUTH or MAIL FROM. `startTLSUpgradeFailureClassification` pins
 `AccountManager.isTransientSendError` on SwiftMail's exact wording, including the EHLO timeout after a completed
-upgrade, which no loopback fake can reach without a certificate.
+upgrade, which no loopback fake can reach without a certificate, the closed connection before the handshake (pinned in SwiftMail by `connectionClosedBeforeTheHandshakeIsAConnectionFailure`), and NIOSSL's hostname check for hosts whose names hold the transient words; `hostnameMismatchOnImplicitTLSIsNotTransient` checks the same error as it arrives bare on 465. `bytesAfterSTARTTLS(count:within:)` waits, bounded, for the fake to keep each connection's bytes, which it does only when the client hangs up.

@@ -832,10 +832,16 @@ extension AccountManager {
         return false
     }
 
+    /// How NIOSSL begins a certificate that does not name the server; the host
+    /// TabMail expected follows, so the text can hold either marker word below.
+    nonisolated static let hostnameValidationFailurePrefix = "NIOSSLExtraError.failedToValidateHostname"
+
     /// Whether the rendered text of a transport error (NIO, NIOSSL) reads as a
-    /// passing connection problem or a timeout.
+    /// passing connection problem or a timeout. A certificate for another name
+    /// never is, and is decided by its kind before the words are read.
     nonisolated static func isTransientTransportText(_ text: String) -> Bool {
-        text.contains("connection") || text.contains("timeout") || text.contains("Connection")
+        if text.hasPrefix(hostnameValidationFailurePrefix) { return false }
+        return text.contains("connection") || text.contains("timeout") || text.contains("Connection")
     }
 
     /// How SwiftMail begins its reason for a failed SMTP STARTTLS upgrade; the
