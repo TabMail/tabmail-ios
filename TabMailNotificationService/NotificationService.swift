@@ -109,7 +109,7 @@ final class NotificationService: UNNotificationServiceExtension {
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttemptContent: UNMutableNotificationContent?
     @TaskLocal static var reconnectTransport: TabMailSessionRefresh.Transport = {
-        try await URLSession.shared.data(for: $0)
+        try await URLSession.shared.data(for: $0, delegate: OwnServerRedirectPolicy.shared)
     }
     @TaskLocal static var visualCapability: @Sendable () async -> Bool = {
         let settings = await UNUserNotificationCenter.current().notificationSettings()

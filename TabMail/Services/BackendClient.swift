@@ -24,7 +24,9 @@ actor BackendClient {
     /// timeoutIntervalForResource caps the TOTAL request time regardless of bytes received,
     /// preventing stalled connections from holding semaphore slots for 5-16 minutes.
     /// The shared ephemeral session doesn't have this because it serves all HTTP traffic.
-    private let llmSession: URLSession
+    /// Like it, it never follows a redirect from TabMail's servers (`OwnServerRedirectPolicy`);
+    /// tests read the session to check that.
+    let llmSession: URLSession
 
     /// Test seam: inject a mock `URLSession` (e.g. `FakeHTTP.makeSession()`) to drive
     /// the streaming/tool-loop path in unit tests. Production passes nil → the default
@@ -34,11 +36,11 @@ actor BackendClient {
     /// llmSession but with the long-op resource cap — a single compaction of a
     /// large user_action.md can legitimately run for minutes. Stall detection
     /// remains the SSE heartbeat watchdog.
-    private lazy var llmLongOpSession: URLSession = {
+    private(set) lazy var llmLongOpSession: URLSession = {
         if let longOpSessionOverride { return longOpSessionOverride }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForResource = SyncConfig.llmLongOpResourceTimeoutSeconds
-        return URLSession(configuration: config)
+        return URLSession(configuration: config, delegate: OwnServerRedirectPolicy.shared, delegateQueue: nil)
     }()
 
     /// The injected session also serves the maintenance-class calls, so a manual compaction is testable.
@@ -52,7 +54,7 @@ actor BackendClient {
         self.llmSession = llmSession ?? {
             let config = URLSessionConfiguration.ephemeral
             config.timeoutIntervalForResource = SyncConfig.llmResourceTimeoutSeconds
-            return URLSession(configuration: config)
+            return URLSession(configuration: config, delegate: OwnServerRedirectPolicy.shared, delegateQueue: nil)
         }()
         longOpSessionOverride = llmSession
         self.isAIOff = isAIOff

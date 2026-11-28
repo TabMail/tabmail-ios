@@ -54,11 +54,12 @@ enum HTTPDeadline {
 /// Ephemeral = no persistent connection cache, no cookies, no credential storage.
 /// When TCP connections die during iOS suspension, the session creates fresh sockets
 /// on the next request — no manual reset needed. Single instance avoids
-/// "Cannot allocate memory" from per-request session creation.
+/// "Cannot allocate memory" from per-request session creation. A request to
+/// TabMail's own servers never follows a redirect (`OwnServerRedirectPolicy`).
 let sharedEphemeralSession: URLSession = {
     let config = URLSessionConfiguration.ephemeral
     config.timeoutIntervalForResource = HTTPConfig.sharedResourceTimeoutSeconds
-    return URLSession(configuration: config)
+    return URLSession(configuration: config, delegate: OwnServerRedirectPolicy.shared, delegateQueue: nil)
 }()
 
 /// Result of an HTTP request — success returns data, failure returns nil data + status code.

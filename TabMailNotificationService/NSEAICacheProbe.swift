@@ -49,7 +49,7 @@ enum NSEAICacheProbe {
         request.httpBody = try? JSONSerialization.data(withJSONObject: ["keys": [key]])
         request.timeoutInterval = 3 // Fast timeout — peers should respond quickly
 
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        guard let (data, response) = try? await URLSession.shared.data(for: request, delegate: OwnServerRedirectPolicy.shared),
               let httpResponse = response as? HTTPURLResponse,
               httpResponse.statusCode == 200 else {
             NSELog.step("NSE probe: request failed or non-200")
