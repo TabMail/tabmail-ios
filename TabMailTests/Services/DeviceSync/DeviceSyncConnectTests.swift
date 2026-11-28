@@ -343,6 +343,15 @@ struct DeviceSyncConnectTests {
         head.split(separator: "\r\n").contains { $0.lowercased().hasPrefix("authorization:") }
     }
 
+    /// A socket's address without its scheme ("//host:port/path?query"): on the simulator a WebSocket task
+    /// reports its request as `http`, not the `ws` it was made with. What reached the relay is checked by
+    /// the request line it received.
+    nonisolated private static func address(_ url: URL?) -> String? {
+        guard let url, var parts = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        parts.scheme = nil
+        return parts.string
+    }
+
     @Test("A connect opens the socket with a fresh pass; the upgrade carries neither the token nor an Authorization header")
     func connectOpensTheSocketWithAPass() async throws {
         let relay = try LoopbackRecorder()
@@ -359,7 +368,8 @@ struct DeviceSyncConnectTests {
             #expect(passTokens == [Self.token])
             #expect(passBases == [Self.relayBase])
             let request = try #require(sync.webSocket?.originalRequest)
-            #expect(request.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=pass-1")
+            let address = Self.address(request.url)
+            #expect(address == "//127.0.0.1:\(port)/ws?pass=pass-1")
             #expect(request.value(forHTTPHeaderField: "Authorization") == nil)
 
             let heads = await relay.heads(atLeast: 1, waitingUpTo: .seconds(10))
@@ -398,7 +408,8 @@ struct DeviceSyncConnectTests {
 
             let passTokens = script.passRequests.map { $0.token }
             #expect(passTokens == [Self.token(1), Self.token(2)], "the retry asked for a pass with a token of its own")
-            #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=pass-2")
+            let address = Self.address(sync.webSocket?.originalRequest?.url)
+            #expect(address == "//127.0.0.1:\(port)/ws?pass=pass-2")
             let heads = await relay.heads(atLeast: 1, waitingUpTo: .seconds(10))
             let requestLines = heads.map(Self.requestLine)
             #expect(requestLines == ["GET /ws?pass=pass-2 HTTP/1.1"])
@@ -428,7 +439,8 @@ struct DeviceSyncConnectTests {
             #expect(passTokens == [Self.token(1), Self.token(2)], "the retry asked for a pass with a token of its own")
             #expect(sync.reconnectAttempts == 1, "the refused socket took the shared backoff's first step")
             await waitUntil { sync.webSocket?.originalRequest?.url?.query == "pass=pass-2" }
-            #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=pass-2")
+            let address = Self.address(sync.webSocket?.originalRequest?.url)
+            #expect(address == "//127.0.0.1:\(port)/ws?pass=pass-2")
         }
     }
 
@@ -495,7 +507,8 @@ struct DeviceSyncConnectTests {
 
             let passTokens = script.passRequests.map { $0.token }
             #expect(passTokens == [Self.token(1), Self.token(2)], "the active connect asked for a pass with a fresh token")
-            #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=pass-2")
+            let address = Self.address(sync.webSocket?.originalRequest?.url)
+            #expect(address == "//127.0.0.1:\(port)/ws?pass=pass-2")
             let heads = await relay.heads(atLeast: upgrades.count + 1, waitingUpTo: .seconds(10))
             let requestLines = heads.map(Self.requestLine)
             #expect(requestLines.count == upgrades.count + 1)
@@ -592,7 +605,8 @@ struct DeviceSyncConnectTests {
                 script.answerToken(2, .success(Self.token))
                 await waitUntil { sync.webSocket != nil }
                 let pass = "pass-\(late.wait == .pass ? 2 : 1)"
-                #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=\(pass)")
+                let address = Self.address(sync.webSocket?.originalRequest?.url)
+                #expect(address == "//127.0.0.1:\(port)/ws?pass=\(pass)")
                 let writtenByTheReplacement = Self.timestamps()
                 #expect(writtenByTheReplacement == [Self.epochZero, Self.epochZero, Self.epochZero])
             case .disconnect:
@@ -639,7 +653,8 @@ struct DeviceSyncConnectTests {
 
             let firstBases = script.passRequests.map { $0.relayBase }
             #expect(firstBases == [Self.relayBase])
-            #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(firstPort)/ws?pass=pass-1")
+            let firstAddress = Self.address(sync.webSocket?.originalRequest?.url)
+            #expect(firstAddress == "//127.0.0.1:\(firstPort)/ws?pass=pass-1")
 
             sync.disconnect()
             sync.connect()
@@ -647,7 +662,8 @@ struct DeviceSyncConnectTests {
 
             let bothBases = script.passRequests.map { $0.relayBase }
             #expect(bothBases == [Self.relayBase, Self.otherRelayBase])
-            #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(secondPort)/ws?pass=pass-2")
+            let secondAddress = Self.address(sync.webSocket?.originalRequest?.url)
+            #expect(secondAddress == "//127.0.0.1:\(secondPort)/ws?pass=pass-2")
         }
     }
 
