@@ -260,14 +260,14 @@ struct BackendConfigConstantTests {
         #expect(BackendConfig.syncBaseURL.hasPrefix("https://"))
     }
 
-    @Test("syncWebSocketURL starts with wss")
+    @Test("The Device Sync socket address starts with wss")
     func syncWSS() {
-        #expect(BackendConfig.syncWebSocketURL.hasPrefix("wss://"))
+        #expect(BackendConfig.syncEndpoints.webSocket.hasPrefix("wss://"))
     }
 
-    @Test("syncWebSocketURL ends with /ws")
+    @Test("The Device Sync socket address ends with /ws")
     func syncWSPath() {
-        #expect(BackendConfig.syncWebSocketURL.hasSuffix("/ws"))
+        #expect(BackendConfig.syncEndpoints.webSocket.hasSuffix("/ws"))
     }
 
     @Test("templatesBaseURL has HTTPS scheme")

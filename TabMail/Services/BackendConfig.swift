@@ -36,13 +36,15 @@ enum BackendConfig {
             : URL(string: "https://api.tabmail.ai")!
     }
 
-    static var syncBaseURL: String {
-        useDevServers ? "https://sync-dev.tabmail.ai" : "https://sync.tabmail.ai"
+    /// Device Sync's HTTPS base and socket address from one read of the setting. A connect takes
+    /// both from one snapshot, so it asks for its pass at the host its socket then opens.
+    static var syncEndpoints: (base: String, webSocket: String) {
+        useDevServers
+            ? ("https://sync-dev.tabmail.ai", "wss://sync-dev.tabmail.ai/ws")
+            : ("https://sync.tabmail.ai", "wss://sync.tabmail.ai/ws")
     }
 
-    static var syncWebSocketURL: String {
-        useDevServers ? "wss://sync-dev.tabmail.ai/ws" : "wss://sync.tabmail.ai/ws"
-    }
+    static var syncBaseURL: String { syncEndpoints.base }
 
     static var templatesBaseURL: URL {
         useDevServers
