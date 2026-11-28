@@ -22,13 +22,13 @@ struct ChatReplyToChoice: Equatable {
         if ticked.remove(person.address) == nil { ticked.insert(person.address) }
     }
 
-    /// Adds the address in `text` (a contact pick, or a typed address), ticked. Nothing for text
-    /// that names no address or names the user. Returns whether someone was added or ticked.
+    /// Adds the address in `text` (a contact pick, or a typed address), ticked; one of the user's
+    /// own addresses too, as asked (a note to self). Nothing for text that names no address. Returns
+    /// whether someone was added or ticked.
     @discardableResult
-    mutating func add(_ text: String, name: String? = nil, ownAddresses: Set<String>) -> Bool {
+    mutating func add(_ text: String, name: String? = nil) -> Bool {
         guard let recipient = RecipientEntry(text).recipients.first else { return false }
         let address = recipient.address.lowercased()
-        guard !ownAddresses.contains(address) else { return false }
         if !people.contains(where: { $0.address == address }) {
             let shownName = [name, recipient.name].compactMap { $0 }.first { !$0.isEmpty }
             people.append(ChatThread.Person(address: address, name: shownName ?? ChatThread.fallbackName(address)))
@@ -56,7 +56,6 @@ struct ChatReplyToChoice: Equatable {
 /// section of the people the user recently sent email to.
 struct ChatReplyToSheet: View {
     let replyPeople: [ChatThread.Person]
-    let ownAddresses: Set<String>
     let title: String
     /// The recent people, read as the sheet opens (`ChatRecentPeople`); nil: no Recent section.
     let recentPeople: (@MainActor () async -> [ChatThread.Person])?
@@ -76,11 +75,10 @@ struct ChatReplyToSheet: View {
     static let personId = "chatReplyToPerson"
     static let recentId = "chatRecentPerson"
 
-    init(replyPeople: [ChatThread.Person], target: ChatReplyTarget, ownAddresses: Set<String>,
+    init(replyPeople: [ChatThread.Person], target: ChatReplyTarget,
          title: String = Self.replyToTitle, recentPeople: (@MainActor () async -> [ChatThread.Person])? = nil,
          onDone: @escaping (ChatReplyTarget) -> Void) {
         self.replyPeople = replyPeople
-        self.ownAddresses = ownAddresses
         self.title = title
         self.recentPeople = recentPeople
         self.onDone = onDone
@@ -160,13 +158,13 @@ struct ChatReplyToSheet: View {
     }
 
     private func addTyped() {
-        if choice.add(query, ownAddresses: ownAddresses) { query = "" }
+        if choice.add(query) { query = "" }
     }
 
     /// A search result or a Recent row: added, ticked, and the search cleared, so Done does not
     /// add the typed text as well.
     private func pick(_ address: String, name: String) {
-        choice.add(address, name: name, ownAddresses: ownAddresses)
+        choice.add(address, name: name)
         query = ""
     }
 

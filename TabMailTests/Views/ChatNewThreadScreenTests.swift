@@ -1014,38 +1014,38 @@ struct ChatNewThreadScreenTests {
             && labels(of: ChatNewThreadView.hintId, in: screen.view).isEmpty
     }
 
-    @Test("With someone picked, the header's sheet lists who is picked, and the user's own addresses (every account's) typed there are not added")
+    @Test("With someone picked, the header's sheet lists who is picked, and the user's own addresses (every account's) typed there are added like anyone's")
     func pickedPeople() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
         try await HostedAccessibility.withAutomation { try await pickedPeopleBody() }
     }
 
     private func pickedPeopleBody() async throws {
-        // The app's debug log, on for this test: the screen's own-address read logs there when it
-        // fails, and the last check below reports those lines.
-        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
-        defer { DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil } }
         let fixture = try fixture()
         defer { finish(fixture) }
         // The user's second account, whose address is the user's own too. It is stored with
-        // capitals, as an address can be set up: the sheet compares addresses in lower case.
+        // capitals, as an address can be set up: the sheet keeps addresses in lower case.
         let otherAccount = try FolderEpochTestFixture.makeAccount(id: "\(Self.accountId)-Other", provider: .imap, pool: fixture.pool)
         let recorder = QueueRecorder()
         let model = ChatNewThreadModel(account: fixture.account, queueDraftSave: { recorder.queue($0, $1) })
         model.setPeople([ChatThread.Person(address: "maria@example.com", name: "Maria")])
         try await withScreen(model) { screen in
             // The user's addresses are every account's: this email's account and the other one.
-            // The screen reads them as it opens (`loadOwnAddresses`); the window before that read
-            // ends is tabmail-ios#1236. This read is the test's own: it confirms both accounts are
-            // in the database the screen reads, not that the screen has read them.
+            // The screen reads them as it opens (`loadOwnAddresses`). This read is the test's own:
+            // it confirms both accounts are in the database the screen reads, so the sheet would
+            // have them to refuse.
             let ownAddresses = [fixture.account.emailAddress, otherAccount.emailAddress]
             try await Self.waitUntil { try await Set(Self.accountAddresses()).isSuperset(of: ownAddresses) }
             let known = try await Self.accountAddresses()
             #expect(Set(known).isSuperset(of: ownAddresses), "control: the database the screen reads has both accounts: \(known)")
-            // Each address typed in turn; the last, someone else's, is added, which shows typed
-            // text reaches the sheet's choice in this test.
-            let typed: [(address: String, people: [String])] = ownAddresses.map { (address: $0, people: ["maria@example.com"]) }
-                + [(address: "sam@example.com", people: ["maria@example.com", "sam@example.com"])]
+            // Each address typed in turn joins the people picked: the user's own two, then
+            // someone else's.
+            let own = ownAddresses.map { $0.lowercased() }
+            let typed: [(address: String, people: [String])] = [
+                (address: ownAddresses[0], people: ["maria@example.com", own[0]]),
+                (address: ownAddresses[1], people: ["maria@example.com"] + own),
+                (address: "sam@example.com", people: ["maria@example.com"] + own + ["sam@example.com"]),
+            ]
             for entry in typed {
                 let names = try #require(Self.names(in: screen.view))
                 #expect(names.accessibilityActivate())
@@ -1063,8 +1063,7 @@ struct ChatNewThreadScreenTests {
                 #expect(done.accessibilityActivate(), "Done takes a tap")
                 try await Self.waitUntil { Self.topPresented(screen) == nil }
                 #expect(Self.topPresented(screen) == nil, "Done closes the sheet")
-                let screenLog = AppLogStore.read(channel: .debug).split(separator: "\n").filter { $0.contains("[ChatNewEmail]") }
-                #expect(model.people.map(\.address) == entry.people, "\(entry.address): only someone else's address is added; the screen's log: \(screenLog.suffix(10))")
+                #expect(model.people.map(\.address) == entry.people, "\(entry.address) is added")
             }
         }
     }

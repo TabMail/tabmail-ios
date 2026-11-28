@@ -97,7 +97,7 @@ struct ChatRecentPeopleTests {
         #expect(choice.unlisted([maria, sam, jordan]) == [sam, jordan], "Maria is picked already")
         choice.toggle(maria)
         #expect(choice.unlisted([maria, sam]) == [sam], "an unticked person is still in the list")
-        let added = choice.add(sam.address, name: sam.name, ownAddresses: Self.own)
+        let added = choice.add(sam.address, name: sam.name)
         #expect(added)
         #expect(choice.isTicked(sam), "added ticked, as a search result")
         #expect(choice.people.last == sam, "under the name the Recent row shows")

@@ -26,3 +26,9 @@ same addresses through `thread`, so the body already depended on them.
 **Still open:** the sheet can open, and a contact can be picked, before the read finishes, and a failed
 read leaves the set empty (tabmail-ios#1236, P4). A stored account email with spaces around it is not
 trimmed before the comparison (tabmail-ios#1245).
+
+**Update 2026-11-28:** the sheet no longer refuses the user's own addresses: a typed or picked own
+address is added like anyone's (ADR-IOS-114 decision 11, amendment of 2026-11-28). The captured
+`ownAddresses` still matter: the Add recipient sheet's Recent section leaves them out
+(`ChatRecentPeople.load`), and a stale empty capture would list the user there. The rule of thumb
+above is unchanged.
