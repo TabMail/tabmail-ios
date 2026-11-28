@@ -1867,7 +1867,9 @@ extension SyncEngine {
                                             // refuses every range's SEARCH the same way, so it
                                             // stops the worker like an unreachable server
                                             // (`BackfillEncryptionRefusalTests`); walking on
-                                            // opened one refused connection per range.
+                                            // opened about one refused connection per round
+                                            // of workers (they share each refused attempt),
+                                            // down to UID 1.
                                             await cursor.failRange(from: range.from, to: range.to)
                                             outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")
