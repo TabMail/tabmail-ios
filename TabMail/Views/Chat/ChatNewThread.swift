@@ -104,8 +104,9 @@ enum ChatNewDraft {
         done.only ?? current
     }
 
-    /// The line the empty chat shows before anyone is picked.
-    static let emptyHint = "New email. Type what you want to say, or ask TabMail to write it."
+    /// The lines the empty chat shows before anyone is picked: "New email." on a line of its own, then
+    /// what to do.
+    static let emptyHint = "New email.\nType what you want to say, or ask TabMail to write it."
 
     /// The line the chat shows once people are picked: "New email to Maria and Sam."
     static func recipientsLine(_ people: [ChatThread.Person]) -> String? {

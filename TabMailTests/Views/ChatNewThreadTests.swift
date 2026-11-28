@@ -205,7 +205,8 @@ struct ChatNewThreadTests {
         #expect(one == "New email to Maria.")
         #expect(two == "New email to Maria and Sam.")
         #expect(three == "New email to Maria, Sam and Lee.")
-        #expect(ChatNewDraft.emptyHint == "New email. Type what you want to say, or ask TabMail to write it.")
+        // "New email." stands on a line of its own, then what to do.
+        #expect(ChatNewDraft.emptyHint == "New email.\nType what you want to say, or ask TabMail to write it.")
     }
 
     @Test("A saved draft's line has the time, and the date too when it was saved before today")
