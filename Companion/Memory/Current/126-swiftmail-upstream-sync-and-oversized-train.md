@@ -573,6 +573,7 @@ serializer that writes recipients:
   file under the length limit.
 - App side: re-pinned in `project.yml` and the root `Package.resolved`. `AccountManager.isTransientSTARTTLSFailure`
   relies on two pieces of library wording, the reason prefix `STARTTLS upgrade failed: ` and the "SMTP " that
-  begins every `SMTPError` rendering. `isTransientTransportText` decides NIOSSL's hostname check (`NIOSSLExtraError.failedToValidateHostname`, whose
-  text names the host) by that kind first, so a host name holding "connection" or "timeout" cannot make it transient. The app's end-to-end tests run both through the pinned library, so a
+  begins every `SMTPError` rendering. `isTransientTransportText` decides NIOSSL's two host-name check failures (`NIOSSLExtraError.failedToValidateHostname`
+  and `.serverHostnameImpossibleToMatch`, whose texts name the host) by their kind first, so a host name holding
+  "connection" or "timeout" cannot make them transient. The app's end-to-end tests run both through the pinned library, so a
   wording change upstream fails them at the next re-pin. Detail: `IOS-TLS-002`, amendment 2026-11-28.

@@ -207,6 +207,8 @@ extension MailTransportEncryptionTests {
             // A certificate for another name: the expected host holds the marker words.
             "STARTTLS upgrade failed: " + Self.hostnameMismatch("connection.example.com"),
             "STARTTLS upgrade failed: " + Self.hostnameMismatch("smtp-timeout.example.com"),
+            // A server name the check cannot match at all (an underscore), holding a marker word.
+            "STARTTLS upgrade failed: " + Self.unmatchableHostname("timeout_mail.example.com"),
         ]
         for reason in permanent {
             #expect(!AccountManager.isTransientSendError(SMTPError.tlsFailed(reason)), "\(reason)")
@@ -220,15 +222,26 @@ extension MailTransportEncryptionTests {
         "NIOSSLExtraError.failedToValidateHostname: Couldn't find \(host) in certificate from peer"
     }
 
-    /// The same error on port 465, where it reaches the Outbox bare.
+    /// NIOSSL's text for a server name its check cannot match, such as one with an
+    /// underscore (`NIOSSLExtraError.serverHostnameImpossibleToMatch(hostname:)`).
+    private static func unmatchableHostname(_ host: String) -> String {
+        "NIOSSLExtraError.serverHostnameImpossibleToMatch: The server hostname \(host) cannot be matched "
+            + "due to containing non-DNS characters"
+    }
+
+    /// The same errors on port 465, where they reach the Outbox bare.
     private struct BareTransportError: Error, CustomStringConvertible {
         let description: String
     }
 
-    @Test("A certificate for another name takes the strikes on port 465 too, whatever the host is called")
+    @Test("A failed host-name check takes the strikes on port 465 too, whatever the host is called")
     func hostnameMismatchOnImplicitTLSIsNotTransient() {
         for host in ["connection.example.com", "smtp-timeout.example.com", "Connection.example.com"] {
             let error = BareTransportError(description: Self.hostnameMismatch(host))
+            #expect(!AccountManager.isTransientSendError(error), "\(error)")
+        }
+        for host in ["timeout_mail.example.com", "connection_mail.example.com"] {
+            let error = BareTransportError(description: Self.unmatchableHostname(host))
             #expect(!AccountManager.isTransientSendError(error), "\(error)")
         }
         // A connection problem still reads as one.
