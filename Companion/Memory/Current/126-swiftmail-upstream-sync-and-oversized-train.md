@@ -555,7 +555,7 @@ serializer that writes recipients:
 - Fork branch `fix/smtp-starttls-error-detail` on fork `main` `64b294d`: "Report the TLS error when a STARTTLS
   upgrade fails" (`e4f5f9f0`) and the review follow-ups "Record only handshake errors and keep EHLO parameters
   as sent" (`fbfcddf0`) and "Report a close before the STARTTLS handshake as a connection failure"
-  (`43d9d191`, the pin). It lands on fork `main` after review, and the same change, rebased on
+  (`43d9d191`), and "Test that a reset during the STARTTLS handshake beats the later EOF" (`439e3045`, the pin). It lands on fork `main` after review, and the same change, rebased on
   `upstream/main`, becomes an upstream PR. Upstream had moved past the pin (#339, #341, #344); that
   resync is separate work and needs its own collision check.
 - Cause, measured: after STARTTLS the client sent its EHLO without waiting for the handshake. A failed
@@ -563,7 +563,8 @@ serializer that writes recipients:
   5`), so a below-TLS-1.2 server and a bad certificate read the same and stayed queued as transient
   `.tlsFailed`. `TLSHandshakeErrorRecorder`, added before the TLS handler (whose `handlerAdded` starts the
   handshake at once) and so sitting right after it, keeps the first error the channel reports until
-  `TLSUserEvent.handshakeCompleted`, and the failed upgrade reports it. After the handshake nothing is recorded,
+  `TLSUserEvent.handshakeCompleted`, and the failed upgrade reports it. The FIRST error wins: a read reset mid-handshake is followed by NIOSSL's
+  "EOF during handshake" when the channel goes inactive, and the reset (transient) must not be replaced by the EOF (a strike). After the handshake nothing is recorded,
   so a server's own reply (a 421 followed by a close without a TLS close notification) stays the result. No
   wait, timeout or reordering is added. A connection that closes after the 220 and before the TLS handler is in
   (`ChannelError.ioOnClosedChannel` while adding it) is reported as `SMTPError.connectionFailed("Connection closed
