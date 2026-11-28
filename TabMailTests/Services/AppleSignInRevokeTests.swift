@@ -828,14 +828,17 @@ struct AppleSignInRevokeWiringTests {
         #expect(start.upperBound < end.lowerBound)
         guard start.upperBound < end.lowerBound else { return }
         let view = String(text[start.upperBound..<end.lowerBound])
-        #expect(view.contains(
-            "Text(AccountDeletionCopy.keepAccountConsequence) .font(.caption) .foregroundStyle(.secondary) " +
-            ".multilineTextAlignment(.center) .padding(.horizontal) " +
-            "if showsAppleManualStop { VStack(spacing: 6) { Text(AccountDeletionCopy.appleSignInManualStop) " +
-            ".font(.subheadline) .foregroundStyle(.secondary) .multilineTextAlignment(.center) " +
-            "if let supportURL = URL(string: AccountDeletionCopy.appleSignInSupportURL) { " +
-            "Link(\"How to stop using Sign in with Apple\", destination: supportURL) .font(.subheadline) } } " +
-            ".padding(.horizontal) } if let errorMessage { Text(errorMessage)"))
+        // Built outside the macro: a long `+` chain inside `#expect` cannot be type-checked in reasonable time.
+        let manualSteps = [
+            "Text(AccountDeletionCopy.keepAccountConsequence) .font(.caption) .foregroundStyle(.secondary) ",
+            ".multilineTextAlignment(.center) .padding(.horizontal) ",
+            "if showsAppleManualStop { VStack(spacing: 6) { Text(AccountDeletionCopy.appleSignInManualStop) ",
+            ".font(.subheadline) .foregroundStyle(.secondary) .multilineTextAlignment(.center) ",
+            "if let supportURL = URL(string: AccountDeletionCopy.appleSignInSupportURL) { ",
+            "Link(\"How to stop using Sign in with Apple\", destination: supportURL) .font(.subheadline) } } ",
+            ".padding(.horizontal) } if let errorMessage { Text(errorMessage)",
+        ].joined()
+        #expect(view.contains(manualSteps))
         #expect(Self.count("showsAppleManualStop", in: view) == 2, "declared and the guard")
         #expect(Self.count("AccountDeletionCopy.appleSignInManualStop", in: text) == 1)
         #expect(Self.count("AccountDeletionCopy.appleSignInSupportURL", in: text) == 1)
