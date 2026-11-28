@@ -356,7 +356,7 @@ struct OwnServerRedirectPolicyTests {
     func configuredEndpointsAreOwn() throws {
         var endpoints = [BackendConfig.apiBaseURL, BackendConfig.templatesBaseURL, BackendConfig.billingBaseURL,
                          BackendConfig.trialFeedbackURL, BackendConfig.appleWebhookBaseURL]
-        for address in [BackendConfig.syncBaseURL, BackendConfig.syncWebSocketURL, PushConfig.baseURL] {
+        for address in [BackendConfig.syncEndpoints.base, BackendConfig.syncEndpoints.webSocket, PushConfig.baseURL] {
             let url = try #require(URL(string: address))
             endpoints.append(url)
         }
@@ -531,7 +531,7 @@ struct OwnServerRedirectPolicyTests {
         var sharedUses: [String] = []
         var newSessions: [String] = []
         var deviceSyncSessions = 0
-        var aiSends = 0
+        var policySends = 0
         var misses: [String] = []
         var uses: [String: Int] = [:]
         for file in files {
@@ -556,7 +556,7 @@ struct OwnServerRedirectPolicyTests {
                 }
                 if file.path == Self.backendClientFile, Self.sendCalls.contains(where: { code.contains($0) }) {
                     if code.contains(Self.policy) {
-                        aiSends += 1
+                        policySends += 1
                     } else if !code.contains("sharedEphemeralSession.") {
                         misses.append("\(file.path): \(code)")
                     }
@@ -569,6 +569,6 @@ struct OwnServerRedirectPolicyTests {
         #expect(extensionUses.count >= 5, "the scan found the extension's requests: \(sharedUses)")
         #expect(newSessions.count >= 5, "the scan found the app's sessions: \(newSessions)")
         #expect(deviceSyncSessions == 1, "the scan found the device sync session")
-        #expect(aiSends >= 2, "the scan found the AI requests")
+        #expect(policySends >= 3, "the scan found the AI requests and the sync connect pass")
     }
 }
