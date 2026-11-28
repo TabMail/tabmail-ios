@@ -137,7 +137,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     /// failing URL in userInfo (`NSErrorFailingURLStringKey`) — for this
     /// service that URL once embedded the auth token as a query parameter
     /// (`ws?token=JWT`), so interpolating the raw error put a live
-    /// credential into the console capture (observed 2026-06-09). The URL now
+    /// credential into the console capture. The URL now
     /// carries a one-time connect pass instead (`socketURL`): a redeemed pass is
     /// spent, but one whose handshake failed can stay good for a few seconds,
     /// and a query is nothing a log needs anyway. Render only

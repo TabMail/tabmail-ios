@@ -2,31 +2,59 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import CryptoKit
 import Foundation
 import Network
 import Synchronization
 import Testing
 @testable import TabMail
 
+/// What a `LoopbackRecorder` sends on a connection once its request head is in.
+private enum LoopbackReply {
+    /// The bytes, then the connection closes.
+    case closing(Data)
+    /// The bytes, and the connection stays open (an accepted WebSocket upgrade).
+    case open(Data)
+}
+
+/// The listener did not become ready.
+private struct LoopbackNotReady: Error {}
+
+/// True once, for the first caller.
+private final class Once: @unchecked Sendable {
+    private let claimed = Mutex(false)
+
+    func claim() -> Bool {
+        claimed.withLock { wasClaimed in
+            defer { wasClaimed = true }
+            return !wasClaimed
+        }
+    }
+}
+
 /// Accepts TCP connections on the loopback interface and records the request head each one sends. Connection N
-/// (counted from 0) gets `answer(N)` once its head is in and is then closed; with no answer it stays open
-/// without a reply, so a WebSocket client's upgrade stays pending while a test looks at it.
+/// (counted from 0) with head H gets `answer(N, H)` once its head is in; with no answer it stays open without a
+/// reply, so a WebSocket client's upgrade stays pending while a test looks at it.
 private final class LoopbackRecorder: @unchecked Sendable {
+    /// How long `start` waits for the listener to become ready.
+    static let readyTimeoutSeconds = 10.0
+
     private let listener: NWListener
     private let queue = DispatchQueue(label: "loopback-recorder")
     private let heads = Mutex<[String]>([])
-    private let answer: @Sendable (Int) -> Data?
+    private let answer: @Sendable (Int, String) -> LoopbackReply?
     /// Read and written on `queue` only.
     private var connections: [NWConnection] = []
 
-    init(answer: @escaping @Sendable (Int) -> Data? = { _ in nil }) throws {
+    init(answer: @escaping @Sendable (Int, String) -> LoopbackReply? = { _, _ in nil }) throws {
         let parameters = NWParameters.tcp
         parameters.requiredInterfaceType = .loopback
         listener = try NWListener(using: parameters, on: .any)
         self.answer = answer
     }
 
-    /// Starts listening; the port it listens on.
+    /// Starts listening; the port it listens on. Throws, and so fails the test at once, if the listener
+    /// fails, is left waiting for a network path, is cancelled, or is not ready in `readyTimeoutSeconds`.
     func start() async throws -> UInt16 {
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
@@ -36,20 +64,29 @@ private final class LoopbackRecorder: @unchecked Sendable {
             self.read(connection, index, Data())
         }
         let listener = listener
+        let queue = queue
         return try await withCheckedThrowingContinuation { continuation in
+            let once = Once()
+            let finish: @Sendable (Result<UInt16, any Error>) -> Void = { result in
+                guard once.claim() else { return }
+                listener.stateUpdateHandler = nil
+                if case .failure = result { listener.cancel() }
+                continuation.resume(with: result)
+            }
             listener.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    listener.stateUpdateHandler = nil
-                    continuation.resume(returning: listener.port?.rawValue ?? 0)
-                case .failed(let error):
-                    listener.stateUpdateHandler = nil
-                    continuation.resume(throwing: error)
+                    finish(.success(listener.port?.rawValue ?? 0))
+                case .failed(let error), .waiting(let error):
+                    finish(.failure(error))
+                case .cancelled:
+                    finish(.failure(LoopbackNotReady()))
                 default:
                     break
                 }
             }
             listener.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + Self.readyTimeoutSeconds) { finish(.failure(LoopbackNotReady())) }
         }
     }
 
@@ -61,8 +98,13 @@ private final class LoopbackRecorder: @unchecked Sendable {
             if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
                 let head = String(decoding: buffer[..<end.lowerBound], as: UTF8.self)
                 self.heads.withLock { $0.append(head) }
-                if let reply = self.answer(index) {
+                switch self.answer(index, head) {
+                case .closing(let reply):
                     connection.send(content: reply, completion: .contentProcessed { _ in connection.cancel() })
+                case .open(let reply):
+                    connection.send(content: reply, completion: .contentProcessed { _ in })
+                case nil:
+                    break
                 }
                 return
             }
@@ -86,6 +128,26 @@ private final class LoopbackRecorder: @unchecked Sendable {
             self.connections.forEach { $0.cancel() }
             self.connections = []
         }
+    }
+
+    /// The GUID RFC 6455 appends to a client's key to derive the server's accept value.
+    private static let webSocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    /// A relay's acceptance of the WebSocket upgrade in `head` (RFC 6455 section 4.2.2), followed by one
+    /// unmasked text frame carrying `message` (under 126 bytes).
+    static func acceptedUpgrade(_ head: String, then message: String) -> Data? {
+        let keyLine = head.split(separator: "\r\n").first { $0.lowercased().hasPrefix("sec-websocket-key:") }
+        guard let keyLine, let colon = keyLine.firstIndex(of: ":") else { return nil }
+        let key = keyLine[keyLine.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        let accept = Data(Insecure.SHA1.hash(data: Data((key + webSocketGUID).utf8))).base64EncodedString()
+        let payload = Data(message.utf8)
+        guard payload.count < 126 else { return nil }
+        var reply = Data(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n".utf8
+        )
+        reply.append(contentsOf: [0x81, UInt8(payload.count)])
+        reply.append(payload)
+        return reply
     }
 }
 
@@ -146,12 +208,22 @@ private final class ConnectScript {
     func isTokenHeld(_ request: Int) -> Bool { heldTokens[request] != nil }
     func isPassHeld(_ request: Int) -> Bool { heldPasses[request] != nil }
 
+    /// Answers held token request `request`; a request that is not held is a failed test, never a silent no-op.
     func answerToken(_ request: Int, _ result: TabMailTokenCoordinator.RefreshResult) {
-        heldTokens.removeValue(forKey: request)?.resume(returning: result)
+        guard let held = heldTokens.removeValue(forKey: request) else {
+            Issue.record("token request \(request) is not held")
+            return
+        }
+        held.resume(returning: result)
     }
 
+    /// Answers held pass request `request`; a request that is not held is a failed test, never a silent no-op.
     func answerPass(_ request: Int, _ pass: String?) {
-        heldPasses.removeValue(forKey: request)?.resume(returning: pass)
+        guard let held = heldPasses.removeValue(forKey: request) else {
+            Issue.record("pass request \(request) is not held")
+            return
+        }
+        held.resume(returning: pass)
     }
 
     /// Answers every request still held: no session, no pass.
@@ -164,12 +236,16 @@ private final class ConnectScript {
 /// A connect asks for a fresh one-time pass at the relay's HTTPS base and opens the socket at the relay's
 /// socket address with that pass; both addresses come from one snapshot taken at the start of the connect.
 /// A failed connect, or a socket the relay refuses, takes the shared backoff's scheduled retry, which gets a
-/// pass of its own. A connect superseded during either wait (the token, the pass) changes nothing, whatever
+/// token and a pass of its own; no retry runs while the app is not active. A connect superseded during either wait (the token, the pass) changes nothing, whatever
 /// answer arrives late: the attempt that replaced it keeps its state, and no stale retry is scheduled.
 @Suite("Device Sync connects with a fresh pass", .serialized, .processGlobalState, .timeLimit(.minutes(1)))
 @MainActor
 struct DeviceSyncConnectTests {
     static let token = "header.payload.signature"
+    /// What fresh token lookup N (counted from 1) returns in the retry tests, so each lookup is told apart.
+    private static func token(_ lookup: Int) -> String { "header.payload.signature-\(lookup)" }
+    /// Past the shared backoff's first step (`DeviceSyncService.reconnectBaseDelay`, 5 s), with a margin.
+    private static let pastFirstRetryStep: Duration = .seconds(8)
     private static let relayBase = "https://relay.example.com"
     private static let otherRelayBase = "https://other-relay.example.com"
     private static let epochZero = "1970-01-01T00:00:00.000Z"
@@ -206,11 +282,13 @@ struct DeviceSyncConnectTests {
     }
 
     /// Runs `body` against the shared service with `script` as its environment and the connect's gates open;
-    /// `newDevice` clears the per-field timestamps, otherwise one is held back so a connect writes none.
+    /// `newDevice` clears the per-field timestamps, otherwise one is held back so a connect writes none;
+    /// `livePass` asks for the pass with the shipping request instead of the script's.
     /// Restores all of it after.
     private func withService(
         _ script: ConnectScript,
         newDevice: Bool = false,
+        livePass: Bool = false,
         _ body: (DeviceSyncService) async throws -> Void
     ) async throws {
         let standard = UserDefaults.standard
@@ -237,7 +315,9 @@ struct DeviceSyncConnectTests {
         } else if standard.object(forKey: Self.timestampKeys[0]) == nil {
             standard.set(Self.epochZero, forKey: Self.timestampKeys[0])
         }
-        sync.connectEnvironment = script.environment
+        var environment = script.environment
+        if livePass { environment.pass = DeviceSyncService.ConnectEnvironment.live.pass }
+        sync.connectEnvironment = environment
 
         try await body(sync)
     }
@@ -291,16 +371,18 @@ struct DeviceSyncConnectTests {
         }
     }
 
-    /// Nothing but the scheduled retry calls connect again here.
-    @Test("A connect with no pass opens nothing; the scheduled retry connects with a fresh pass")
+    /// Nothing but the scheduled retry calls connect again here. A new device: the failed connect writes no
+    /// new-device state; the retry that opens the socket does.
+    @Test("A connect with no pass opens nothing; the scheduled retry connects with a fresh token and pass")
     func noPassTakesTheScheduledRetry() async throws {
         let relay = try LoopbackRecorder()
         defer { relay.stop() }
         let port = try await relay.start()
         let script = ConnectScript(relay: (Self.relayBase, "ws://127.0.0.1:\(port)/ws"))
+        script.tokenStep = { .answer(.success(Self.token($0))) }
         script.passStep = { $0 == 1 ? .answer(nil) : .answer("pass-\($0)") }
 
-        try await withService(script) { sync in
+        try await withService(script, newDevice: true) { sync in
             sync.connect()
             let first = try #require(sync.connectTask)
             await first.value
@@ -309,25 +391,31 @@ struct DeviceSyncConnectTests {
             #expect(sync.webSocket == nil, "no socket without a pass")
             #expect(!sync.isConnecting)
             #expect(sync.reconnectAttempts == 1, "the failure took the shared backoff's first step")
+            let writtenByTheFailedConnect = Self.timestamps()
+            #expect(writtenByTheFailedConnect == [nil, nil, nil], "a connect that opened nothing wrote no new-device state")
 
             await waitUntil(.seconds(20)) { sync.webSocket != nil }
 
-            #expect(script.passRequests.count == 2)
+            let passTokens = script.passRequests.map { $0.token }
+            #expect(passTokens == [Self.token(1), Self.token(2)], "the retry asked for a pass with a token of its own")
             #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=pass-2")
             let heads = await relay.heads(atLeast: 1, waitingUpTo: .seconds(10))
             let requestLines = heads.map(Self.requestLine)
             #expect(requestLines == ["GET /ws?pass=pass-2 HTTP/1.1"])
+            let writtenByTheRetry = Self.timestamps()
+            #expect(writtenByTheRetry == [Self.epochZero, Self.epochZero, Self.epochZero])
         }
     }
 
     /// The relay refuses a pass it does not hold (spent, expired, minted elsewhere) at the upgrade.
-    @Test("A socket the relay refuses at the upgrade ends; the scheduled retry connects with a fresh pass")
+    @Test("A socket the relay refuses at the upgrade ends; the scheduled retry connects with a fresh token and pass")
     func refusedUpgradeTakesTheScheduledRetry() async throws {
         let refusal = Data("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
-        let relay = try LoopbackRecorder(answer: { $0 == 0 ? refusal : nil })
+        let relay = try LoopbackRecorder(answer: { index, _ in index == 0 ? .closing(refusal) : nil })
         defer { relay.stop() }
         let port = try await relay.start()
         let script = ConnectScript(relay: (Self.relayBase, "ws://127.0.0.1:\(port)/ws"))
+        script.tokenStep = { .answer(.success(Self.token($0))) }
 
         try await withService(script) { sync in
             sync.connect()
@@ -336,10 +424,82 @@ struct DeviceSyncConnectTests {
             let requestLines = heads.map(Self.requestLine)
 
             #expect(requestLines == ["GET /ws?pass=pass-1 HTTP/1.1", "GET /ws?pass=pass-2 HTTP/1.1"])
-            #expect(script.passRequests.count == 2)
+            let passTokens = script.passRequests.map { $0.token }
+            #expect(passTokens == [Self.token(1), Self.token(2)], "the retry asked for a pass with a token of its own")
             #expect(sync.reconnectAttempts == 1, "the refused socket took the shared backoff's first step")
             await waitUntil { sync.webSocket?.originalRequest?.url?.query == "pass=pass-2" }
             #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=pass-2")
+        }
+    }
+
+    /// How a connect fails in the inactive-app tests.
+    enum Failure: String, Sendable, CaseIterable {
+        case noPass = "no pass"
+        case refusedUpgrade = "a refused upgrade"
+    }
+
+    /// When the app is not active.
+    enum Inactive: String, Sendable, CaseIterable {
+        case atTheFailure = "when the connect fails"
+        case atTheWake = "when the scheduled retry wakes"
+    }
+
+    /// The app is not active when the connect fails, or turns inactive while the retry waits: no token, pass or
+    /// upgrade follows until the app is active again and reconnects (RootView's foreground return), and that
+    /// connect takes a fresh token and a fresh pass.
+    @Test(
+        "No retry runs while the app is not active; the next active connect takes a fresh token and pass",
+        arguments: Failure.allCases, Inactive.allCases
+    )
+    func noRetryWhileInactive(failure: Failure, inactive: Inactive) async throws {
+        let refusal = Data("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+        let relay = try LoopbackRecorder(answer: { index, _ in
+            failure == .refusedUpgrade && index == 0 ? .closing(refusal) : nil
+        })
+        defer { relay.stop() }
+        let port = try await relay.start()
+        let script = ConnectScript(relay: (Self.relayBase, "ws://127.0.0.1:\(port)/ws"))
+        script.tokenStep = { .answer(.success(Self.token($0))) }
+        script.passStep = { failure == .noPass && $0 == 1 ? .answer(nil) : .answer("pass-\($0)") }
+        script.foreground = inactive != .atTheFailure
+
+        try await withService(script) { sync in
+            sync.connect()
+            await waitUntil(.seconds(20)) { sync.webSocket == nil && !sync.isConnecting && script.passRequests.count == 1 }
+            if failure == .refusedUpgrade {
+                let refused = await relay.heads(atLeast: 1, waitingUpTo: .seconds(10))
+                let refusedLines = refused.map(Self.requestLine)
+                #expect(refusedLines == ["GET /ws?pass=pass-1 HTTP/1.1"])
+            }
+            let failed = sync.webSocket == nil && !sync.isConnecting && script.passRequests.count == 1
+            try #require(failed, "the first connect has failed")
+
+            switch inactive {
+            case .atTheFailure:
+                #expect(sync.reconnectAttempts == 0, "no retry is scheduled while the app is not active")
+            case .atTheWake:
+                #expect(sync.reconnectAttempts == 1, "the failure took the shared backoff's first step")
+                script.foreground = false
+                try await Task.sleep(for: Self.pastFirstRetryStep)
+            }
+
+            #expect(script.tokenRequests == 1, "no token lookup while the app is not active")
+            #expect(script.passRequests.count == 1, "no pass request while the app is not active")
+            #expect(sync.webSocket == nil)
+            let upgrades = await relay.heads(atLeast: 0, waitingUpTo: .zero)
+            #expect(upgrades.count == (failure == .refusedUpgrade ? 1 : 0), "no upgrade while the app is not active")
+
+            script.foreground = true
+            sync.reconnectIfNeeded()
+            await waitUntil { sync.webSocket?.originalRequest?.url?.query == "pass=pass-2" }
+
+            let passTokens = script.passRequests.map { $0.token }
+            #expect(passTokens == [Self.token(1), Self.token(2)], "the active connect asked for a pass with a fresh token")
+            #expect(sync.webSocket?.originalRequest?.url?.absoluteString == "ws://127.0.0.1:\(port)/ws?pass=pass-2")
+            let heads = await relay.heads(atLeast: upgrades.count + 1, waitingUpTo: .seconds(10))
+            let requestLines = heads.map(Self.requestLine)
+            #expect(requestLines.count == upgrades.count + 1)
+            #expect(requestLines.last == "GET /ws?pass=pass-2 HTTP/1.1")
         }
     }
 
@@ -392,6 +552,9 @@ struct DeviceSyncConnectTests {
         try await withService(script, newDevice: true) { sync in
             sync.connect()
             await waitUntil { late.wait == .token ? script.isTokenHeld(1) : script.isPassHeld(1) }
+            // Every hold is reached before it is answered or awaited: a missed one fails here, at once.
+            let firstHeld = late.wait == .token ? script.isTokenHeld(1) : script.isPassHeld(1)
+            try #require(firstHeld, "the first connect waits at \(late.wait.rawValue)")
             let first = try #require(sync.connectTask)
 
             switch ending {
@@ -399,7 +562,7 @@ struct DeviceSyncConnectTests {
                 sync.forceReconnect()
                 await waitUntil { script.isTokenHeld(2) }
                 let replacementHeld = script.isTokenHeld(2)
-                #expect(replacementHeld, "the replacement waits at its own token")
+                try #require(replacementHeld, "the replacement waits at its own token")
             case .disconnect:
                 sync.disconnect()
             }
@@ -463,6 +626,8 @@ struct DeviceSyncConnectTests {
         try await withService(script) { sync in
             sync.connect()
             await waitUntil { wait == .token ? script.isTokenHeld(1) : script.isPassHeld(1) }
+            let held = wait == .token ? script.isTokenHeld(1) : script.isPassHeld(1)
+            try #require(held, "the first connect waits at \(wait.rawValue)")
 
             // The server setting changes while the first connect waits.
             script.relay = (Self.otherRelayBase, "ws://127.0.0.1:\(secondPort)/ws")
@@ -493,7 +658,7 @@ struct DeviceSyncConnectTests {
         let answer = Data(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)".utf8
         )
-        let relay = try LoopbackRecorder(answer: { _ in answer })
+        let relay = try LoopbackRecorder(answer: { _, _ in .closing(answer) })
         defer { relay.stop() }
         let port = try await relay.start()
         let session = URLSession(configuration: .ephemeral)
@@ -511,5 +676,76 @@ struct DeviceSyncConnectTests {
         #expect(lines.first == "POST /ws/pass HTTP/1.1")
         let carrying = lines.filter { $0.contains(Self.token) }.map { $0.lowercased() }
         #expect(carrying == ["authorization: bearer \(Self.token)"])
+    }
+
+    /// The shipping pass request against a relay that accepts the upgrade and sends its `connected` frame. The
+    /// server setting changes while the connect waits for its token: the pass is still asked of the relay read at
+    /// the start, the socket opens there, and the other relay sees nothing. The log names the relay on the
+    /// CONNECT line only: the confirmation names no address, and no line carries the pass or the token.
+    @Test("The shipping pass request and the upgrade go to the relay read at the start; the confirmation logs no address")
+    func livePassAndConfirmationUseTheConnectsRelay() async throws {
+        let passBody = #"{"pass":"pass-from-relay"}"#
+        let passAnswer = Data(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \(passBody.utf8.count)\r\nConnection: close\r\n\r\n\(passBody)".utf8
+        )
+        let connectedFrame = #"{"type":"connected","userId":"user-5e1d2c"}"#
+        let relay = try LoopbackRecorder(answer: { _, head in
+            let line = Self.requestLine(head)
+            if line.hasPrefix("POST /ws/pass ") { return .closing(passAnswer) }
+            if line.hasPrefix("GET /ws?pass=") {
+                return LoopbackRecorder.acceptedUpgrade(head, then: connectedFrame).map { LoopbackReply.open($0) }
+            }
+            return nil
+        })
+        let other = try LoopbackRecorder()
+        defer {
+            relay.stop()
+            other.stop()
+        }
+        let port = try await relay.start()
+        let otherPort = try await other.start()
+        let script = ConnectScript(relay: ("http://127.0.0.1:\(port)", "ws://127.0.0.1:\(port)/ws"))
+        script.tokenStep = { _ in .hold }
+
+        let logURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("devicesync_connect_\(UUID().uuidString).log")
+        AppLogStore.fileURLOverride.withLock { $0 = logURL }
+        defer {
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logURL)
+        }
+
+        try await withService(script, livePass: true) { sync in
+            sync.connect()
+            await waitUntil { script.isTokenHeld(1) }
+            let held = script.isTokenHeld(1)
+            try #require(held, "the connect waits at its token")
+
+            // The server setting changes while the connect waits.
+            script.relay = ("http://127.0.0.1:\(otherPort)", "ws://127.0.0.1:\(otherPort)/ws")
+            script.answerToken(1, .success(Self.token))
+            await waitUntil { sync.isConnected }
+
+            #expect(sync.isConnected, "the relay's connected frame confirmed the connection")
+            let heads = await relay.heads(atLeast: 2, waitingUpTo: .seconds(10))
+            let requestLines = heads.map(Self.requestLine)
+            #expect(requestLines == ["POST /ws/pass HTTP/1.1", "GET /ws?pass=pass-from-relay HTTP/1.1"])
+            let atTheOther = await other.heads(atLeast: 0, waitingUpTo: .zero)
+            #expect(atTheOther.isEmpty, "nothing went to the relay the setting changed to")
+
+            let lines = AppLogStore.read(channel: .deviceSync).split(separator: "\n").map(String.init)
+            let connectLines = lines.filter { $0.contains("CONNECT →") }
+            let confirmationLines = lines.filter { $0.contains("CONNECTED as user user-5e1") }
+            let expectedConnect = "CONNECT → ws://127.0.0.1:\(port)/ws"
+            let connectNamesTheRelay = connectLines.count == 1 && connectLines[0].hasSuffix(expectedConnect)
+            #expect(connectNamesTheRelay, "the CONNECT line names the relay the socket opened at: \(connectLines)")
+            #expect(confirmationLines.count == 1, "the confirmation is logged")
+            let confirmationNamesAnAddress = confirmationLines.contains { line in
+                ["127.0.0.1", "ws://", "http://", "relay"].contains { line.contains($0) }
+            }
+            #expect(!confirmationNamesAnAddress, "the confirmation names no relay address")
+            let credentialLogged = lines.contains { $0.contains("pass-from-relay") || $0.contains(Self.token) }
+            #expect(!credentialLogged, "no log line carries the pass or the token")
+        }
     }
 }

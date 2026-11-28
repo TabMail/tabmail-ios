@@ -218,7 +218,7 @@ struct AICacheResultExtendedTests {
 /// URLSession errors carry the failing URL in userInfo, and the DeviceSync
 /// WebSocket URL once embedded the auth token as a query parameter —
 /// interpolating the raw error put a live Supabase JWT into the console
-/// capture (observed 2026-06-09). The URL now carries a one-time connect pass
+/// capture. The URL now carries a one-time connect pass
 /// (`DeviceSyncConnectPassTests`); every WS-layer log site still goes through
 /// `redactedTransportError`, which strips any query.
 @Suite("DeviceSync transport error redaction")

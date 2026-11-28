@@ -522,17 +522,26 @@ unreachable request give no pass, each from the served fixture; the socket's add
 (`DeviceSyncService.socketURL`) carries only the pass; and no source puts a token in a URL query.
 `DeviceSyncConnectTests` drives the service's own connect with a scripted token, pass, relay and
 foreground state (`DeviceSyncService.ConnectEnvironment`), whose requests a test can hold and answer later,
-and a loopback listener that records each request and can answer it: the socket opens with a fresh pass and
-its upgrade has no token and no Authorization header; no pass opens nothing, and the retry the backoff
-schedules (nothing else connects) opens the socket with a new pass; a socket refused at the upgrade (401)
-ends and the scheduled retry connects with a new pass; no session ends a connect with no retry and a failed
+and a loopback listener that records each request and can answer it (it fails the test at once if it never
+gets ready, and answering a request that is not held is a failed test): the socket opens with a fresh pass and
+its upgrade has no token and no Authorization header; no pass opens nothing and, on a new device, writes no
+new-device state, and the retry the backoff schedules (nothing else connects) opens the socket with a new
+pass asked with a token from a fresh lookup and sets the device up; a socket refused at the upgrade (401)
+ends and the scheduled retry connects with a new pass and a fresh token; with the app not active when the
+connect fails (no pass, or a refused upgrade) no retry is scheduled, and with the app turning inactive while
+the retry waits the wake connects nothing: no token, pass or upgrade until the app is active again and
+reconnects, with a fresh token and pass; no session ends a connect with no retry and a failed
 refresh takes the retry step, neither writing new-device state; every late answer (three token failures, a
 token, a pass, no pass) to a connect a network change replaced or a disconnect ended, delivered after that
 and waited out, opens nothing, asks for no pass, schedules no retry and writes no new-device timestamps,
 while the replacement goes on to open its socket with its own pass and set the new device up; both legs use
 the relay read at the connect's start whether the setting changes during the token or the pass wait, the
-next connect the new one; and the live pass request, sent to a loopback HTTP listener, carries the token in
-its Authorization header and in no other line. `DebugModeManagerTests` pins the real dev and production
+next connect the new one; the live pass request, sent to a loopback HTTP listener, carries the token in
+its Authorization header and in no other line; and with the shipping pass request against a loopback relay
+that accepts the upgrade and sends its `connected` frame, a setting change during the token wait leaves both
+the pass request and the upgrade at the relay read at the start (the other relay sees nothing), the frame
+confirms the connection, the CONNECT log line names that relay, the confirmation line names no address and
+no line carries the pass or the token. `DebugModeManagerTests` pins the real dev and production
 address pairs and that locking debug mode resets both; `DeviceSyncErrorRedactionTests` strips a pass from a
 failing URL as it does a token.
 
