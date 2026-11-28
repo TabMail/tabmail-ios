@@ -205,7 +205,8 @@ struct ChatNewThreadTests {
         #expect(one == "New email to Maria.")
         #expect(two == "New email to Maria and Sam.")
         #expect(three == "New email to Maria, Sam and Lee.")
-        #expect(ChatNewDraft.emptyHint == "New email. Type what you want to say, or ask TabMail to write it.")
+        // "New email." stands on a line of its own, then what to do.
+        #expect(ChatNewDraft.emptyHint == "New email.\nType what you want to say, or ask TabMail to write it.")
     }
 
     @Test("A saved draft's line has the time, and the date too when it was saved before today")
@@ -310,9 +311,7 @@ struct ChatNewThreadTests {
         var choice = ChatReplyToChoice(replyPeople: [], target: .replyAll)
         #expect(choice.people.isEmpty)
         #expect(!choice.canFinish, "Done needs someone")
-        let ownAdded = choice.add("me@example.com", ownAddresses: ["me@example.com"])
-        #expect(!ownAdded, "the user's own address is not added")
-        let added = choice.add("Maria <maria@example.com>", ownAddresses: ["me@example.com"])
+        let added = choice.add("Maria <maria@example.com>")
         #expect(added)
         #expect(choice.canFinish)
         let done = choice.target(replyPeople: [])
@@ -325,15 +324,47 @@ struct ChatNewThreadTests {
         let kept = ChatNewDraft.people(after: unchanged, current: current)
         #expect(kept == current)
         var more = ChatReplyToChoice(replyPeople: current, target: .replyAll)
-        more.add("sam@example.com", ownAddresses: [])
+        more.add("sam@example.com")
         let both = ChatNewDraft.people(after: more.target(replyPeople: current), current: current).map(\.address)
         #expect(both == ["maria@example.com", "sam@example.com"])
         // Maria unticked, Sam added: only Sam.
         var swapped = ChatReplyToChoice(replyPeople: current, target: .replyAll)
         swapped.toggle(Self.maria)
-        swapped.add("sam@example.com", ownAddresses: [])
+        swapped.add("sam@example.com")
         let onlySam = ChatNewDraft.people(after: swapped.target(replyPeople: current), current: current).map(\.address)
         #expect(onlySam == ["sam@example.com"])
+    }
+
+    @Test("Add recipient adds the user's own address when it is typed or picked, so a new email can go to themselves")
+    func addRecipientAddsOwnAddress() throws {
+        // me@example.com is the account's own address in these tests.
+        var typed = ChatReplyToChoice(replyPeople: [], target: .replyAll)
+        let addedTyped = typed.add("Me@Example.com")
+        #expect(addedTyped, "typed, it is added")
+        #expect(typed.canFinish, "Done can start a new email to the user alone")
+        let toSelf = ChatNewDraft.people(after: typed.target(replyPeople: []), current: []).map(\.address)
+        #expect(toSelf == ["me@example.com"])
+
+        // Unticked, then typed again: ticked again, still one row.
+        let ownRow = try #require(typed.people.first)
+        typed.toggle(ownRow)
+        let untickedCanFinish = typed.canFinish
+        #expect(!untickedCanFinish, "control: unticked, nobody is picked")
+        let addedAgain = typed.add("me@example.com")
+        let rows = typed.people.map(\.address)
+        let toSelfAgain = ChatNewDraft.people(after: typed.target(replyPeople: []), current: []).map(\.address)
+        #expect(addedAgain, "typed again, it is ticked again")
+        #expect(rows == ["me@example.com"], "one row")
+        #expect(toSelfAgain == ["me@example.com"])
+
+        // Picked (a contact or a Recent row) beside someone already picked: both stay.
+        let current = [Self.maria]
+        var picked = ChatReplyToChoice(replyPeople: current, target: .replyAll)
+        let addedPick = picked.add("me@example.com", name: "Me")
+        #expect(addedPick, "picked, it is added")
+        let people = ChatNewDraft.people(after: picked.target(replyPeople: current), current: current)
+        #expect(people.map(\.address) == ["maria@example.com", "me@example.com"])
+        #expect(people.last?.name == "Me", "under the name picked")
     }
 
     // MARK: - The field and the header

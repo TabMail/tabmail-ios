@@ -450,9 +450,7 @@ struct ChatThreadView: View {
         .fullScreenCover(item: $forwardMessage) { ComposeView(replyTo: $0, isForward: true, openedOn: composeScreen(answering: $0)) }
         .fullScreenCover(item: $newEmailCover) { ChatNewEmailCoverView(cover: $0) }
         .sheet(isPresented: $showsReplyTo) {
-            ChatReplyToSheet(
-                replyPeople: thread.replyPeople, target: replyTarget,
-                ownAddresses: context.ownAddresses) { replyTarget = $0 }
+            ChatReplyToSheet(replyPeople: thread.replyPeople, target: replyTarget) { replyTarget = $0 }
         }
         // The reply field's paperclip: a pick makes the reply's card, which opens once its picker
         // has closed (each picker's `onDismiss`): UIKit refuses the card's cover while the picker

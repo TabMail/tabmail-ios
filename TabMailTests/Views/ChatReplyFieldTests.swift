@@ -391,25 +391,27 @@ struct ChatReplyFieldTests {
         choice.toggle(Self.sarah)
         #expect(choice.canFinish)
 
-        let own: Set<String> = ["me@example.com"]
-        let addedSam = choice.add("Sam Lee <Sam@Example.com>", ownAddresses: own)
+        let addedSam = choice.add("Sam Lee <Sam@Example.com>")
         #expect(addedSam)
         #expect(choice.people.last == Self.sam, "a typed address, lowercased, with its name")
-        let addedPat = choice.add("pat@example.com", name: "Pat Doe", ownAddresses: own)
+        let addedPat = choice.add("pat@example.com", name: "Pat Doe")
         #expect(addedPat)
         #expect(choice.people.last?.name == "Pat Doe", "a contact pick keeps the contact's name")
-        let addedMe = choice.add("me@example.com", ownAddresses: own)
-        #expect(!addedMe, "never the user")
-        let addedText = choice.add("not an address", ownAddresses: own)
+        // The user's own address (me@example.com is the account's in these tests), asked for
+        // explicitly, is added like anyone's.
+        let addedMe = choice.add("Me@Example.com")
+        #expect(addedMe, "the user's own address, typed, is added")
+        #expect(choice.people.last?.address == "me@example.com")
+        let addedText = choice.add("not an address")
         #expect(!addedText)
-        #expect(choice.people.count == 4)
+        #expect(choice.people.count == 5)
 
         choice.toggle(Self.sam)
-        let reAdded = choice.add("sam@example.com", ownAddresses: own)
+        let reAdded = choice.add("sam@example.com")
         #expect(reAdded, "adding someone listed ticks them")
-        #expect(choice.people.count == 4 && choice.isTicked(Self.sam))
+        #expect(choice.people.count == 5 && choice.isTicked(Self.sam))
         #expect(choice.target(replyPeople: people).only?.map(\.address)
-                == ["sarah@example.com", "sam@example.com", "pat@example.com"])
+                == ["sarah@example.com", "sam@example.com", "pat@example.com", "me@example.com"])
 
         let reopened = ChatReplyToChoice(replyPeople: people, target: ChatReplyTarget(only: [Self.david, Self.sam]))
         #expect(reopened.people == people + [Self.sam], "the added person is listed again")
@@ -1872,7 +1874,8 @@ struct ChatReplyFieldTests {
         #expect(Self.count("private func agentAnswered() { guard !fieldComposeOpened else { return }", in: chat) == 1)
         #expect(Self.count("fieldComposeOpened = true", in: chat) == 0)
         #expect(Self.count("if replyTo != nil { replyTarget = .replyAll }", in: chat) == 1, "a sent reply clears it")
-        #expect(Self.count("ownAddresses: context.ownAddresses) { replyTarget = $0 }", in: chat) == 1, "Done sets it")
+        #expect(Self.count("ChatReplyToSheet(replyPeople: thread.replyPeople, target: replyTarget) { replyTarget = $0 }", in: chat) == 1,
+                "Done sets it")
         // The names open who the reply goes to, from the thread's own header or, for a thread a
         // new email's chat hosts, from the chat's header (`ChatThreadHeader.asksReplyTo`).
         #expect(Self.count("ChatHeaderView(thread: thread) { openReplyTo() }", in: chat) == 1)
