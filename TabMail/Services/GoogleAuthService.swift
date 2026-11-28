@@ -46,8 +46,17 @@ final class OAuthService: NSObject {
     /// uses the shared session; a test passes one backed by a fake transport.
     let tokenSession: URLSession
 
-    init(tokenSession: URLSession = sharedEphemeralSession) {
+    /// Opens a provider's sign-in page and returns the address it finally
+    /// sends the user back to on `callbackScheme`.
+    typealias SignInBrowser = @MainActor (_ page: URL, _ callbackScheme: String) async throws -> URL
+
+    /// The app shows the system sign-in sheet (nil); a test passes a fake
+    /// browser that answers the page itself.
+    let signInBrowser: SignInBrowser?
+
+    init(tokenSession: URLSession = sharedEphemeralSession, signInBrowser: SignInBrowser? = nil) {
         self.tokenSession = tokenSession
+        self.signInBrowser = signInBrowser
         super.init()
     }
 
@@ -104,6 +113,7 @@ final class OAuthService: NSObject {
 
         let codeVerifier = generateCodeVerifier()
         let codeChallenge = generateCodeChallenge(from: codeVerifier)
+        let state = generateState()
 
         var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
         var queryItems: [URLQueryItem] = [
@@ -113,6 +123,7 @@ final class OAuthService: NSObject {
             URLQueryItem(name: "scope", value: scope),
             URLQueryItem(name: "code_challenge", value: codeChallenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "prompt", value: "consent"),
         ]
         if accessTypeOffline {
@@ -129,37 +140,38 @@ final class OAuthService: NSObject {
         let authURL = components.url!
         BackgroundSyncLogger.logDebug("[OAuth] authURL: \(LoggableURL.address(authURL))")
 
-        let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
-            let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
-                if let error {
-                    let nsError = error as NSError
-                    BackgroundSyncLogger.logDebug("[OAuth] callback ERROR — domain=\(nsError.domain), code=\(nsError.code), userInfo=\(nsError.userInfo), description=\(nsError.localizedDescription)")
-                    continuation.resume(throwing: error)
-                } else if let url {
-                    if DebugModeManager.isLoggingEnabled() {
-                        let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-                        let hasCode = queryItems.contains(where: { $0.name == "code" })
-                        let hasError = queryItems.first(where: { $0.name == "error" })?.value
-                        BackgroundSyncLogger.logDebug("[OAuth] callback received — hasCode=\(hasCode), googleError=\(hasError ?? "nil")")
+        let callbackURL: URL
+        if let signInBrowser {
+            callbackURL = try await signInBrowser(authURL, redirectScheme)
+        } else {
+            callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+                let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
+                    if let error {
+                        let nsError = error as NSError
+                        BackgroundSyncLogger.logDebug("[OAuth] callback ERROR — domain=\(nsError.domain), code=\(nsError.code), userInfo=\(nsError.userInfo), description=\(nsError.localizedDescription)")
+                        continuation.resume(throwing: error)
+                    } else if let url {
+                        if DebugModeManager.isLoggingEnabled() {
+                            let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+                            let hasCode = queryItems.contains(where: { $0.name == "code" })
+                            let hasError = queryItems.first(where: { $0.name == "error" })?.value
+                            BackgroundSyncLogger.logDebug("[OAuth] callback received — hasCode=\(hasCode), googleError=\(hasError ?? "nil")")
+                        }
+                        continuation.resume(returning: url)
+                    } else {
+                        BackgroundSyncLogger.logDebug("[OAuth] callback received — url: nil, error: nil (treating as cancel)")
+                        continuation.resume(throwing: OAuthError.cancelled)
                     }
-                    continuation.resume(returning: url)
-                } else {
-                    BackgroundSyncLogger.logDebug("[OAuth] callback received — url: nil, error: nil (treating as cancel)")
-                    continuation.resume(throwing: OAuthError.cancelled)
                 }
+                session.prefersEphemeralWebBrowserSession = false
+                session.presentationContextProvider = self
+                self.currentSession = session
+                let started = session.start()
+                BackgroundSyncLogger.logDebug("[OAuth] session.start() returned: \(started) (scope=\(scope))")
             }
-            session.prefersEphemeralWebBrowserSession = false
-            session.presentationContextProvider = self
-            self.currentSession = session
-            let started = session.start()
-            BackgroundSyncLogger.logDebug("[OAuth] session.start() returned: \(started) (scope=\(scope))")
         }
 
-        guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-            .queryItems?.first(where: { $0.name == "code" })?.value else {
-            throw OAuthError.noAuthCode
-        }
-
+        let code = try Self.authorizationCode(from: callbackURL, state: state)
         return try await exchangeGoogleCode(code, codeVerifier: codeVerifier)
     }
 
@@ -336,6 +348,35 @@ final class OAuthService: NSObject {
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
     }
+
+    // MARK: - Sign-in state
+
+    /// A fresh `state` for one sign-in (RFC 6749 section 4.1): 256 bits from
+    /// the system's cryptographically secure generator, base64url. The reply
+    /// must carry it back (`authorizationCode(from:state:)`).
+    func generateState() -> String {
+        let bytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        return bytes.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    /// The authorization code in a sign-in reply. A reply whose `state` is
+    /// missing, different from this sign-in's, or given more than once is not
+    /// the answer to this sign-in (it may come from another page), so it is
+    /// refused before any code from it reaches a token endpoint.
+    nonisolated static func authorizationCode(from callbackURL: URL, state: String) throws -> String {
+        let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        let replied = items.filter { $0.name == "state" }.map(\.value)
+        guard replied.count == 1, replied[0] == state else {
+            throw OAuthError.stateMismatch
+        }
+        guard let code = items.first(where: { $0.name == "code" })?.value else {
+            throw OAuthError.noAuthCode
+        }
+        return code
+    }
 }
 
 // MARK: - Response Models
@@ -357,6 +398,8 @@ enum OAuthError: Error {
     case notConfigured(String)
     case cancelled
     case noAuthCode
+    /// The sign-in reply did not carry this sign-in's `state`.
+    case stateMismatch
     case tokenExchangeFailed(String)
     case consentFailed(String)
 }

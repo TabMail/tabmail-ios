@@ -64,6 +64,7 @@ struct InboxErrorBannerTests {
             OAuthError.consentFailed(m),
             OAuthError.cancelled,
             OAuthError.noAuthCode,
+            OAuthError.stateMismatch,
             IMAPTransportSecurityError.tlsFloorNotMet(host: m),
             IMAPTransportSecurityError.noEncryptedConnection(host: m, port: 143, encryptedPort: 993),
             IMAPError.connectionFailed(m),
