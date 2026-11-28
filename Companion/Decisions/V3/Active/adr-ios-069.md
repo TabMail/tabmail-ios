@@ -38,6 +38,16 @@ The owner's ruling: ***"much better than a fragile and complicated codebase."***
 5. **The signal on refusal is a log, and nothing else.** Drop the refused **whole** operation, never
    a split subset and never unrelated queued work. If the deletion write itself fails, requeue that
    original operation unchanged and stop.
+   *Amended 2026-11-25 (#814):* a dropped **move** also reports its members' header ids on
+   `.messageMovesRefused` after the commit (`AccountManager.movedHeaderIds(of:)`,
+   `announceMovesRefused`), at all three exit-4 sites: the reset's step-5 sweep
+   (`uidValidityResetStampFreshEpoch`), the drain's checkpoint A (`claimFrontierOperation`) and the
+   executor's checkpoint B (the `ProviderError.uidValidityChanged` arm of
+   `AccountOperationExecutor.executeSingleOp`). The gesture hid those rows, the move has no provider-confirmed
+   result (usually the source stays; a COPY, or after a lost response the whole move, may already have
+   landed, which the folders' sync shows), and the resync can re-seat a different email at the same id. This is list state, not a user-facing
+   signal: still no dialog and no toast. It replaces the 2026-11-11 contract in `ios-move-002.md`
+   that only a move refused before admission is reported.
 6. **Once dropped, dropped.** v3 compares against the op's **durable** `observedUidValidity`, not
    against a selection minted inside the same call. The reference's refusal silently re-armed on
    retry; v3's does not — **once the folder's epoch moves, every retry of that op fails identically

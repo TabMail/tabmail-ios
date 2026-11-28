@@ -367,13 +367,15 @@ actor PushClient {
     /// before forwarding to the proxy; only the proxy decrypts, after consuming
     /// that admission. Success requires committed active authority. Neither
     /// side persists the envelope or decrypted IMAP credentials.
+    ///
+    /// The proxy always connects with implicit TLS (`MailTransportPolicy`),
+    /// and the payload says so outright.
     func subscribeIMAP(
         context: IMAPSubscribeContext,
         host: String,
         port: Int,
         username: String,
         password: String,
-        security: String? = nil,
         authToken: String
     ) async throws {
         let payload = IMAPCredPayload(
@@ -381,7 +383,7 @@ actor PushClient {
             port: port,
             username: username,
             password: password,
-            security: security
+            security: MailTransportPolicy.pushSubscriptionSecurity
         )
         let credsCiphertext: String
         do {

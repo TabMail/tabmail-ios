@@ -168,6 +168,18 @@ struct SyncRunBannerEntryPointTests {
         }
     }
 
+    @Test("a refresh against a server that refuses an encrypted connection raises the encryption line",
+          arguments: [IMAPTransportSecurityError.noEncryptedConnection(host: "mail.example.com", port: 143, encryptedPort: 993),
+                      .tlsFloorNotMet(host: "mail.example.com")])
+    func refusedEncryptionRaisesItsLine(refusal: IMAPTransportSecurityError) async throws {
+        try await withWorld { world in
+            await world.providerA.setConnectThrows(refusal)
+            await world.providerA.setFetchMessagesThrows(refusal)
+            await InboxViewModel(folders: [world.inboxA, world.inboxB]).refreshSync()
+            #expect(banner == InboxErrorBanner.encryptionMessage, "\(refusal)")
+        }
+    }
+
     @Test("foreground poll (full): never raises; clears when no account failed")
     func foregroundPollNeverRaises() async throws {
         try await withWorld { world in

@@ -76,8 +76,10 @@ struct ComposeOrigin: Hashable, Sendable {
     let sessionKey: String
     let screen: Screen
     /// The account a new email the turn asks for is sent from, bound as the turn starts: the
-    /// account of the email the chat view or email screen was opened on. Nil in the inbox, whose
-    /// card picks its account when it opens. Replies and forwards are sent from their email's
+    /// account of the email the chat view was opened on, or of the email the email screen's chat
+    /// is about. Nil in the inbox. `email_compose` puts the account it signs the body as here
+    /// (`EmailComposeTool.sendingAccount`: this one, else the primary, else the oldest), so the
+    /// card opens from it on every screen. Replies and forwards are sent from their email's
     /// account and never read it (`AgentToolRouter.ComposeRequest.fromAccountId`).
     let fromAccountId: String?
 

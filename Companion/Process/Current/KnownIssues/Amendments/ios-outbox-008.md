@@ -62,6 +62,9 @@ Related cases, same cause (the subject is the only signal):
 Rare. It needs another app that sets `In-Reply-To` on a forward (Thunderbird does; Apple Mail and
 Outlook are not measured, IOS-OUTBOX-009) and then either a hand-edited subject or a forward prefix
 outside the list. TabMail's own forwards carry no `In-Reply-To` (#1483), so they are not affected.
+*(Amended 2026-11-27, #1559: this now reaches Outlook accounts too. Their sync reads `In-Reply-To`
+from the extended property `String 0x1042`, so such a copy in an Outlook Sent folder marks its
+original as it does on Gmail and IMAP; before, an Outlook account's Sent copies named nothing.)*
 
 ## Recoverability
 

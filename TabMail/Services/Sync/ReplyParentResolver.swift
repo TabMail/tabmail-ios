@@ -67,8 +67,8 @@ enum ReplyParentResolver {
 
         // Normalize defensively. Every provider already hands In-Reply-To over
         // bare (IMAP's `IMAPProvider.mapMessageInfo` through `normalizeMessageId`,
-        // Gmail and RFC 822 parsing through `extractFirstMessageId`; Graph gives
-        // none), and `normalizeMessageId` is idempotent, so this costs nothing
+        // Gmail, RFC 822 and Graph's extended property through
+        // `extractFirstMessageId`), and `normalizeMessageId` is idempotent, so this costs nothing
         // when the value was already normalized.
         var replied = Set<String>()
         var forwarded = Set<String>()
@@ -212,9 +212,13 @@ enum ReplyParentResolver {
             let placeholders = Array(repeating: "?", count: slice.count).joined(separator: ",")
             var args: [any DatabaseValueConvertible] = [accountId, FolderRole.sent.rawValue]
             for value in slice { args.append(value) }
+            // Named index: where the stored mail has no In-Reply-To (Outlook stores
+            // none), ANALYZE counts all its rows under one value and the planner read
+            // every row of each Sent folder instead (#1563). The index is
+            // migration-built (v13), never deferred or dropped.
             copies += try Row.fetchAll(db, sql: """
                 SELECT DISTINCT r.inReplyTo, r.subject
-                FROM messageHeader r JOIN folder f ON f.id = r.folderId
+                FROM messageHeader r INDEXED BY messageHeader_inReplyTo JOIN folder f ON f.id = r.folderId
                 WHERE r.accountId = ? AND f.role = ? AND r.inReplyTo IN (\(placeholders))
                 """, arguments: StatementArguments(args)).map { SentCopy(inReplyTo: $0["inReplyTo"], subject: $0["subject"]) }
         }
@@ -240,7 +244,9 @@ enum ReplyParentResolver {
     /// normalized (Gmail and RFC 822 parsing through
     /// `EmailFilter.extractFirstMessageId`; IMAP's envelope mapping and the
     /// extension's `IMAPFetchMapping` through `EmailFilter.normalizeMessageId`;
-    /// the optimistic Sent copy; Graph stores none), so the bare form is the only
+    /// the optimistic Sent copy; Graph through `GraphParse.parseMessage`, which
+    /// reads the expanded In-Reply-To with `EmailFilter.extractFirstMessageId`),
+    /// so the bare form is the only
     /// one matched, as `markInsertedParentsOfStoredReplies` matches it.
     static func hasStoredReply(
         toRfc822MessageId rfc822MessageId: String?,

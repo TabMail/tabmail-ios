@@ -426,7 +426,7 @@ struct QueueCoreInvariantTests {
             provenDestinations: [ProvenDestinationAddress(
                 sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
             addressChangesOnMove: true,
-            context: AccountOperationExecutor.DrainContext())
+            copiedNothing: false, context: AccountOperationExecutor.DrainContext())
 
         let destinationId = MessageIdentity.headerId(
             accountId: fixture.accountId, folderPath: "Archive", messageId: "5")
@@ -468,18 +468,17 @@ struct QueueCoreInvariantTests {
         await AccountManager.shared.retirePartiallyCompletedOp(
             op, provenMembers: ["77"], remaining: ["88"],
             provenDestinations: [], addressChangesOnMove: true,
-            context: AccountOperationExecutor.DrainContext())
+            copiedNothing: false, context: AccountOperationExecutor.DrainContext())
 
         // THE CONTROL: the re-key is authorized by the server's own `COPYUID`
-        // and by nothing else. With no destination proved, the address must not
-        // move — a re-key on unproven evidence would be the wrong-message
-        // mutation this whole design exists to refuse.
+        // and by nothing else. With no destination proved, no row may take a
+        // guessed address — that would be the wrong-message mutation this whole
+        // design exists to refuse. On IMAP the unproven remnant is dropped
+        // instead (`IOS-MOVE-002`); the destination sync brings the message back.
         let rows = try await fixture.pool.read { db in
             try MessageHeader.filter(Column("accountId") == fixture.accountId).fetchAll(db)
         }
-        #expect(rows.count == 1)
-        guard rows.count == 1 else { return }
-        #expect(rows[0].id == seeded.id && rows[0].messageId == "77")
+        #expect(rows.isEmpty, "the unproven remnant \(seeded.id) survived: \(rows.map(\.id))")
 
         let after = try fetchOp(op.id, fixture)
         #expect(after?.messageIds == ["88"], "the unproven member stays queued")
@@ -541,7 +540,7 @@ struct QueueCoreInvariantTests {
                 sourceProviderId: "graph-old", destinationProviderId: "graph-new",
                 destinationUidValidity: nil)],
             addressChangesOnMove: true,
-            context: AccountOperationExecutor.DrainContext())
+            copiedNothing: false, context: AccountOperationExecutor.DrainContext())
 
         // The row answers to the proven address, IN THE FOLDER IT OCCUPIES.
         let landedId = MessageIdentity.headerId(
@@ -647,7 +646,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: nil),
             ],
             addressChangesOnMove: true,
-            context: AccountOperationExecutor.DrainContext())
+            copiedNothing: false, context: AccountOperationExecutor.DrainContext())
 
         let readdressed = try fetchOp(frozenFollower.id, fixture)
         #expect(readdressed?.messageIds == ["graph-untouched", "graph-new-1", "graph-new-2"], """
@@ -778,7 +777,7 @@ struct QueueCoreInvariantTests {
                 sourceProviderId: "77", destinationProviderId: "5",
                 destinationUidValidity: 42)],
             addressChangesOnMove: true,
-            context: AccountOperationExecutor.DrainContext())
+            copiedNothing: false, context: AccountOperationExecutor.DrainContext())
 
         // NON-VACUITY: the narrowing write really was attempted and really was
         // refused — once per `retryWrite` attempt, and never more.
@@ -908,7 +907,7 @@ struct QueueCoreInvariantTests {
                     sourceProviderId: "graph-old", destinationProviderId: "graph-new",
                     destinationUidValidity: nil)],
                 addressChangesOnMove: true,
-                context: AccountOperationExecutor.DrainContext())
+                copiedNothing: false, context: AccountOperationExecutor.DrainContext())
 
             #expect(refuser.refusals.withLock { $0 } == 3, """
                 the refusal did not land on the narrowing write for all three \
@@ -1165,7 +1164,7 @@ struct QueueCoreInvariantTests {
             try MessageHeaderRekey.finishMove(
                 op, destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
-                addressChangesOnMove: true, accountScopedIds: false, db: db)
+                addressChangesOnMove: true, accountScopedIds: false, copiedNothing: false, db: db)
         }
         await AccountManager.shared.publishMoveFinish(outcome)
 
@@ -1209,7 +1208,7 @@ struct QueueCoreInvariantTests {
                 addressChangesOnMove: true,
                 // Outlook fixture — Graph ids are account-scoped.
                 accountScopedIds: true,
-                db: db)
+                copiedNothing: false, db: db)
         }
 
         let newId = MessageIdentity.headerId(
@@ -1278,7 +1277,7 @@ struct QueueCoreInvariantTests {
             try MessageHeaderRekey.finishMove(
                 op, destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "5", destinationUidValidity: 42)],
-                addressChangesOnMove: true, accountScopedIds: false, db: db)
+                addressChangesOnMove: true, accountScopedIds: false, copiedNothing: false, db: db)
         }
 
         #expect(outcome.applied.map(\.newHeaderId) == [newId], "precondition: the move re-keyed the row")
@@ -1340,7 +1339,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: nil)],
                 addressChangesOnMove: true,
                 accountScopedIds: true,
-                db: db)
+                copiedNothing: false, db: db)
         }
 
         // NON-VACUITY: the row really is NOT in the operation's destination, so
@@ -1388,7 +1387,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: 42)],
                 addressChangesOnMove: true,
                 accountScopedIds: false,
-                db: db)
+                copiedNothing: false, db: db)
         }
 
         #expect(result.applied.isEmpty, """
@@ -1445,7 +1444,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: nil)],
                 addressChangesOnMove: true,
                 accountScopedIds: true,
-                db: db)
+                copiedNothing: false, db: db)
         }
 
         let (followerIds, bystanderIds) = try await fixture.pool.read { db in
@@ -1522,7 +1521,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: nil)],
                 addressChangesOnMove: true,
                 accountScopedIds: true,
-                db: db)
+                copiedNothing: false, db: db)
         }
 
         let (mine, theirs) = try await fixture.pool.read { db in
@@ -1581,7 +1580,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: 42)],
                 addressChangesOnMove: true,
                 accountScopedIds: false,
-                db: db)
+                copiedNothing: false, db: db)
         }
 
         // NON-VACUITY: the move DID prove a destination and the header DID move
@@ -1619,7 +1618,7 @@ struct QueueCoreInvariantTests {
                 // Gmail ids are account-scoped, but `addressChangesOnMove: false`
                 // short-circuits before either arm — that is what this test pins.
                 op, destinations: [], addressChangesOnMove: false,
-                accountScopedIds: true, db: db)
+                accountScopedIds: true, copiedNothing: false, db: db)
         }
 
         #expect(result == .empty)
@@ -1640,7 +1639,7 @@ struct QueueCoreInvariantTests {
         let result = try await fixture.pool.write { db in
             try MessageHeaderRekey.finishMove(
                 op, destinations: [], addressChangesOnMove: true,
-                accountScopedIds: false, db: db)
+                accountScopedIds: false, copiedNothing: false, db: db)
         }
         let oldId = MessageIdentity.headerId(
             accountId: fixture.accountId, folderPath: "INBOX", messageId: "77")
@@ -1648,6 +1647,195 @@ struct QueueCoreInvariantTests {
         #expect(result.applied.isEmpty)
         #expect(result.unsafeUndoOldHeaderIds.isEmpty)
         #expect(result.removedOldHeaderIds == [oldId])
+    }
+
+    /// **THE PROPERTY (`IOS-MOVE-002`): on IMAP, a retired move that the wire
+    /// named no destination for leaves no local row or body at the unproven
+    /// source address, reports it as removed so its external mirrors go too, and
+    /// touches nothing else.** On an account-scoped provider the same missing
+    /// evidence keeps the row and its body (control).
+    @Test("IMAP: a retired move with no proven destination drops its remnant and that remnant's body only")
+    func imapUnprovenRemnantIsDroppedWithItsBody() async throws {
+        let fixture = try fixture(accountId: "acc-unproven-remnant")
+        defer { finish(fixture) }
+
+        var remnant = try seedHeader(
+            fixture, messageId: "77", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        remnant.rfc822MessageId = "remnant@example.com"
+        let survivor = try seedHeader(fixture, messageId: "77", folderPath: "Archive")
+        try await fixture.pool.write { [remnant] db in
+            try remnant.update(db)
+            for id in [remnant.id, survivor.id] {
+                try MessageBody(contentKey: ContentKey(rawValue: id), htmlContent: "<p>\(id)</p>")
+                    .insert(db)
+            }
+        }
+
+        let op = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [], addressChangesOnMove: true,
+                accountScopedIds: false, copiedNothing: false, db: db)
+        }
+
+        #expect(result.applied.isEmpty)
+        #expect(result.removedOldHeaderIds == [remnant.id],
+                "the dropped remnant must be reported so its FTS entry, assets and undo member go too")
+        #expect(result.unsafeUndoOldHeaderIds.isEmpty)
+        #expect(result.droppedRemnants == [DroppedRemnant(
+            headerId: remnant.id, accountId: fixture.accountId, messageId: "77",
+            rfc822MessageId: "remnant@example.com", folderPath: "Archive", isInInbox: false)])
+        let (headers, bodies) = try await fixture.pool.read { db in
+            (try MessageHeader.fetchAll(db).map(\.id).sorted(),
+             try MessageBody.fetchAll(db).map(\.id.rawValue).sorted())
+        }
+        #expect(headers == [survivor.id], "remnant header left behind or survivor lost: \(headers)")
+        #expect(bodies == [survivor.id], "remnant body left behind or survivor body lost: \(bodies)")
+    }
+
+    @Test("IMAP: a move the server refused outright keeps its row and body")
+    func refusedMoveKeepsTheRow() async throws {
+        let fixture = try fixture(accountId: "acc-refused-move")
+        defer { finish(fixture) }
+
+        let row = try seedHeader(
+            fixture, messageId: "66", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        try await fixture.pool.write { db in
+            try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>refused</p>")
+                .insert(db)
+        }
+        let op = PendingOperation(
+            type: .move, messageIds: ["66"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [], addressChangesOnMove: true,
+                accountScopedIds: false, copiedNothing: true, db: db)
+        }
+
+        #expect(result.removedOldHeaderIds.isEmpty && result.droppedRemnants.isEmpty)
+        #expect(result.unsafeUndoOldHeaderIds == [row.id])
+        let (header, body) = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: row.id),
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: row.id)))
+        }
+        #expect(header != nil && body != nil,
+                "a refused move dropped the only local row of a message that never left the source")
+    }
+
+    /// A move that leaves the queue with NO provider result (a retry-limit exit,
+    /// an epoch refusal, a not-found drop, a claim-time retire) proves no copy,
+    /// so its optimistic IMAP row and body stay: the message may never have left
+    /// its source, and this row may be its only local copy.
+    @Test("IMAP: a move retired with no provider result keeps its row and body")
+    func moveRetiredWithNoProviderResultKeepsTheRow() async throws {
+        let fixture = try fixture(accountId: "acc-retired-no-result")
+        defer { finish(fixture) }
+
+        let row = try seedHeader(
+            fixture, messageId: "55", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        try await fixture.pool.write { db in
+            try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>retired</p>")
+                .insert(db)
+        }
+        let op = PendingOperation(
+            type: .move, messageIds: ["55"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: 42)
+        let retired = try await fixture.pool.write { db in
+            var queued = op
+            try queued.insert(db)
+            return try AccountOperationExecutor.deleteRetiringOperation(queued, db: db)
+        }
+        #expect(retired, "precondition: the operation left the queue")
+
+        let (header, body) = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: row.id),
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: row.id)))
+        }
+        #expect(header != nil && body != nil,
+                "a move with no provider result dropped the only local row of a message no copy was proven for")
+    }
+
+    @Test("account-scoped: a retired move with no proven destination keeps its row and body")
+    func accountScopedMissingEvidenceKeepsTheRow() async throws {
+        let fixture = try fixture(
+            accountId: "acc-graph-unproven", provider: .outlook,
+            folders: [("INBOX", .inbox, nil), ("Archive", .archive, nil)])
+        defer { finish(fixture) }
+
+        let row = try seedHeader(
+            fixture, messageId: "graph-id", folderPath: "Archive",
+            keyedFromFolderPath: "INBOX", epoch: nil)
+        try await fixture.pool.write { db in
+            try MessageBody(contentKey: ContentKey(rawValue: row.id), htmlContent: "<p>graph</p>")
+                .insert(db)
+        }
+        let op = PendingOperation(
+            type: .move, messageIds: ["graph-id"], accountId: fixture.accountId,
+            folderPath: "INBOX", destinationPath: "Archive", observedUidValidity: nil)
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [], addressChangesOnMove: true,
+                accountScopedIds: true, copiedNothing: false, db: db)
+        }
+
+        #expect(result.removedOldHeaderIds.isEmpty && result.droppedRemnants.isEmpty)
+        #expect(result.unsafeUndoOldHeaderIds == [row.id])
+        let (header, body) = try await fixture.pool.read { db in
+            (try MessageHeader.fetchOne(db, key: row.id),
+             try MessageBody.fetchOne(db, key: ContentKey(rawValue: row.id)))
+        }
+        #expect(header != nil && body != nil)
+    }
+
+    /// **THE PROPERTY: a message moved INTO the inbox keeps its entered-inbox AI
+    /// event when the wire named no destination,** even though G4 deleted its
+    /// optimistic row: the drain's in-memory list records the dropped row's own
+    /// captured fields, and the post-drain resolver finds the copy the
+    /// destination sync inserted at its real UID.
+    @Test("a dropped remnant that entered the inbox is recorded for its AI enqueue")
+    func droppedInboxRemnantIsRecordedForAI() async throws {
+        let fixture = try fixture(accountId: "acc-unproven-inbox")
+        defer { finish(fixture) }
+
+        var remnant = try seedHeader(
+            fixture, messageId: "77", folderPath: "INBOX",
+            keyedFromFolderPath: "Archive", epoch: nil)
+        remnant.rfc822MessageId = "entered@example.com"
+        try await fixture.pool.write { [remnant] db in try remnant.update(db) }
+
+        let op = PendingOperation(
+            type: .move, messageIds: ["77"], accountId: fixture.accountId,
+            folderPath: "Archive", destinationPath: "INBOX", observedUidValidity: 42)
+        let result = try await fixture.pool.write { db in
+            try MessageHeaderRekey.finishMove(
+                op, destinations: [], addressChangesOnMove: true,
+                accountScopedIds: false, copiedNothing: false, db: db)
+        }
+        #expect(result.removedOldHeaderIds == [remnant.id], "precondition: the remnant was dropped")
+
+        let context = AccountOperationExecutor.DrainContext()
+        await AccountManager.shared.recordMembersThatEnteredInbox(
+            op, destinationPath: "INBOX", droppedRemnants: result.droppedRemnants,
+            context: context)
+
+        // The destination sync inserts the message at its real UID.
+        var synced = try seedHeader(fixture, messageId: "501", folderPath: "INBOX")
+        synced.rfc822MessageId = "entered@example.com"
+        try await fixture.pool.write { [synced] db in try synced.update(db) }
+
+        let entries = context.enteredInbox.withLock { $0["\(fixture.accountId)|INBOX"] ?? [] }
+        #expect(entries.count == 1, "the member that entered the inbox was not recorded: \(entries)")
+        let targets = try await fixture.pool.read { db in
+            try AccountManager.resolveInboxEntryAITargets(
+                entries: entries, folderPath: "INBOX", db: db)
+        }
+        #expect(targets.map(\.headerId) == [synced.id])
     }
 
     /// **THE ACCOUNT-SCOPED HALF OF THE SAME PROPERTY, with a REAL producer: a
@@ -1708,7 +1896,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: nil)],
                 addressChangesOnMove: true,
                 accountScopedIds: true,
-                db: db)
+                copiedNothing: false, db: db)
         }
 
         #expect(result.applied.isEmpty, "there was no row to re-key")
@@ -1785,7 +1973,7 @@ struct QueueCoreInvariantTests {
                 op, destinations: [ProvenDestinationAddress(
                     sourceProviderId: "77", destinationProviderId: "5",
                     destinationUidValidity: 42)],
-                addressChangesOnMove: true, accountScopedIds: false, db: db)
+                addressChangesOnMove: true, accountScopedIds: false, copiedNothing: false, db: db)
         }
         await AccountManager.shared.publishMoveFinish(result)
 
@@ -1987,7 +2175,7 @@ struct QueueCoreInvariantTests {
                     destinationUidValidity: 42)],
                 addressChangesOnMove: true,
                 accountScopedIds: false,
-                db: db)
+                copiedNothing: false, db: db)
         }
         #expect(finishResult.applied.count == 1)
         UndoService.shared.applyRekeys(MailPointerMoves(finishResult.applied.map(MailPointerMove.row)))

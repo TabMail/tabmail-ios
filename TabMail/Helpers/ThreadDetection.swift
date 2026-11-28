@@ -43,7 +43,8 @@ enum ThreadDetection {
     /// - `messageReference WHERE referencedRfc822Id IN L` covers (3) + (5).
     ///
     /// All three use existing indexes (`messageHeader_rfc822MessageId`,
-    /// `messageHeader_inReplyTo`, `messageReference_referencedRfc822Id`).
+    /// `messageHeader_inReplyTo`, `messageReference_referencedRfc822Id`); the
+    /// `inReplyTo` lookup names its index (`INDEXED BY`), see below.
     ///
     /// Messages whose `folderId` points at a Trash or Spam folder are excluded —
     /// deleted replies and junk should not reappear in thread bubbles. Applied as a
@@ -54,12 +55,15 @@ enum ThreadDetection {
 
     /// `findRelatedMessages`, and the ids its reference search reached: `msg` and every email,
     /// copies included, linked to it through the five signals above, before the native
-    /// `threadId` members are added. The links are direction-agnostic, so the search reaches this
-    /// same set from any of its ids: a lookup started at one of them, with the same `threadId`,
-    /// returns the same thread. The chat walk uses it to look each thread up once.
+    /// `threadId` members are added, less the emails across a forward (`threadsAcrossForwards`).
+    /// The links are direction-agnostic, so the search reaches this same set from any of its ids: a
+    /// lookup started at one of them, with the same `threadId`, returns the same thread. The chat
+    /// walk uses it to look each thread up once; an email across a forward is not in it, so the
+    /// walk looks its thread up from that email.
     ///
     /// `copies` are the rows the search found that `excludeCopies` left out of `messages`: other
     /// copies of an email already shown (the opened one's included), in another folder or account.
+    /// Neither `messages` nor `copies` holds an email across a forward.
     /// The chat shows each email once but acts on every row it loaded, each by its own id
     /// (ADR-IOS-068 D4: a Message-ID is never mutation authority).
     static func related(to msg: MessageHeader, in dbPool: DatabasePool) throws -> (messages: [MessageHeader], copies: [MessageHeader], linkedIds: Set<String>) {
@@ -118,12 +122,19 @@ enum ThreadDetection {
                 // (2) + (4) Reverse + lateral via inReplyTo: messages whose inReplyTo is in L.
                 // - in L because of my rfc822 → classic direct children (reverse).
                 // - in L because of one of my ancestors → classic siblings (lateral).
-                let inReplyToMatches = try MessageHeader
-                    .filter(L.contains(Column("inReplyTo"))
-                            && !seenIds.contains(Column("id"))
-                            && !excludedFolderIds.contains(Column("folderId")))
-                    .order(Column("date").desc)
-                    .fetchAll(db)
+                // Named index: where the stored mail has no In-Reply-To (Outlook stores
+                // none), ANALYZE counts all its rows under one value and the planner
+                // walked the date index over the whole table instead (#1563). The index
+                // is migration-built (v13), never deferred or dropped.
+                let seen = Array(seenIds)
+                let excluded = Array(excludedFolderIds)
+                let inReplyToMatches = try MessageHeader.fetchAll(db, sql: """
+                    SELECT * FROM messageHeader INDEXED BY messageHeader_inReplyTo
+                    WHERE inReplyTo IN (\(Self.placeholders(L.count)))
+                      AND id NOT IN (\(Self.placeholders(seen.count)))
+                      AND folderId NOT IN (\(Self.placeholders(excluded.count)))
+                    ORDER BY date DESC
+                    """, arguments: StatementArguments(L + seen + excluded))
 
                 // (3) + (5) Reverse + lateral via References: messages whose References
                 // header contains any entry of L. The messageReference junction table is
@@ -173,12 +184,63 @@ enum ThreadDetection {
 
         if collected.isEmpty { return ([], [], linkedIds) }
 
+        // A forward's thread and its source's stay apart (ADR-IOS-043, forward split): the emails
+        // across a forward leave the shown emails, their copies and the reached ids alike, so the
+        // chat neither shows nor acts on them, and its walk looks their threads up on their own.
+        let acrossForwards = threadsAcrossForwards(collected, of: msg)
+        let kept = collected.filter { !acrossForwards.contains($0.computedThreadId) }
+        let leftOut = Set(collected.filter { acrossForwards.contains($0.computedThreadId) }.map(\.id))
+
         // Deduplicate cross-folder copies, sort by date. The whole thread, however long: the chat
         // shows every email of it, all the way back (ADR-IOS-114).
-        let deduped = excludeCopies(collected, of: msg)
+        let deduped = excludeCopies(kept, of: msg)
         let shownIds = Set(deduped.map(\.id))
-        let copies = collected.filter { !shownIds.contains($0.id) }
-        return (deduped.sorted { $0.date > $1.date }, copies.sorted { $0.date > $1.date }, linkedIds)
+        let copies = kept.filter { !shownIds.contains($0.id) }
+        return (deduped.sorted { $0.date > $1.date }, copies.sorted { $0.date > $1.date }, linkedIds.subtracting(leftOut))
+    }
+
+    /// The related emails on `msg`'s side of every forward among them.
+    ///
+    /// A forward shares References with the thread it came from (and on Gmail its
+    /// thread id), so the search above reaches across it both ways. Its own thread
+    /// (`ThreadUtils.assignComputedThreadId`: the forward, its copies and replies)
+    /// is told apart by `computedThreadId`:
+    /// - a forward in another thread than `msg`'s: that thread is left out;
+    /// - a forward in `msg`'s thread (`msg` is it, or is a reply to it): the
+    ///   threads of the emails it forwards are left out.
+    /// A forward stored before the split shares its source's thread and shows with
+    /// it; seen from another thread of the conversation it is a forward elsewhere and
+    /// its whole thread is left out (IOS-THREAD-002). An email not stored yet (opened
+    /// from its notification before the merge) has no thread, so nothing is left out.
+    static func excludeAcrossForwards(_ results: [MessageHeader], of msg: MessageHeader) -> [MessageHeader] {
+        let excluded = threadsAcrossForwards(results, of: msg)
+        guard !excluded.isEmpty else { return results }
+        return results.filter { !excluded.contains($0.computedThreadId) }
+    }
+
+    /// The `computedThreadId`s `excludeAcrossForwards` leaves out of `results`.
+    static func threadsAcrossForwards(_ results: [MessageHeader], of msg: MessageHeader) -> Set<String> {
+        let own = msg.computedThreadId
+        guard !own.isEmpty else { return [] }
+        let all = [msg] + results
+        var threadByMessageId: [String: String] = [:]
+        for header in all {
+            if let rfc = header.rfc822MessageId, !rfc.isEmpty, threadByMessageId[rfc] == nil {
+                threadByMessageId[rfc] = header.computedThreadId
+            }
+        }
+        var excluded = Set<String>()
+        for forward in all where ThreadUtils.hasForwardPrefix(forward.subject) && !forward.computedThreadId.isEmpty {
+            if forward.computedThreadId != own {
+                excluded.insert(forward.computedThreadId)
+            } else {
+                let sources = (forward.inReplyTo.map { [$0] } ?? []) + forward.references
+                for source in sources {
+                    if let thread = threadByMessageId[source], !thread.isEmpty, thread != own { excluded.insert(thread) }
+                }
+            }
+        }
+        return excluded
     }
 
     /// Filter out copies of the same email that exist in different folders.
@@ -208,6 +270,11 @@ enum ThreadDetection {
                 .order(Column("date").desc)
                 .fetchAll(db)
         }
+    }
+
+    /// `count` comma-separated `?` placeholders for a SQL `IN` list.
+    private static func placeholders(_ count: Int) -> String {
+        Array(repeating: "?", count: count).joined(separator: ",")
     }
 
 }

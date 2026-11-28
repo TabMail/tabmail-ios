@@ -66,15 +66,35 @@ extension ComposeEditContext {
             bodyText: related.map { relatedBodyText ?? $0.snippet } ?? "")
     }
 
+    /// What a failed body read means to a caller of `relatedBodyText`.
+    enum BodyReadFailure: Sendable {
+        /// The read's error is thrown, so the request takes its caller's failure path (the compose
+        /// card's editor refuses the edit; the chat field's reply restores the user's words).
+        case refuse
+        /// The email is read as having no body: the context carries its snippet and the request
+        /// goes ahead (the agent's reply and forward tools, as on main).
+        case readsAsMissing
+    }
+
     /// THE body read of every compose edit's context: the text of `header`'s body, the primary
     /// message only (embedded .eml sections stripped, they are other people's emails), read in the
     /// same snapshot as the check that the row at its address is still that email
     /// (`AIWriteTarget.stillHolds`). The outer nil refuses: another email is seated at the address
     /// (a UIDVALIDITY reset), so its body is never sent with this email's context. The inner nil:
-    /// no body is stored (the context then carries the snippet).
-    static func relatedBodyText(of header: MessageHeader, db: Database) throws -> String?? {
+    /// no body is stored (the context then carries the snippet). A failed body read is thrown,
+    /// unless the caller reads it as a missing body (`onBodyReadFailure`).
+    static func relatedBodyText(
+        of header: MessageHeader, onBodyReadFailure: BodyReadFailure = .refuse, db: Database
+    ) throws -> String?? {
         guard try AIWriteTarget.stillHolds(header, db: db) else { return nil }
-        guard let html = try MessageBody.fetchOne(db, key: header.id)?.htmlContent, !html.isEmpty else { return .some(nil) }
+        let body: MessageBody?
+        do {
+            body = try MessageBody.fetchOne(db, key: header.id)
+        } catch {
+            guard onBodyReadFailure == .readsAsMissing else { throw error }
+            body = nil
+        }
+        guard let html = body?.htmlContent, !html.isEmpty else { return .some(nil) }
         return .some(EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html)))
     }
 }

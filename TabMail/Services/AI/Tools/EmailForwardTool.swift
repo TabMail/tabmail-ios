@@ -100,11 +100,15 @@ struct EmailForwardTool: AgentTool, Sendable {
             // The related email's body for context, through the one identity-checked read: another
             // email seated at its address since it was read refuses the request.
             guard let relatedBodyText = try await ctx.db.read({ db in
-                try ComposeEditContext.relatedBodyText(of: header, db: db)
+                try ComposeEditContext.relatedBodyText(of: header, onBodyReadFailure: .readsAsMissing, db: db)
             }) else {
                 return ComposeOutcome.failed("the email changed since it was read; nothing was done").describeForLLM
             }
             do {
+                // The forward is sent from the forwarded email's account, so the AI signs as it.
+                let sender: Account? = try? await ctx.db.read { db in
+                    try Account.fetchOne(db, key: header.accountId)
+                }
                 let result = try await EmailComposeTool.runComposeEdit(
                     to: to,
                     cc: cc,
@@ -114,7 +118,7 @@ struct EmailForwardTool: AgentTool, Sendable {
                     mode: "edit_forward",
                     relatedHeader: header,
                     relatedBodyText: relatedBodyText,
-                    db: ctx.db,
+                    sender: sender,
                     composeEdit: composeEdit
                 )
                 generatedSubject = result.subject

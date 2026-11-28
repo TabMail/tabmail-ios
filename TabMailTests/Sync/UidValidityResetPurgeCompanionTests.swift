@@ -12,7 +12,9 @@ import Synchronization
 /// purge-and-resync reaction: the NSE staged-state purges
 /// (`NSEDataBridge.purgeStagedStateForFolder`,
 /// `NSEDataBridge.purgeInboxRemovalMarkersForAccount`) and the chat-pill identity
-/// purge (`ChatIdTranslator.purgeMappingsForFolder`).
+/// purge (`ChatIdTranslator.purgeMappingsForFolder`). Also the process-local
+/// address links of provider-proven moves (`MessageHeaderRekey.forgetAddressHandoffs`,
+/// #1139), forgotten in the write that stamps the new epoch.
 ///
 /// THE INVARIANT ALL FOUR TESTS PIN, stated once: **after a folder's UIDVALIDITY is
 /// reset, nothing anywhere may still resolve one of that folder's old headerIds to
@@ -930,6 +932,174 @@ struct UidValidityResetPurgeCompanionTests {
                 "the real admission gate let an untouched folder's quarantined item back in")
 
         await clearBoth()
+        await Self.resetProcessGlobals()
+    }
+
+    /// #1139 — the address links a provider-proven move leaves behind
+    /// (`MessageHeaderRekey`'s handoffs, old header id → new header id) are keys
+    /// only. After a folder's reset the resync can seat a different email at an
+    /// id that starts or ends a link, and the link then joins two different
+    /// messages: a pending change of one is read as the other's (the state an
+    /// Undo snapshot records, the location an action guard reads), and a lookup
+    /// of one id follows to the other message.
+    ///
+    /// Both directions are driven: a message moved OUT of the reset folder (the
+    /// old end now names another email) and a message moved INTO it (the new end
+    /// does). A link wholly outside the folder is the two-sided control: a reset
+    /// that forgot every link would pass both legs.
+    @Test("A completed reset forgets every address link that starts or ends in the reset folder, and only those")
+    @MainActor
+    func resetForgetsTheAddressLinksOfItsFolderOnly() async throws {
+        Self.resetStagingGlobals()
+        MessageHeaderRekey.clearAddressHandoffsForTesting()
+        defer { MessageHeaderRekey.clearAddressHandoffsForTesting() }
+
+        let server = FakeIMAPServer(mailboxes: [
+            "INBOX": [Self.message(uid: 9701, id: "post-reset-9701@example.com")],
+            "Archive": []
+        ])
+        server.setUidValidity(Self.newEpoch, for: "INBOX")
+        server.setUidValidity(Self.newEpoch, for: "Archive")
+        try server.start()
+        defer { server.stop() }
+
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer {
+            AppDatabase.shared.withLock { $0 = previous }
+            NSEDataBridge.purgeStagingPathOverrideForTesting.withLock { $0 = nil }
+            TestDatabaseTeardown.retire(pool: pool, directory: dir)
+        }
+
+        let accountId = "t4s4-handoff"
+        _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "INBOX", role: .inbox, pool: pool,
+            totalCount: 1, lastKnownUidValidity: Self.oldEpoch)
+        try FolderEpochTestFixture.insertFolder(
+            accountId: accountId, path: "Archive", role: .archive, pool: pool,
+            lastKnownUidValidity: Self.oldEpoch)
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "INBOX", uids: [1601], pool: pool)
+
+        func id(_ folderPath: String, _ uid: String) -> String {
+            MessageIdentity.headerId(accountId: accountId, folderPath: folderPath, messageId: uid)
+        }
+        // Moved OUT: archived from INBOX 4101 to Archive 4201.
+        let leftInbox = id("INBOX", "4101")
+        let archived = id("Archive", "4201")
+        // Moved IN: returned from Archive 4202 to INBOX 4102.
+        let leftArchive = id("Archive", "4202")
+        let returned = id("INBOX", "4102")
+        // Control: Archive 4203 to Sent 4301, nowhere near INBOX.
+        let controlOld = id("Archive", "4203")
+        let controlNew = id("Sent", "4301")
+        // Controls at the folder's edges: the same path in another account, and
+        // a ':'-nested folder under INBOX, neither of which the reset reissued.
+        let otherAccountOld = MessageIdentity.headerId(
+            accountId: "t4s4-handoff-other", folderPath: "INBOX", messageId: "4103")
+        let otherAccountNew = MessageIdentity.headerId(
+            accountId: "t4s4-handoff-other", folderPath: "Archive", messageId: "4204")
+        let nestedOld = id("INBOX:Sub", "4104")
+        let nestedNew = id("Archive", "4205")
+        try await pool.write { db in
+            MessageHeaderRekey.publishAddressHandoffsAfterCommit([
+                HeaderRekeyRecord(oldHeaderId: leftInbox, newHeaderId: archived,
+                                  newProviderMessageId: "4201", newObservedUidValidity: Self.oldEpoch),
+                HeaderRekeyRecord(oldHeaderId: leftArchive, newHeaderId: returned,
+                                  newProviderMessageId: "4102", newObservedUidValidity: Self.oldEpoch),
+                HeaderRekeyRecord(oldHeaderId: controlOld, newHeaderId: controlNew,
+                                  newProviderMessageId: "4301"),
+                HeaderRekeyRecord(oldHeaderId: otherAccountOld, newHeaderId: otherAccountNew,
+                                  newProviderMessageId: "4204"),
+                HeaderRekeyRecord(oldHeaderId: nestedOld, newHeaderId: nestedNew,
+                                  newProviderMessageId: "4205")
+            ], in: db)
+        }
+        let seededOut = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: leftInbox)
+        let seededIn = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: leftArchive)
+        #expect(seededOut == archived && seededIn == returned,
+                "precondition: both links exist before the reset, so their absence below is not vacuous")
+
+        let provider = Self.imapProvider(for: server)
+        try await provider.connect()
+        defer { Task { try? await provider.disconnect() } }
+
+        await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.runUidValidityResetReaction(
+                accountId: accountId, folderPath: "INBOX")
+        }
+
+        let folder = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        #expect(folder?.lastKnownUidValidity == Self.newEpoch,
+                "the reaction never completed, so nothing below is evidence about it")
+
+        let manager = AccountManager.shared
+        defer { manager.removeOverlayEntries(ids: [leftInbox, leftArchive]) }
+
+        // OUT. INBOX 4101 now holds a different email, retagged and not yet written.
+        manager.registerMutation(id: leftInbox, mutation: .init(actionTag: .some(ActionTag.reply)))
+        var archivedRow = MessageHeader(
+            messageId: "4201", subject: "archived", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "archived", folderId: "\(accountId):Archive",
+            accountId: accountId, folderPath: "Archive", isInInbox: false)
+        archivedRow.actionTag = nil
+        #expect(archivedRow.id == archived, "setup: the archived row carries the link's new id")
+        let archivedUndoSnapshot = manager.overlayAdjustedSnapshot(archivedRow)
+        #expect(archivedUndoSnapshot.actionTag == nil,
+                """
+                the archived message took the retag of the email now at its OLD inbox address: \
+                a link out of the reset folder survived and joined two different messages, so \
+                an Undo snapshot of the archived message records a tag it never had.
+                """)
+        let followedFromOldInbox = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: leftInbox)
+        #expect(followedFromOldInbox == leftInbox,
+                "a lookup of the email now at INBOX 4101 still follows the link to the archived message")
+
+        // IN. INBOX 4102 now holds a different email; the returned message's
+        // pending read is still held under its old Archive id.
+        manager.registerMutation(id: leftArchive, mutation: .init(isRead: true))
+        var newOccupant = MessageHeader(
+            messageId: "4102", subject: "new occupant", from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: Date(), snippet: "new occupant", folderId: "\(accountId):INBOX",
+            accountId: accountId, folderPath: "INBOX", isInInbox: true)
+        newOccupant.isRead = false
+        #expect(newOccupant.id == returned, "setup: the new occupant carries the link's new id")
+        let occupantSnapshot = manager.overlayAdjustedSnapshot(newOccupant)
+        #expect(!occupantSnapshot.isRead,
+                """
+                the email now at INBOX 4102 took the pending read of the message that had moved \
+                there before the reset: a link into the reset folder survived.
+                """)
+        let followedFromOldArchive = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: leftArchive)
+        #expect(followedFromOldArchive == leftArchive,
+                "a lookup of the returned message's old Archive id still reaches the email now at INBOX 4102")
+
+        // Control: the reset reached no link outside its folder.
+        let followedControl = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: controlOld)
+        #expect(followedControl == controlNew,
+                "the reset forgot a link with no end in INBOX, so it forgets more than the addresses the server reissued")
+        let followedOtherAccount = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: otherAccountOld)
+        #expect(followedOtherAccount == otherAccountNew,
+                "the reset forgot another account's link at the same folder path")
+        let followedNested = MessageHeaderRekey.currentHeaderId(afterHandoffFrom: nestedOld)
+        #expect(followedNested == nestedNew,
+                "the reset forgot a link from a folder nested under INBOX, which was not reset")
+
+        // The forgotten link's address is linked again (the email now at INBOX
+        // 4101 is moved later): it is one link, counted once.
+        let movedAgain = id("Archive", "4206")
+        try await pool.write { db in
+            MessageHeaderRekey.publishAddressHandoffsAfterCommit([
+                HeaderRekeyRecord(oldHeaderId: leftInbox, newHeaderId: movedAgain,
+                                  newProviderMessageId: "4206", newObservedUidValidity: Self.newEpoch)
+            ], in: db)
+        }
+        let predecessors = MessageHeaderRekey.predecessorHeaderIds(leadingTo: movedAgain)
+        #expect(predecessors == [leftInbox],
+                "a forgotten link left its order entry behind, so a link made again at that address is counted twice: \(predecessors)")
+
         await Self.resetProcessGlobals()
     }
 }

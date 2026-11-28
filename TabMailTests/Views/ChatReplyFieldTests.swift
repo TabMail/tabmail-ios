@@ -1917,8 +1917,8 @@ struct ChatReplyFieldTests {
         }
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         let detail = try Self.source("TabMail/Views/Message/MessageDetailView.swift")
-        #expect(Self.count("onAgentCompose: { agentCompose = $0 }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
-                "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert")
+        #expect(Self.count("onAgentCompose: { req in guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } agentCompose = req }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
+                "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert; a new email's bound account is looked up as the card is taken")
         #expect(Self.count("private var composeHostShown: Bool { emailsOpenBeside || (selectedMessageId == nil && pushedMessageId == nil) }", in: inbox) == 1)
         // Whether an opened email shows beside the inbox comes from the split view's own width, read
         // outside its columns, and reaches the inbox through the content column.
@@ -1930,7 +1930,8 @@ struct ChatReplyFieldTests {
                 "every sheet, cover and alert of the inbox holds a compose card")
         #expect(Self.count("newEmailCover != nil || replyMessage != nil || replyAllMessage != nil || forwardMessage != nil || agentCompose != nil || moveMessage != nil || labelMenuMessage != nil }", in: detail) == 1,
                 "every sheet and cover of the email screen holds a compose card")
-        #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1)
+        #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: (chatContextMessage ?? message).accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1,
+                "the email screen binds the account of the email its chat is about (ComposeEditSenderAccountTests)")
         #expect(Self.count(".fullScreenCover(item: $agentCompose) { req in req.composeView(account: fromAccount(of: req), onOutcome: req.onOutcome) }", in: detail) == 1,
                 "the email screen's new message opens from its bound account, through the one presenter")
         let detailActions = try Self.source("TabMail/Views/Message/MessageDetailView+Actions.swift")

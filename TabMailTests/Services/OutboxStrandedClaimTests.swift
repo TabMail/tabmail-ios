@@ -89,9 +89,10 @@ struct OutboxStrandedClaimTests {
         accountId: String,
         id: String,
         status: OutboxStatus = .queued,
-        sentAt: Date? = nil
+        sentAt: Date? = nil,
+        draft queuedDraft: DraftMessage? = nil
     ) throws -> OutboxMessage {
-        let draft = DraftMessage(
+        let draft = queuedDraft ?? DraftMessage(
             to: ["recipient@example.com"],
             subject: "Post-claim provider loss \(id)",
             body: "Body"
@@ -163,6 +164,68 @@ struct OutboxStrandedClaimTests {
             "a successful send must finalize the exact durable row"
         )
         await AccountManager.shared.unregisterProviderForTesting(accountId: accountId)
+    }
+
+    /// #1031: Send queues each recipient under its display name. The durable
+    /// row keeps the names, and the send the drain makes from it, at once or
+    /// after the user's Retry of a failed send, hands the provider every name.
+    @Test("A queued send's recipient names reach the provider on the drain and after Retry")
+    func queuedSendKeepsRecipientNames() async throws {
+        let suffix = UUID().uuidString.lowercased()
+        let accountId = "acc-names-\(suffix)"
+        let queuedId = "outbox-names-queued-\(suffix)"
+        let failedId = "outbox-names-failed-\(suffix)"
+        let (pool, directory, previous) = try makeTestDB(accountId: accountId)
+        defer { restore(pool: pool, directory: directory, previous: previous) }
+
+        // The fields as compose fills them: typed, a picked contact, a contact
+        // with a non-ASCII name.
+        let typed = ComposeDraftGuards.committing("Sam Lee <sam@example.com>,", to: .init(), room: 10)
+        let toField = try #require(typed)
+        let fields = ComposeDraftGuards.Recipients(
+            to: toField,
+            cc: ComposeDraftGuards.picking("ann@example.com", name: "Lee, Ann", to: .init(), room: 10),
+            bcc: ComposeDraftGuards.picking("zoe@example.com", name: "Zoë Kim", to: .init(), room: 10))
+        guard case .send(let to, let cc, let bcc) = fields.pendingCommitted.sendRecipients else {
+            Issue.record("compose refused the fields")
+            return
+        }
+        let namedTo = [#""Sam Lee" <sam@example.com>"#]
+        let namedCc = [#""Lee, Ann" <ann@example.com>"#]
+        let namedBcc = [#""Zoë Kim" <zoe@example.com>"#]
+        let draft = DraftMessage(to: to, cc: cc, bcc: bcc, subject: "Names", body: "Body")
+        try seedOutbox(pool, accountId: accountId, id: queuedId, draft: draft)
+        try seedOutbox(pool, accountId: accountId, id: failedId, status: .failed, draft: draft)
+
+        for id in [queuedId, failedId] {
+            let stored = try row(pool, id: id)
+            let durable = try #require(stored)
+            #expect(durable.to == namedTo, "\(id)")
+            #expect(durable.cc == namedCc, "\(id)")
+            #expect(durable.bcc == namedBcc, "\(id)")
+        }
+
+        let provider = MockEmailProvider()
+        try await TestProviderRegistry.withRegisteredProvider(accountId: accountId, provider: provider) {
+            await AccountManager.shared.drainOutbox()
+            #expect(await provider.sentDrafts.count == 1, "the drain sends the queued row only")
+            let retried = AccountManager.shared.retryOutboxMessage(failedId)
+            #expect(retried)
+            // Retry starts its own drain in an unawaited task. When that drain
+            // takes the outbox first, this call returns at once
+            // (`isDrainingOutbox`) while the send is still on its way, so the
+            // sends are read only once no drain owns the outbox.
+            await AccountManager.shared.drainOutbox()
+            try #require(await OutboxDrainLatch.waitForClear(), "the drain after Retry never let the outbox go")
+            let sent = await provider.sentDrafts
+            #expect(sent.count == 2)
+            guard sent.count == 2 else { return }
+            for (index, sentDraft) in sent.enumerated() {
+                #expect(sentDraft.to == namedTo, "send \(index)")
+                #expect(sentDraft.cc == namedCc, "send \(index)")
+                #expect(sentDraft.bcc == namedBcc, "send \(index)")
+            }
+        }
     }
 
     /// #531 — **a send the user already made survives an app update, goes out

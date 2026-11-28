@@ -18,9 +18,13 @@ import Testing
 /// - a queued action and a send are kept while the sign-in is refused, however
 ///   many drains run, and go out once the user signs in again, which also clears
 ///   the warning;
+/// - a token endpoint that asks for another sign-in step or consent, or reports
+///   an admin restriction, warns the same way (#659); a calendar change queued
+///   meanwhile waits, and goes through once a token is issued again;
 /// - a token endpoint that could not answer (offline, 5xx, a body without an
 ///   OAuth `error` code, `temporarily_unavailable`) raises no warning;
-/// - a refusal of a sign-in the user has already replaced raises no warning.
+/// - a refusal of a sign-in the user has already replaced, or of a removed
+///   account, raises no warning, whichever queue the refusal reaches.
 ///
 /// Gmail and Outlook take their tokens through the one accessor
 /// `AccountManager.makeOAuthAccessor` builds, so both are driven end to end
@@ -173,9 +177,17 @@ struct RevokedMailGrantSignalTests {
 
     // MARK: - The warning, the queue and the outbox
 
-    @Test("A revoked sign-in shows the warning, keeps the queued action and the send, and both go out after signing in again",
-          arguments: [AccountProvider.gmail, .outlook])
-    func revokedSignInWarnsAndKeepsTheWork(kind: AccountProvider) async throws {
+    /// Each provider with a refused grant, and with the code it returns when the
+    /// sign-in needs the user (#659): Google's admin restriction, Microsoft's
+    /// further sign-in step.
+    static let refusedMailSignIns: [(AccountProvider, String)] = [
+        (.gmail, "invalid_grant"), (.outlook, "invalid_grant"),
+        (.gmail, "admin_policy_enforced"), (.outlook, "interaction_required"),
+    ]
+
+    @Test("A refused sign-in shows the warning, keeps the queued action and the send, and both go out after signing in again",
+          arguments: refusedMailSignIns)
+    func revokedSignInWarnsAndKeepsTheWork(kind: AccountProvider, code: String) async throws {
         try await withFixture(kind) { f, http in
             let providerId = "revoked-\(kind)-message"
             let routes = Self.routes(kind, providerId: providerId)
@@ -193,38 +205,52 @@ struct RevokedMailGrantSignalTests {
                 refreshCoordinator: OAuthRefreshCoordinator()
             ) { _ in
                 refusals.withLock { $0 += 1 }
-                throw OAuthError.tokenExchangeFailed("invalid_grant")
+                throw OAuthError.tokenExchangeFailed(code)
             }
             let provider: any EmailProvider = kind == .outlook
                 ? ExchangeProvider(userEmail: f.account.emailAddress, accessToken: accessor, session: http.session)
                 : GmailProvider(userEmail: f.account.emailAddress, accessToken: accessor, session: http.session)
 
-            // The user's gesture and send, made before the sign-in was refused.
+            // The user's gesture, made before the sign-in was refused.
             let header = try seedHeader(f, providerId: providerId)
             await AccountManager.shared.markRead([header])
             try #require(await waitForQuietQueue(), "the gesture's own drain never returned")
             let queued = try queuedOperations(f)
             #expect(queued.count == 1, "the gesture was not queued")
             guard queued.count == 1 else { return }
+
+            // Each queue on its own, from an account with no warning, gets more
+            // drains than any retry limit, all against a refused sign-in, and must
+            // raise the warning itself: first the queued action, then the send.
+            await AccountManager.shared.registerProviderForTesting(accountId: f.account.id, provider: provider)
+            let drains = max(SyncConfig.pendingOperationServerRefusalRetryLimit, 3) + 1
+            try #require(await warningReaches(false, for: f.account.id), "fixture check: the warning was up before any drain")
+            for _ in 0..<drains {
+                try #require(await waitForQuietQueue(), "an earlier drain still owns the queue")
+                await AccountManager.shared.drainPendingQueue()
+            }
+            try #require(await waitForQuietQueue(), "the last drain never returned")
+            let refusalsOfTheAction = refusals.withLock { $0 }
+            #expect(refusalsOfTheAction > 0, "\(kind): the queued action never asked the refused sign-in for a token")
+            #expect(await warningReaches(true, for: f.account.id),
+                    "\(kind) \(code): the queued action's refusal did not tell the user to sign in again")
+
+            await AccountManager.shared.clearAuthFailed(f.account.id)
+            try #require(await warningReaches(false, for: f.account.id), "fixture check: the warning stayed after it was cleared")
             let draft = DraftMessage(to: ["recipient@example.com"], subject: "Revoked send", body: "Body of the send")
             var message = OutboxMessage(accountId: f.account.id, draft: draft)
             message.holdUntil = Date().addingTimeInterval(-60)
             let seeded = message
             try await f.pool.write { db in try seeded.insert(db) }
-
-            // More drains than any retry limit, all against a refused sign-in.
-            await AccountManager.shared.registerProviderForTesting(accountId: f.account.id, provider: provider)
-            let drains = max(SyncConfig.pendingOperationServerRefusalRetryLimit, 3) + 1
             for _ in 0..<drains {
-                try #require(await waitForQuietQueue(), "an earlier drain still owns the queue")
-                await AccountManager.shared.drainPendingQueue()
+                try #require(await OutboxDrainLatch.waitForClear(), "an earlier drain still owns the outbox")
                 await AccountManager.shared.drainOutbox()
             }
-            try #require(await waitForQuietQueue(), "the last drain never returned")
-
-            #expect(refusals.withLock { $0 } > 0, "the refused sign-in was never asked for a token")
+            try #require(await OutboxDrainLatch.waitForClear(), "the last send drain never let the outbox go")
+            let refusalsOfTheSend = refusals.withLock { $0 } - refusalsOfTheAction
+            #expect(refusalsOfTheSend > 0, "\(kind): the send never asked the refused sign-in for a token")
             #expect(await warningReaches(true, for: f.account.id),
-                    "\(kind): the user was not told to sign in again")
+                    "\(kind) \(code): the send's refusal did not tell the user to sign in again")
 
             let kept = try queuedOperations(f)
             #expect(kept.count == 1, "\(kind): the user's mark-read was dropped while the sign-in was refused")
@@ -296,6 +322,9 @@ struct RevokedMailGrantSignalTests {
         RefreshFailure(testDescription: "server_error") { OAuthError.tokenExchangeFailed("server_error") },
         RefreshFailure(testDescription: "no error code in the body") { OAuthError.tokenExchangeFailed("unknown") },
         RefreshFailure(testDescription: "invalid_scope (our request, not the grant)") { OAuthError.tokenExchangeFailed("invalid_scope") },
+        RefreshFailure(testDescription: "an unknown code that contains a known one") {
+            OAuthError.tokenExchangeFailed("not_interaction_required")
+        },
         RefreshFailure(testDescription: "offline") { URLError(.notConnectedToInternet) },
         RefreshFailure(testDescription: "timed out") { URLError(.timedOut) },
         RefreshFailure(testDescription: "an HTML error page") {
@@ -305,6 +334,18 @@ struct RevokedMailGrantSignalTests {
 
     /// The codes with which the token endpoint itself refuses the grant.
     static let refused = ["invalid_grant", "invalid_client", "unauthorized_client", " INVALID_GRANT\n"]
+
+    /// The codes with which the token endpoint asks for something only the user, or
+    /// their admin, can do: another sign-in step or consent (Microsoft), a Workspace
+    /// admin restriction (Google). Signing in again is how the user takes the step
+    /// or gives the consent, and how access comes back once an admin acts, so they
+    /// warn the same way (#659).
+    static let needsTheUser = [
+        "interaction_required", "consent_required", "admin_policy_enforced", " Interaction_Required\n",
+    ]
+
+    /// Every code after which the user is told to sign in again.
+    static let warns = refused + needsTheUser
 
     private func refreshThroughTheAccessor(
         _ failure: @escaping @Sendable () -> any Error
@@ -343,7 +384,8 @@ struct RevokedMailGrantSignalTests {
         await AccountManager.shared.clearAuthFailed(accountId)
     }
 
-    @Test("A grant the token endpoint refuses tells the user to sign in again", arguments: refused)
+    @Test("A refused grant, or a sign-in that needs the user, tells the user to sign in again",
+          arguments: warns)
     func refusedGrantRaisesTheWarning(_ code: String) async throws {
         let (accountId, error) = try await refreshThroughTheAccessor { OAuthError.tokenExchangeFailed(code) }
         #expect(error != nil, "the refused refresh returned a token")
@@ -357,8 +399,84 @@ struct RevokedMailGrantSignalTests {
         await AccountManager.shared.clearAuthFailed(accountId)
     }
 
-    @Test("A refusal of a sign-in the user has already replaced does not warn about the new one")
-    func refusalOfAReplacedSignInRaisesNoWarning() async throws {
+    /// A token endpoint's answer as the provider sends it, and the code a refresh
+    /// reads from it.
+    struct TokenAnswer: Sendable, CustomTestStringConvertible {
+        let testDescription: String
+        let kind: AccountProvider
+        let body: String
+        let code: String
+        let warns: Bool
+    }
+
+    /// The code is the answer's top-level `error` field; the same word anywhere
+    /// else in the answer says nothing.
+    static let tokenAnswers: [TokenAnswer] = [
+        TokenAnswer(
+            testDescription: "Google admin restriction", kind: .gmail,
+            body: #"{"error":"admin_policy_enforced","error_description":"Access is restricted by the administrator."}"#,
+            code: "admin_policy_enforced", warns: true),
+        TokenAnswer(
+            testDescription: "Microsoft further sign-in step", kind: .outlook,
+            body: #"{"error":"interaction_required","error_description":"Another sign-in step is required.","error_codes":[50076],"suberror":"basic_action"}"#,
+            code: "interaction_required", warns: true),
+        TokenAnswer(
+            testDescription: "a known code only in the description", kind: .outlook,
+            body: #"{"error":"invalid_request","error_description":"interaction_required"}"#,
+            code: "invalid_request", warns: false),
+        TokenAnswer(
+            testDescription: "known codes only in fields the client does not read", kind: .gmail,
+            body: #"{"error_description":"admin_policy_enforced","suberror":"consent_required"}"#,
+            code: "unknown", warns: false),
+    ]
+
+    /// The refresh a resource request's 401 forces, through the app's own token
+    /// request and the endpoint's answer as sent, so the warning rests on the code
+    /// the real decoder reads.
+    @Test("The token endpoint's answer warns only on its top-level code", arguments: tokenAnswers)
+    func tokenEndpointAnswerWarnsOnItsCode(_ answer: TokenAnswer) async throws {
+        let harness = CredentialTestHarness(), store = harness.provider
+        let accountId = "revoked-answer-" + UUID().uuidString
+        let stored = CredentialTestHarness.tokens()
+        try store.install(accountId: accountId, tokens: stored)
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        http.register(path: "token", method: "POST", response: .json(raw: answer.body, statusCode: 400))
+        let service = await OAuthService(tokenSession: http.session)
+        let kind = answer.kind
+        let accessor = await AccountManager.shared.makeOAuthAccessor(
+            accountId: accountId, email: "user@example.com",
+            store: store, refreshCoordinator: OAuthRefreshCoordinator(store: store)
+        ) { refreshToken in
+            if kind == .outlook { return try await service.refreshMicrosoftToken(refreshToken: refreshToken) }
+            return try await service.refreshGoogleToken(refreshToken: refreshToken)
+        }
+        var caught: (any Error)?
+        do { _ = try await accessor(true) } catch { caught = error }
+
+        let code = Self.tokenExchangeCode(caught)
+        #expect(code == answer.code, "\(answer.testDescription): the refresh did not read the answer's top-level code")
+        #expect(await warningReaches(answer.warns, for: accountId),
+                "\(answer.testDescription): the warning does not follow the answer's top-level code")
+        await AccountManager.shared.clearAuthFailed(accountId)
+
+        let posts = http.recordedCalls().filter { $0.method == "POST" }
+        let postedTo = posts.map { $0.url }
+        #expect(posts.count == 1, "\(answer.testDescription): token requests: \(postedTo)")
+        guard posts.count == 1 else { return }
+        let endpoint = kind == .outlook
+            ? "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+            : "https://oauth2.googleapis.com/token"
+        #expect(posts[0].url == endpoint)
+        let fields = FormDecoding.fields(posts[0].body.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+        let presented = fields["refresh_token"]
+        let expected = stored.refreshToken.map { [$0] }
+        #expect(presented == expected, "\(answer.testDescription): the refresh did not present the stored sign-in")
+    }
+
+    @Test("A refusal of a sign-in the user has already replaced does not warn about the new one",
+          arguments: warns)
+    func refusalOfAReplacedSignInRaisesNoWarning(_ code: String) async throws {
         let harness = CredentialTestHarness(), store = harness.provider
         let accountId = "revoked-replaced-" + UUID().uuidString
         try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
@@ -369,7 +487,7 @@ struct RevokedMailGrantSignalTests {
         ) { _ in
             await started.signal()
             await release.wait()
-            throw OAuthError.tokenExchangeFailed("invalid_grant")
+            throw OAuthError.tokenExchangeFailed(code)
         }
         let refresh = Task { try await accessor(true) }
         await started.wait()
@@ -378,16 +496,16 @@ struct RevokedMailGrantSignalTests {
             accessToken: "new-access", refreshToken: "new-refresh", expiresAt: Date().addingTimeInterval(3600)))
         await release.signal()
         let result = await refresh.result
-        #expect(Self.tokenExchangeCode(result.failure) == "invalid_grant",
-                "the old sign-in's refusal did not reach the caller unchanged")
+        #expect(Self.tokenExchangeCode(result.failure) == code,
+                "\(code): the old sign-in's refusal did not reach the caller unchanged")
 
         #expect(await warningReaches(false, for: accountId),
-                "the old sign-in's refusal told the user to sign in again after they had")
+                "\(code): the old sign-in's refusal told the user to sign in again after they had")
         await AccountManager.shared.clearAuthFailed(accountId)
     }
 
-    @Test("A refusal that lands after the account was removed does not warn")
-    func refusalAfterRemovalRaisesNoWarning() async throws {
+    @Test("A refusal that lands after the account was removed does not warn", arguments: warns)
+    func refusalAfterRemovalRaisesNoWarning(_ code: String) async throws {
         let harness = CredentialTestHarness(), store = harness.provider
         var account = Account(
             emailAddress: "removed-\(UUID().uuidString)@example.com", displayName: "Removed", provider: .gmail)
@@ -401,7 +519,7 @@ struct RevokedMailGrantSignalTests {
         ) { _ in
             await started.signal()
             await release.wait()
-            throw OAuthError.tokenExchangeFailed("invalid_grant")
+            throw OAuthError.tokenExchangeFailed(code)
         }
         let refresh = Task { try await accessor(true) }
         await started.wait()
@@ -412,12 +530,194 @@ struct RevokedMailGrantSignalTests {
         #expect(store.activation(accountId: accountId) != nil, "the credential the test relies on is gone")
         await release.signal()
         let result = await refresh.result
-        #expect(Self.tokenExchangeCode(result.failure) == "invalid_grant",
-                "the removed account's refusal did not reach the caller unchanged")
+        #expect(Self.tokenExchangeCode(result.failure) == code,
+                "\(code): the removed account's refusal did not reach the caller unchanged")
 
         #expect(await warningReaches(false, for: accountId),
-                "a removed account was told to sign in again")
+                "\(code): a removed account was told to sign in again")
         await AccountManager.shared.clearAuthFailed(accountId)
+    }
+
+    @Test("A refusal warns only for the sign-in its refresh began with, on an account still there")
+    func refusalWarnsOnlyForTheInstalledSignIn() async throws {
+        let harness = CredentialTestHarness(), store = harness.provider
+        let accountId = "revoked-generation-" + UUID().uuidString
+        let old = try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens()).generation
+        let current = try store.install(accountId: accountId, tokens: .init(
+            accessToken: "new-access", refreshToken: "new-refresh", expiresAt: Date().addingTimeInterval(3600))).generation
+        #expect(old != current, "fixture check: the new sign-in kept the old one's generation")
+
+        await AccountManager.shared.markAuthFailed(accountId, refusedSignIn: old, store: store)
+        #expect(await warningReaches(false, for: accountId), "a refusal of the replaced sign-in warned")
+        await AccountManager.shared.markAuthFailed(accountId, refusedSignIn: current, store: store)
+        #expect(await warningReaches(true, for: accountId), "a refusal of the installed sign-in did not warn")
+        await AccountManager.shared.clearAuthFailed(accountId)
+
+        var removed = Account(
+            emailAddress: "removed-\(UUID().uuidString)@example.com", displayName: "Removed", provider: .gmail)
+        removed.id = "revoked-generation-removed-" + UUID().uuidString
+        let removedId = removed.id
+        let generation = try store.install(accountId: removedId, tokens: CredentialTestHarness.tokens()).generation
+        await AccountManager.shared.disconnectAccount(removed, deletingCredentials: [])
+        #expect(store.activation(accountId: removedId)?.generation == generation,
+                "fixture check: the credential the test relies on is gone")
+        await AccountManager.shared.markAuthFailed(removedId, refusedSignIn: generation, store: store)
+        #expect(await warningReaches(false, for: removedId), "a removed account was told to sign in again")
+        await AccountManager.shared.clearAuthFailed(removedId)
+    }
+
+    /// The text from `start` up to, not including, the first `end` after it.
+    private static func slice(of source: String, from start: String, to end: String) -> String? {
+        guard let lower = source.range(of: start),
+              let upper = source.range(of: end, range: lower.upperBound..<source.endIndex) else { return nil }
+        return String(source[lower.lowerBound..<upper.lowerBound])
+    }
+
+    /// A check made before the hop to the account actor could pass, a new sign-in
+    /// then be installed and its warning cleared, and the insert put the warning
+    /// back. The tests above settle the sign-in before the refusal is released, and
+    /// no schedule a test can set up lands in that gap, so the source is read: the
+    /// accessor's refusal branch makes no check of its own and calls only the
+    /// guarded writer, whose check and insert are one actor method with no
+    /// suspension point between them.
+    @Test("The refusal's check and the warning's insert run in one turn of the account actor")
+    func refusalCheckAndInsertShareOneActorTurn() throws {
+        let source = try AppLogStoreTests.projectFile("TabMail/Services/Account/AccountManager.swift")
+
+        let accessorText = Self.slice(of: source, from: "func makeOAuthAccessor(", to: "\n    }\n")
+        let accessor = try #require(accessorText, "makeOAuthAccessor was not found")
+        let branchText = Self.slice(of: accessor, from: "} catch {", to: "throw error")
+        let branch = try #require(branchText, "the accessor's refusal branch was not found")
+        #expect(branch.contains("await self.markAuthFailed(accountId, refusedSignIn: generation, store: store)"),
+                "the refusal branch does not call the guarded writer")
+        #expect(!branch.contains("isRuntimeRemoved"), "the refusal branch checks the removal before the hop")
+        #expect(!branch.contains("activation("), "the refusal branch checks the sign-in before the hop")
+        #expect(!branch.contains("markAuthFailed(accountId)"), "the refusal branch calls the unguarded writer")
+
+        let signature = "func markAuthFailed(_ accountId: String, refusedSignIn generation: String, store: ProviderCredentialStore) {"
+        #expect(!source.contains("nonisolated " + signature), "the guarded writer does not run on the actor")
+        let writerText = Self.slice(of: source, from: signature, to: "\n    }\n")
+        let writer = try #require(writerText, "the guarded writer was not found")
+        #expect(writer.contains("!isRuntimeRemoved(accountId)"), "the guarded writer does not check the removal")
+        #expect(writer.contains("store.activation(accountId: accountId)?.generation == generation"),
+                "the guarded writer does not check the installed sign-in")
+        #expect(writer.contains("authFailedAccounts.insert(accountId)"), "the guarded writer does not raise the warning")
+        #expect(!writer.contains("await"), "the guarded writer can suspend between its check and its insert")
+    }
+
+    // MARK: - The calendar queue
+
+    /// One calendar change queued for an Outlook account whose token comes from the
+    /// real accessor over a test credential store holding an expired sign-in, so
+    /// the first request refreshes it with `refresher`. The change goes to the fake
+    /// Graph calendar through the real `ExchangeCalendarProvider` and the real
+    /// queue (`AccountManager.drainCalendarQueue`).
+    private func withCalendarChange(
+        refresher: @escaping @Sendable (_ refreshToken: String) async throws -> OAuthTokens,
+        _ body: (_ accountId: String, _ store: ProviderCredentialStore, _ op: PendingCalendarOperation,
+                 _ db: CalendarQueueTestDatabase, _ graph: FakeGraphCalendar) async throws -> Void
+    ) async throws {
+        let harness = CredentialTestHarness(), store = harness.provider
+        let accountId = "revoked-calendar-" + UUID().uuidString
+        try store.install(accountId: accountId, tokens: CredentialTestHarness.tokens())
+        let graph = FakeGraphCalendar([])
+        let http = FakeHTTP.Scenario()
+        graph.install(on: http)
+        let accessor = await AccountManager.shared.makeOAuthAccessor(
+            accountId: accountId, email: "cal@example.com",
+            store: store, refreshCoordinator: OAuthRefreshCoordinator(store: store), refresher: refresher)
+        let provider = ExchangeCalendarProvider(mailbox: "cal@example.com", accessToken: accessor, session: http.session)
+        let db = try CalendarQueueTestDatabase(accountId: accountId)
+        await AccountManager.shared.registerCalendarProviderForTesting(accountId: accountId, provider: provider)
+        let start = GraphFixture.onDevice(days: 2, hour: 10)
+        let zone = TimeZone.current.identifier
+        let op = PendingCalendarOperation(
+            operationType: .create, accountId: accountId, eventId: "precreated659", calendarId: "primary",
+            arguments: [
+                "title": .string("Planning"),
+                "start_iso": .string(GraphFixture.wall(start, in: zone)),
+                "end_iso": .string(GraphFixture.wall(start.addingTimeInterval(3_600), in: zone)),
+            ], eventTitle: "Planning")
+        var failure: (any Error)?
+        do {
+            try await db.pool.write { db in try op.insert(db) }
+            try await body(accountId, store, op, db, graph)
+        } catch {
+            failure = error
+        }
+        await AccountManager.shared.clearAuthFailed(accountId)
+        await AccountManager.shared.unregisterCalendarProviderForTesting(accountId: accountId)
+        // A refused grant retires the change and loads it into the shared list of
+        // late calendar failures; empty that list while this database is still the
+        // installed one, so the failure does not outlive the test.
+        try? await db.pool.write { db in _ = try PendingCalendarOperation.deleteAll(db) }
+        await LateCalendarFailureStore.shared.reload()
+        http.close()
+        db.finish()
+        withExtendedLifetime(harness) {}
+        if let failure { throw failure }
+    }
+
+    @Test("A calendar change waits while its sign-in needs the user, and goes through once a token is issued again",
+          arguments: needsTheUser)
+    func calendarChangeWaitsForTheUser(_ code: String) async throws {
+        let refusing = Mutex(true), refusals = Mutex(0)
+        try await withCalendarChange(refresher: { _ in
+            if refusing.withLock({ $0 }) {
+                refusals.withLock { $0 += 1 }
+                throw OAuthError.tokenExchangeFailed(code)
+            }
+            return Self.newSignIn()
+        }) { accountId, _, op, db, graph in
+            // Two drains while the token is refused: the change is retried, never given up.
+            for attempt in 1...2 {
+                let before = refusals.withLock { $0 }
+                await AccountManager.shared.drainCalendarQueue()
+                let after = refusals.withLock { $0 }
+                #expect(after > before, "\(code), drain \(attempt): the change did not ask for a token")
+                let row = try await db.pool.read { db in try PendingCalendarOperation.fetchOne(db, key: op.id) }
+                #expect(row?.status == PendingStatus.queued.rawValue,
+                        "\(code), drain \(attempt): the change left the queue (\(String(describing: row?.status)), \(row?.failureReason ?? "no reason"))")
+                #expect(row?.failureKind == nil,
+                        "\(code), drain \(attempt): it was recorded as a failure of kind \(String(describing: row?.failureKind))")
+                #expect(row?.failureReason == nil,
+                        "\(code), drain \(attempt): it was given a failure reason: \(row?.failureReason ?? "")")
+            }
+            #expect(await warningReaches(true, for: accountId), "\(code): the user was not told to sign in again")
+            #expect(graph.writes.isEmpty, "\(code): a write went out without a token: \(graph.writes)")
+
+            // A token is issued again (the user took the step, or an admin lifted the restriction).
+            refusing.withLock { $0 = false }
+            await AccountManager.shared.drainCalendarQueue()
+            let rows = try await db.pool.read { db in try PendingCalendarOperation.fetchAll(db) }
+            #expect(rows.isEmpty,
+                    "\(code): the change did not leave the queue once a token was issued: \(rows.map { "\($0.status) \($0.failureReason ?? "")" })")
+            let made = graph.created
+            let subject = made.first?["subject"] as? String
+            #expect(made.count == 1 && subject == "Planning", "\(code): the change was not made exactly once: \(graph.writes)")
+        }
+    }
+
+    @Test("A refusal of a replaced sign-in that reaches the calendar queue does not warn about the new one",
+          arguments: warns)
+    func calendarRefusalOfAReplacedSignInRaisesNoWarning(_ code: String) async throws {
+        let started = CredentialTestLatch(), release = CredentialTestLatch()
+        try await withCalendarChange(refresher: { _ in
+            await started.signal()
+            await release.wait()
+            throw OAuthError.tokenExchangeFailed(code)
+        }) { accountId, store, _, _, graph in
+            let drain = Task { await AccountManager.shared.drainCalendarQueue() }
+            await started.wait()
+            // The user signs in again while the old sign-in's refresh is on the wire.
+            try store.install(accountId: accountId, tokens: .init(
+                accessToken: "new-access", refreshToken: "new-refresh", expiresAt: Date().addingTimeInterval(3600)))
+            await release.signal()
+            await drain.value
+            #expect(graph.writes.isEmpty, "\(code): fixture check: the refused attempt reached the server: \(graph.writes)")
+            #expect(await warningReaches(false, for: accountId),
+                    "\(code): the old sign-in's refusal, through the calendar queue, told the user to sign in again after they had")
+        }
     }
 
     // MARK: - Password (IMAP and iCloud) sign-ins

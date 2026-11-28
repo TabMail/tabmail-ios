@@ -696,11 +696,12 @@ struct ExchangeProviderSelectionWiringTests {
     private static let backfillFields = "\(headerFields),body"
     private static let fullFields = "\(headerFields),body,parentFolderId"
     // The listings, the header reads and the details batch also expand Outlook's
-    // last verb, right after their `$select` (`ExchangeGraphMessageRequest.selection`);
-    // search, backfill, the full read and the message delta do not. The expansion
-    // is the provider's own constant: it names one Graph property, whose wire form
-    // `OutlookLastVerbTests` pins.
-    private static let lastVerb = GraphAPI.lastVerbExpandParameter
+    // last verb and threading ids, right after their `$select`
+    // (`ExchangeGraphMessageRequest.selection`), as do the backfill reads
+    // (`fetchSingleBackfill`, the older-mail walk and the catch-up); search, the
+    // full read and the message delta do not. The expansion is the provider's own constant:
+    // it names three Graph properties, whose wire form `OutlookLastVerbTests` pins.
+    private static let lastVerb = GraphAPI.extendedPropertiesExpandParameter
 
     private func provider(_ http: FakeHTTP.Scenario) -> ExchangeProvider {
         ExchangeProvider(
@@ -861,7 +862,7 @@ struct ExchangeProviderSelectionWiringTests {
             normalizedURL("\(Self.graphBase)/messages/full-route?$select=\(Self.fullFields)"),
             normalizedURL(
                 "\(Self.graphBase)/messages/full-route/attachments?\(GraphAPI.attachmentMetadataQuery)"),
-            normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)"),
+            normalizedURL("\(Self.graphBase)/messages/backfill-route?$select=\(Self.backfillFields)&\(Self.lastVerb)"),
             normalizedURL(
                 "\(Self.graphBase)/mailFolders/search-route/messages?$select=\(h)"
                     + "&$search=%22route%22&$top=20"),

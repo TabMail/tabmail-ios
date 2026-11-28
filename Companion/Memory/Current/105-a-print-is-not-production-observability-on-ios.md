@@ -211,15 +211,20 @@ build**. The error's text stays in the debug-gated logs only.
   the account the user just fixed.
 - **Re-auth alert by phase.** Refused password: the password line (the probe records the refusal through
   its own local reporter, and `updateIMAPPassword` (since 2026-11-11 `updatePassword`, topic 145) rethrows it as `ProviderError.authenticationFailed`);
-  TLS minimum not met: the existing TLS sentence for the account's host; anything after the password was
+  TLS minimum not met: the existing TLS sentence for the account's host; a server that offers no
+  encryption on the account's port (`IMAPTransportSecurityError.noEncryptedConnection`, 2026-11-27): that
+  error's own sentence, the one alert line that is not fixed, built only from the account's host and ports
+  and never from server text; anything after the password was
   accepted (save, sync) or a temporary refusal: "Couldn't finish setting up the account. Try again.";
-  offline: no alert.
+  offline: no alert. The inbox banner shows one fixed line for either transport refusal
+  (`InboxErrorBanner.encryptionMessage`).
 - **The probe never marks the account.** `createIMAPProvider(passwordOverride:)` builds the probe with no
   account reporter; `installAcceptedPasswordProbeAsLive` attaches the real one in the same actor turn
   that makes the probe the live provider.
 - **The IOS-SCROLL-003 qualifier in §4 still holds**: a connection failure during pagination raises no
   banner, as before.
-- Tests: `InboxErrorBannerTests` (fixed lines for every error; alert line by phase),
+- Tests: `InboxErrorBannerTests` (fixed lines for every error, the no-encryption alert sentence the one
+  exception; alert line by phase),
   `SyncRunBannerEntryPointTests` (each run entry point; ten-run sequence), `IMAPLoginRefusalSignInTests`
   (codes, factory wiring, probe never marks, live provider after Update Password reports).
 

@@ -24,6 +24,9 @@ import Synchronization
 ///     message, and asks the model nothing.
 ///
 /// `.processGlobalState`: the AI opt-out flag and `AppDatabase.shared` are process-wide.
+/// The providers whose numbering can be reset under an email (main's `epochProviders`).
+private let recomputeEpochProviders: [AccountProvider] = [.imap, .icloud]
+
 @Suite("AI text messages through their producers", .serialized, .processGlobalState)
 struct AITextMessageCallerTests {
 
@@ -55,8 +58,12 @@ struct AITextMessageCallerTests {
             })
         }
 
-        /// `summary`: the summary the backend answers with.
-        init(summary: String = AITextMessageCallerTests.blurb) {
+        /// `summary`: the summary the backend answers with. `reply`: the reply request's response in
+        /// place of the usual answer. `duringReply`: run as the reply request arrives, so while the
+        /// model call is in flight.
+        init(summary: String = AITextMessageCallerTests.blurb,
+             reply: (@Sendable () -> FakeHTTP.CannedResponse)? = nil,
+             duringReply: (@Sendable () -> Void)? = nil) {
             http.register(path: "/completions/chat", method: "POST") { request in
                 let prompt = Self.prompt(request.body)
                 let object: [String: Any]
@@ -69,14 +76,34 @@ struct AITextMessageCallerTests {
                 case "system_prompt_action":
                     object = ["action": "reply"]
                 default:
+                    duringReply?()
+                    if let reply { return reply() }
                     object = ["subject": "Re: Plans", "body": AITextMessageCallerTests.replyBody,
                               "text_message": AITextMessageCallerTests.replyText,
                               "change_command": AITextMessageCallerTests.replyCommand]
                 }
-                let assistant = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
-                let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
-                let stream = "event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n"
-                return .bytes(Data(stream.utf8), contentType: "text/event-stream")
+                return Self.streamed(object)
+            }
+        }
+
+        /// The backend's streamed answer carrying `object` as the assistant's JSON.
+        static func streamed(_ object: [String: Any]) -> FakeHTTP.CannedResponse {
+            let assistant = String(decoding: (try? JSONSerialization.data(withJSONObject: object)) ?? Data(), as: UTF8.self)
+            return streamed(assistant: assistant)
+        }
+
+        /// The backend's streamed answer with `assistant` as the assistant's text, verbatim.
+        static func streamed(assistant: String) -> FakeHTTP.CannedResponse {
+            let final = (try? JSONSerialization.data(withJSONObject: ["assistant": assistant])) ?? Data()
+            let stream = "event: final\ndata: " + String(decoding: final, as: UTF8.self) + "\n\n"
+            return .bytes(Data(stream.utf8), contentType: "text/event-stream")
+        }
+
+        /// The text of each request's message (the email the model is told about).
+        var messages: [String] {
+            http.recordedCalls().compactMap { call -> String? in
+                let json = call.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                return (json["messages"] as? [[String: Any]])?.first?["message"] as? String
             }
         }
 
@@ -114,9 +141,9 @@ struct AITextMessageCallerTests {
         /// `summarized`: the email already has its summary and action, so opening it asks only
         /// for the reply.
         init(fromAddress: String = "sender@example.com", replyTextMessage: String? = nil, summarized: Bool = false,
-             messageId: String = "1") throws {
+             messageId: String = "1", provider: AccountProvider = .imap) throws {
             (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-            account = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .imap, pool: pool)
+            account = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: provider, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
             var header = MessageHeader(
                 messageId: messageId, subject: "Plans", from: "Sender", fromAddress: fromAddress,
@@ -815,6 +842,37 @@ struct AITextMessageCallerTests {
         }
     }
 
+    /// THE SYSTEM PROPERTY: Recompute gives the model the email's own text, never the text of an
+    /// email attached to it (an attached .eml is another person's email). Control: the email's own
+    /// text is there.
+    @Test("Recomputing for an email with an attached email asks with the email's own text only")
+    func composeRecomputeWithoutTheAttachedEmail() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            let id = fixture.header.id
+            let html = "<p>Main text</p><div class=\"tm-eml-section\" data-filename=\"attached.eml\"><p>Attached email text</p></div>"
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageBody SET htmlContent = ? WHERE id = ?", arguments: [html, id])
+            }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(suggestion?.body == Self.replyBody)
+            let messages = backend.http.recordedCalls().compactMap { call -> String? in
+                let json = call.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                return (json["messages"] as? [[String: Any]])?.first?["message"] as? String
+            }
+            #expect(messages.count == 1)
+            guard messages.count == 1 else { return }
+            #expect(messages[0].contains("Main text"), "control: the email's own text: \(messages[0])")
+            #expect(!messages[0].contains("Attached email text"), "the attached email's text: \(messages[0])")
+        }
+    }
+
     @Test("A recompute does not store its reply on a different email that took the same address")
     func composeRecomputeReplacedEmail() async throws {
         try await withAIEnabled {
@@ -842,10 +900,179 @@ struct AITextMessageCallerTests {
                 aiService: backend.service, dbPool: AppDatabase.dbPool)
 
             #expect(suggestion == nil, "the AI is never asked about, or shown a reply for, another email")
-            let row = try #require(try fixture.row())
+            #expect(backend.http.recordedCalls().isEmpty, "the model was asked about another email")
+            let fetched = try fixture.row()
+            let row = try #require(fetched)
             #expect(row.rfc822MessageId == "different@example.com")
             #expect(row.cachedReply == "The other email's reply")
             #expect(row.replyTextMessage == "The other email's text")
+        }
+    }
+
+    /// Another email at `original`'s address, holding its own AI Suggestion: what a UIDVALIDITY reset
+    /// and a resync leave there.
+    private static func successor(of original: MessageHeader) -> MessageHeader {
+        var successor = MessageHeader(
+            messageId: original.messageId, subject: "Different email", from: "Other sender",
+            fromAddress: "other@example.com", to: original.to, date: Date(), snippet: "Different email",
+            folderId: original.folderId, accountId: original.accountId, folderPath: original.folderPath,
+            isInInbox: true)
+        successor.rfc822MessageId = "different@example.com"
+        successor.cachedReply = "The other email's reply"
+        successor.replyTextMessage = "The other email's text"
+        return successor
+    }
+
+    /// THE SYSTEM PROPERTY (main's `recomputeStoresOnTheEmailTheModelWasToldAbout`): the email the
+    /// model is told about is the email its answer is stored on. Compose hands Recompute one email
+    /// (`ComposeView.aiReplyEmail`); here it is the email renumbered to another address, as a saved
+    /// draft resolves it. The model gets that email's own text and the answer lands on it. The
+    /// header held at the old address is refused before the model is asked: the chat view's
+    /// stricter rule for a card that holds the old address, listed in the merge's PR.
+    @Test("Recompute tells the model about the email it was handed and stores the answer on that same email")
+    func composeRecomputeStoresOnTheEmailTheModelWasToldAbout() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            let held = fixture.header
+            var renumbered = MessageHeader(
+                messageId: "9", subject: "Plans", from: held.from, fromAddress: held.fromAddress, to: held.to,
+                date: held.date, snippet: held.snippet, folderId: held.folderId, accountId: held.accountId,
+                folderPath: held.folderPath, isInInbox: true)
+            renumbered.rfc822MessageId = held.rfc822MessageId
+            let renumberedRow = renumbered
+            try await fixture.pool.write { db in
+                _ = try MessageHeader.deleteOne(db, key: held.id)
+                try renumberedRow.insert(db)
+                try MessageBody(contentKey: ContentKey(rawValue: renumberedRow.id),
+                                htmlContent: "<p>The renumbered email's own text</p>").insert(db)
+            }
+
+            let atOldAddress = await ComposeView.recomputedReply(
+                for: held, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+            #expect(atOldAddress == nil)
+            #expect(backend.messages.isEmpty, "the model was asked about an address that no longer holds the email")
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: renumberedRow, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+            #expect(suggestion?.body == Self.replyBody)
+            let messages = backend.messages
+            #expect(messages.count == 1)
+            guard messages.count == 1 else { return }
+            #expect(messages[0].contains("The renumbered email's own text"), "the model was told about another email: \(messages[0])")
+            let fetched = try await fixture.pool.read { db in try MessageHeader.fetchOne(db, key: renumberedRow.id) }
+            let stored = try #require(fetched)
+            #expect(stored.suggestion == ReplyResult(body: Self.replyBody, textMessage: Self.replyText, changeCommand: Self.replyCommand))
+            let oldAddress = try fixture.row()
+            #expect(oldAddress == nil, "something was written at the old address")
+        }
+    }
+
+    /// THE SYSTEM PROPERTY (main's `recomputeDoesNotStoreOnAReplacementSeatedDuringTheModelCall`):
+    /// another email seated at the address while the model writes keeps its own suggestion, and the
+    /// card, whose stored suggestion is the email's own, shows nothing it could not store. The
+    /// original and the replacement hold the SAME stored suggestion, so the whole-value compare alone
+    /// would let the write through: only the identity check keeps the answer off the replacement.
+    @Test("A different email seated at the address while the model runs keeps its own suggestion",
+          arguments: recomputeEpochProviders)
+    func composeRecomputeReplacedDuringTheModelCall(provider: AccountProvider) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(provider: provider)
+            let shared = ReplyResult(body: "The shared earlier reply", textMessage: "The shared earlier text")
+            let id = fixture.header.id
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
+                               arguments: [shared.body, shared.textMessage, id])
+            }
+            let seeded = try fixture.row()
+            let original = try #require(seeded)
+            #expect(original.suggestion == shared)
+            var replacement = Self.successor(of: original)
+            replacement.cachedReply = shared.body
+            replacement.replyTextMessage = shared.textMessage
+            let seat = replacement
+            let pool = fixture.pool
+            let backend = Backend(duringReply: {
+                // A UIDVALIDITY reset purges the email and a resync seats another at its address.
+                try? pool.write { db in
+                    _ = try MessageHeader.deleteOne(db, key: original.id)
+                    try seat.insert(db)
+                }
+            })
+            defer { backend.close(); fixture.close() }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: original, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            // Non-vacuity: the model was asked, about the email compose opened for.
+            #expect(backend.messages.count == 1)
+            #expect(suggestion == nil, "the card showed an answer it could not store")
+            let fetched = try fixture.row()
+            let row = try #require(fetched)
+            #expect(row.rfc822MessageId == "different@example.com")
+            #expect(row.suggestion == shared, "the answer was stored on another email")
+        }
+    }
+
+    /// The positive control for the test above: with no replacement, the same seeded email takes the
+    /// whole answer, so the refusal above is the identity check's and not a compare or write failure.
+    @Test("With no replacement, the same seeded email takes the answer", arguments: recomputeEpochProviders)
+    func composeRecomputeKeptEmailTakesTheAnswer(provider: AccountProvider) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(provider: provider)
+            let id = fixture.header.id
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
+                               arguments: ["The shared earlier reply", "The shared earlier text", id])
+            }
+            let seeded = try fixture.row()
+            let original = try #require(seeded)
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: original, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(suggestion?.body == Self.replyBody)
+            let fetched = try fixture.row()
+            let row = try #require(fetched)
+            #expect(row.suggestion == ReplyResult(body: Self.replyBody, textMessage: Self.replyText, changeCommand: Self.replyCommand))
+        }
+    }
+
+    /// THE SYSTEM PROPERTY (main's `recomputeWithoutAnAnswerShowsAndStoresNothing`): a recompute
+    /// whose model call gives no reply (an empty body, an answer that cannot be read, a failed call)
+    /// shows nothing and leaves the stored suggestion as it was.
+    @Test("No answer, an empty answer or a failed model call shows and stores nothing", arguments: RecomputeNoAnswer.allCases)
+    func composeRecomputeWithoutAnAnswer(answer: RecomputeNoAnswer) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(replyTextMessage: "Earlier text")
+            let backend = Backend(reply: {
+                switch answer {
+                case .emptyBody: return Backend.streamed(["subject": "Re: Plans", "body": "", "text_message": "Empty"])
+                case .unreadable: return Backend.streamed(assistant: "not a reply")
+                case .failedCall: return .status(500)
+                }
+            })
+            defer { backend.close(); fixture.close() }
+            let id = fixture.header.id
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET cachedReply = 'Earlier reply' WHERE id = ?", arguments: [id])
+            }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(!backend.messages.isEmpty, "precondition: the model was asked")
+            #expect(suggestion == nil)
+            let row = try fixture.row()
+            #expect(row?.suggestion == ReplyResult(body: "Earlier reply", textMessage: "Earlier text"))
         }
     }
 
@@ -878,3 +1105,7 @@ struct AITextMessageCallerTests {
     }
 
 }
+
+/// How a recompute's model call gives no reply (`AITextMessageCallerTests.composeRecomputeWithoutAnAnswer`),
+/// at file scope: a test trait cannot name a member of the suite it is attached to.
+enum RecomputeNoAnswer: CaseIterable, Sendable { case emptyBody, unreadable, failedCall }

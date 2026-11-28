@@ -125,7 +125,7 @@ final class AccountManagerState {
     /// What the generic inbox banner means, stated once for its only two writers
     /// (`finishSyncRun` and `failRefresh`):
     ///
-    /// The generic banner is raised only by a user-started refresh that failed
+    /// The generic banner (any of its fixed lines) is raised only by a user-started refresh that failed
     /// with an error that counts (`InboxErrorBanner.countsAsFailure`). A failed
     /// refresh never clears it. It is cleared only by a run that covered every
     /// active account and had no counted failure; scheduler and background polls
@@ -152,11 +152,12 @@ final class AccountManagerState {
         }
     }
 
-    /// A user-started refresh failed. It raises the banner when its error counts
-    /// and never clears it (see `finishSyncRun` for the banner's meaning).
-    func failRefresh(countedFailure: Bool) {
-        if countedFailure {
-            syncErrorBanner = InboxErrorBanner.genericMessage
+    /// A user-started refresh failed. It raises the banner with `line` (one of
+    /// `InboxErrorBanner.allLines`) when its error counts, `nil` when it does
+    /// not, and never clears it (see `finishSyncRun` for the banner's meaning).
+    func failRefresh(line: String?) {
+        if let line {
+            syncErrorBanner = line
         }
     }
 
@@ -177,12 +178,19 @@ enum SyncRunCoverage: Sendable, Equatable {
 /// server prose); it stays in the debug-gated logs. This replaces the earlier
 /// rule that showed the raw text when debug logging was unlocked.
 enum InboxErrorBanner {
-    /// The one line the banner shows. Every inbox list carries `.refreshable`, so
-    /// pull-to-refresh is genuinely the recovery gesture.
+    /// The line the banner shows for most failures. Every inbox list carries
+    /// `.refreshable`, so pull-to-refresh is genuinely the recovery gesture.
     static let genericMessage = "Unable to refresh mail. Pull to retry."
 
+    /// The line for a mail server that refuses an encrypted connection
+    /// (`IMAPTransportSecurityError`: it offers no encryption on the account's
+    /// port, or only an outdated one). Pulling again cannot change that, so the
+    /// line says where to look instead.
+    static let encryptionMessage =
+        "TabMail could not open an encrypted connection to your mail server. Check the server and port in Settings."
+
     /// Every line the banner can show. Tests assert membership in this set.
-    static let allLines: Set<String> = [genericMessage]
+    static let allLines: Set<String> = [genericMessage, encryptionMessage]
 
     /// Whether an account's failure counts for the banner
     /// (`AccountManagerState.finishSyncRun`). It does not count when the account
@@ -214,10 +222,12 @@ enum InboxErrorBanner {
     ///   (offline shows no banner).
     /// - `nil` for `AuthError.refreshFailed`: a refused sign-in is told by the
     ///   per-account "sign in again" banner, which reads `authFailedAccounts`.
+    /// - `encryptionMessage` for a server that refuses an encrypted connection.
     /// - `genericMessage` for every other error.
     nonisolated static func text(for error: Error) -> String? {
         if error is CancellationError { return nil }
         if error.isDatabaseSuspensionAbort { return nil }
+        if error is IMAPTransportSecurityError { return encryptionMessage }
         if case AuthError.refreshFailed = error { return nil }
         if SyncEngine.isTransientError(error) { return nil }
         if SyncEngine.isConnectionError(error) { return nil }

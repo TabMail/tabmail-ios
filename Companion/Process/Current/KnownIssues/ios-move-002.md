@@ -73,6 +73,38 @@
 > An Undo naming a row this record refuses now shows the "Couldn't undo" alert ("Nothing was moved
 > back."), like every other refused move Undo. The refusal itself is unchanged, and
 > `IOS-EPOCH-001` D6(a) (no dialog, no toast) still holds for new gestures.
+>
+> **AMENDMENT (2026-11-25, tabmail-ios #814) — an admitted move that a reset drops is reported
+> too.** The 2026-11-11 report covered only a move refused before admission. A move admitted under
+> the old epoch and then dropped by the reset with no provider-confirmed result (exit 4: the step-5
+> sweep, checkpoint A or checkpoint B) now posts the same `.messageMovesRefused` report after its delete commits, so
+> its row shows again instead of hiding whatever email the resync re-seats at that id. Detail:
+> ADR-IOS-069 item 5. The report assertion in `IdResetDispositionMatrixTests` now expects the
+> report in every reset phase for archive and delete, and none for the executed positive control.
+>
+> **AMENDMENT (2026-11-25, tabmail-ios #537) — on IMAP the remnant of a move that copied something is
+> no longer minted.** When an IMAP move member retires on the wire with no proven destination UID and
+> the provider reports that the move copied something (`MoveOutcome.copiedNothing` false),
+> `MessageHeaderRekey.finishMove`'s G4 arm now DELETES the optimistic row in the retiring transaction
+> (ADR-IOS-111, amendment 2026-11-25): its AI fields go to `MessageAICache` under the destination
+> folder (and to a copy a sync already stored there), its body and its chat-pill mapping (retired to a
+> stand-in) go with it, both folders' bookmarks drop as before, and the dropped row's rfc822 key is
+> withdrawn from the 30-second recently-completed store before the destination syncs. The destination's
+> listing, or the owed catch-up listing for a copy below the window, then inserts the message at its real
+> UID with its epoch, so it is actionable again. Sub-states (i)-(iii) no longer arise for such a move.
+> What does NOT change: (1) the remnant is still kept, exactly as described above, for a move that copied
+> nothing (mailbox absent, permanent refusal), for every retirement with no provider result
+> (`deleteRetiringOperation`), for a chained move (the row moved on), for a proven destination under an
+> epoch the folder does not share, and on every account-scoped provider; for those rows this record's
+> exits (1)-(4) and flip-back conditions (α)-(δ) stand. (2) Admission, the two-sided merge gate and both
+> anchor tests are untouched; the drop never derives an address from RFC 822 equality (the AI fill copies
+> display content only and mutates nothing on the server, so D4 is not engaged). (3) No queued operation
+> can name the deleted row: admission refuses its nil epoch before any insert, ops queued before the move
+> address the source, a deferred successor is materialized only for a provider-proven re-key, and
+> `readdressQueuedOperations` is account-scoped only. Residuals: the copy is missing from its folder
+> until that listing (#963), and a copy given the same UID it had in the source stays hidden until the
+> 30-second store expires (#964). Pins: `FinishTheMoveLocallyTests.aMoveWithNoCopyUidLeavesNoRemnantRow`,
+> `aRefusedMoveKeepsTheLocalRow`, and the `QueueCoreInvariantTests` drop and control tests.
 <!-- KNOWN-ISSUES-AMENDMENT-END -->
 # IOS-MOVE-002
 

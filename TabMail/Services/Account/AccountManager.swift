@@ -470,6 +470,12 @@ actor AccountManager {
         let predecessorDestinationPath: String
         let oldHeaderId: String
         var desiredDestinationPath: String
+        /// The email this successor moves: the Message-ID of its row when the
+        /// successor was recorded, nil when that row has no usable Message-ID.
+        /// An Undo cancels a successor only for the same email; another email
+        /// that later took this address owns its successor (C3). A content
+        /// witness that can only refuse, never an address (ADR-IOS-068/D4).
+        let messageIdentity: ExpectedMessageIdentity?
     }
 
     /// Old source-address header id -> latest successor.
@@ -782,6 +788,21 @@ actor AccountManager {
         }
     }
 
+    /// Withdraw protection keys whose protected local row no longer exists.
+    ///
+    /// Used for the rfc822 key of a move remnant `MessageHeaderRekey.finishMove`
+    /// deleted (`IOS-MOVE-002`): that key exists to keep a sync from
+    /// overwriting the optimistically moved row in its destination, and with
+    /// the row gone it would instead stop the destination sync from inserting
+    /// the message at its real address for the whole TTL. The bare source-UID
+    /// key is not passed here; it keeps guarding the source folder (#106).
+    func releaseRecentlyCompleted(messageIds: [String]) {
+        guard !messageIds.isEmpty else { return }
+        recentlyCompletedStore.withLock { store in
+            for id in messageIds { store.removeValue(forKey: id) }
+        }
+    }
+
     func pruneRecentlyCompleted() {
         let now = Date()
         recentlyCompletedStore.withLock { $0 = $0.filter { $0.value > now } }
@@ -801,9 +822,10 @@ actor AccountManager {
     /// (`IOS-TEST-006`). Production keeps the unscoped key deliberately: the
     /// map's OTHER leg is the RFC 822 Message-ID, which is folder-agnostic by
     /// construction and is what protects an optimistically-moved row at its
-    /// destination, and every consumer uses the map only to SKIP a delete or an
-    /// overwrite — so an over-broad match costs at most one sync pass and never
-    /// removes protection. Scoping the key would narrow it, which is the
+    /// destination, and every consumer uses the map only to SKIP a delete, an
+    /// overwrite or an insert — so an over-broad match delays one message by at
+    /// most the TTL and never removes protection (a same-UID message landing in
+    /// the destination of a no-`COPYUID` move waits out that TTL, IOS-MOVE-002). Scoping the key would narrow it, which is the
     /// dangerous direction. The leak is therefore closed in the test harness:
     /// `ProcessGlobalTestState.withLock` calls this on entry to every scoped
     /// test, which is the only boundary that composes across suites
@@ -1468,6 +1490,18 @@ actor AccountManager {
         authFailedAccounts.insert(accountId)
     }
 
+    /// Raise "sign in again" for a token refresh of sign-in `generation` that the
+    /// token endpoint refused, unless the account was removed or another sign-in was
+    /// installed after that refresh began. The check and the insert run in one turn
+    /// of this actor, which is also where a new sign-in is installed
+    /// (`installOAuthCredentials`) and the warning cleared (`connectAccount`), so a
+    /// sign-in installed in between is always seen.
+    func markAuthFailed(_ accountId: String, refusedSignIn generation: String, store: ProviderCredentialStore) {
+        guard !isRuntimeRemoved(accountId),
+              store.activation(accountId: accountId)?.generation == generation else { return }
+        authFailedAccounts.insert(accountId)
+    }
+
     func clearAuthFailed(_ accountId: String) {
         authFailedAccounts.remove(accountId)
     }
@@ -1490,8 +1524,8 @@ actor AccountManager {
     #if DEBUG
     /// Test seam: `IMAPProvider`'s TLS override for providers this factory and
     /// `addIMAPAccount` build, so the factory, `updatePassword` and the IMAP add
-    /// can be driven against the plain-TCP `FakeIMAPServer`. `nil` (production)
-    /// lets SwiftMail choose.
+    /// can be driven against the plain-TCP `FakeIMAPServer`. `nil` (production):
+    /// the transport comes from `MailTransportPolicy`.
     private nonisolated let imapUseTLSOverrideBox = Mutex<Bool?>(nil)
     nonisolated func setIMAPUseTLSOverrideForTesting(_ useTLS: Bool?) {
         imapUseTLSOverrideBox.withLock { $0 = useTLS }
@@ -1948,17 +1982,22 @@ actor AccountManager {
                 // Every Gmail API and Graph request (sync, queued actions, sends,
                 // connect, calendar) gets its token here, so this is where a
                 // revoked sign-in tells the user to sign in again (#534). Only
-                // the three grant-level codes the token endpoint itself returns
-                // count; a 5xx, an offline device, `temporarily_unavailable` or
-                // a body without an `error` field says nothing about the grant.
-                // A refusal of a sign-in the user has already replaced is not
-                // reported. The error is rethrown unchanged, so each caller
-                // keeps its own disposition: queued actions and sends are kept.
+                // the top-level `error` code of the token endpoint's answer is
+                // read, whatever the HTTP status, and only the codes for a refused
+                // grant, or for another sign-in step, consent or an admin
+                // restriction (#659), count (`isSignInAgainOAuthFailure`); an
+                // offline device, an answer without an `error` code,
+                // `temporarily_unavailable` or `server_error` says nothing about
+                // the sign-in.
+                // A refusal of a sign-in the user has already replaced, or of a
+                // removed account, is not reported; that check runs on the actor,
+                // in the same turn as the insert. This is the only place a token
+                // refusal raises the warning (the calendar drain does not). The
+                // error is rethrown unchanged, so each caller keeps its own
+                // disposition: queued actions and sends are kept.
                 if case OAuthError.tokenExchangeFailed(let reason) = error,
-                   Self.isGrantLevelOAuthFailure(reason),
-                   !self.isRuntimeRemoved(accountId),
-                   store.activation(accountId: accountId)?.generation == generation {
-                    await self.markAuthFailed(accountId)
+                   Self.isSignInAgainOAuthFailure(reason) {
+                    await self.markAuthFailed(accountId, refusedSignIn: generation, store: store)
                 }
                 throw error
             }

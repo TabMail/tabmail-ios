@@ -603,10 +603,12 @@ struct MessageDetailView: View {
                 .offset(y: showSideButtons ? 0 : 30)
                 .allowsHitTesting(showSideButtons)
 
+                // The chat is about the highlighted email (else the screen's), and a new email it
+                // asks for is sent from that email's account.
                 DynamicIslandChat(message: chatContextMessage ?? message, isExpanded: $chatExpanded, isInputFocused: $chatInputFocused, isWorking: $chatWorking, onAgentReply: { text in
                     showAgentToast(text)
                 }, onAgentCompose: openAgentCompose,
-                composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)
+                composeFromAccountId: (chatContextMessage ?? message).accountId, composeHostCovered: isAnyCoverPresented)
 
                 Menu {
                     RestrictedMailActionButton(

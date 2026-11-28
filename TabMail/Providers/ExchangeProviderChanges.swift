@@ -22,7 +22,8 @@ import Foundation
 ///   the folder does not hold, whose record carries `receivedDateTime` (a new or
 ///   moved-in message), gets its headers fetched (`fetchMessageDetails`, in
 ///   `$batch`es) when the folder is tracking, or during its baseline when the
-///   message is within the folder's held range (`ChangeFolder.heldSince`). The
+///   message is within the folder's held range (`ChangeFolder.heldSince`; with
+///   no range, the whole folder once its older-mail walk has completed). The
 ///   folder's bookmark never passes a page until every such header is in, read
 ///   as gone, or reported unreadable (`rereadLater`); a page cut short is read
 ///   again on the next pass, which fetches only what is still missing.
@@ -34,8 +35,10 @@ import Foundation
 /// pass, out of the allowance left, so they never delay paging or new mail, and
 /// they never hold a page: a message whose verb
 /// was not read (budget, throttle, failed batch, unusable answer) goes on the
-/// re-read list, whose full read carries it. Only the replied and forwarded
-/// marks join the record. A baseline reads none (it lists the folder as it is).
+/// re-read list, whose full read carries it. The replied and forwarded marks
+/// join the record, and the threading ids (In-Reply-To, References; #1559) its
+/// header, which only the apply's insert of a new row reads. A baseline reads
+/// none (it lists the folder as it is).
 ///
 /// **Re-read lists.** Every listed folder's list is read (`reread`): a synced
 /// folder's after its delta, also during its baseline; on a `.all` pass, a folder
@@ -244,7 +247,7 @@ extension ExchangeProvider {
                 if held.contains(record.id) || state.select == .header {
                     collected.add(Self.changeRecord(record, header: page.headers[record.id]))
                     if state.phase == .tracking { verbIds.insert(record.id) }
-                } else if Self.needsHeader(record, phase: state.phase, heldSince: folder.heldSince) {
+                } else if Self.needsHeader(record, phase: state.phase, heldSince: folder.heldSince, olderMailComplete: folder.olderMailComplete) {
                     missing.append(record.id)
                 }
             }
@@ -437,9 +440,13 @@ extension ExchangeProvider {
 
     /// Reads the last verb (replied, forwarded) of messages whose records came
     /// from a delta page, in `$batch`es within the allowance, and sets those
-    /// records' marks. Returns the ids not read: past the budget or allowance, a
-    /// failed batch, a throttle or an unusable answer. A message gone or now in
-    /// another folder needs nothing (that folder's round reports it).
+    /// records' marks. The same answer carries the threading ids, which the
+    /// delta page cannot (#1559): they go on the record's header, which only the
+    /// apply's insert reads, so a new message threads under the one it answers
+    /// and a stored row's chain and thread stay (`fullRecord`). Returns the ids
+    /// not read: past the budget or allowance, a failed batch, a throttle or an
+    /// unusable answer. A message gone or now in another folder needs nothing
+    /// (that folder's round reports it).
     private func readLastVerbs(
         _ ids: [String], folder: ChangeFolder, context: ChangeContext, allowance: inout ChangeReadAllowance,
         changes: inout FolderChanges
@@ -464,6 +471,8 @@ extension ExchangeProvider {
                     guard let header = verbs[changes.records[index].messageId] else { continue }
                     changes.records[index].isReplied = header.isReplied
                     changes.records[index].isForwarded = header.isForwarded
+                    changes.records[index].header?.inReplyTo = header.inReplyTo
+                    changes.records[index].header?.references = header.references
                 }
                 notRead += batch.unreadable + batch.unanswered.keys
             } catch {
@@ -480,8 +489,9 @@ extension ExchangeProvider {
 
     // MARK: - Records
 
-    /// A record from a whole Graph message. No selection asks Graph for a
-    /// References header, so the record carries none and a stored chain stays.
+    /// A record from a whole Graph message. Its references stay unset, so a
+    /// stored row's chain stays; a new row takes its threading ids from the
+    /// header, present when the read expanded them (#1559).
     private nonisolated static func fullRecord(_ header: MessageHeaderInfo) -> ChangeRecord {
         var change = ChangeRecord(header: header)
         change.references = nil
@@ -514,14 +524,17 @@ extension ExchangeProvider {
     /// A message the folder does not hold needs its headers fetched when its
     /// record carries `receivedDateTime` (a new or moved-in message; an update
     /// carries only what changed) and, during the baseline, that date is within
-    /// the folder's held range. Below the range, or with no range yet, the apply
-    /// would insert nothing, so nothing is fetched.
-    nonisolated static func needsHeader(_ record: GraphDeltaMessage, phase: OutlookFolderCursor.Phase, heldSince: Date?) -> Bool {
+    /// the folder's held range. Below the range the apply would insert nothing,
+    /// so nothing is fetched. With no range yet, the whole folder is in range
+    /// once its older-mail walk has completed (`olderMailComplete`: the walk
+    /// found it empty, so it holds no date; IMAP's rule, "every UID once the walk
+    /// has completed"); before that, nothing is fetched (#1363).
+    nonisolated static func needsHeader(_ record: GraphDeltaMessage, phase: OutlookFolderCursor.Phase, heldSince: Date?, olderMailComplete: Bool) -> Bool {
         guard let raw = record.receivedDateTime, let date = Date.fromISO8601(raw) else { return false }
         switch phase {
         case .tracking: return true
         case .baseline:
-            guard let heldSince else { return false }
+            guard let heldSince else { return olderMailComplete }
             return date >= heldSince
         }
     }

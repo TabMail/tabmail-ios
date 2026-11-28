@@ -336,7 +336,8 @@ struct IsValidEmailAddressTests {
     func validMeansSendable() throws {
         for address in ["user@example.com", "user+tag@example.com", "user@münchen.de", "taro.@example.com"] {
             #expect(isValidEmailAddress(address))
-            #expect(try IMAPProvider.sendableRecipients([address]).count == 1)
+            let sendable = try OutgoingRecipients.sendableRecipients([address])
+            #expect(sendable.count == 1)
         }
     }
 }

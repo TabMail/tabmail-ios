@@ -537,7 +537,7 @@ enum NSEDataBridge {
         }
     }
 
-    /// Mirror IMAP account connection info (host/port/username/useTLS) for
+    /// Mirror IMAP account connection info (host/port/username) for
     /// NSE one-shot fetches on `imap_new_mail` / `imap_reconnect` pushes.
     /// The password is already in shared Keychain
     /// (`KeychainHelper.passwordKey(accountId:)` reads/writes via the
@@ -574,16 +574,13 @@ enum NSEDataBridge {
                     ?? (row["emailAddress"] as String?)
                     ?? ""
                 let port = (row["imapPort"] as Int?) ?? 993
+                // No transport flag: the NSE picks the transport from the port
+                // (`MailTransportPolicy`), as `IMAPProvider` does.
                 let entry: [String: Any] = [
                     "host": host,
                     "port": port,
                     "username": username,
                 ]
-                // Main app's IMAPProvider defaults useTLS to nil → SwiftMail
-                // picks based on port. We mirror that — only stash `useTLS`
-                // if the operator ever wires an override; otherwise omit.
-                // (Currently always omitted — present as a schema hook.)
-                _ = entry
                 map[id] = entry
             }
             let data = try JSONSerialization.data(withJSONObject: map, options: [.sortedKeys])
@@ -3804,8 +3801,8 @@ enum NSEDataBridge {
         // (SyncEngineFullSync computes this on insert). Without this, a
         // pushed message sits in a singleton thread until sync materializes
         // the row again.
-        // Timed: new-header path only. assignComputedThreadId runs up to 3 indexed
-        // IN-probes over messageHeader for reply-chain adoption — fast normally, but
+        // Timed: new-header path only. assignComputedThreadId runs up to one indexed seek per id of the email's own Message-ID,
+        // In-Reply-To and References (a forward: its own id only), stopping at the first match, then up to 2 indexed IN-probes — fast normally, but
         // the other merge-write suspect if the body/snippet marks come back cheap.
         let threadT0 = CFAbsoluteTimeGetCurrent()
         try ThreadUtils.assignComputedThreadId(

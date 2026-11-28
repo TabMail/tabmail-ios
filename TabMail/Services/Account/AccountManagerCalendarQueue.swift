@@ -655,6 +655,10 @@ extension AccountManager {
                     // This is what makes the RETRYABLE half below recoverable rather
                     // than a silent wedge: the op stays queued, the user is told to
                     // re-authenticate, and one ordinary gesture drains it.
+                    // A token-endpoint refusal is signalled before it gets here, by
+                    // the token accessor (`makeOAuthAccessor`, #659), and only while
+                    // the refused sign-in is still the installed one; this check does
+                    // not raise it again.
                     if Self.isCalendarOAuthReauthRequired(error) {
                         markAuthFailed(currentOp.accountId)
                     }
@@ -1497,6 +1501,39 @@ extension AccountManager {
         }
     }
 
+    /// The OAuth token-endpoint `error` codes after which the user is told to sign
+    /// in again (#659), read by the token accessor (`makeOAuthAccessor`): the three
+    /// of `isGrantLevelOAuthFailure`, plus three codes that ask for something only
+    /// the user, or their admin, can do:
+    ///   * `interaction_required` (Microsoft): another sign-in step is needed, such
+    ///     as multi-factor or a Conditional Access step;
+    ///   * `consent_required` (Microsoft): consent is needed, from the user or,
+    ///     where the organisation reserves it, from an admin. Microsoft lists it in
+    ///     the token endpoint's error table, which its refresh documentation points to;
+    ///   * `admin_policy_enforced` (Google): a Workspace admin restricted one of the
+    ///     requested services. Google documents this code for the sign-in step, so
+    ///     on a refresh it is matched only if it comes.
+    /// The code is the top-level `error` field of the token endpoint's answer,
+    /// whatever its HTTP status. Signing in again is how the user takes the step or
+    /// gives the consent, and how access comes back once an admin lifts a
+    /// restriction; until then a new sign-in can be refused the same way and the
+    /// warning stays. Those three raise the account's warning, with what that mark
+    /// already does for the other codes: while it is up, the account's other
+    /// failures in a sync poll do not count for the inbox refresh banner
+    /// (`InboxErrorBanner.countsAsFailure`); a pull still shows its own error.
+    /// They are not in `isGrantLevelOAuthFailure`, so `isCalendarAuthError` does not retire a
+    /// calendar operation on them: it stays queued and goes through once a sign-in
+    /// gets a token again. Same exact match and normalisation as
+    /// `isGrantLevelOAuthFailure`, so an answer that says nothing
+    /// (`temporarily_unavailable`, `server_error`, `"unknown"`) never warns.
+    static func isSignInAgainOAuthFailure(_ reason: String) -> Bool {
+        if isGrantLevelOAuthFailure(reason) { return true }
+        switch reason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "interaction_required", "consent_required", "admin_policy_enforced": return true
+        default: return false
+        }
+    }
+
     /// True when the error proves the account's OAuth credential can no longer be
     /// obtained or used, so the user has to re-authenticate — **independent of
     /// whether the queued operation is retired.**
@@ -1511,7 +1548,15 @@ extension AccountManager {
     /// the two arm lists rather than trusting either sentence:
     ///   * signal ∖ terminal = `ProviderError.authenticationFailed` — deliberately
     ///     retryable (see below), so it raises the prompt without retiring the op.
-    ///   * terminal ∖ signal = `CalDAVError.authFailed` — retired without going
+    ///   * terminal ∖ signal = the three grant-level OAuth codes (since #659) and
+    ///     `CalDAVError.authFailed` (next bullet). A token-endpoint refusal
+    ///     (`OAuthError.tokenExchangeFailed`) is no longer this predicate's at all: the token accessor every Google and Microsoft
+    ///     calendar request takes its token from (`makeOAuthAccessor`) raises the
+    ///     warning for it, only while the refused sign-in is still the installed
+    ///     one. This predicate raised it again without that check, so a refusal of
+    ///     the old sign-in that reached the drain after the user had signed in again
+    ///     put the warning back up.
+    ///   * `CalDAVError.authFailed` (terminal ∖ signal) — retired without going
     ///     through THIS predicate. ⚠️ **Until round 18 this bullet ended *"because
     ///     CalDAV's persistent signal is the `caldavConfig.needsReauth` write in
     ///     the same arm rather than `authFailedAccounts`"*, and that reason was
@@ -1524,7 +1569,8 @@ extension AccountManager {
     ///     `KNOWN_ISSUES.md` `IOS-CAL-007` rather than papered over here. (The
     ///     retirement it causes is now shown, on the card or as an inbox banner;
     ///     no re-authentication prompt is raised.)
-    /// Both halves shared: the two raw 401s and the three grant-level OAuth codes.
+    /// Both halves shared: the two raw 401s (until #659 also the three grant-level
+    /// OAuth codes, now terminal here and signalled by the token accessor).
     /// The behaviour is correct; the SENTENCE was the problem, and it was copied
     /// verbatim into `KNOWN_ISSUES.md`, where a reviewer read it as evidence that
     /// signal coverage had been checked. It is what hid the missing-scope arm's
@@ -1532,18 +1578,22 @@ extension AccountManager {
     ///
     /// ⚠️ **`ProviderError.authenticationFailed` IS DELIBERATELY NOT TERMINAL, and
     /// the round-14 brief's claim that it "is unambiguous and can be claimed
-    /// directly" was refuted in the tree.** `OAuthRefreshCoordinator.refresh` raises
-    /// it from exactly two guards:
-    ///   1. `guard !invalidated` — the account was removed. Those ops cannot wedge
-    ///      anything: `pendingCalendarOperation.accountId` is declared
+    /// directly" was refuted in the tree.** The token accessor
+    /// (`AccountManager.makeOAuthAccessor`) and `OAuthRefreshCoordinator.refresh`
+    /// raise it when:
+    ///   1. the account was removed (`isRuntimeRemoved`, or the coordinator was
+    ///      invalidated). Those ops cannot wedge anything:
+    ///      `pendingCalendarOperation.accountId` is declared
     ///      `.references("account", onDelete: .cascade)`, one of the live cascading
     ///      foreign keys (`MigrationForeignKeyModeTests.everyLiveForeignKeyCascades`),
     ///      so deleting the account already deleted them.
-    ///   2. `guard let refreshToken = KeychainHelper.loadString(…)` — and
-    ///      `KeychainHelper.load` returns `nil` for **any** `SecItemCopyMatching`
-    ///      failure, not only "the token is gone". That is an ABSENCE OF EVIDENCE,
-    ///      i.e. never-drop clause 2's *"we could not determine the answer"*, which
-    ///      is retryable forever and is never a provider-authoritative refusal.
+    ///   2. the account has no active sign-in in `ProviderCredentialStore`, the
+    ///      active sign-in changed during the exchange, or its stored grant has no
+    ///      refresh credential (`CredentialRefreshError.inactive`,
+    ///      `.requiresAuthorization`). None of these is the provider refusing the
+    ///      operation or the sign-in, and each ends once a sign-in is installed or
+    ///      read again, so none is a provider-authoritative answer (never-drop
+    ///      clause 2): the op stays retryable.
     /// Terminalizing it would trade a wedge that ONE ordinary user gesture clears —
     /// re-authenticate, prompted by the very signal this predicate raises — for a
     /// permanently dropped intention, which nothing recovers. The asymmetry is the
@@ -1552,9 +1602,6 @@ extension AccountManager {
         if case GoogleCalendarError.httpError(401, _) = error { return true }
         if case ExchangeCalendarError.httpError(401, _) = error { return true }
         if case ProviderError.authenticationFailed = error { return true }
-        if case OAuthError.tokenExchangeFailed(let reason) = error {
-            return isGrantLevelOAuthFailure(reason)
-        }
         return false
     }
 

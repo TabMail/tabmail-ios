@@ -362,12 +362,14 @@ struct IdResetDispositionMatrixTests {
             }
         }
 
-        // A move refused before any local mutation must be reported back to the
-        // list that hid its row at gesture time (#441); an admitted move, whose
-        // local row already left the source, must not be.
-        let refusedBeforeMutation = cell.phase == .recognizedBeforeAdmission
+        // Every move the reset kept from running must be reported back to the
+        // list that hid its row at gesture time, at every checkpoint: refused
+        // before admission (#441) or admitted and then dropped (#814). The
+        // resync can hand that id to a different email, which would otherwise
+        // stay hidden. A move that ran, and every non-move, is not reported.
+        let droppedMove = cell.phase.isReset
             && (cell.gesture == .archive || cell.gesture == .delete)
-        #expect(refusalTap.snapshot == (refusedBeforeMutation ? [header.id] : []),
+        #expect(refusalTap.snapshot == (droppedMove ? [header.id] : []),
                 "move refusal report for \(cell.description)")
 
         let remaining = try await fixture.pool.read { db in try PendingOperation.fetchAll(db) }

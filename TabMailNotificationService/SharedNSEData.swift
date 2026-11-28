@@ -41,7 +41,8 @@ enum SharedNSEData {
     static let accountMapKey = "nse.accountMap"
     /// Per-IMAP-account connection info the NSE needs for one-shot fetches
     /// on `imap_new_mail` / `imap_reconnect` pushes. JSON-encoded:
-    ///   accountId → { host, port, username, useTLS }
+    ///   accountId → { host, port, username }
+    /// The NSE picks the transport from the port (`MailTransportPolicy`).
     /// The password lives in shared Keychain (`SharedKeychain.getPassword`) —
     /// never in this mirror. Main app writes on account add/remove; NSE
     /// reads per push. See `NSEState.getIMAPAccount`.

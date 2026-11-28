@@ -23,9 +23,21 @@ struct ExchangeAttachmentSendTests {
     /// The inline refusal #422 reported for `sendMail`, read strictly as 3,000,000 bytes.
     private static let reportedInlineLimit = 3_000_000
 
+    /// Each field's recipients as compose stores them, and the address and name
+    /// Graph must get for each on every route (#1031): every field has a named
+    /// one, and Cc also one with no name.
+    private static let recipients: [(key: String, stored: [String], graph: [[String: String]])] = [
+        ("toRecipients", [#""Rec, Ipient" <recipient@example.com>"#],
+         [["address": "recipient@example.com", "name": "Rec, Ipient"]]),
+        ("ccRecipients", [#""Copy Person" <copy@example.com>"#, "plain@example.com"],
+         [["address": "copy@example.com", "name": "Copy Person"], ["address": "plain@example.com"]]),
+        ("bccRecipients", [#""Blind Zoë" <blind@example.com>"#],
+         [["address": "blind@example.com", "name": "Blind Zoë"]]),
+    ]
+
     private func draft(_ files: [DraftAttachment], html: Bool = false) -> DraftMessage {
-        DraftMessage(to: ["recipient@example.com"], cc: ["copy@example.com"],
-                     bcc: ["blind@example.com"], subject: "Re: Plan",
+        DraftMessage(to: Self.recipients[0].stored, cc: Self.recipients[1].stored,
+                     bcc: Self.recipients[2].stored, subject: "Re: Plan",
                      body: html ? "<p>Authored <b>text</b></p><blockquote>Quoted</blockquote>" : "Authored text",
                      isHTML: html, inReplyTo: "parent@example.com",
                      references: ["root@example.com", "parent@example.com"], attachments: files)
@@ -183,9 +195,10 @@ struct ExchangeAttachmentSendTests {
         #expect(message.files == Dictionary(uniqueKeysWithValues: authored.attachments.map { ($0.filename, $0.data) }))
         #expect(message.json["subject"] as? String == authored.subject)
         #expect((message.json["body"] as? [String: String]) == ["contentType": authored.isHTML ? "html" : "text", "content": authored.body])
-        for (key, expected) in [("toRecipients", authored.to), ("ccRecipients", authored.cc), ("bccRecipients", authored.bcc)] {
+        for (key, _, graph) in Self.recipients {
             let recipients = message.json[key] as? [[String: [String: String]]]
-            #expect(recipients?.compactMap { $0["emailAddress"]?["address"] } == expected)
+            let mailboxes = recipients?.compactMap { $0["emailAddress"] }
+            #expect(mailboxes == graph, "\(key)")
         }
         // A reply keeps its thread whichever way it is sent (#419).
         let properties = message.json["singleValueExtendedProperties"] as? [[String: String]] ?? []
