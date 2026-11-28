@@ -1023,7 +1023,10 @@ extension AccountManager {
                 try MessageAICache.restoreIfCached(
                     into: &header, from: sentMessageId, accountId: msg.accountId, folderPath: sentFolder.path, db: db)
                 // Thread grouping so the sent message appears in the conversation
-                try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: sentCopy?.identity.threadId, db: db)
+                // A forward starts its own thread, even with its subject rewritten
+                // (the send records it); the sync's copy then joins this row.
+                try ThreadUtils.assignComputedThreadId(
+                    to: &header, nativeThreadId: sentCopy?.identity.threadId, sentAsForward: msg.isForward, db: db)
                 try header.insert(db)
                 try ThreadUtils.insertMessageReferences(for: header, db: db)
 
@@ -1679,8 +1682,8 @@ extension AccountManager {
     /// A reply the user has sent since keeps both. One this device sent has
     /// already taken them off this row's record at its completion
     /// (`deleteCompletedSendAtomic`). One sent from another client is found by
-    /// its copy in Sent (`ReplyParentResolver.hasStoredReply`; not on Outlook,
-    /// where Graph gives no In-Reply-To), asked only by a reply that set the
+    /// its copy in Sent (`ReplyParentResolver.hasStoredReply`; on Outlook, a copy
+    /// stored from a read that expanded the threading ids, #1559), asked only by a reply that set the
     /// mark: its original was unreplied at Send, so a stored reply is news.
     /// Another app's forward stored there does not count, though it may name
     /// the original in In-Reply-To (`ReplyParentResolver.SentCopy.isForward`).

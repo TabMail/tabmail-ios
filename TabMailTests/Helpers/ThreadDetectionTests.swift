@@ -1109,4 +1109,63 @@ struct ThreadDetectionTests {
         #expect(related.messages.map(\.id) == [replySent.id])
         #expect(Set(related.copies.map(\.id)) == [openedCopy.id, replyInbox.id])
     }
+
+    @Test("A forward's thread and its source's stay apart in the chat's lookup: no email, copy or reached id across the forward, so no chat key of the other thread")
+    func relatedKeepsEachSideOfAForward() throws {
+        let (pool, directory) = try makePool()
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        try insertAccount(pool)
+        try insertAccount(pool, id: "acc2")
+        try insertFolder(pool)
+        try insertFolder(pool, accountId: "acc2")
+
+        let now = Date()
+        let source = try insertHeaderWithComputedThreadId(
+            pool, messageId: "1", subject: "Plans", rfc822MessageId: "<a-source@test.com>",
+            date: now.addingTimeInterval(-7200))
+        let sourceCopy = try insertHeaderWithComputedThreadId(
+            pool, messageId: "1", subject: "Plans", rfc822MessageId: "<a-source@test.com>",
+            date: now.addingTimeInterval(-7200), folderId: "acc2:INBOX", accountId: "acc2")
+        let reply = try insertHeaderWithComputedThreadId(
+            pool, messageId: "2", subject: "Re: Plans", rfc822MessageId: "<b-reply@test.com>",
+            inReplyTo: "<a-source@test.com>", references: ["<a-source@test.com>"],
+            date: now.addingTimeInterval(-5400))
+        let forward = try insertHeaderWithComputedThreadId(
+            pool, messageId: "3", subject: "Fwd: Plans", rfc822MessageId: "<f-forward@test.com>",
+            references: ["<a-source@test.com>"], date: now.addingTimeInterval(-3600))
+        let forwardCopy = try insertHeaderWithComputedThreadId(
+            pool, messageId: "3", subject: "Fwd: Plans", rfc822MessageId: "<f-forward@test.com>",
+            references: ["<a-source@test.com>"], date: now.addingTimeInterval(-3600),
+            folderId: "acc2:INBOX", accountId: "acc2")
+        let forwardReply = try insertHeaderWithComputedThreadId(
+            pool, messageId: "4", subject: "Re: Fwd: Plans", rfc822MessageId: "<r-forward-reply@test.com>",
+            inReplyTo: "<f-forward@test.com>", references: ["<a-source@test.com>", "<f-forward@test.com>"],
+            date: now.addingTimeInterval(-1800))
+        #expect(forward.computedThreadId != source.computedThreadId, "control: the forward starts its own thread")
+        #expect(Set([reply, sourceCopy].map(\.computedThreadId)) == [source.computedThreadId], "control: the source's side")
+        #expect(Set([forwardReply, forwardCopy].map(\.computedThreadId)) == [forward.computedThreadId], "control: the forward's side")
+
+        let sourceSide: Set<String> = [source.id, sourceCopy.id, reply.id]
+        let forwardSide: Set<String> = [forward.id, forwardCopy.id, forwardReply.id]
+
+        let fromSource = try ThreadDetection.related(to: source, in: pool)
+        #expect(fromSource.messages.map(\.id) == [reply.id])
+        #expect(fromSource.copies.map(\.id) == [sourceCopy.id])
+        #expect(fromSource.linkedIds.isDisjoint(with: forwardSide), "reached across the forward: \(fromSource.linkedIds.intersection(forwardSide))")
+        #expect(fromSource.linkedIds.isSuperset(of: sourceSide), "control: the source's side is reached")
+        let sourceKeys = Set([source, sourceCopy, reply].map { ChatThreadKey.key(for: $0) })
+        let forwardKeys = Set([forward, forwardCopy, forwardReply].map { ChatThreadKey.key(for: $0) })
+        let sourceChat = Set(ThreadChatReader.keys(about: source, members: fromSource.messages + fromSource.copies))
+        let crossedFromSource = sourceChat.intersection(forwardKeys)
+        #expect(crossedFromSource.isEmpty, "the source's chat merges no chat of the forward's thread: \(sourceChat)")
+
+        let fromForward = try ThreadDetection.related(to: forward, in: pool)
+        #expect(fromForward.messages.map(\.id) == [forwardReply.id])
+        #expect(fromForward.copies.map(\.id) == [forwardCopy.id])
+        #expect(fromForward.linkedIds.isDisjoint(with: sourceSide), "reached across the forward: \(fromForward.linkedIds.intersection(sourceSide))")
+        #expect(fromForward.linkedIds.isSuperset(of: forwardSide), "control: the forward's side is reached")
+        let forwardChat = Set(ThreadChatReader.keys(about: forward, members: fromForward.messages + fromForward.copies))
+        let crossedFromForward = forwardChat.intersection(sourceKeys)
+        #expect(crossedFromForward.isEmpty, "the forward's chat merges no chat of the source's thread: \(forwardChat)")
+    }
 }

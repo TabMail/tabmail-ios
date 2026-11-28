@@ -259,6 +259,12 @@ struct OutboxRow: View {
         self.didRenderHeldState = didRenderHeldState
     }
 
+    /// The row's recipient line: every To address, as before Send carried the
+    /// display names (#1031).
+    nonisolated static func recipientLine(_ to: [String]) -> String {
+        RecipientEntry.shownAddresses(to).joined(separator: ", ")
+    }
+
     private var statusIcon: String {
         switch message.outboxStatus {
         case .queued: return "clock"
@@ -290,7 +296,7 @@ struct OutboxRow: View {
                     Image(systemName: statusIcon)
                         .foregroundStyle(statusColor)
                         .font(.caption)
-                    Text(message.to.joined(separator: ", "))
+                    Text(Self.recipientLine(message.to))
                         .font(.subheadline)
                         .fontWeight(.medium)
                         .lineLimit(1)

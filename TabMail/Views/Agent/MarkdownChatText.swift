@@ -369,6 +369,20 @@ struct MarkdownChatText: View {
     nonisolated private static let sentinelClose: Character = "\u{E001}"
     nonisolated(unsafe) private static let sentinelPattern = /\u{E000}(\d+)\u{E001}/
 
+    /// A pill is unavailable (greyed, tap does nothing) in history, or when
+    /// its mapping was retired by a move whose destination is unproven.
+    nonisolated static func pillIsUnavailable(isHistory: Bool, isRetired: Bool) -> Bool {
+        isHistory || isRetired
+    }
+
+    /// Whether a chip's mapping is retired, as the chip reads it (email pills
+    /// only; history pills are unavailable anyway).
+    static func pillIsRetired(numericId: Int, type: String, isHistory: Bool,
+                              translator: ChatIdTranslator = .shared) async -> Bool {
+        guard type == "email", !isHistory else { return false }
+        return await translator.isRetiredPill(numericId)
+    }
+
     /// Pre-pass over the rendered LLM response: scan for `[label](tabmail://type/N)`
     /// markdown links produced by `ChatIdTranslator.processResponseForDisplay`,
     /// replace each with `\u{E000}<index>\u{E001}`, and return the table of
@@ -666,7 +680,7 @@ struct MarkdownChatText: View {
 /// SwiftUI would accept the state write (and the tap log would print) but could
 /// decline to mount any popover. Local state plus one item-driven host makes the
 /// tapped occurrence the only possible presenter.
-private enum ChatPillPresentation: Identifiable {
+enum ChatPillPresentation: Identifiable {
     case email(EmailPillDetail)
     case contact(ContactPillDetail)
     case event(EventPillDetail)
@@ -682,13 +696,89 @@ private enum ChatPillPresentation: Identifiable {
     }
 }
 
-private struct ChatPillChip: View {
+/// A mounted chip's availability and its one presentation slot. A pill whose
+/// mapping a move retired (its destination unproven) is unavailable: it takes
+/// the history look, a tap opens nothing, and an open popover closes. The
+/// chip owns one; it observes `.chatPillsRetired` from `startObserving()` on,
+/// so a pill already on screen greys out in place.
+@MainActor
+@Observable
+final class ChatPillAvailability {
+    private(set) var isRetired = false
+    var presentation: ChatPillPresentation?
+
+    @ObservationIgnored private var numericId: Int
+    @ObservationIgnored private var type: String
+    @ObservationIgnored private var isHistory: Bool
+    @ObservationIgnored private let translator: ChatIdTranslator
+    @ObservationIgnored private var observer: NSObjectProtocol?
+
+    init(numericId: Int, type: String, isHistory: Bool, translator: ChatIdTranslator = .shared) {
+        self.numericId = numericId
+        self.type = type
+        self.isHistory = isHistory
+        self.translator = translator
+    }
+
+    isolated deinit {
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+    }
+
+    var isUnavailable: Bool {
+        MarkdownChatText.pillIsUnavailable(isHistory: isHistory, isRetired: isRetired)
+    }
+
+    /// Registers for `.chatPillsRetired`; idempotent. Registration is
+    /// synchronous, so a retirement posted after this call is seen.
+    func startObserving() {
+        guard observer == nil else { return }
+        observer = NotificationCenter.default.addObserver(
+            forName: .chatPillsRetired, object: nil, queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.refresh() }
+        }
+    }
+
+    /// Shows the given pill (a chip re-rendered with a new number) and
+    /// re-reads its availability.
+    func show(numericId: Int, type: String, isHistory: Bool) async {
+        self.numericId = numericId
+        self.type = type
+        self.isHistory = isHistory
+        await refresh()
+    }
+
+    /// Re-reads whether this pill's mapping is retired; a retired pill drops
+    /// any open popover. Runs on appearance, on a new number, before a tap
+    /// resolves, and whenever mappings are retired.
+    func refresh() async {
+        isRetired = await MarkdownChatText.pillIsRetired(
+            numericId: numericId, type: type, isHistory: isHistory, translator: translator)
+        if isRetired { presentation = nil }
+    }
+}
+
+struct ChatPillChip: View {
     let numericId: Int
     let type: String
     let label: String
     let isHistory: Bool
 
-    @State private var presentation: ChatPillPresentation?
+    @State private var availability: ChatPillAvailability
+
+    /// `availability` is for tests that host a chip and observe its model;
+    /// the chat passes none and the chip makes its own.
+    init(numericId: Int, type: String, label: String, isHistory: Bool,
+         availability: ChatPillAvailability? = nil) {
+        self.numericId = numericId
+        self.type = type
+        self.label = label
+        self.isHistory = isHistory
+        _availability = State(initialValue: availability ?? ChatPillAvailability(
+            numericId: numericId, type: type, isHistory: isHistory))
+    }
+
+    private var isUnavailable: Bool { availability.isUnavailable }
 
     var body: some View {
         Button {
@@ -700,32 +790,36 @@ private struct ChatPillChip: View {
                 .lineLimit(1)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
-                .background(Theme.accent.opacity(isHistory ? 0.06 : 0.12))
-                .foregroundStyle(isHistory ? Theme.textSecondary : Theme.accent)
+                .background(Theme.accent.opacity(isUnavailable ? 0.06 : 0.12))
+                .foregroundStyle(isUnavailable ? Theme.textSecondary : Theme.accent)
                 .clipShape(Capsule())
                 .overlay(
                     Capsule().stroke(
-                        (isHistory ? Theme.textSecondary : Theme.accent).opacity(0.3),
+                        (isUnavailable ? Theme.textSecondary : Theme.accent).opacity(0.3),
                         lineWidth: 0.5
                     )
                 )
                 .overlay {
                     // Guided tutorial: the answer's email reference is the next tap
                     // (its popover's Open Email takes the ring once it is open).
-                    if type == "email" && !isHistory && presentation == nil
+                    if type == "email" && !isUnavailable && availability.presentation == nil
                         && TutorialCoordinator.shared.highlightsEmailReference {
                         TutorialPulseRing(shape: Capsule(), lineWidth: 2, outset: 3)
                     }
                 }
         }
         .buttonStyle(.plain)
-        .disabled(isHistory)
-        .popover(item: $presentation) { item in
+        .disabled(isUnavailable)
+        .task(id: numericId) {
+            availability.startObserving()
+            await availability.show(numericId: numericId, type: type, isHistory: isHistory)
+        }
+        .popover(item: $availability.presentation) { item in
             Group {
                 switch item {
                 case .email(let detail):
                     EmailPillPopover(detail: detail) {
-                        presentation = nil
+                        availability.presentation = nil
                         NotificationCenter.default.post(
                             name: .emailPillTapped,
                             object: nil,
@@ -734,7 +828,7 @@ private struct ChatPillChip: View {
                     }
                 case .contact(let detail):
                     ContactPillPopover(detail: detail) { email in
-                        presentation = nil
+                        availability.presentation = nil
                         NotificationCenter.default.post(
                             name: .contactPillComposeTapped,
                             object: nil,
@@ -745,7 +839,7 @@ private struct ChatPillChip: View {
                     EventPillPopover(detail: detail)
                 case .template(let detail):
                     TemplatePillPopover(detail: detail) {
-                        presentation = nil
+                        availability.presentation = nil
                         NotificationCenter.default.post(
                             name: .templatePillOpenTapped,
                             object: nil,
@@ -758,35 +852,45 @@ private struct ChatPillChip: View {
         }
     }
 
+    /// Opens the popover only if the pill is still available once its detail
+    /// is resolved: a retirement during the lookup keeps it closed.
+    @MainActor
+    private func present(_ item: ChatPillPresentation) async {
+        await availability.refresh()
+        guard !availability.isUnavailable else { return }
+        availability.presentation = item
+    }
+
     @MainActor
     private func resolveForPresentation() async {
-        guard !isHistory else { return }
+        await availability.refresh()
+        guard !isUnavailable else { return }
         switch type {
         case "contact":
             if let detail = await ChatIdTranslator.shared.resolveContactDetail(numericId) {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Contact pill tapped: numericId=\(numericId) name=\(detail.name)")
-                presentation = .contact(detail)
+                await present(.contact(detail))
             } else {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Contact pill tapped but could not resolve detail for numericId=\(numericId)")
             }
         case "event":
             if let detail = await ChatIdTranslator.shared.resolveEventDetail(numericId) {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Event pill tapped: numericId=\(numericId) title=\(detail.title.prefix(40))")
-                presentation = .event(detail)
+                await present(.event(detail))
             } else {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Event pill tapped but could not resolve detail for numericId=\(numericId)")
             }
         case "template":
             if let detail = await ChatIdTranslator.shared.resolveTemplateDetail(numericId) {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Template pill tapped: numericId=\(numericId) name=\(detail.name)")
-                presentation = .template(detail)
+                await present(.template(detail))
             } else {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Template pill tapped but could not resolve detail for numericId=\(numericId)")
             }
         default:
             if let detail = await ChatIdTranslator.shared.resolveEmailDetail(numericId) {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Pill tapped: numericId=\(numericId) subject=\(detail.subject.prefix(40))")
-                presentation = .email(detail)
+                await present(.email(detail))
             } else {
                 BackgroundSyncLogger.logDebug("[AIChatDebug] Pill tapped but could not resolve detail for numericId=\(numericId)")
             }
@@ -1209,6 +1313,10 @@ extension Notification.Name {
     /// Posted when an email pill's "Open Email" is tapped in a chat bubble.
     /// UserInfo contains `numericId: Int` and `realId: String`.
     static let emailPillTapped = Notification.Name("emailPillTapped")
+
+    /// Posted (on the main actor) when chat pill mappings were retired, so a
+    /// mounted pill re-checks its availability and greys out in place.
+    static let chatPillsRetired = Notification.Name("chatPillsRetired")
 
     /// Posted when a contact pill's email is tapped to compose.
     /// UserInfo contains `email: String` and `name: String`.

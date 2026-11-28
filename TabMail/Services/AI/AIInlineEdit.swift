@@ -71,10 +71,11 @@ extension ComposeEditContext {
     /// same snapshot as the check that the row at its address is still that email
     /// (`AIWriteTarget.stillHolds`). The outer nil refuses: another email is seated at the address
     /// (a UIDVALIDITY reset), so its body is never sent with this email's context. The inner nil:
-    /// no body is stored (the context then carries the snippet).
+    /// no body is stored, or its read failed (the context then carries the snippet, and the edit
+    /// still runs, as with no body).
     static func relatedBodyText(of header: MessageHeader, db: Database) throws -> String?? {
         guard try AIWriteTarget.stillHolds(header, db: db) else { return nil }
-        guard let html = try MessageBody.fetchOne(db, key: header.id)?.htmlContent, !html.isEmpty else { return .some(nil) }
+        guard let html = (try? MessageBody.fetchOne(db, key: header.id))?.htmlContent, !html.isEmpty else { return .some(nil) }
         return .some(EmailFilter.htmlToPlainText(EmailFilter.stripEmbeddedEmlSections(html)))
     }
 }

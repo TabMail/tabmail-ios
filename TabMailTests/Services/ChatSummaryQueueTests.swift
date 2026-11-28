@@ -28,7 +28,8 @@ import Synchronization
 ///     else, at most each thread's newest `ChatViewConfig.summaryWindow` emails, members with their
 ///     body and without a done chat summary, never Trash. It never asks for a draft, and a draft
 ///     takes no place in a thread's window. Each thread is looked up once however many of its
-///     emails are in the Inbox, and no email of a thread is lost to that. A foreground pass runs it
+///     emails are in the Inbox, and no email of a thread is lost to that, a forward's thread and its
+///     source's (walked apart, ADR-IOS-043) included. A foreground pass runs it
 ///     only when the chat view was on as the pass began.
 ///  6. The chat view is on by default; it needs the user's toggle and AI on, and AI going off
 ///     never rewrites the toggle.
@@ -634,6 +635,71 @@ struct ChatSummaryQueueTests {
         let candidates = Set(try ActiveAIQueue.chatWalkCandidates(pool: pool).map(\.headerId))
         #expect(candidates.contains(reply.id), "the email of a row reached only by its native thread id: \(candidates)")
         #expect(candidates.contains(split.id), "the email of a row under another native thread id: \(candidates)")
+    }
+
+    /// Stores a row as the sync does: its thread assigned at insert (`ThreadUtils.assignComputedThreadId`,
+    /// under the provider's thread id) and its References indexed.
+    @discardableResult
+    private func storeThreaded(
+        accountId: String, uid: String, subject: String, folderPath: String, date: Date,
+        inReplyTo: String? = nil, references: [String] = [], threadId: String, pool: DatabasePool
+    ) throws -> MessageHeader {
+        var header = MessageHeader(
+            messageId: uid, subject: subject, from: "Sender",
+            fromAddress: "sender@example.com", to: "recipient@example.com",
+            date: date, snippet: "fixture",
+            folderId: MessageIdentity.folderId(accountId: accountId, folderPath: folderPath),
+            accountId: accountId, folderPath: folderPath, isInInbox: folderPath == "INBOX"
+        )
+        header.rfc822MessageId = Self.rfc(uid)
+        header.inReplyTo = inReplyTo
+        header.referencesJSON = MessageHeader.encodeReferences(references)
+        header.threadId = threadId
+        header.headerComplete = true
+        header.bodyComplete = true
+        try pool.write { db in
+            try ThreadUtils.assignComputedThreadId(to: &header, nativeThreadId: threadId, db: db)
+            try header.insert(db)
+            try ThreadUtils.insertMessageReferences(for: header, db: db)
+        }
+        return header
+    }
+
+    @Test("A forward's thread and its source's are walked apart and neither is lost: an Inbox email across a forward is looked up itself")
+    func walkLosesNeitherSideOfAForward() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+        let acc = "acc-cs-forward"
+        try makeAccount(acc, pool: pool)
+        let now = Date()
+        // Gmail files a forward in its source's conversation (g1), so every row carries one provider
+        // thread id, but the forward starts a thread of its own (ADR-IOS-043, forward split). The
+        // source side's newest email is walked first, and the search from it reaches the forward and
+        // the reply to it through their References: the forward, in the Inbox, must still be looked
+        // up, so the reply to it, in Archive, is walked.
+        let source = try storeThreaded(accountId: acc, uid: "source", subject: "Plans", folderPath: "Archive",
+                                       date: now.addingTimeInterval(-4 * 3600), threadId: "g1", pool: pool)
+        let forward = try storeThreaded(accountId: acc, uid: "forward", subject: "Fwd: Plans", folderPath: "INBOX",
+                                        date: now.addingTimeInterval(-3 * 3600), references: [Self.rfc("source")],
+                                        threadId: "g1", pool: pool)
+        let forwardReply = try storeThreaded(accountId: acc, uid: "forward-reply", subject: "Re: Fwd: Plans",
+                                             folderPath: "Archive", date: now.addingTimeInterval(-2 * 3600),
+                                             inReplyTo: Self.rfc("forward"),
+                                             references: [Self.rfc("source"), Self.rfc("forward")],
+                                             threadId: "g1", pool: pool)
+        let sourceReply = try storeThreaded(accountId: acc, uid: "source-reply", subject: "Re: Plans", folderPath: "INBOX",
+                                            date: now.addingTimeInterval(-3600), inReplyTo: Self.rfc("source"),
+                                            references: [Self.rfc("source")], threadId: "g1", pool: pool)
+        #expect(sourceReply.computedThreadId == source.computedThreadId, "control: a reply joins its source's thread")
+        #expect(forwardReply.computedThreadId == forward.computedThreadId, "control: a reply to the forward joins the forward's")
+        #expect(forward.computedThreadId != source.computedThreadId, "control: the forward starts its own thread")
+
+        let fromSourceSide = try ThreadDetection.related(to: sourceReply, in: pool)
+        #expect(fromSourceSide.messages.map(\.id) == [source.id], "control: the source side's chat shows only its own emails")
+
+        let candidates = Set(try ActiveAIQueue.chatWalkCandidates(pool: pool).map(\.headerId))
+        #expect(candidates == [source.id, sourceReply.id, forward.id, forwardReply.id],
+                "both sides of the forward are walked: \(candidates)")
     }
 
     // MARK: - 6. The switch

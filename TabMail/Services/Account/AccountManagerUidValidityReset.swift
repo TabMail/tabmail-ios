@@ -820,7 +820,9 @@ extension AccountManager {
 
     /// Step 5 — the ONE write that stamps the new epoch, exits reset state, and
     /// invalidates this folder's address-only durable intentions. All three land
-    /// together or not at all.
+    /// together or not at all. After the commit, the members of every dropped
+    /// move are reported on `.messageMovesRefused`, so a list stops hiding the
+    /// ids the resync can re-seat a different email at (#814).
     ///
     /// The ordering is the point, and it is the mirror-image trap this whole family
     /// of bugs lives in. If the address-only ops were dropped in a SEPARATE write
@@ -901,18 +903,20 @@ extension AccountManager {
         accountId: String, folderPath: String, folderId: String, fresh: UInt32
     ) async -> Bool {
         do {
-            let stamped = try await dbPool.write { db -> Bool in
-                guard var folder = try Folder.fetchOne(db, key: folderId) else { return false }
+            let (stamped, droppedMoveIds) = try await dbPool.write { db -> (Bool, Set<String>) in
+                guard var folder = try Folder.fetchOne(db, key: folderId) else { return (false, []) }
                 guard folder.uidValidityResetPendingAt != nil else {
-                    return folder.lastKnownUidValidity == Int(fresh)
+                    return (folder.lastKnownUidValidity == Int(fresh), [])
                 }
                 let ops = try PendingOperation
                     .filter(Column("accountId") == accountId && Column("folderPath") == folderPath)
                     .fetchAll(db)
+                var droppedMoveIds: Set<String> = []
                 for op in ops where Self.opIsProvenInvalidatedByReset(op, fresh: fresh) {
                     // A .move goes through the exit rule (ADR-IOS-111 item 11): its
                     // optimistic row may sit in a tracked destination.
                     try AccountOperationExecutor.deleteRetiringOperation(op, db: db)
+                    droppedMoveIds.formUnion(Self.movedHeaderIds(of: op))
                     BackgroundSyncLogger.log("[UIDValidity] dropped address-only op \(op.type.rawValue) \(op.id.prefix(8)) on \(folderId) — recorded under UIDVALIDITY \(op.observedUidValidity.map(String.init) ?? "?"), server now \(fresh); its UIDs belong to the epoch the server discarded (exit 4)")
                 }
                 // Before the new epoch becomes admissible: every gesture stamped
@@ -923,14 +927,30 @@ extension AccountManager {
                 // rolled-back transaction leaves the bump in place, which only
                 // refuses more pre-reset work.
                 FolderResetGeneration.recordReset(folderId: folderId)
+                // The same moment ends every address link into or out of this
+                // folder (#1139): the resync can seat a different email at
+                // either end of one. Here rather than at the purge because a
+                // move retired before this write could still prove a
+                // destination under the old epoch (G2 compares against the
+                // folder's stored epoch, which changes only below); after it,
+                // G2 refuses one. Each earlier write published its links when
+                // it committed, before this write began. A rollback leaves
+                // them forgotten, which only drops a short-lived bridge.
+                MessageHeaderRekey.forgetAddressHandoffs(
+                    accountId: accountId, folderPath: folderPath)
                 folder.lastKnownUidValidity = Int(fresh)
                 folder.uidValidityResetPendingAt = nil
                 try folder.update(db)
-                return true
+                return (true, droppedMoveIds)
             }
             if !stamped {
                 BackgroundSyncLogger.log("[UIDValidity] step 5 (stamp fresh epoch): Folder row \(folderId) vanished or disagreed with the fresh epoch — aborting; re-drive will retry")
             }
+            // A dropped move has no provider-confirmed result (usually its
+            // source stays), but its gesture hid its rows, and the resync can re-seat a different
+            // email at those ids: report them as not moved so a list shows
+            // them again (#814). After the commit.
+            await Self.announceMovesRefused(droppedMoveIds)
             return stamped
         } catch {
             BackgroundSyncLogger.log("[UIDValidity] step 5 (stamp fresh epoch, clear flag) failed for \(folderId): \(error) — aborting, flag stays set, re-drive will retry")

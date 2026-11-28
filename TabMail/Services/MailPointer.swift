@@ -177,6 +177,17 @@ struct MailPointerMoves: Sendable, Equatable {
         outsideStoresLane.yield(OutsideStoresBatch(records: records, done: nil))
     }
 
+    /// Retires, on the same lane, the chat pills of rows a move dropped with
+    /// no proven destination (`ChatIdTranslator.retireMappings`, the
+    /// in-memory half of `MessageHeaderRekey.finishMove`'s stored retire).
+    /// It runs after every re-key handed over before it, so a pill whose
+    /// follow to a dropped row was still waiting is retired, not left bound to
+    /// a row that is gone. Not a move: a dropped row has no new row to point at.
+    static func retireOutsideStoresInOrder(realIds: [String]) {
+        guard !realIds.isEmpty else { return }
+        outsideStoresLane.yield(OutsideStoresBatch(records: [], retiredRealIds: realIds, done: nil))
+    }
+
     #if DEBUG
     /// Returns once every batch handed to the lane before this call has run.
     static func outsideStoresSettledForTesting() async {
@@ -184,10 +195,22 @@ struct MailPointerMoves: Sendable, Equatable {
             outsideStoresLane.yield(OutsideStoresBatch(records: [], done: done))
         }
     }
+
+    /// Holds the lane: every batch handed over after this call waits, in
+    /// order, until the returned release runs.
+    static func holdOutsideStoresForTesting() -> @Sendable () -> Void {
+        let (gate, release) = AsyncStream<Void>.makeStream()
+        outsideStoresLane.yield(OutsideStoresBatch(records: [], hold: gate, done: nil))
+        return { release.finish() }
+    }
     #endif
 
     private struct OutsideStoresBatch: Sendable {
         let records: [HeaderRekeyRecord]
+        var retiredRealIds: [String] = []
+        #if DEBUG
+        var hold: AsyncStream<Void>?
+        #endif
         let done: CheckedContinuation<Void, Never>?
     }
 
@@ -195,6 +218,9 @@ struct MailPointerMoves: Sendable, Equatable {
         let (stream, continuation) = AsyncStream<OutsideStoresBatch>.makeStream()
         Task.detached {
             for await batch in stream {
+                #if DEBUG
+                if let hold = batch.hold { for await _ in hold {} }
+                #endif
                 for record in batch.records {
                     _ = await ChatIdTranslator.shared.remapRealId(
                         from: record.oldHeaderId, to: record.newHeaderId)
@@ -205,6 +231,9 @@ struct MailPointerMoves: Sendable, Equatable {
                         old: ChatStore.messageSessionId(accountId: ids.accountId, stableId: ids.old),
                         new: ChatStore.messageSessionId(accountId: ids.accountId, stableId: ids.new))
                 })
+                if !batch.retiredRealIds.isEmpty {
+                    await ChatIdTranslator.shared.retireMappings(realIds: batch.retiredRealIds)
+                }
                 batch.done?.resume()
             }
         }

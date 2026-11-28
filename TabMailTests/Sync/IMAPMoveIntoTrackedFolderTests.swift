@@ -356,9 +356,9 @@ struct IMAPMoveIntoTrackedFolderTests {
     @Test("Below the listing window: an unproven MOVE whose destination copy the server holds below the window is loaded by the older-mail check alone, held once in the destination under the server's UID, before any foreground sync")
     @MainActor
     func placeholderBelowTheWindowIsHealedByTheCatchUp() async throws {
-        // Archive holds contiguous UIDs 1...N except the source UID 88, so the
-        // optimistic Archive row the unproven MOVE leaves under UID 88 is provably
-        // absent from the server. The device holds all of them, its older-mail
+        // Archive holds contiguous UIDs 1...N except the source UID 88, so an
+        // optimistic Archive row left under UID 88 would be provably absent from
+        // the server (the MOVE's retirement drops it). The device holds all of them, its older-mail
         // walk complete. The MOVE takes the server's next UID; enough later
         // arrivals then push that copy far below the newest window, so neither
         // the window listing nor the count walk reaches it.
@@ -390,7 +390,9 @@ struct IMAPMoveIntoTrackedFolderTests {
             #expect(w.server.uids(in: "Archive", rfc822MessageId: Self.target) == landed, "below-window: setup: the server holds it below the window")
             #expect(w.server.uids(in: "INBOX", rfc822MessageId: Self.target).isEmpty, "below-window: setup: the source no longer holds it")
             let before = try w.heldTarget().map { "\($0.folderPath)/\($0.messageId)" }
-            #expect(before.contains("Archive/\(sourceUID)"), "below-window: setup: the unproven MOVE left its remnant under the source UID: \(before)")
+            // The unproven MOVE's retirement drops its optimistic row, so no
+            // row is left under the source UID.
+            #expect(!before.contains("Archive/\(sourceUID)"), "below-window: setup: the unproven MOVE left a remnant under the source UID: \(before)")
             // The MOVE's drain can relist the owed Archive and load the copy
             // while it is still the newest UID (#1062). That row is taken away
             // here, after the arrivals put the copy below the window, so the

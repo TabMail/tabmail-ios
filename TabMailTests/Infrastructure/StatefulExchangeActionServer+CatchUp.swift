@@ -172,7 +172,7 @@ extension StatefulExchangeActionServer {
             let start = min(skip, matches.count)
             let end = min(matches.count, start + size)
             let rows: [[String: Any]] = matches[start..<end].map { message in
-                let row = graphRow(message, expandLastVerb: expandsLastVerb(request.url.absoluteString))
+                let row = graphRow(message, expanding: expandedPropertyIds(request.url.absoluteString))
                 guard let selected else { return row }
                 return row.filter { selected.contains($0.key) || $0.key == "singleValueExtendedProperties" }
             }

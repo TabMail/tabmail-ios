@@ -53,9 +53,24 @@ struct UIDExistenceResult: Sendable {
 enum IMAPTransportSecurityError: Error, Equatable, CustomStringConvertible, LocalizedError {
     /// The server would not negotiate the minimum TLS version TabMail requires.
     case tlsFloorNotMet(host: String)
+    /// The server did not offer STARTTLS on a port where TabMail requires it
+    /// (`MailTransportPolicy`). `encryptedPort` is the implicit-TLS port the
+    /// sentence suggests instead (993 for incoming mail, 465 for sending).
+    case noEncryptedConnection(host: String, port: Int, encryptedPort: Int)
 
     var description: String {
         switch self {
+        case .noEncryptedConnection(let host, let port, let encryptedPort):
+            // ⚠️ Keep the words "connection" and "timeout" out of this sentence.
+            // `isTransientSendError` and `SyncEngine.isConnectionError` check this
+            // type before reading any text, but other consumers classify by the
+            // rendered text, where either word would make a refusal that can never
+            // succeed look like a passing network problem.
+            return """
+                \(host) does not offer encryption on port \(port). TabMail always encrypts your \
+                mail and password and will not send them unencrypted. Try port \(encryptedPort), \
+                or ask your mail provider to turn on STARTTLS.
+                """
         case .tlsFloorNotMet(let host):
             // ⚠️ The version named here is SwiftMail's `MailTLSMinimumVersion`
             // default (`.tlsv12`), which is the floor TabMail's `IMAPServer` /
@@ -102,23 +117,57 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// `SyncEngine.isConnectionError` uses for NIO's error families.
     static let tlsProtocolVersionAlert = "TLSV1_ALERT_PROTOCOL_VERSION"
 
+    /// Whether `error` is SwiftMail's own refusal when a connection that requires
+    /// STARTTLS (`MailTransportPolicy`) finds the server not offering it, before
+    /// sign-in or any mail: IMAP `IMAPError.connectionFailed("Server did not
+    /// advertise STARTTLS on port N")` (`IMAPConnection.applyPostGreetingTLSPolicy`)
+    /// and SMTP `SMTPError.tlsFailed("STARTTLS required but not advertised by
+    /// server")` (`SMTPServer.applyPostEHLOTLSPolicy`).
+    ///
+    /// Only the library's exact case with its complete reason counts, never text
+    /// that merely contains these words: other errors of the same cases carry the
+    /// server's own reply (a rejected EHLO, a refused STARTTLS command), and a
+    /// reply that repeated the words would otherwise turn a passing failure into
+    /// a permanent one. The end-to-end tests against servers that offer no
+    /// STARTTLS pin both reasons against the pinned library.
+    nonisolated static func isStartTLSNotOffered(_ error: Error, port: Int) -> Bool {
+        if case IMAPError.connectionFailed(let reason) = error {
+            return reason == "Server did not advertise STARTTLS on port \(port)"
+        }
+        if case SMTPError.tlsFailed(let reason) = error {
+            return reason == "STARTTLS required but not advertised by server"
+        }
+        return false
+    }
+
     /// Return an actionable transport-security error when — and ONLY when — the
-    /// failure was the server refusing the TLS version floor. Everything else is
-    /// returned UNCHANGED.
+    /// failure was the server refusing the TLS version floor, or the server not
+    /// offering STARTTLS where TabMail requires it. Everything else is returned
+    /// UNCHANGED.
     ///
     /// Fail-to-generic is the safe direction and it is chosen on purpose. A shape
     /// this function does not recognise stays whatever it already was, so it keeps
     /// its existing transient/retryable classification and the user's send keeps
     /// retrying. Recognising too much is the dangerous direction: it would label a
     /// recoverable failure permanent and stop a send that would have gone through.
+    ///
+    /// `port` is the port that was refused and `encryptedPort` the implicit-TLS
+    /// port of the same service, both for the no-STARTTLS sentence.
     nonisolated static func mapTransportSecurityFailure(
         _ error: Error,
-        host: String
+        host: String,
+        port: Int,
+        encryptedPort: Int
     ) -> Error {
-        guard String(describing: error).contains(tlsProtocolVersionAlert) else {
-            return error
+        let rendered = String(describing: error)
+        if rendered.contains(tlsProtocolVersionAlert) {
+            return IMAPTransportSecurityError.tlsFloorNotMet(host: host)
         }
-        return IMAPTransportSecurityError.tlsFloorNotMet(host: host)
+        if isStartTLSNotOffered(error, port: port) {
+            return IMAPTransportSecurityError.noEncryptedConnection(
+                host: host, port: port, encryptedPort: encryptedPort)
+        }
+        return error
     }
 
     private let host: String
@@ -128,9 +177,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     private let senderEmail: String
     private let smtpHost: String
     private let smtpPort: Int
-    /// Test-only TLS override. `nil` in production — SwiftMail infers TLS from
-    /// the port (993 → implicit TLS, 143 → plain). Tests set `false` to point
-    /// IMAPProvider at an in-process plain-TCP fake on an ephemeral port.
+    /// Test-only TLS override, read only in DEBUG builds (`imapTransportSecurity`).
+    /// `nil` in production, where the transport always comes from
+    /// `MailTransportPolicy`. Tests set `false` to point IMAPProvider at an
+    /// in-process plain-TCP fake on an ephemeral port.
     private let useTLS: Bool?
     /// Reports what a login the server answered says about the account's
     /// sign-in. Injected by the account layer; `nil` reports nothing. Stored in a
@@ -999,12 +1049,32 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     }
     #endif
 
-    /// The SMTP session one send uses.
+    /// The SMTP session one send uses: always an encrypted connection
+    /// (`MailTransportPolicy`), with no plain-text mode even in DEBUG.
     private nonisolated func makeSMTPSession() -> any SMTPSubmissionSession {
         #if DEBUG
         if let factory = smtpSessionTestFactory.withLock({ $0 }) { return factory() }
         #endif
-        return SMTPServer(host: smtpHost, port: smtpPort)
+        return SMTPServer(
+            host: smtpHost,
+            port: smtpPort,
+            transportSecurity: smtpTransportSecurity
+        )
+    }
+
+    /// The transport of every send this provider makes (`makeSMTPSession`).
+    nonisolated var smtpTransportSecurity: MailTransportSecurity {
+        MailTransportPolicy.smtpSecurity(port: smtpPort)
+    }
+
+    /// The transport of every IMAP connection this provider opens: always an
+    /// encrypted connection (`MailTransportPolicy`). Only a DEBUG build honours
+    /// the test override that reaches the plain-TCP `FakeIMAPServer`.
+    nonisolated var imapTransportSecurity: MailTransportSecurity {
+        #if DEBUG
+        if useTLS == false { return MailTransportSecurity.plainText }
+        #endif
+        return MailTransportPolicy.imapSecurity(port: port)
     }
 
     /// Test seam: install `serverCreatedTestHook`.
@@ -1082,7 +1152,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         let server = IMAPServer(
             host: host,
             port: port,
-            useTLS: useTLS,
+            transportSecurity: imapTransportSecurity,
             responseBufferLimit: IMAPFetchMapping.responseBufferLimit
         )
         if let passGeneration {
@@ -1110,8 +1180,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             if openingTornDown(passGeneration) { throw ProviderError.notConnected }
             // IOS-TLS-002: a server below the TLS floor otherwise arrives at the
             // UI as "The operation couldn't be completed. (NIOSSL.NIOSSLError
-            // error 0.)" — permanent, actionable, and named nowhere.
-            throw Self.mapTransportSecurityFailure(error, host: host)
+            // error 0.)" — permanent, actionable, and named nowhere. A server
+            // that offers no STARTTLS would read as a passing network failure.
+            throw Self.mapTransportSecurityFailure(
+                error, host: host, port: port,
+                encryptedPort: MailTransportPolicy.imapImplicitTLSPort)
         }
         // Checked right before the LOGIN is written, after every wait that comes
         // before it: a teardown (`markDirty`, `disconnect`) during any of them
@@ -6300,8 +6373,8 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // every member is reported complete and the whole op retires.
             //
             // No destination address: nothing was copied anywhere, so there is
-            // nothing to re-key.
-            return MoveOutcome(provenIds: ids, provenDestinations: [])
+            // nothing to re-key, and the local row must stay (`copiedNothing`).
+            return MoveOutcome(provenIds: ids, provenDestinations: [], copiedNothing: true)
         } catch is IMAPActionPermanentlyRefused {
             // GitHub #115 round 3b — OWNER DECISION 2026-09-05. The atomic
             // `UID MOVE` was refused with a response code from the permanent set
@@ -6323,7 +6396,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             // above: that type means "an exact LIST proved the mailbox gone" and
             // is thrown from two other call sites in this file, so widening it
             // would change their dispositions too.
-            return MoveOutcome(provenIds: ids, provenDestinations: [])
+            return MoveOutcome(provenIds: ids, provenDestinations: [], copiedNothing: true)
         }
     }
 
@@ -6401,8 +6474,11 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
                 // FOREVER: `isTransientSendError` reads `.tlsFailed`/connection
                 // shapes as transient, so a message addressed to a server that can
                 // never accept it was retried indefinitely and the user was never
-                // given the Retry/Discard agency Outbox Rules 7/9 promise.
-                throw Self.mapTransportSecurityFailure(error, host: self.smtpHost)
+                // given the Retry/Discard agency Outbox Rules 7/9 promise. The same
+                // holds for a server that offers no STARTTLS (`.tlsFailed`).
+                throw Self.mapTransportSecurityFailure(
+                    error, host: self.smtpHost, port: self.smtpPort,
+                    encryptedPort: MailTransportPolicy.smtpImplicitTLSPort)
             }
             // Connect, greeting and TLS were awaited: an account removed
             // meanwhile neither authenticates nor submits.
@@ -7077,9 +7153,9 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     static func buildEmail(from draft: DraftMessage, senderEmail: String) throws -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
-            recipients: try sendableRecipients(draft.to),
-            ccRecipients: try sendableRecipients(draft.cc),
-            bccRecipients: try sendableRecipients(draft.bcc)
+            recipients: try OutgoingRecipients.sendableRecipients(draft.to),
+            ccRecipients: try OutgoingRecipients.sendableRecipients(draft.cc),
+            bccRecipients: try OutgoingRecipients.sendableRecipients(draft.bcc)
         )
     }
 
@@ -7092,16 +7168,10 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     static func buildDraftEmail(from draft: DraftMessage, senderEmail: String) -> Email {
         buildEmail(
             from: draft, senderEmail: senderEmail,
-            recipients: draftRecipients(draft.to),
-            ccRecipients: draftRecipients(draft.cc),
-            bccRecipients: draftRecipients(draft.bcc)
+            recipients: OutgoingRecipients.draftRecipients(draft.to),
+            ccRecipients: OutgoingRecipients.draftRecipients(draft.cc),
+            bccRecipients: OutgoingRecipients.draftRecipients(draft.bcc)
         )
-    }
-
-    private static func draftRecipients(_ recipients: [String]) -> [SwiftMail.EmailAddress] {
-        recipients.flatMap { recipient in
-            (try? sendableRecipients([recipient])) ?? [SwiftMail.EmailAddress(address: recipient)]
-        }
     }
 
     /// The recipients as one header field body, each written as a draft writes
@@ -7114,7 +7184,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// the comma that follows it when another recipient comes next, so the comma is
     /// counted on the line it ends.
     static func recipientsFieldBody(_ name: String, _ recipients: [String]) -> String {
-        let written = draftRecipients(recipients).map(\.description)
+        let written = OutgoingRecipients.draftRecipients(recipients).map(\.description)
         let tokens = written.enumerated().map { index, recipient in
             index < written.count - 1 ? recipient + "," : recipient
         }
@@ -7163,34 +7233,6 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     static func threadingMessageIDs(_ ids: [String]) -> [String] {
         ids.filter { !$0.isEmpty && !$0.unicodeScalars.contains { CharacterSet.newlines.contains($0) } }
             .map { $0.hasPrefix("<") ? $0 : "<\($0)>" }
-    }
-
-    /// The mailboxes each recipient names. Compose hands over one address per
-    /// recipient (ADR-IOS-092), but a send queued by an earlier version can hold a
-    /// typed list such as `a@example.com, b@example.com` in one recipient; it goes
-    /// to every mailbox it names. Throws on the first recipient that names no
-    /// mailbox or holds text that is not one (an empty group included). Each mailbox is written again by
-    /// SwiftMail, never copied as text, so no recipient can add a header line.
-    static func sendableRecipients(_ recipients: [String]) throws -> [SwiftMail.EmailAddress] {
-        try recipients.flatMap { recipient in
-            var mailboxes: [SwiftMail.EmailAddress] = []
-            for entry in AddressParser.parseAddressList(recipient) {
-                switch entry {
-                case .mailbox(let mailbox): mailboxes.append(mailbox)
-                case .group(_, let members):
-                    // A group naming nobody is not an address: beside other
-                    // recipients it fails the send too, never silently dropped.
-                    guard !members.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
-                    mailboxes += members
-                case .invalid:
-                    // Any entry that is not a mailbox fails the whole send, even
-                    // one whose decoded text is empty (`""`): nothing is dropped.
-                    throw SMTPError.invalidEmailAddress(recipient)
-                }
-            }
-            guard !mailboxes.isEmpty else { throw SMTPError.invalidEmailAddress(recipient) }
-            return mailboxes
-        }
     }
 
     private static func buildEmail(
@@ -8010,7 +8052,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     func mapMessageInfo(_ info: MessageInfo, keepEmptySubject: Bool = false) -> MessageHeaderInfo? {
         // Shared with the NSE (`NSEIMAPConnection.mapInfoToMetadata`), so both
         // targets list a message under the same sender.
-        let from = IMAPFetchMapping.sender(from: info)
+        let from = EmailAddress.sender(of: info.fromAddresses)
             ?? EmailAddress(name: "Unknown", email: "")
         let fromName = from.name
         let fromAddr = from.email

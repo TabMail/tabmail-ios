@@ -23,21 +23,24 @@ enum ExchangeGraphMessageRequest: CaseIterable, Hashable, Sendable {
     /// `GraphAPI.stateSelection` and never reach the parser.
     case readChanges
 
-    /// The listings and the change reader's message reads also expand
-    /// Outlook's last verb, so a message replied to or forwarded on another
-    /// device shows it (#890). The message delta (`readChanges`) cannot.
+    /// The listings, the older-mail and catch-up reads (`fetchSingleBackfill`,
+    /// which store the messages they read) and the change reader's message
+    /// reads also expand Outlook's last verb, so a message replied to or
+    /// forwarded on another device shows it (#890), and the threading ids, so
+    /// a reply threads under the message it answers (#1559). The message delta
+    /// (`readChanges`) cannot.
     var selection: GraphMessageSelection {
         switch self {
         case .search, .readChanges:
             GraphAPI.headerOnlySelection
         case .fetchMessages, .fetchMessageHeaders, .fetchOlderMessages:
-            GraphAPI.headerOnlySelection.withLastVerb
+            GraphAPI.headerOnlySelection.withExtendedProperties
         case .fetchSingleBackfill:
-            GraphAPI.backfillSelection
+            GraphAPI.backfillSelection.withExtendedProperties
         case .fetchMessage:
             GraphAPI.fullSelection
         case .fetchMessageDetails:
-            GraphAPI.metadataSelection.withLastVerb
+            GraphAPI.metadataSelection.withExtendedProperties
         }
     }
 }
@@ -285,7 +288,8 @@ actor ExchangeProvider: EmailProvider {
             extraHeaders: forDraft ? ["Prefer": "outlook.body-content-type=\"text\""] : [:])
         let msg = try JSONDecoder().decode(GraphMessage.self, from: data)
 
-        guard let header = parseGraphMessage(msg, selection: selection, keepEmptySubject: forDraft) else {
+        guard let header = parseGraphMessage(
+            msg, selection: selection, keepEmptySubject: forDraft, keepRecipientNames: forDraft) else {
             throw ProviderError.messageNotFound
         }
 
@@ -1835,10 +1839,15 @@ actor ExchangeProvider: EmailProvider {
     /// - Parameter keepEmptySubject: a draft copy's subject is the draft's own, so
     ///   an empty one stays empty rather than becoming the "(no subject)" a list
     ///   shows (#217).
+    /// - Parameter keepRecipientNames: a draft copy's To, Cc and Bcc keep each
+    ///   recipient's name (`draftRecipientText`), so a reopened or adopted draft's
+    ///   chips keep them and its next save and Send carry them (#1031). Other reads
+    ///   keep addresses only.
     internal func parseGraphMessage(
         _ msg: GraphMessage,
         selection: GraphMessageSelection,
-        keepEmptySubject: Bool = false
+        keepEmptySubject: Bool = false,
+        keepRecipientNames: Bool = false
     ) -> MessageHeaderInfo? {
         // Round-trip through JSON so the shared parser is the single source of
         // truth. Cheap — we already decoded once on the way in.
@@ -1862,9 +1871,15 @@ actor ExchangeProvider: EmailProvider {
             subject: metadata.subject.isEmpty && !keepEmptySubject ? "(no subject)" : metadata.subject,
             from: metadata.from.name,
             fromAddress: metadata.from.email,
-            to: metadata.to.map { $0.email }.joined(separator: ", "),
-            cc: metadata.cc.map { $0.email }.joined(separator: ", "),
-            bcc: metadata.bcc.map { $0.email }.joined(separator: ", "),
+            to: keepRecipientNames
+                ? Self.draftRecipientText(msg.toRecipients)
+                : metadata.to.map { $0.email }.joined(separator: ", "),
+            cc: keepRecipientNames
+                ? Self.draftRecipientText(msg.ccRecipients)
+                : metadata.cc.map { $0.email }.joined(separator: ", "),
+            bcc: keepRecipientNames
+                ? Self.draftRecipientText(msg.bccRecipients)
+                : metadata.bcc.map { $0.email }.joined(separator: ", "),
             replyTo: metadata.replyTo?.email,
             date: metadata.date,
             snippet: "",
@@ -1913,11 +1928,6 @@ actor ExchangeProvider: EmailProvider {
 
     // MARK: - Sending Helpers
 
-    /// PidTagInReplyToId, the property Exchange writes a sent message's In-Reply-To from.
-    static let graphInReplyToProperty = "String 0x1042"
-    /// PidTagInternetReferences, the property Exchange writes a sent message's References from.
-    static let graphReferencesProperty = "String 0x1039"
-
     /// - Parameter sending: true when the payload sends the message (`sendMail`, or
     ///   the draft a send with files creates). Only then does it carry
     ///   `draft.messageId`, as Graph's `internetMessageId` (writable while the
@@ -1938,18 +1948,12 @@ actor ExchangeProvider: EmailProvider {
             "content": draft.body,
         ]
 
-        // Recipients. Every list is sent even when empty: a draft update is a
-        // PATCH, which leaves out properties unchanged, so an omitted list would
-        // keep recipients the user removed.
-        message["toRecipients"] = draft.to.map { email in
-            ["emailAddress": ["address": email]]
-        }
-        message["ccRecipients"] = draft.cc.map { email in
-            ["emailAddress": ["address": email]]
-        }
-        message["bccRecipients"] = draft.bcc.map { email in
-            ["emailAddress": ["address": email]]
-        }
+        // Recipients, each under its display name (#1031). Every list is sent
+        // even when empty: a draft update is a PATCH, which leaves out properties
+        // unchanged, so an omitted list would keep recipients the user removed.
+        message["toRecipients"] = Self.graphRecipients(draft.to)
+        message["ccRecipients"] = Self.graphRecipients(draft.cc)
+        message["bccRecipients"] = Self.graphRecipients(draft.bcc)
 
         // Message-ID (RFC 2822 requires angle brackets around message IDs). Graph
         // exposes it as `internetMessageId`, so it goes there, and only on a send.
@@ -1962,14 +1966,15 @@ actor ExchangeProvider: EmailProvider {
         // the MAPI properties Exchange writes those headers from (confirmed by a live
         // reply on `sendMail`). A send with files carries them on its draft create,
         // then `/messages/{id}/send` (#422); a draft save uploads without them
-        // (`DraftStore.uploadThreadHeaders`).
+        // (`DraftStore.uploadThreadHeaders`). Every expanded read reads them back
+        // (`GraphParse.parseMessage`).
         var threading: [[String: String]] = []
         if let inReplyTo = IMAPProvider.threadingMessageIDs(draft.inReplyTo.map { [$0] } ?? []).first {
-            threading.append(["id": Self.graphInReplyToProperty, "value": inReplyTo])
+            threading.append(["id": GraphAPI.inReplyToPropertyId, "value": inReplyTo])
         }
         let references = IMAPProvider.threadingMessageIDs(draft.references)
         if !references.isEmpty {
-            threading.append(["id": Self.graphReferencesProperty, "value": references.joined(separator: " ")])
+            threading.append(["id": GraphAPI.referencesPropertyId, "value": references.joined(separator: " ")])
         }
         if !threading.isEmpty {
             message["singleValueExtendedProperties"] = threading
@@ -1981,6 +1986,37 @@ actor ExchangeProvider: EmailProvider {
         }
 
         return message
+    }
+
+    /// Graph `recipient` objects for a recipient list: every mailbox each
+    /// recipient names, with its display name when it has one, read as IMAP
+    /// and Gmail read them (`OutgoingRecipients.draftRecipients`), so
+    /// `"Sam Lee" <sam@example.com>` goes as `name` and `address`, never as one
+    /// address (#1031). Text that names no mailbox goes as the address, as
+    /// before: a draft keeps it, and what a send does with it is Graph's to decide.
+    nonisolated static func graphRecipients(_ recipients: [String]) -> [[String: Any]] {
+        OutgoingRecipients.draftRecipients(recipients).map { mailbox -> [String: Any] in
+            var emailAddress = ["address": mailbox.address]
+            if let name = mailbox.name { emailAddress["name"] = name }
+            return ["emailAddress": emailAddress]
+        }
+    }
+
+    /// A draft copy's recipient list as compose reads it back (#1031): each
+    /// recipient as `"Name" <address>` (`IMAPFetchMapping.mailboxText`), or its bare
+    /// address when it has no name or Graph gives the address itself as the name
+    /// (as it does for a recipient saved without one). A recipient with no address
+    /// is left out, as the address-only read leaves it empty. It does not reuse
+    /// `formatRecipient` (an attached email's envelope), which keeps a recipient
+    /// with a name and no address as the name alone: a draft field holds only
+    /// mailboxes, as compose reads each entry back as one.
+    nonisolated static func draftRecipientText(_ recipients: [GraphRecipient]?) -> String {
+        (recipients ?? []).compactMap { recipient -> String? in
+            guard let address = recipient.emailAddress?.address, !address.isEmpty else { return nil }
+            let name = recipient.emailAddress?.name ?? ""
+            guard !name.isEmpty, name.caseInsensitiveCompare(address) != .orderedSame else { return address }
+            return IMAPFetchMapping.mailboxText(name: name, address: address)
+        }.joined(separator: ", ")
     }
 
     nonisolated static func graphFileAttachment(_ attachment: DraftAttachment) -> [String: Any] {
@@ -2104,7 +2140,7 @@ struct GraphMessage: Codable {
     let bodyPreview: String?
     let body: GraphBody?
     let parentFolderId: String?
-    /// Present only when the request expanded it (`GraphAPI.lastVerbExpandParameter`).
+    /// Present only when the request expanded it (`GraphAPI.extendedPropertiesExpandParameter`).
     var singleValueExtendedProperties: [GraphExtendedProperty]? = nil
 
     /// PidTagLastVerbExecuted, when the request expanded it and Outlook has one.

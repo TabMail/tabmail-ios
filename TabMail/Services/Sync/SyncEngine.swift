@@ -1368,6 +1368,10 @@ actor SyncEngine {
     /// NOTE: ProviderError.networkError (HTTP 4xx/5xx) is NOT a connection error — the request
     /// completed and the server responded. Only transport-level failures warrant reconnection.
     nonisolated static func isConnectionError(_ error: Error) -> Bool {
+        // A server that refuses an encrypted connection is not a network
+        // problem, and its sentence names the user's own host, which the
+        // substring checks below would otherwise read.
+        if error is IMAPTransportSecurityError { return false }
         if case ProviderError.notConnected = error { return true }
         // URLError from URLSession (Gmail/Exchange HTTP): airplane mode, DNS failure, connection lost, etc.
         if error is URLError { return true }

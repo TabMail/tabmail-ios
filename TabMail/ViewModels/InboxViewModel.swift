@@ -948,8 +948,9 @@ final class InboxViewModel {
             // the real thread id. Uses the same linkage signals insert-time thread
             // detection does (provider threadId, rfc822 In-Reply-To/References), so
             // the reconcile normally agrees. A miss or wrong guess self-heals via
-            // the reconcile reload — exactly today's regroup, never worse.
-            if let adopted = loadedMessages.first(where: { snap in
+            // the reconcile reload — exactly today's regroup, never worse. A
+            // forward starts its own thread, so it adopts none.
+            if !ThreadUtils.hasForwardPrefix(row.subject), let adopted = loadedMessages.first(where: { snap in
                 guard snap.accountId == row.accountId, !snap.computedThreadId.isEmpty else { return false }
                 if let tid = row.threadId, tid == snap.threadId { return true }
                 if let rfc = snap.rfc822MessageId, !rfc.isEmpty,
@@ -1837,8 +1838,8 @@ final class InboxViewModel {
             AccountManagerState.shared.lastSyncFailed = true
             // The run's outcome is the one error it sees; a failed refresh never clears.
             AccountManagerState.shared.failRefresh(
-                countedFailure: InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: false)
-                    && InboxErrorBanner.text(for: error) != nil)
+                line: InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: false)
+                    ? InboxErrorBanner.text(for: error) : nil)
         }
 
         // Refresh loaded messages to pick up changes from sync.

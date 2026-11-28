@@ -183,6 +183,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
    updates a stored row, and inserts only a message dated within the folder's held range, checked inside
    the transaction; a folder with no held range (after a reset) inserts nothing. A later round's record
    inserts at any age: a message moved in by another client appears whatever its date (#722, #536).
+   *Amended 2026-11-26 (#1363):* a folder with no held range whose older-mail walk has completed (the walk
+   found it empty) holds the whole folder and inserts at any age; see the amendment of that date at the end.
 4. **The read budget ends before the caller's deadline** (`SyncEngine.changeReadEnd`): the smaller of
    `SyncConfig.changeReadBudgetSeconds` and the caller's deadline less one request's timeout
    (`changeReadRequestTimeoutSeconds`) and the apply margin (`changeReadApplyMarginSeconds`). No request
@@ -203,7 +205,8 @@ window never appeared (#722, #536), and changes to older mail were lost (#464, #
      (`GraphAPI.stateSelection`: `id,isRead,flag,receivedDateTime,categories`). A change to a message the
      phone holds applies from that record; a message the folder does not hold whose record carries
      `receivedDateTime` (a new or moved-in message) gets its headers fetched, when the folder is tracking,
-     or during its baseline when the message is within the held range.
+     or during its baseline when the message is within the held range (with no range, every such message
+     once the folder's older-mail walk has completed; amended 2026-11-26, #1363).
    - **Why not ids only.** A delta chain keeps the `$select` it was started with (Graph encodes it in the
      next and delta links), and later rounds carry only selected fields. With `$select=id` every read or
      flag change would cost one GET per message, or might not be reported at all; a change key says only
@@ -596,12 +599,32 @@ does not read the verb. The arrow is never written to the server (Mail.Send and 
 out of scope).
 *Amended 2026-11-15 (#915):* the app now writes the verb on the original after a confirmed send
 (memory 151); the reader sees that echo as a mark already set locally, so it changes nothing.
+*Amended 2026-11-27 (#1559):* the same expand also names the threading ids `String 0x1042` (In-Reply-To)
+and `String 0x1039` (References), joined with `or` (observed, not documented: Microsoft documents the
+filter with one id, and the `or` form was measured on 2026-11-27; a refusal would answer every expanded
+read with 400, a loud failure, never a silent loss); the names became
+`GraphMessageSelection.expandsExtendedProperties` / `withExtendedProperties` and
+`GraphAPI.extendedPropertiesExpandParameter`, and the notification extension's `messageMetadata` expands
+too, as do the older-mail and catch-up reads (`fetchSingleBackfill`). `GraphParse.parseMessage` reads
+both ids. `readLastVerbs` also copies them onto the record's header, which only the apply's insert reads,
+so a new message threads under the one it answers, and the change reader never moves a stored row's chain,
+thread or reference rows (`fullRecord`). A full listing's merge of a stored row (its ordinary
+existing-row arm, when the incoming Message-ID normalizes) writes the server's References onto it, as on
+every provider, and keeps its thread, In-Reply-To and reference rows; a stored Sent or Drafts row takes the
+earlier metadata-skip arm and keeps its References too. No new
+request. Residuals (a by-id read the allowance or budget cut, or that failed: 5xx, 429, a failed batch,
+an unusable answer; an Inbox baseline; search) in IOS-THREAD-002 case 4.
+Since the Sent copies now carry In-Reply-To, the Sent-copy marks (`ReplyParentResolver`) and the revert's
+`hasStoredReply` work on Outlook as on Gmail and IMAP, and so does the accepted wrong-arrow class of
+IOS-OUTBOX-008 (another app's forward with In-Reply-To and no `Fwd:`/`Fw:` subject).
 
-Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`).
+Tests: `OutlookLastVerbTests.swift` (extension of `OutlookChangeReadingTests`); threading ids:
+`OutlookReplyThreadingTests.swift`.
 
 Keywords: last verb, PidTagLastVerbExecuted, 0x1081, replied, answered, forwarded, reply arrow,
 singleValueExtendedProperties, $expand, expandsLastVerb, readLastVerbs, batchItemURL,
-double encoding, ReplyDetect, #890.
+double encoding, ReplyDetect, #890, expandsExtendedProperties, extendedPropertiesExpandParameter,
+0x1042, 0x1039, In-Reply-To, References, threading ids, #1559.
 
 ### Amendment 2026-11-16: Gmail resumes its history read (#491)
 
@@ -856,7 +879,9 @@ QRESYNC, folder by folder, on a dedicated change connection (`IMAPProviderChange
    (`ChangePassOutcome.folderBookmarkLeft`), whatever the read returned (a first read, a "nothing
    changed" read). A retirement whose row is no longer at its key drops the source too. Nothing is deleted and no queued operation is touched:
    removing the placeholder would drop queued user actions that name it, which the never-drop rule
-   forbids. The window listing reaches only the newest messages, and the IMAP older-mail catch-up
+   forbids. *(Amended 2026-11-25 (#537), see the amendment of that date at the end: on IMAP the
+   placeholder of a retired move that copied something and named no destination is deleted; no queued
+   operation can name it, and no queued operation is touched. The bookmark drops above are unchanged.)* The window listing reaches only the newest messages, and the IMAP older-mail catch-up
    only updates or removes rows it holds, so a message such a move left in a folder below the window
    (a move that retired with no effect, its source message older than the window, with backfill
    complete) would stay missing. So a bookmark this rule drops also owes the folder ONE self-heal
@@ -1704,3 +1729,125 @@ syncable set, 15-minute clock, clockDue, readCut, cut folder, tried, slow link, 
 listing bound, catchUpRequestTimeoutSeconds, Outlook baseline page not passed, baselining readCut, #1110,
 #1358, runRemovalCheck, removal check step, CONDSTORE without QRESYNC, per provider call, account removal,
 headerFetch slot, staging merge, firstFolderDeadline, forFirstFolder, slow NOOP, first folder in the slice, pendingCheck kept.
+
+### Amendment 2026-11-26 (#1363): a folder the older-mail walk found empty is held whole
+
+**Context.** Decision 3 lets a baseline insert nothing in a folder with no held range, and Outlook's reader
+(decision 5) fetches nothing for it. The older-mail walk sets the held range (`Folder.oldestSyncedDate`) only
+from messages it sees, so a folder it finds empty is marked complete (`Folder.backfillComplete`) with no range.
+Mail that landed there after the walk and before the folder's first read was skipped by that read, and the
+bookmark then passed it: later reads report only later changes, and the Outlook catch-up lists only the ranges
+between the folder's own rows, of which there are none. It stayed missing from the folder's list and from
+search until the user opened the folder. This shows on folders outside the syncable set, whose first read is
+the other-folder run's (#1110): a synced folder's window listing fetches its newest `syncMessageLimit`
+messages, and sets its range once the folder holds that many. IMAP already holds the whole folder once its walk
+has completed (`IMAPProvider.heldRangeStart`, amendment 2026-11-16).
+
+**Decision.**
+1. **A folder with no held range whose older-mail walk has completed holds the whole folder.** A baseline
+   record inserts a message the folder lacks whatever the message's date. The apply reads `backfillComplete`
+   from the folder row it already loads in the folder's transaction (`SyncEngine.applyChangeRecord`). Outlook's
+   reader fetches the headers of every such message (`ExchangeProvider.needsHeader`, from
+   `ChangeFolder.olderMailComplete`, which `SyncEngine.changeFolder` already fills). Before the walk has
+   completed, a folder with no range still inserts and fetches nothing: the walk takes what is there.
+2. **A completed walk never widens a held range.** A folder with a range keeps decision 3: mail below the
+   range of a walked folder is the older-mail catch-up's (ADR-IOS-107: once the walk has completed, it lists
+   a folder that holds rows down to the epoch). A folder with no rows has no such listing, which is why the
+   no-range case above needed its own rule.
+3. **Resets are unchanged.** Every reset clears `backfillComplete` in the same write that clears or
+   re-anchors the range (`resetSyncStateTxn`, the startup resets and the shipped migration clear both;
+   Smart Reindex's `resetCrawlState` anchors the range at now), so decision 3's folder "after a reset" still
+   inserts nothing until its walk runs again.
+4. **Nothing new is stored or asked.** No new query, statement, column or migration, and no new kind of
+   request: Outlook's first read already fetches missing messages in `$batch`es, within its time budget and
+   request allowance. Only Outlook's first read carries records today (IMAP's and Gmail's set the bookmark
+   only), so nothing changes for them; the apply's rule stays provider-neutral.
+5. **Sync timing promises: unchanged** (each is listed in the change's pull request). No trigger, gate, turn,
+   deadline, skip, IDLE step or start-of-pass work changes. The header fetches run inside the read's own budget
+   and allowance; a pass reads tracked folders and the Inbox before folders on their first read; an
+   other-folder slice stays one slice; nothing is added to the startup or return path.
+
+**Consequences.**
+- A folder the walk completed empty is healed by its first read on a build with this change, mail moved in
+  with an older date included. A folder whose first read ran on an earlier build keeps what that read skipped
+  until it is opened.
+- Cost: one header fetch per message the folder lacks, inside the read's allowance; a long first read goes on
+  across slices and runs (#1358), and bodies follow by the download rules. Under a storage limit such a folder
+  may take more mail than the walk would have; the storage prune trims it as it does any folder, and a
+  re-baseline loads trimmed mail again, as for any folder.
+- The reader decides from the folder as its read began (`ChangeFolder`, a value snapshot), the apply from the
+  row in its transaction. A reset while a read is under way leaves the apply inserting nothing (the row's
+  `backfillComplete` is false again). A walk that completes while a first read is under way: that read keeps
+  the earlier rule, and the baseline's later reads take the new one.
+
+Tests: `OutlookChangeReadingTests` (`baselineWithNoHeldRangeAfterTheWalkTakesEveryMessage`, `needsHeaderRule`,
+`baselineFetchesOnlyWithinTheHeldRange` with and without a completed walk, `baselineWithNoHeldRangeInsertsNothing`
+before the walk), `ChangeApplyTests.firstReadInsertsWithinTheHeldRange`, and end to end on the Graph fake
+`OtherFolderOutlookTests.mailAfterAnEmptyWalkComesInWithTheFirstRead` (the walk finds an other folder empty, a
+new and an older moved-in message land, the run's first read inserts both).
+
+Keywords: #1363, walked empty, empty folder, no held range, held whole, oldestSyncedDate nil, backfillComplete,
+olderMailComplete, needsHeader, heldRangeApplies, first read, baseline gate, older-mail walk completed, moved in
+with an older date, other-folder run, IMAP heldRangeStart rule.
+
+### Amendment 2026-11-25 (#537): a move that copied with no proven destination drops its placeholder
+
+**Context.** Item 11 kept the optimistic row of an IMAP move member that retired without a proven
+destination UID, because removing it "would drop queued user actions that name it". That row keeps the
+SOURCE primary key and UID with a nil epoch: no proof can ever stamp it, every gesture on it is refused, and
+the destination's listing takes it as the owner of that numeric UID there, so it hides a different message at
+that UID or stays as a permanent inert duplicate (`IOS-MOVE-002`). Only Delete All Index Data or a
+UIDVALIDITY turnover removed it.
+
+**Decision.** In `MessageHeaderRekey.finishMove`, the arm with no proven destination, on a mailbox-local UID
+space (`accountScopedIds` false), when the provider reports that the move copied something
+(`MoveOutcome.copiedNothing` false), deletes the placeholder in the retiring transaction:
+
+1. its AI fields are written to `MessageAICache` under the destination folder (no rfc822 Message-ID, no
+   key: nothing is kept), and any copy a sync already stored in that folder with the same rfc822
+   Message-ID gets them through `MessageAICache.restoreIfCached` (first-compute-wins; one indexed lookup);
+2. its body is removed with it, and its chat-pill mapping is retired in the same write to a stand-in that
+   names no row, so the pill greys out and its number is never reused or rebound by Message-ID; the
+   translator's half of the retire runs after the commit on the outside-stores lane
+   (`MailPointerMoves.retireOutsideStoresInOrder`), after every pill follow already handed over, so a follow
+   still waiting to bind a pill to the dropped row is retired too (amended 2026-11-27, after the rebase onto
+   #1588's lane). A follow whose hand-over trails its producer's commit can still land after it (ios#1581).
+   Until the lane runs, the stored stand-in alone makes a reopen heal's re-point miss;
+3. the bookmark drops of item 11 are unchanged (both folders), so the owed check of the #1062 amendment
+   still lists them; `MoveFinishResult.droppedRemnants` carries the dropped rows for the entered-inbox AI
+   recorder, and `publishCommittedEffects` withdraws each dropped row's rfc822 key from the 30-second
+   recently-completed store before the destination syncs (the bare source-UID key stays).
+
+`copiedNothing` is true only for the two `IMAPProvider.move` results where nothing was copied (the
+mailbox-absent arm and a permanent refusal), and for every retirement with no provider result
+(`AccountOperationExecutor.deleteRetiringOperation`); those, a chained move (the row moved on), a proven
+destination under an epoch the folder does not share, and every account-scoped provider keep the row
+exactly as before.
+
+**Why no queued operation can name the placeholder.** (1) The optimistic move sets its epoch to nil and
+admission (`admittedOrdinaryActionTargets`) runs before any `PendingOperation` insert, so no gesture after
+the move queues an op on it. (2) The annihilation of a never-attempted opposite predecessor retires through
+`deleteRetiringOperation` (`copiedNothing` true: row kept); a deferred successor is materialized only for a
+member the provider re-keyed (`result.applied`), and a dropped member is never in it. (3) Ops queued before
+the move address the source (folder, UID, epoch on the op); no code removes or keeps an op by reading the
+header row. (4) `readdressQueuedOperations` rewrites ops only on account-scoped providers. So deleting the
+row drops no user action, and no queued operation is touched.
+
+**Recovery.** The drain syncs every move destination; its listing inserts the copy at its real UID with its
+epoch (a moved copy takes a UID at or above the destination's UIDNEXT). A copy the window does not reach is
+loaded by the owed catch-up listing (#1062 amendment: every missing UID at or above the load floor). All
+sync insert paths restore the AI fields from the cache. Accepted: the copy is missing from its folder until that
+listing (no Message-ID matching, #963); a copy given the same UID it had in the source stays hidden until
+the 30-second store expires (#964); after a MOVE that failed part-way
+(`moveFailedAfterPartialCompletion`) on such a server, a member the server did not actually move is dropped
+too and stays hidden in its source until the 30-second store expires and the source's listing stores it
+again (its AI content is recomputed when needed).
+
+Tests: `FinishTheMoveLocallyTests` (no remnant row, the lost-reply retry and the large move after the
+catch-up, AI content kept and filled, the inbox AI enqueue, a refused move, the eight pill tests),
+`QueueCoreInvariantTests` (the drop, the account-scoped and `copiedNothing` controls, the inbox record),
+`ChatIdTranslatorTests`, `ChatPillChipHostingTests`.
+
+Keywords: placeholder, remnant, optimistic row, copiedNothing, droppedRemnants, DroppedRemnant, no proven
+destination, COPYUID withheld, retireStoredMappings, retireOutsideStoresInOrder, retired pill, releaseRecentlyCompleted, MessageAICache,
+restoreIfCached, IOS-MOVE-002, #537, #1062, #963, #964.

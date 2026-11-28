@@ -432,6 +432,68 @@ struct WriteTierRoutingTests {
         try? await SearchIndex.shared.removeMessages( contentKeys: [header.id].map(ContentKey.init(rawValue:)))
     }
 
+    // MARK: - Compose Recompute's store
+
+    @Test("Recompute's store takes its turn in the write queue at .priority and lands on the email compose opened for")
+    func recomputeStoreIsAdmittedThroughTheWriteQueue() async throws {
+        let (header, restore) = try makeTestDB()
+        defer { restore() }
+        let recorded = Mutex<[(WritePriority, String?)]>([])
+        let clearObserver = await installObserver { priority, label in recorded.withLock { $0.append((priority, label)) } }
+
+        await ComposeView.storeRecomputedReply("recomputed", replyTo: header, db: AppDatabase.dbPool)
+        await clearObserver()
+
+        let snapshot = recorded.withLock { $0 }
+        #expect(snapshot.count == 1, "one queued write, got \(snapshot.map(\.0))")
+        #expect(snapshot.allSatisfy { $0.0 == .priority })
+        let stored = try await AppDatabase.rawPool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
+        #expect(stored?.cachedReply == "recomputed", "sanity: the write actually landed")
+    }
+
+    @Test("Recompute's store through the write queue leaves a different IMAP email seated at the same address alone")
+    func recomputeStoreSkipsADifferentEmailAtTheSameAddress() async throws {
+        let (fixture, restore) = try makeTestDB()
+        defer { restore() }
+        var opened = fixture
+        opened.rfc822MessageId = "<opened@example.com>"
+        opened.observedUidValidity = 111
+        let other: MessageHeader = {
+            var row = fixture
+            row.rfc822MessageId = "<other@example.com>"
+            row.observedUidValidity = nil
+            row.cachedReply = "the other email's own suggestion"
+            return row
+        }()
+        try await AppDatabase.rawPool.write { db in
+            let storedAccount = try Account.fetchOne(db, key: "acc1")
+            var account = try #require(storedAccount)
+            account.provider = .imap
+            try account.update(db)
+            let storedFolder = try Folder.filter(Column("accountId") == "acc1").fetchOne(db)
+            var folder = try #require(storedFolder)
+            folder.lastKnownUidValidity = 111
+            try folder.update(db)
+            // The opened email was purged and another seated at the same folder and UID.
+            _ = try MessageHeader.deleteOne(db, key: fixture.id)
+            try other.insert(db)
+        }
+
+        await ComposeView.storeRecomputedReply("recomputed", replyTo: opened, db: AppDatabase.dbPool)
+
+        let seated = try await AppDatabase.rawPool.read { db in try MessageHeader.fetchOne(db, key: fixture.id) }
+        let after = try #require(seated)
+        #expect(after.rfc822MessageId == "<other@example.com>")
+        #expect(after.cachedReply == "the other email's own suggestion", "the answer was stored on another email")
+
+        // Non-vacuity: the row is writable, so the check, not a failed write, kept the answer off it.
+        try await AppDatabase.rawPool.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = ? WHERE id = ?", arguments: ["control", fixture.id])
+        }
+        let control = try await AppDatabase.rawPool.read { db in try MessageHeader.fetchOne(db, key: fixture.id) }
+        #expect(control?.cachedReply == "control")
+    }
+
     // MARK: - ActiveAIQueue / ActiveBodyQueue own pool tier
 
     @Test("ActiveAIQueue.dbPool is .normal (ADR-IOS-056) — was .background before this ADR")

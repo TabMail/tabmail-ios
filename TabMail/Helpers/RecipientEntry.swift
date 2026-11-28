@@ -267,13 +267,31 @@ struct RecipientEntry: Equatable, Sendable {
         return IMAPFetchMapping.mailboxText(name: name, address: address)
     }
 
+    /// The address each stored recipient names, or the text of one that names
+    /// none, read element by element: a recipient list where only addresses
+    /// are shown (the Undo Send toast, the Outbox row), whether or not its
+    /// recipients carry display names (#1031).
+    static func shownAddresses(_ recipients: [String]) -> [String] {
+        recipients.flatMap { recipient -> [String] in
+            let entry = RecipientEntry(recipient)
+            return entry.addresses + entry.leftovers
+        }
+    }
+
     /// Who a reply goes to: every mailbox the message's Reply-To names (Gmail
     /// keeps the raw header, which can name several), or its sender, under the
-    /// sender's name, when it has no Reply-To.
+    /// sender's name, when it has no Reply-To. A sender with no name is listed
+    /// under its address (`IMAPFetchMapping.sender`), which is not a name: Send
+    /// carries the name (#1031), and it would write `"bob@example.com"
+    /// <bob@example.com>`. The stored address may be spelled differently from
+    /// the address read from it (a quoted local part loses its quotes), so the
+    /// sender is compared with both.
     static func reply(to msg: MessageHeader) -> RecipientEntry {
         if let replyTo = msg.replyTo { return RecipientEntry(replyTo) }
         var entry = RecipientEntry(msg.fromAddress)
-        if entry.recipients.count == 1, entry.recipients[0].name == nil, !msg.from.isEmpty {
+        if entry.recipients.count == 1, entry.recipients[0].name == nil, !msg.from.isEmpty,
+           msg.from.caseInsensitiveCompare(msg.fromAddress) != .orderedSame,
+           msg.from.caseInsensitiveCompare(entry.recipients[0].address) != .orderedSame {
             entry.recipients[0] = Recipient(address: entry.recipients[0].address, name: msg.from)
         }
         return entry

@@ -414,9 +414,10 @@ final class AgentToolRouter {
             case forward
         }
 
-        /// The account a new email is sent from, bound when the turn started
-        /// (`ComposeOrigin.fromAccountId`). Nil for a reply or forward, sent from its email's
-        /// account, and for a new email asked in the inbox, whose card picks its account.
+        /// The account a new email is sent from: the account `email_compose` signed its body as
+        /// (`ComposeOrigin.fromAccountId`, the one bound when the turn started, else the primary,
+        /// else the oldest). Nil for a reply or forward, sent from its email's account, and for a
+        /// new email with no account to send from (demo without the demo account).
         var fromAccountId: String? { mode == .compose ? origin.fromAccountId : nil }
 
         /// The accounts the request depends on: the account of the email it replies to or
@@ -426,7 +427,7 @@ final class AgentToolRouter {
         /// and the removed account's key is not among the keys a screen reads once that
         /// account's emails are gone, even where the merged thread's chat still shows through a
         /// surviving account's emails (ADR-IOS-114 decision 14). A new email asked in the inbox
-        /// depends on none.
+        /// depends on the account it is sent from.
         var accountIds: [String] {
             [replyTo?.accountId, fromAccountId, ChatThreadKey.parse(origin.sessionKey)?.accountId].compactMap { $0 }
         }

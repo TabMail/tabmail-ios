@@ -76,6 +76,9 @@ extension AccountManager {
             var claimed: QueueJob?
             var newlyDeferred: Set<String> = []
             var stop = false
+            /// Members of moves checkpoint A retired here (exit 4), with no
+            /// provider-confirmed result.
+            var droppedMoveIds: Set<String> = []
         }
         do {
             let result = try await dbPool.write { db -> WalkResult in
@@ -116,6 +119,7 @@ extension AccountManager {
                     case .retire(let diagnostic):
                         if let op = try PendingOperation.fetchOne(db, key: job.id) {
                             try AccountOperationExecutor.deleteRetiringOperation(op, db: db)
+                            out.droppedMoveIds.formUnion(Self.movedHeaderIds(of: op))
                         }
                         if let diagnostic { BackgroundSyncLogger.log(diagnostic) }
                         continue
@@ -133,6 +137,14 @@ extension AccountManager {
                 return out
             }
             state.deferredOperationIds.formUnion(result.newlyDeferred)
+            // A move retired with no provider-confirmed result left its
+            // gesture-time hide behind; the email is wherever the folders' sync
+            // finds it (usually still the source), under an id the epoch's
+            // resync can hand to a different email (#814). Guarded so an ordinary claim
+            // keeps its single suspension point (the write above).
+            if !result.droppedMoveIds.isEmpty {
+                await Self.announceMovesRefused(result.droppedMoveIds)
+            }
             if result.stop { return .stop }
             guard let job = result.claimed else { return .exhausted }
             return .claimed(job)

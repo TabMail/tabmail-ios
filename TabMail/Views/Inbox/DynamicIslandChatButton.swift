@@ -72,8 +72,10 @@ struct DynamicIslandChat: View {
     /// Phase 2): the pill takes them from the router while it is on screen and hands each one
     /// here. Nil: the host presents none, and this pill's turns can open no compose card.
     var onAgentCompose: ((AgentToolRouter.ComposeRequest) -> Void)?
-    /// The account a new email this pill's turns ask for is sent from: the host's opened email's
-    /// account, bound to each turn as it starts (`ComposeOrigin.fromAccountId`). Nil in the inbox.
+    /// The account a new email this pill's turns ask for is sent from: the account of the email
+    /// the host's chat is about (the chat view: the email it was opened on; the email screen: the
+    /// highlighted email, else its own), bound to each turn as it starts
+    /// (`ComposeOrigin.fromAccountId`). Nil in the inbox.
     let composeFromAccountId: String?
     /// The host's own sheet or cover is up over the pill: it takes no compose card until that
     /// closes, so a card never opens under it.

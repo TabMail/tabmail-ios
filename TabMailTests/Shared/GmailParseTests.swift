@@ -127,6 +127,36 @@ struct GmailParseTests {
         #expect(GmailParse.rawHeader(json, name: "CC") == "c@ex.com")
     }
 
+    /// A long recipient list is folded (RFC 5322 §2.2.3), sometimes inside one
+    /// name. Compose splits recipients at line breaks, so a draft read must get
+    /// the value as one line or that name opens as two broken entries (#1031).
+    @Test("rawHeader unfolds a folded recipient list, so each name reads back whole", arguments: [
+        "\"Doe, Alice Long\r\n Display Name\" <alice@example.com>,\r\n Bob <bob@example.com>",
+        "\"Doe, Alice Long\n Display Name\" <alice@example.com>,\n Bob <bob@example.com>",
+        "\"Doe, Alice Long\r\n\tDisplay Name\" <alice@example.com>,\r\n\tBob <bob@example.com>"
+    ])
+    func rawHeaderUnfoldsFoldedNames(folded: String) {
+        let json: [String: Any] = ["payload": ["headers": [["name": "To", "value": folded]]]]
+        let value = GmailParse.rawHeader(json, name: "To") ?? ""
+        // By scalar: a CRLF pair is one Character, which a Character search can miss.
+        let hasLineBreak = value.unicodeScalars.contains { $0 == "\r" || $0 == "\n" }
+        #expect(!hasLineBreak)
+        let recipients = RecipientEntry(value).recipients
+        #expect(recipients.map(\.address) == ["alice@example.com", "bob@example.com"])
+        // Each name whole; the fold's own space or tab stays in it (RFC 5322 §2.2.3).
+        let names = recipients.map { $0.name?.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
+        #expect(names == ["Doe, Alice Long Display Name", "Bob"])
+        #expect(RecipientEntry(value).draftEntries.count == 2)
+    }
+
+    @Test("unfolded removes only a line break followed by a space or tab")
+    func unfoldedKeepsOtherLineBreaks() {
+        #expect(GmailParse.unfolded("a\r\n b") == "a b")
+        #expect(GmailParse.unfolded("a\n\tb") == "a\tb")
+        #expect(GmailParse.unfolded("a\r\nb") == "a\r\nb")
+        #expect(GmailParse.unfolded("a@example.com") == "a@example.com")
+    }
+
     @Test("rawHeader returns nil for missing header")
     func rawHeaderMissing() {
         let json: [String: Any] = ["payload": ["headers": []]]

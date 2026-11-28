@@ -30,4 +30,8 @@
 - **Tests:** `TabMailTests/Tools/FSMToolDeliveryTests.swift` — owned routing (card reaches only the invoking sink, not another session's), nil-sink fast-fail without suspension, accept/decline resume, and `SessionUISink` level-triggered append.
 - **Files:** `TabMail/Services/AI/Tools/ToolInvocation.swift` (new: `ToolInvocation`, `AgentUISink`, `SessionUISink`); `ToolRegistry.swift`, `AgentToolRouter.swift`, `BackendClient.swift`, `AIService.swift`, `AIChat.swift`, `DynamicIslandChatButton.swift`, and the 12 confirmation tools.
 
+**Amendment (2026-11-27, tabmail-ios #1521):** `ToolInvocation` also carries `openEmailAccountId`, the account of the email open where the user asked (an email screen's chat; nil in the inbox and for `.noninteractive`). It is per-call, like the sink, so it lives here and not in `ToolContext`. The chat view builds every session invocation in one place (`toolInvocation`). `email_compose` sends a new email from that account (ADR-IOS-030, #1521 amendment).
+
+**Merge note (2026-11-28, main merged into the chat view branch):** on that branch the open email's account rides `ComposeOrigin.fromAccountId` (amendment 2), not a `ToolInvocation` field. The pill's one origin builder reads its host's `composeFromAccountId` as each turn starts, and the email screen binds the account of the email its chat is about (the highlighted email, else its own), as #1521 decided; for the email screen, amendment 2's "the account of the email the screen was opened on" reads "the email its chat is about". `email_compose` stamps the account it signs the body as on the request's origin, so a new email asked in the inbox depends on that account (ADR-IOS-030, merge note).
+
 ---

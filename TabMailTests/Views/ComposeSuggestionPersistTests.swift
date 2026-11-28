@@ -940,4 +940,215 @@ struct ComposeSuggestionPersistTests {
         #expect(fetched?.replyTextMessage == nil)
         #expect(fetched?.summaryTextMessage == "Summary text message")
     }
+
+    /// The reply's email was renumbered and a different email now sits at the reply's own address.
+    /// The edit is stored only while the row at that address is still the email compose opened for,
+    /// so it never lands on the email now at the old address.
+    @Test("An edit after a renumbering never lands on the email now at the reply's old address", arguments: epochProviders)
+    func editAfterARenumberingNeverLandsOnTheEmailAtTheOldAddress(provider: AccountProvider) async throws {
+        let db = try epochFixture(provider, folderEpoch: 222)
+        let held = header(rfc822: "x@example.com", epoch: 111)
+        let renumbered = header(rfc822: "x@example.com", epoch: 222, uid: "9")
+        let other = replacement(rfc822: "y@example.com", epoch: 222)
+        try await db.write { db in
+            try renumbered.insert(db)
+            try other.insert(db)
+        }
+        #expect(other.id == held.id, "setup: another email sits at the reply's own address")
+
+        await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: held, db: db)
+
+        #expect(try row(db, other.id).cachedReply == Self.replacementsOwn, "the edit landed on the email now at the old address")
+
+        // Control: the email the row does hold takes the same write, so the check, not a failed
+        // write, kept the edit off it.
+        await ComposeView.writeOverCurrent(ReplyResult(body: "control", textMessage: nil, changeCommand: nil), replyTo: other, db: db)
+        #expect(try row(db, other.id).cachedReply == "control")
+    }
+
+    // MARK: - What a reply card shows at open for the email it opened for
+
+    /// The stored suggestion a reply card opened without a given one shows: `prepopulate`'s
+    /// `freshSuggestion` read, which `prefillReadsTheStoredSuggestionThroughTheIdentityCheck` pins
+    /// to this shape (the identity check inside the read, then the row's suggestion).
+    private func storedSuggestionAtOpen(for held: MessageHeader, in db: DatabaseQueue) throws -> String? {
+        try db.read { db -> String? in
+            guard try AIWriteTarget.stillHolds(held, db: db) else { return nil }
+            return try MessageHeader.fetchOne(db, key: held.id)?.suggestion?.body
+        }
+    }
+
+    /// The email at the shared address after a reset seated `replacement` there: present, holding its
+    /// own suggestion.
+    private func seat(_ replacement: MessageHeader, in db: DatabaseQueue) throws {
+        try db.write { db in
+            _ = try MessageHeader.deleteOne(db, key: replacement.id)
+            try replacement.insert(db)
+        }
+        let seated = try row(db, replacement.id)
+        #expect(seated.rfc822MessageId == replacement.rfc822MessageId, "setup: the replacement holds the address")
+    }
+
+    private static let replacementsOwn = "the replacement's own suggestion"
+
+    private func replacement(rfc822: String?, epoch: Int?) -> MessageHeader {
+        var other = header(rfc822: rfc822, epoch: epoch)
+        other.cachedReply = Self.replacementsOwn
+        return other
+    }
+
+    @Test("The suggestion shown at open is the stored one while the row is still the email compose opened for", arguments: epochProviders)
+    func openingSuggestionTakesTheStoredRowOfTheSameEmail(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let held = header(rfc822: "<x@example.com>", epoch: 111)
+        var stored = held
+        stored.cachedReply = "updated since the caller captured it"
+        let storedRow = stored
+        try db.write { try storedRow.insert($0) }
+        let updated = try storedSuggestionAtOpen(for: held, in: db)
+        #expect(updated == "updated since the caller captured it")
+
+        // Cleared since the capture: the cleared answer stands.
+        try db.write { db in
+            try db.execute(sql: "UPDATE messageHeader SET cachedReply = NULL WHERE id = ?", arguments: [held.id])
+        }
+        let cleared = try storedSuggestionAtOpen(for: held, in: db)
+        #expect(cleared == nil)
+    }
+
+    @Test("A different email seated at the reply's address never supplies the suggestion", arguments: epochProviders)
+    func openingSuggestionRefusesAnotherEmailAtTheAddress(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let held = header(rfc822: "<x@example.com>", epoch: 111)
+        try seat(replacement(rfc822: "<y@example.com>", epoch: nil), in: db)
+        let shown = try storedSuggestionAtOpen(for: held, in: db)
+        #expect(shown == nil)
+    }
+
+    @Test("A Message-ID-less replacement seated under the new numbering never supplies the suggestion", arguments: epochProviders)
+    func openingSuggestionRefusesAMessageIDLessReplacement(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 222)
+        let held = header(rfc822: nil, epoch: 111)
+        try seat(replacement(rfc822: nil, epoch: 222), in: db)
+        let shown = try storedSuggestionAtOpen(for: held, in: db)
+        #expect(shown == nil)
+    }
+
+    /// The opened email has neither a Message-ID nor a numbering, so nothing can prove the row at its
+    /// address is still it: the stored row is never read for the suggestion, whatever sits there.
+    @Test("With nothing to prove the opened email, the stored row never supplies the suggestion", arguments: epochProviders)
+    func openingSuggestionWithNothingToProveReadsNothing(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 222)
+        let held = header(rfc822: nil, epoch: nil)
+        try seat(replacement(rfc822: "<y@example.com>", epoch: 222), in: db)
+        let shown = try storedSuggestionAtOpen(for: held, in: db)
+        #expect(shown == nil)
+    }
+
+    @Test("With the row gone nothing stored is read, and the suggestion the caller gave is shown", arguments: epochProviders)
+    func openingSuggestionShowsTheGivenOneWhenTheRowIsGone(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let held = header(rfc822: "<x@example.com>", epoch: 111)
+        let stored = try storedSuggestionAtOpen(for: held, in: db)
+        #expect(stored == nil)
+        let shown = ComposeDraftGuards.suggestionToShow(
+            given: ReplyResult(body: Self.earlier, textMessage: nil), isReply: true, onlyToChosen: false,
+            freshSuggestion: { stored.map { ReplyResult(body: $0, textMessage: nil) } })
+        #expect(shown?.body == Self.earlier)
+    }
+
+    // MARK: - What the inline editor is told
+
+    private static let embeddedEmail =
+        "<p>Main text</p><div class=\"tm-eml-section\" data-filename=\"note.eml\"><p>Attached email text</p></div>"
+
+    private func email(subject: String, from: String, snippet: String) -> MessageHeader {
+        var email = header(rfc822: "<\(subject)@example.com>", epoch: 111)
+        email.subject = subject
+        email.from = from
+        email.fromAddress = from
+        email.snippet = snippet
+        return email
+    }
+
+    /// The editor is told about the email compose was opened for, before any email a saved row
+    /// names, and the card's edit is stored on that same email (`suggestionEdit` is handed
+    /// `replyTo`), so an answer about one email is never stored on another.
+    @Test("The editor is told about the email compose opened for, and its edit is stored on that same email")
+    func editorIsToldAboutTheEmailItsEditIsStoredOn() throws {
+        let argument = email(subject: "argument", from: "second@example.com", snippet: "argument snippet")
+        let resolved = email(subject: "resolved", from: "first@example.com", snippet: "resolved snippet")
+        let related = ComposeDraftGuards.relatedEmail(composeArgument: argument, persistedRowClaim: .resolved(resolved))
+        #expect(related?.subject == "argument")
+        #expect(related?.fromAddress == "second@example.com")
+        #expect(ComposeDraftGuards.editorMode(related: related, isForward: false) == "edit_reply")
+
+        let source = try composeSource()
+        let selection = try functionBody(
+            "private var relatedEmail: MessageHeader? {", before: "private func buildComposeEditContext(", in: source)
+        #expect(selection.contains(
+            "ComposeDraftGuards.relatedEmail(composeArgument: replyTo, persistedRowClaim: persistedReplyTargetClaim)"))
+        let edit = try functionBody("private func applyInlineEdit(", before: "struct SuggestionEdit {", in: source)
+        let gate = try #require(edit.range(of: "let edit = Self.suggestionEdit("))
+        let call = String(edit[gate.lowerBound...].prefix(400))
+        #expect(call.contains("replyTo: replyTo,"), "the edit's store target is the email the editor is told about: \(call)")
+    }
+
+    @Test("A saved reply reopened with no caller email (Undo Send) still gives the editor its email and mode")
+    func editorKeepsTheReplyWhenReopenedWithoutAnArgument() {
+        let resolved = email(subject: "resolved", from: "first@example.com", snippet: "resolved snippet")
+        let related = ComposeDraftGuards.relatedEmail(composeArgument: nil, persistedRowClaim: .resolved(resolved))
+        #expect(related?.subject == "resolved")
+        #expect(ComposeDraftGuards.editorMode(related: related, isForward: false) == "edit_reply")
+        #expect(ComposeDraftGuards.editorMode(related: related, isForward: true) == "edit_forward")
+
+        // A row whose email was refused, or that names none, gives the editor no email.
+        for claim in [ComposeDraftGuards.PersistedReplyTargetClaim.unresolved, .noClaim] {
+            let none = ComposeDraftGuards.relatedEmail(composeArgument: nil, persistedRowClaim: claim)
+            let isNewMessage = none == nil
+            #expect(isNewMessage, "\(claim)")
+        }
+    }
+
+    @Test("Without a saved row the editor takes the compose argument; a new message gives none")
+    func editorFallsBackToTheArgumentAlone() {
+        let argument = email(subject: "argument", from: "second@example.com", snippet: "argument snippet")
+        let related = ComposeDraftGuards.relatedEmail(composeArgument: argument, persistedRowClaim: nil)
+        #expect(related?.subject == "argument")
+        #expect(ComposeDraftGuards.editorMode(related: related, isForward: true) == "edit_forward")
+
+        let none = ComposeDraftGuards.relatedEmail(composeArgument: nil, persistedRowClaim: nil)
+        let isNewMessage = none == nil
+        #expect(isNewMessage)
+        #expect(ComposeDraftGuards.editorMode(related: none, isForward: false) == "edit_new")
+        #expect(ComposeDraftGuards.editorMode(related: none, isForward: true) == "edit_forward")
+    }
+
+    @Test("The editor reads only the email's own body, without an attached email's text", arguments: epochProviders)
+    func editorStripsAnAttachedEmail(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let opened = email(subject: "opened", from: "first@example.com", snippet: "opened snippet")
+        try db.write { try opened.insert($0) }
+        try TestDatabase.insertMessageBody(db, headerId: opened.id, htmlContent: Self.embeddedEmail)
+        let read = try db.read { db in try ComposeEditContext.relatedBodyText(of: opened, db: db) }
+        let held = try #require(read, "the row is still the email")
+        let text = held ?? ""
+        #expect(text.contains("Main text"))
+        #expect(!text.contains("Attached email text"))
+    }
+
+    @Test("A body that arrives after the reply opened reaches the editor's next request", arguments: epochProviders)
+    func editorReadsALaterBody(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 111)
+        let opened = email(subject: "opened", from: "first@example.com", snippet: "opened snippet")
+        try db.write { try opened.insert($0) }
+        let atOpen = try db.read { db in try ComposeEditContext.relatedBodyText(of: opened, db: db) }
+        let heldAtOpen = try #require(atOpen, "the row is still the email")
+        #expect(heldAtOpen == nil, "no body yet: the request carries the email's own snippet")
+
+        try TestDatabase.insertMessageBody(db, headerId: opened.id, htmlContent: "<p>Body fetched later</p>")
+        let later = try db.read { db in try ComposeEditContext.relatedBodyText(of: opened, db: db) }
+        let heldLater = try #require(later, "the row is still the email")
+        #expect(heldLater?.contains("Body fetched later") == true)
+    }
 }

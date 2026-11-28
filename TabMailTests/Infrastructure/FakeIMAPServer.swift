@@ -615,6 +615,8 @@ final class FakeIMAPServer: @unchecked Sendable {
         var greetingsHeld = false
         /// Connections that waited for their greeting under a hold.
         var heldGreetingCount = 0
+        /// Every connection accepted since `start()`.
+        var acceptedConnectionCount = 0
     }
 
     /// See `State.latencyInjection`'s doc comment.
@@ -950,6 +952,12 @@ final class FakeIMAPServer: @unchecked Sendable {
     /// How many connections have waited for their greeting under a hold.
     func heldGreetingCount() -> Int {
         withState { $0.heldGreetingCount }
+    }
+
+    /// How many connections the server has accepted: a client's connection
+    /// attempts, counted whether or not the session got past the greeting.
+    func acceptedConnectionCount() -> Int {
+        withState { $0.acceptedConnectionCount }
     }
 
     /// Hold the response to the next command containing `fragment` for
@@ -2230,6 +2238,7 @@ final class FakeIMAPServer: @unchecked Sendable {
             }
         }
         guard clientFd >= 0 else { return }
+        withState { $0.acceptedConnectionCount += 1 }
         // A late answer written after `stop()` shut the socket down fails with
         // EPIPE instead of raising SIGPIPE in the test host.
         var noSigPipe: Int32 = 1

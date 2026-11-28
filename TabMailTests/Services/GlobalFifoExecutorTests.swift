@@ -2130,6 +2130,6 @@ private extension AccountManager {
         let id = "refusal-successor-header"
         deferredMoveSuccessors[id] = DeferredMoveSuccessor(
             predecessorOperationId: predecessor, predecessorDestinationPath: "Archive",
-            oldHeaderId: id, desiredDestinationPath: "INBOX")
+            oldHeaderId: id, desiredDestinationPath: "INBOX", messageIdentity: nil)
     }
 }

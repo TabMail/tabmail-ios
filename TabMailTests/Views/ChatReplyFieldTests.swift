@@ -1927,7 +1927,8 @@ struct ChatReplyFieldTests {
                 "every sheet, cover and alert of the inbox holds a compose card")
         #expect(Self.count("newEmailCover != nil || replyMessage != nil || replyAllMessage != nil || forwardMessage != nil || agentCompose != nil || moveMessage != nil || labelMenuMessage != nil }", in: detail) == 1,
                 "every sheet and cover of the email screen holds a compose card")
-        #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: message.accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1)
+        #expect(Self.count("onAgentCompose: openAgentCompose, composeFromAccountId: (chatContextMessage ?? message).accountId, composeHostCovered: isAnyCoverPresented)", in: detail) == 1,
+                "the email screen binds the account of the email its chat is about (ComposeEditSenderAccountTests)")
         #expect(Self.count(".fullScreenCover(item: $agentCompose) { req in req.composeView(account: fromAccount(of: req), onOutcome: req.onOutcome) }", in: detail) == 1,
                 "the email screen's new message opens from its bound account, through the one presenter")
         let detailActions = try Self.source("TabMail/Views/Message/MessageDetailView+Actions.swift")

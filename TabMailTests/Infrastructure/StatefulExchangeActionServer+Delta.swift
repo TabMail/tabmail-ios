@@ -77,6 +77,9 @@ struct DeltaModel: Sendable {
     /// Per message id, the answer its `$batch` item gets instead of the message:
     /// a status and a raw JSON body (any JSON value), served until cleared.
     var batchItemAnswers: [String: (status: Int, body: String?)] = [:]
+    /// Serve a `$batch`'s item answers in reverse order: Graph documents no
+    /// order for them, so a reader correlates them by item id.
+    var batchResponsesReversed = false
     /// Per message id, selected fields its delta records leave out (Graph may
     /// leave out any field).
     var omittedFields: [String: Set<String>] = [:]
@@ -183,6 +186,40 @@ extension StatefulExchangeActionServer {
             message.lastVerb = verb
             model.messagesByProviderId[providerMessageId] = message
             model.delta.log(folderId: message.folderId, messageId: providerMessageId, kind: .lastVerb)
+        }
+    }
+
+    /// The last verb a message already holds when it is first read (the user
+    /// answered it in another client before TabMail saw it); nothing is logged
+    /// to the delta.
+    func setLastVerbAsDelivered(providerMessageId: String, verb: Int) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.lastVerb = verb
+            model.messagesByProviderId[providerMessageId] = message
+        }
+    }
+
+    /// The threading ids the message arrived with (In-Reply-To, References, as
+    /// the sender's client wrote them), kept as Exchange keeps them: extended
+    /// properties, served only to a request that expands them. A message as
+    /// delivered; nothing is logged to the delta.
+    func setThreadingIds(providerMessageId: String, inReplyTo: String?, references: String? = nil) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.extendedProperties["String 0x1042"] = inReplyTo
+            message.extendedProperties["String 0x1039"] = references
+            model.messagesByProviderId[providerMessageId] = message
+        }
+    }
+
+    /// The Graph conversation the message is filed in, as delivered; nothing is
+    /// logged to the delta.
+    func setConversationId(providerMessageId: String, _ conversationId: String) {
+        state.value.withLock { model in
+            guard var message = model.messagesByProviderId[providerMessageId] else { return }
+            message.conversationId = conversationId
+            model.messagesByProviderId[providerMessageId] = message
         }
     }
 
@@ -301,6 +338,11 @@ extension StatefulExchangeActionServer {
 
     func clearBatchItemAnswers() {
         state.value.withLock { $0.delta.batchItemAnswers = [:] }
+    }
+
+    /// Serve every later `$batch`'s item answers in reverse order (or in order).
+    func reverseBatchResponses(_ reversed: Bool) {
+        state.value.withLock { $0.delta.batchResponsesReversed = reversed }
     }
 
     /// The width of every `$batch` served, in order.
@@ -571,8 +613,9 @@ extension StatefulExchangeActionServer {
                     continue
                 }
                 responses.append(["id": id, "status": 200,
-                                  "body": graphRow(message, expandLastVerb: expandsLastVerb(path))])
+                                  "body": graphRow(message, expanding: expandedPropertyIds(path))])
             }
+            if model.delta.batchResponsesReversed { responses.reverse() }
             let data = (try? JSONSerialization.data(withJSONObject: ["responses": responses])) ?? Data()
             return .bytes(data, contentType: "application/json")
         }

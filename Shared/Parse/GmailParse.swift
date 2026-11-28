@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 import Foundation
+import SwiftMail
 
 /// Pure, GRDB-free, main-app-independent JSON parsing for Gmail REST responses.
 /// Compiled into both the main app and the NSE via the Shared/ glob.
@@ -68,11 +69,15 @@ enum GmailParse {
                 .compactMap { EmailFilter.extractFirstMessageId($0) }
         }()
 
-        let from = EmailAddress.parse(fromRaw)
-        let to = splitAddressList(toRaw).map { EmailAddress.parse($0) }
-        let cc = splitAddressList(ccRaw).map { EmailAddress.parse($0) }
-        let bcc = splitAddressList(bccRaw).map { EmailAddress.parse($0) }
-        let replyTo = replyToRaw.map { EmailAddress.parse($0) }
+        // Address fields are read whole by SwiftMail's parser, structure first:
+        // a name's quoted or encoded text is never read as an address or split
+        // as a list (see `EmailAddress.sender(of:)`).
+        let from = EmailAddress.sender(of: AddressParser.parseAddressList(fromRaw))
+            ?? EmailAddress(name: "", email: "")
+        let to = EmailAddress.mailboxes(of: AddressParser.parseAddressList(toRaw))
+        let cc = EmailAddress.mailboxes(of: AddressParser.parseAddressList(ccRaw))
+        let bcc = EmailAddress.mailboxes(of: AddressParser.parseAddressList(bccRaw))
+        let replyTo = replyToRaw.flatMap { EmailAddress.mailboxes(of: AddressParser.parseAddressList($0)).first }
 
         let labelIds = json["labelIds"] as? [String] ?? []
         let snippet = json["snippet"] as? String ?? ""
@@ -278,18 +283,28 @@ enum GmailParse {
         return found
     }
 
-    /// Read a raw header value directly from the Gmail message JSON.
-    /// Callers that need the raw RFC 2822 header (e.g. GmailProvider storing
-    /// `to`/`cc`/`bcc` verbatim) use this to bypass the parsed EmailAddress list.
+    /// Read a header value directly from the Gmail message JSON.
+    /// Callers that need the RFC 2822 header text (e.g. GmailProvider storing
+    /// `to`/`cc`/`bcc` with their names) use this to bypass the parsed
+    /// EmailAddress list. The value is unfolded (`unfolded`), not verbatim:
+    /// compose splits recipients at line breaks, so a fold inside one long name
+    /// would split it in two (#1031).
     static func rawHeader(_ json: [String: Any], name: String) -> String? {
         let payload = json["payload"] as? [String: Any] ?? [:]
         let headers = payload["headers"] as? [[String: Any]] ?? []
         for h in headers {
             if let n = h["name"] as? String, n.caseInsensitiveCompare(name) == .orderedSame {
-                return h["value"] as? String
+                return (h["value"] as? String).map(unfolded)
             }
         }
         return nil
+    }
+
+    /// A header value as one line (RFC 5322 §2.2.3): each line break followed
+    /// by a space or tab is removed and the space or tab kept. A value with no
+    /// fold is returned unchanged.
+    static func unfolded(_ value: String) -> String {
+        value.replacingOccurrences(of: "\r?\n(?=[ \t])", with: "", options: .regularExpression)
     }
 
     private static func findPartBody(_ part: [String: Any], wantedMime: String) -> String? {
@@ -350,28 +365,5 @@ enum GmailParse {
         while base64.count % 4 != 0 { base64.append("=") }
         guard let data = Data(base64Encoded: base64) else { return nil }
         return String(data: data, encoding: .utf8)
-    }
-
-    /// Split an RFC 2822 address list into individual address tokens.
-    /// Handles commas inside quoted display names.
-    private static func splitAddressList(_ s: String) -> [String] {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        var out: [String] = []
-        var current = ""
-        var inQuotes = false
-        for c in trimmed {
-            if c == "\"" { inQuotes.toggle(); current.append(c); continue }
-            if c == "," && !inQuotes {
-                let t = current.trimmingCharacters(in: .whitespaces)
-                if !t.isEmpty { out.append(t) }
-                current = ""
-                continue
-            }
-            current.append(c)
-        }
-        let t = current.trimmingCharacters(in: .whitespaces)
-        if !t.isEmpty { out.append(t) }
-        return out
     }
 }

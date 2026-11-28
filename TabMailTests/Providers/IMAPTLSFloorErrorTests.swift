@@ -75,7 +75,7 @@ struct IMAPTLSFloorErrorTests {
     @Test("A below-floor handshake becomes an error that names the TLS floor and the server")
     func belowFloorIsNamed() throws {
         let mapped = IMAPProvider.mapTransportSecurityFailure(
-            Self.belowFloor, host: "mail.example.com")
+            Self.belowFloor, host: "mail.example.com", port: 993, encryptedPort: 993)
 
         #expect(mapped as? IMAPTransportSecurityError
                 == IMAPTransportSecurityError.tlsFloorNotMet(host: "mail.example.com"))
@@ -101,7 +101,7 @@ struct IMAPTLSFloorErrorTests {
     @Test("A certificate-verification failure — same handshake shape — is NOT relabelled as a TLS-floor failure")
     func certificateFailureIsNotRelabelled() throws {
         let mapped = IMAPProvider.mapTransportSecurityFailure(
-            Self.certVerifyFailed, host: "mail.example.com")
+            Self.certVerifyFailed, host: "mail.example.com", port: 993, encryptedPort: 993)
         #expect(mapped as? IMAPTransportSecurityError == nil)
         #expect(String(describing: mapped) == Self.certVerifyFailed.description)
     }
@@ -109,7 +109,7 @@ struct IMAPTLSFloorErrorTests {
     @Test("An ordinary refused TCP connection is returned unchanged, not mislabelled permanent")
     func transientConnectFailureIsUnchanged() throws {
         let mapped = IMAPProvider.mapTransportSecurityFailure(
-            Self.connectionRefused, host: "mail.example.com")
+            Self.connectionRefused, host: "mail.example.com", port: 993, encryptedPort: 993)
         #expect(mapped as? IMAPTransportSecurityError == nil)
         #expect(String(describing: mapped) == Self.connectionRefused.description)
     }

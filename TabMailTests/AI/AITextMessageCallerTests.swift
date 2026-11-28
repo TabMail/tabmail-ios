@@ -815,6 +815,37 @@ struct AITextMessageCallerTests {
         }
     }
 
+    /// THE SYSTEM PROPERTY: Recompute gives the model the email's own text, never the text of an
+    /// email attached to it (an attached .eml is another person's email). Control: the email's own
+    /// text is there.
+    @Test("Recomputing for an email with an attached email asks with the email's own text only")
+    func composeRecomputeWithoutTheAttachedEmail() async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture()
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+            let id = fixture.header.id
+            let html = "<p>Main text</p><div class=\"tm-eml-section\" data-filename=\"attached.eml\"><p>Attached email text</p></div>"
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageBody SET htmlContent = ? WHERE id = ?", arguments: [html, id])
+            }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: fixture.header, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(suggestion?.body == Self.replyBody)
+            let messages = backend.http.recordedCalls().compactMap { call -> String? in
+                let json = call.body.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+                return (json["messages"] as? [[String: Any]])?.first?["message"] as? String
+            }
+            #expect(messages.count == 1)
+            guard messages.count == 1 else { return }
+            #expect(messages[0].contains("Main text"), "control: the email's own text: \(messages[0])")
+            #expect(!messages[0].contains("Attached email text"), "the attached email's text: \(messages[0])")
+        }
+    }
+
     @Test("A recompute does not store its reply on a different email that took the same address")
     func composeRecomputeReplacedEmail() async throws {
         try await withAIEnabled {

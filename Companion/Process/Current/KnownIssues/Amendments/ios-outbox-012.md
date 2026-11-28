@@ -81,7 +81,9 @@ What the user then sees on the moved message:
   device and clears its Reply tag, as it does for any Sent message naming it in In-Reply-To. The
   server's replied mark stays unset.
 - **A reply on Outlook:** no replied arrow. Its sync reads no In-Reply-To, so the Sent copy marks
-  nothing.
+  nothing. *(Amended 2026-11-27, #1559: Outlook's sync now reads In-Reply-To, so this is as on Gmail
+  and IMAP above: the synced Sent copy marks the original replied on this device and clears its Reply
+  tag.)*
 - **A forward:** no forwarded arrow. A forward's Sent copy names no original in In-Reply-To (#1483).
 
 ## When it happens

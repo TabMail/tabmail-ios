@@ -378,6 +378,27 @@ struct AccountPasswordUpdateTests {
         }
     }
 
+    @Test("a mail server that offers no encryption: the update is refused with its sentence before LOGIN, and changes nothing")
+    func serverWithoutEncryptionRefusesTheUpdate() async throws {
+        try await withAccount(.imap, calendar: .none) { f in
+            // The production transport from here on: the fake's port requires
+            // STARTTLS, which it never offers. `finish()` resets the override.
+            AccountManager.shared.setIMAPUseTLSOverrideForTesting(nil)
+
+            let thrown = await Self.update(Self.newPassword, for: f.account)
+
+            let error = try #require(thrown, "an update against a server with no encryption returned without an error")
+            let expected = IMAPTransportSecurityError.noEncryptedConnection(
+                host: "127.0.0.1", port: f.server.port, encryptedPort: MailTransportPolicy.imapImplicitTLSPort)
+            #expect(error as? IMAPTransportSecurityError == expected, "\(error)")
+            #expect(AccountReauthAlert.passwordUpdateLine(for: error, host: "127.0.0.1") == expected.description)
+            #expect(Self.mailLoginCount(f) == 0, "the new password was sent to a server with no encryption")
+            #expect(Self.storedMailPassword(f) == Self.oldPassword, "the refused update saved the password")
+            #expect(await Self.liveMail(f) === f.oldMail, "the refused update replaced the live provider")
+            #expect(await !Self.isMarked(f), "a server with no encryption marked the account as needing sign-in")
+        }
+    }
+
     // MARK: - 3. iCloud mail and calendar
 
     @Test("iCloud: the calendar password follows the mail password")

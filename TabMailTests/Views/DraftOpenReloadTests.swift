@@ -130,8 +130,8 @@ struct DraftOpenReloadTests {
             let date = ISO8601DateFormatter().string(from: Date())
             let provider = exchangeProvider(http, copyResponse: .json(raw: """
                 {"id":"g1","subject":"fresh subject","from":{"emailAddress":{"address":"owner@example.com"}},\
-                "toRecipients":[{"emailAddress":{"address":"fresh@example.com"}}],\
-                "bccRecipients":[{"emailAddress":{"address":"new-bcc@example.com"}}],\
+                "toRecipients":[{"emailAddress":{"name":"Fresh, Person","address":"fresh@example.com"}}],\
+                "bccRecipients":[{"emailAddress":{"name":"New Bcc","address":"new-bcc@example.com"}}],\
                 "receivedDateTime":"\(date)","isRead":true,"isDraft":true,"hasAttachments":false,\
                 "body":{"contentType":"html","content":"<p>fresh body</p>"}}
                 """))
@@ -146,6 +146,9 @@ struct DraftOpenReloadTests {
                 #expect(row.subject == "fresh subject")
                 #expect(RecipientEntry(row.toArray).addresses == ["fresh@example.com"])
                 #expect(RecipientEntry(row.bccArray).addresses == ["new-bcc@example.com"])
+                // Each recipient keeps its name (#1031).
+                #expect(RecipientEntry(row.toArray).recipients.map(\.name) == ["Fresh, Person"])
+                #expect(RecipientEntry(row.bccArray).recipients.map(\.name) == ["New Bcc"])
                 #expect(row.serverPushStatus == "pushed")
                 #expect(row.pushAttemptVersion > draft.pushAttemptVersion)
                 #expect(!http.recordedCalls().contains { $0.method != "GET" }, "opening never writes to the server")
@@ -664,6 +667,60 @@ struct DraftOpenReloadTests {
         }
     }
 
+    /// The bug this guards (#1031): a reopened draft lost its recipients' names,
+    /// and Gmail serves a header value folded as it is stored, so a name folded
+    /// inside its phrase must be read whole.
+    @Test("A Gmail draft reopened keeps each recipient's name, a folded one too")
+    func gmailReopenKeepsRecipientNames() async throws {
+        try await withInstalledPool { pool in
+            let draft = try await pool.write { try insertDraft($0, provider: .gmail) }
+            let http = FakeHTTP.Scenario()
+            defer { http.close() }
+            http.register(path: "/drafts/r1", method: "GET", response: .json(raw: #"{"id":"r1","message":{"id":"m2"}}"#))
+            // An unquoted name and two encoded words folded inside their phrase,
+            // and a quoted name holding a comma folded inside its quotes.
+            let headers: [[String: String]] = [
+                ["name": "Subject", "value": "Plan"], ["name": "From", "value": "owner@example.com"],
+                ["name": "To", "value": "Jane\r\n Doe <jane@example.com>, =?UTF-8?B?w4lsaXNl?=\r\n =?UTF-8?B?IE1hcnRpbg==?= <elise@example.com>"],
+                ["name": "Cc", "value": "\"Lee,\r\n Ann\" <ann@example.com>"],
+                ["name": "Bcc", "value": "Hidden Person <hidden@example.com>"],
+            ]
+            http.register(path: "/messages/m2", method: "GET") { _ in
+                let text = "phone edit\r\n"
+                let message: [String: Any] = [
+                    "id": "m2", "internalDate": String(Int(Date().timeIntervalSince1970 * 1000)), "labelIds": ["DRAFT"],
+                    "payload": [
+                        "mimeType": "text/plain", "headers": headers,
+                        "body": ["size": text.utf8.count, "data": Self.base64URL(Data(text.utf8))],
+                    ] as [String: Any],
+                ]
+                guard let data = try? JSONSerialization.data(withJSONObject: message) else { return .status(500) }
+                return .json(raw: String(decoding: data, as: UTF8.self))
+            }
+            let provider = GmailProvider(
+                userEmail: "owner@example.com", accessToken: { _ in "token" }, session: http.session)
+
+            try await withRegisteredProvider(provider) {
+                await ExternalDraftAdoption.refreshBeforeOpen(draftId: draft.id, willReadServer: {})
+                let reloaded = try await pool.read { try Draft.fetchOne($0, key: draft.id) }
+                let row = try #require(reloaded)
+                #expect(row.pushAttemptVersion > draft.pushAttemptVersion, "precondition: the open reloaded")
+                let stored = row.toArray + row.ccArray + row.bccArray
+                let hasLineBreak = stored.joined().unicodeScalars.contains { $0 == "\r" || $0 == "\n" }
+                #expect(!hasLineBreak, "\(stored)")
+                let to = RecipientEntry(row.toArray).recipients
+                let cc = RecipientEntry(row.ccArray).recipients
+                let bcc = RecipientEntry(row.bccArray).recipients
+                #expect(to.map(\.address) == ["jane@example.com", "elise@example.com"])
+                #expect(to.map(\.name) == ["Jane Doe", "Élise Martin"])
+                #expect(cc.map(\.address) == ["ann@example.com"])
+                #expect(cc.map(\.name) == ["Lee, Ann"])
+                #expect(bcc.map(\.address) == ["hidden@example.com"])
+                #expect(bcc.map(\.name) == ["Hidden Person"])
+            }
+        }
+    }
+
     @Test("An attachment added to an Outlook draft is still there when the draft reopens")
     func outlookAddedAttachmentSurvivesReopen() async throws {
         try await withInstalledPool { pool in
@@ -886,6 +943,12 @@ struct DraftOpenReloadTests {
             var message = try #require(
                 try JSONSerialization.jsonObject(with: Data(Self.copyJSON(body: "body").utf8)) as? [String: Any])
             message["body"] = ["contentType": "text", "content": "body"]
+            message["toRecipients"] = [
+                ["emailAddress": ["name": "Alice Doe", "address": "alice@example.com"]],
+                // Graph gives a recipient saved with no name its address as the name.
+                ["emailAddress": ["name": "BOB@example.com", "address": "bob@example.com"]]
+            ]
+            message["ccRecipients"] = [["emailAddress": ["name": "Carol \"C\" Lee", "address": "carol@example.com"]]]
             message["bccRecipients"] = [["emailAddress": ["name": "Hidden, Person", "address": "hidden@example.com"]]]
             let json = try JSONSerialization.data(withJSONObject: message)
             http.register(path: "/messages/g1", method: "GET", response: .json(raw: String(decoding: json, as: UTF8.self)))
@@ -897,6 +960,14 @@ struct DraftOpenReloadTests {
                 try await ExternalDraftAdoption.adopt(header: header, address: .outlook(graphId: "g1"), runtimeKind: .outlook)
                 let row = try #require(try await pool.read { try Draft.fetchOne($0) })
                 #expect(RecipientEntry(row.bccArray).addresses == ["hidden@example.com"], "adoption lost a Bcc recipient")
+                // The draft opens with each recipient's name (#1031).
+                let to = RecipientEntry(row.toArray).recipients
+                let cc = RecipientEntry(row.ccArray).recipients
+                let bcc = RecipientEntry(row.bccArray).recipients
+                #expect(to.map(\.address) == ["alice@example.com", "bob@example.com"])
+                #expect(to.map(\.name) == ["Alice Doe", nil], "adoption dropped a To name or kept an address as one")
+                #expect(cc.map(\.name) == ["Carol \"C\" Lee"], "adoption dropped a Cc name")
+                #expect(bcc.map(\.name) == ["Hidden, Person"], "adoption dropped a Bcc name")
                 try await pool.write { db in
                     var edited = row
                     edited.body += " edit"
@@ -907,9 +978,21 @@ struct DraftOpenReloadTests {
                     runtimeKind: .outlook, draftsFolderPath: "Drafts") == .completed)
                 let patch = try #require(http.recordedCalls().first { $0.method == "PATCH" }?.body)
                 let payload = try #require(try JSONSerialization.jsonObject(with: patch) as? [String: Any])
-                let bcc = payload["bccRecipients"] as? [[String: Any]] ?? []
-                let addresses = bcc.compactMap { ($0["emailAddress"] as? [String: Any])?["address"] as? String }
-                #expect(addresses == ["hidden@example.com"], "the first save dropped an adopted Bcc recipient")
+                func pairs(_ key: String) -> [[String]] {
+                    (payload[key] as? [[String: Any]] ?? []).map { recipient in
+                        let emailAddress = recipient["emailAddress"] as? [String: Any] ?? [:]
+                        return [emailAddress["name"] as? String ?? "", emailAddress["address"] as? String ?? ""]
+                    }
+                }
+                let patchedBcc = pairs("bccRecipients")
+                let patchedBccAddresses = patchedBcc.map { $0[1] }
+                #expect(patchedBccAddresses == ["hidden@example.com"], "the first save dropped an adopted Bcc recipient")
+                // The first save keeps every name, and adds none for the recipient without one.
+                let patchedTo = pairs("toRecipients")
+                let patchedCc = pairs("ccRecipients")
+                #expect(patchedTo == [["Alice Doe", "alice@example.com"], ["", "bob@example.com"]])
+                #expect(patchedCc == [["Carol \"C\" Lee", "carol@example.com"]])
+                #expect(patchedBcc == [["Hidden, Person", "hidden@example.com"]])
             }
         }
     }

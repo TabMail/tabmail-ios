@@ -827,6 +827,16 @@ range, by leaving that side of the window unbounded; `MemoryIndexTests` reads a 
 through a window whose upper or lower edge falls past that range. The delete tests check that a fractional id
 in `unique_ids` is dropped, not truncated.
 
+## Agent tool rounds — the thinking signature goes back
+
+`ThinkingSignatureToolRoundTests` drives the tool loop (both `sendCompletionsWithTools` and
+`sendCompletionsWithToolsDirect`) against a fake backend whose first round asks for a client tool and
+keeps the assistant turn in `conversation_state.harmony_messages` with its `thinking` and
+`thinkingSignature`, as the backend does for an Anthropic model that thought before the call. The next
+request carries that assistant turn with the same signature and thinking, plus the tool's result. A
+message with no signature is encoded with no `thinkingSignature` key, so other providers' requests are
+unchanged.
+
 ## CalDAV series edits — moving a series' time
 
 `CalDAVSeriesStartShiftTests` checks what an edit that moves a repeating
@@ -1278,6 +1288,68 @@ host's zone, and compares the write on the fake with the card.
   `this_and_following` delete with no cut or no zone is retired as failed with nothing sent. An event
   that does not repeat, given any `delete_scope`, is deleted as it is (the scope dropped).
 
+## Assistant-written emails — signed as the account they are sent from
+
+`TabMailTests/Tools/ComposeEditSenderAccountTests.swift` pins #1521, on the chat view branch's
+carrier (`ComposeOrigin.fromAccountId`, ADR-IOS-030 and ADR-IOS-053 merge notes). Each case has a
+home and a work account, asks from a classic screen with the chat view setting off (the inbox's
+chat, `ComposeTestOrigin.invocation`, or an email screen's chat, a compose origin of screen
+`.email` bound to the open email's account), and captures the edit context the tool builds through
+the tool's `composeEdit:` init; the assertions read that context and the compose request the
+screen's pill takes (`takeCompose(for:)`; the card itself is not presented). The card's account is
+the request's `fromAccountId`.
+
+- `ComposeEditSenderAccountTests` (`.processGlobalState`, demo mode pinned and the chat view
+  setting off per case, with a control that `ChatViewConfig.isActive` is false):
+  - A reply and a forward of an email in the work account (sent to a team alias, not the
+    account's address), with either account as the primary, build an edit context with the work
+    account's name and address; the request's parent email is the work account's and the request
+    carries no account of its own.
+  - The edit of a reply, a forward and a new email (asked on the work email's screen), each sent
+    through a real `AIService` request with home as the primary, reaches the backend with the work
+    account's name as `user_name` (the fake backend answers with a JSON-protocol compose edit).
+  - A new email asked in the inbox (no open email), with either account as the primary, carries
+    the primary account on its compose request, and the edit context has that same account's name
+    and address. Without a writing request, the request still carries the account. A primary
+    change while the edit runs leaves the request on the account the body was signed as.
+  - Demo boundary: with the demo row and a real primary both primary, a new email is the demo
+    account's in demo and the real primary's out of demo. With no active real primary (none, or
+    an inactive one), it is the active real account (not the demo row, not an inactive account).
+    The rows a lookup filter must skip are inserted before the expected account, so a lookup
+    without that filter picks the wrong one.
+  - A calendar-only primary is never the new email's account: the mail account is. With no
+    primary, the oldest account is, though another comes first by insertion and by id. In demo
+    with no demo account, neither the context nor the request has a real account (control: the
+    card opens).
+  - Asked on an email's screen (run through a `ToolRegistry` with that screen's invocation, as a
+    chat turn runs it, and taken by that screen's pill): a new email is the open email's account,
+    with the other account as the primary, for either account, with or without a writing
+    request. In demo it is still the demo account when the open email is a real account's; out
+    of demo an email of the demo row gives the real primary. An open email whose account is not
+    active gives the primary. A reply and a forward asked on another account's screen are signed
+    as, and sent from, the email's own account (the work account's; in demo the demo account's,
+    with a real primary coexisting), and never take the screen's account.
+- `AssistantChatOpenEmailAccountWiringTests`: a source fence over the app target, comments and
+  strings masked. Exactly two `ComposeOrigin(` constructions: the pill's one builder, which binds
+  `fromAccountId: composeFromAccountId`, and `email_compose`'s request, which stamps the account it
+  read with `sendingAccount(openEmailAccountId: origin.fromAccountId, …)` and signed the body as.
+  The chat pill hosts are exactly `MessageDetailView`, `InboxView`, `ComposeView`,
+  `ChatThreadView`, `ChatNewThreadView` and `KeyboardFocusTestScene`: `MessageDetailView` builds
+  its pill with `message: chatContextMessage ?? message` and binds
+  `composeFromAccountId: (chatContextMessage ?? message).accountId`; `InboxView`, `ComposeView` and
+  the test scene give neither (the chat view's hosts are pinned by `ChatReplyFieldTests`). The two
+  local invocations (the fresh turn's and the field compose's) carry `composeOrigin: origin`, and
+  `sendChatMessage`, `resumeChatMessage` and `TutorialChatScript.response` each pass an invocation
+  with the turn's origin; the compose editor's `performInlineEdit` passes the session's sink only
+  (its pill opens no card).
+- `AssistantComposeCardAccountWiringTests`: a source fence, comments masked. The one presenter
+  (`ComposeRequest.composeView(account:)`) passes `account: account` in its `.compose` case and no
+  other account argument, and `replyTo: replyTo` with no account argument in `.reply` and
+  `.forward`, so a reply or forward sends from the email's own account. `InboxView` and
+  `MessageDetailView` each call it once, with the account looked up by `req.fromAccountId` in the
+  app's accounts (`MessageDetailView` through `fromAccount(of:)`), and each takes the card only
+  after `AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts)`.
+
 ## CalDAV organizer — every event with guests names its organizer
 
 `TabMailTests/Providers/CalDAVOrganizerTests.swift` pins ADR-IOS-109 (#711): every CalDAV PUT runs
@@ -1499,6 +1571,30 @@ capsule, and `menuViewsWireTheCopy` the several-person item's title and address 
 `ChatBubbleActionTests.bubbleCopiesItsSendersAddress` opens a group chat in a window: each sender's
 bubble offers VoiceOver "Copy <name>'s Address", and performing it puts that sender's address on the
 general clipboard (the default pasteboard the menu writes).
+
+## An Undo cancels a waiting move only for its own email
+
+`UndoProviderIdentitySafetyTests.undoCancelsOnlyTheSameEmailsWaitingDelete` and
+`undoCancelsAnUndosWaitingMoveOnlyForItsEmail` run an Undo against a move waiting behind an in-flight
+IMAP move at the same address: a Delete waiting behind a move back to Inbox, and an Undo waiting
+behind its own forward move. Each runs four ways: the Undo names a different email (another
+Message-ID), the same email, or an email with no Message-ID, or the waiting email has no Message-ID
+while the Undo names one. A different email, or a waiting email with no Message-ID, restores nothing
+and leaves the waiting move in place, and that move is queued once the move ahead of it lands; the
+same email, or an Undo with no Message-ID, cancels it as before, and nothing is queued.
+
+## Address fields — read whole by SwiftMail's parser (ADR-IOS-120)
+
+`AddressFieldReadTests` runs each From value through both `GmailParse.parseMessage` and
+`RFC5322Parse.buildMetadata` and asserts the sender the message is listed under: ordinary forms,
+a legacy `address (Name)` mailbox, an encoded name, a comment before the address, text that names
+no single mailbox (two angle-addrs, a stray `<` or `>`, an unterminated quote, `MAILER-DAEMON`:
+a name with no address; a group with no members, by its name; several such entries, their texts
+joined), names whose quoted, escaped, commented or encoded text holds `<…@…>`, a
+quote followed by a combining mark, an encoded-word inside a quoted-string (literal), and a From
+naming several mailboxes or a group (the first). The list rows assert To/Cc/Bcc and Reply-To split
+only at commas outside quoted-strings, comments and encoded-words. `IMAPFetchMappingAddressTests`
+covers `EmailAddress.sender(of:)` over SwiftMail's structured entries.
 
 ## Database proof harness
 
