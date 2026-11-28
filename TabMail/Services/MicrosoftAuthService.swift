@@ -37,8 +37,9 @@ extension OAuthService {
             throw OAuthError.notConfigured("Microsoft OAuth client ID not set")
         }
 
-        let codeVerifier = generateCodeVerifier()
+        let codeVerifier = try generateCodeVerifier()
         let codeChallenge = generateCodeChallenge(from: codeVerifier)
+        let state = try generateState()
         let redirectUri = "\(redirectScheme)://auth"
 
         var components = URLComponents(string: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize")!
@@ -49,6 +50,7 @@ extension OAuthService {
             URLQueryItem(name: "scope", value: scope),
             URLQueryItem(name: "code_challenge", value: codeChallenge),
             URLQueryItem(name: "code_challenge_method", value: "S256"),
+            URLQueryItem(name: "state", value: state),
             URLQueryItem(name: "response_mode", value: "query"),
             // `select_account` shows the picker. When `loginHint` is
             // set Microsoft auto-selects the matching account so the
@@ -63,25 +65,8 @@ extension OAuthService {
         let authURL = components.url!
         BackgroundSyncLogger.logDebug("[OAuth] Microsoft authURL: \(LoggableURL.address(authURL))")
 
-        let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
-            let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
-                BackgroundSyncLogger.logDebug("[OAuth] Microsoft callback — url: \(LoggableURL.address(url)), error: \(String(describing: error))")
-                if let error { continuation.resume(throwing: error) }
-                else if let url { continuation.resume(returning: url) }
-                else { continuation.resume(throwing: OAuthError.cancelled) }
-            }
-            session.prefersEphemeralWebBrowserSession = false
-            session.presentationContextProvider = self
-            self.currentSession = session
-            let started = session.start()
-            BackgroundSyncLogger.logDebug("[OAuth] Microsoft session.start() returned: \(started)")
-        }
-
-        guard let code = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?
-            .queryItems?.first(where: { $0.name == "code" })?.value else {
-            throw OAuthError.noAuthCode
-        }
-
+        let callbackURL = try await openSignInPage(authURL, callbackScheme: redirectScheme, logPrefix: "[OAuth] Microsoft")
+        let code = try Self.authorizationCode(from: callbackURL, state: state)
         return try await exchangeMicrosoftCode(code, codeVerifier: codeVerifier, scope: scope)
     }
 

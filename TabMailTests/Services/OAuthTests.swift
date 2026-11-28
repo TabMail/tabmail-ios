@@ -13,17 +13,17 @@ struct OAuthTests {
     // MARK: - generateCodeVerifier
 
     @Test("Code verifier has expected length (32 bytes base64url = 43 chars)")
-    @MainActor func codeVerifierLength() {
+    @MainActor func codeVerifierLength() throws {
         let service = OAuthService()
-        let verifier = service.generateCodeVerifier()
+        let verifier = try service.generateCodeVerifier()
         // 32 bytes → 44 base64 chars → remove 1 padding '=' → 43
         #expect(verifier.count == 43)
     }
 
     @Test("Code verifier contains only base64url characters")
-    @MainActor func codeVerifierCharacterSet() {
+    @MainActor func codeVerifierCharacterSet() throws {
         let service = OAuthService()
-        let verifier = service.generateCodeVerifier()
+        let verifier = try service.generateCodeVerifier()
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
         for scalar in verifier.unicodeScalars {
             #expect(allowed.contains(scalar), "Unexpected character: \(scalar)")
@@ -31,25 +31,25 @@ struct OAuthTests {
     }
 
     @Test("Code verifier has no padding characters")
-    @MainActor func codeVerifierNoPadding() {
+    @MainActor func codeVerifierNoPadding() throws {
         let service = OAuthService()
-        let verifier = service.generateCodeVerifier()
+        let verifier = try service.generateCodeVerifier()
         #expect(!verifier.contains("="))
     }
 
     @Test("Code verifier has no standard base64 characters (+, /)")
-    @MainActor func codeVerifierNoStandardBase64Chars() {
+    @MainActor func codeVerifierNoStandardBase64Chars() throws {
         let service = OAuthService()
-        let verifier = service.generateCodeVerifier()
+        let verifier = try service.generateCodeVerifier()
         #expect(!verifier.contains("+"))
         #expect(!verifier.contains("/"))
     }
 
     @Test("Two code verifiers are different (randomness)")
-    @MainActor func codeVerifierRandomness() {
+    @MainActor func codeVerifierRandomness() throws {
         let service = OAuthService()
-        let v1 = service.generateCodeVerifier()
-        let v2 = service.generateCodeVerifier()
+        let v1 = try service.generateCodeVerifier()
+        let v2 = try service.generateCodeVerifier()
         #expect(v1 != v2)
     }
 
