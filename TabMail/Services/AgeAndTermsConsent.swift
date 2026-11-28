@@ -153,4 +153,76 @@ enum AgeAndTermsConsent {
         if let backend = error as? BackendError, backend.isRetriable { return .retry }
         return .signOut
     }
+
+    /// One deletion request's answer: `error` is nil when billing acknowledged it (a 2xx).
+    struct DeletionAnswer: Sendable {
+        let error: Error?
+
+        var handshake: DeletionHandshake { AgeAndTermsConsent.deletionHandshake(after: error) }
+    }
+
+    /// Sends the deletion request after a failed age check and returns billing's answer. A code, when given,
+    /// goes only into the request body and is never logged.
+    static func sendDeletionRequest(
+        appleAuthorizationCode: String?,
+        client: BillingClient = BillingClient()
+    ) async -> DeletionAnswer {
+        do {
+            try await client.requestAgeIneligibleDeletion(appleAuthorizationCode: appleAuthorizationCode)
+            BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible account deletion requested")
+            return DeletionAnswer(error: nil)
+        } catch {
+            BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible deletion request failed: \(error)")
+            return DeletionAnswer(error: error)
+        }
+    }
+
+    /// The deletion after a failed age check (ADR-034: under 18, delete now) and OK's decision on the refusal,
+    /// held by the screen for as long as it shows.
+    ///
+    /// The request goes out at the failed check, with no code. OK waits for its answer; without a sign-out
+    /// answer it sends the request again now, with no code, and still none answers `.retry` (stay, ask again
+    /// on the next OK). Once billing has acknowledged the deletion (a 2xx, not a refusal or a gone session), an
+    /// account that signed in with Apple runs Apple's sheet once and sends one more request with its code, so
+    /// billing revokes the app's Sign in with Apple authorization. That request never replaces the deletion's
+    /// own answer and never changes the decision; a sheet that ends without a code sends nothing more.
+    ///
+    /// A sign-out decision is kept: a later OK (signing out failed on the device) answers `.signOut` again at
+    /// once, with no request and no sheet.
+    @MainActor
+    final class RefusalExit {
+        typealias Send = @MainActor @Sendable (_ appleAuthorizationCode: String?) async -> DeletionAnswer
+
+        private let send: Send
+        private var deletion: Task<DeletionAnswer, Never>?
+        private var decidedSignOut = false
+
+        nonisolated init(send: @escaping Send) {
+            self.send = send
+        }
+
+        /// The deletion request, with no code; OK waits for its answer.
+        func requestDeletion() {
+            let send = self.send
+            deletion = Task { await send(nil) }
+        }
+
+        func leave(
+            isAppleAccount: Bool,
+            appleAuthorizationCode: @MainActor () async -> String?
+        ) async -> DeletionHandshake {
+            if decidedSignOut { return .signOut }
+            var answer = await deletion?.value
+            if answer?.handshake != .signOut {
+                requestDeletion()
+                answer = await deletion?.value
+            }
+            guard let answer, answer.handshake == .signOut else { return .retry }
+            decidedSignOut = true
+            if answer.error == nil, isAppleAccount, let code = await appleAuthorizationCode() {
+                _ = await send(code)
+            }
+            return .signOut
+        }
+    }
 }

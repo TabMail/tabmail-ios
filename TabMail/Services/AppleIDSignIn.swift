@@ -56,4 +56,84 @@ enum AppleIDSignIn {
         }
         return error
     }
+
+    // MARK: - Account deletion: revoke the app's Sign in with Apple authorization
+
+    /// Runs Apple's request on its sheet and returns the authorization code data of the result. The deletion
+    /// screens pass SwiftUI's `AuthorizationController`; tests pass a stand-in.
+    typealias CodeAuthorization = @MainActor (ASAuthorizationAppleIDRequest) async throws -> Data?
+
+    /// The request the deletion sheet runs: no scopes and no nonce. Only its authorization code is used,
+    /// which billing exchanges and revokes at Apple once the deletion is scheduled.
+    static func makeRevokeRequest() -> ASAuthorizationAppleIDRequest {
+        ASAuthorizationAppleIDProvider().createRequest()
+    }
+
+    /// The authorization code data of the sheet's result; a result that is not an Apple ID credential has none.
+    static func authorizationCode(of result: ASAuthorizationResult) -> Data? {
+        guard case .appleID(let credential) = result else { return nil }
+        return credential.authorizationCode
+    }
+
+    /// A fresh authorization code from Apple's sheet, as text. Every way the sheet can end without one (the
+    /// person closes it, it fails, no code or one that is not UTF-8) gives nil and never throws, so the
+    /// deletion goes ahead without it. The code is never logged.
+    @MainActor
+    static func freshAuthorizationCode(authorize: CodeAuthorization) async -> String? {
+        let data: Data?
+        do {
+            data = try await authorize(makeRevokeRequest())
+        } catch {
+            let ending = signInError(error) is CancellationError ? "closed" : "failed"
+            BackgroundSyncLogger.logDebug("[AppleIDSignIn] Revoke sheet \(ending) with no code")
+            return nil
+        }
+        guard let data, let code = String(data: data, encoding: .utf8), !code.isEmpty else {
+            BackgroundSyncLogger.logDebug("[AppleIDSignIn] Revoke sheet gave no usable code")
+            return nil
+        }
+        return code
+    }
+
+    /// The account deletion request, with Apple's sheet in front of it for an account that signed in with
+    /// Apple: called once the subscription steps are done, right before the request, so the code (valid for
+    /// five minutes) is fresh. A sheet that ends without a code sends the request without one, so the deletion
+    /// goes ahead either way.
+    @MainActor
+    static func scheduleDeletion(
+        isAppleAccount: Bool,
+        authorize: CodeAuthorization,
+        request: (_ appleAuthorizationCode: String?) async throws -> BillingClient.DeletionResponse
+    ) async throws -> BillingClient.DeletionResponse {
+        let code = isAppleAccount ? await freshAuthorizationCode(authorize: authorize) : nil
+        return try await request(code)
+    }
+
+    /// Whether the deletion confirmation shows how to stop using the Apple Account with TabMail by hand: for an
+    /// account that signed in with Apple whose answer is not `true` (false; or nil: no code was sent, or the
+    /// answer was lost and the deletion read back from its status).
+    static func showsManualStopLine(isAppleAccount: Bool, appleAuthorizationRevoked: Bool?) -> Bool {
+        isAppleAccount && appleAuthorizationRevoked != true
+    }
+
+    /// Whether the TabMail account signed in with Apple, from the `app_metadata.providers` list in the app's
+    /// own access token. The token is decoded, not verified: the answer only decides whether to show Apple's
+    /// sheet. A missing or malformed token (not three non-empty segments), or one without the list, is not an
+    /// Apple account.
+    static func isAppleAccount(accessToken: String?) -> Bool {
+        guard let accessToken else { return false }
+        let parts = accessToken.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 3, !parts.contains(where: \.isEmpty) else { return false }
+        var base64 = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64.append("=") }
+        guard let payload = Data(base64Encoded: base64),
+              let claims = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let appMetadata = claims["app_metadata"] as? [String: Any],
+              let providers = appMetadata["providers"] as? [String] else {
+            return false
+        }
+        return providers.contains("apple")
+    }
 }

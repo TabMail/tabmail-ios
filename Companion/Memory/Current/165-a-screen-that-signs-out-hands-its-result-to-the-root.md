@@ -19,8 +19,8 @@ the local sign-out failed (a Keychain error), because then the screen stays.
 ## The pattern
 
 - `AccountDeletionReceipt` (`TabMail/Services/Account/AccountDeletionReceipt.swift`) holds one receipt in
-  memory (the formatted server date). Nothing is stored; a killed app shows nothing, which is fine for a
-  notice.
+  memory (the formatted server date and whether to show Apple's manual steps, memory 164). Nothing is
+  stored; a killed app shows nothing, which is fine for a notice.
 - The deletion screen signs out only through `AccountDeletionReceipt.signOut(handing:signOut:)`: the receipt
   is placed with no suspension before `completeSession`, and dropped at once when it returns false (no
   notification follows a failed sign-out, so a receipt left behind would surface on some later, ordinary
@@ -40,6 +40,6 @@ the local sign-out failed (a Keychain error), because then the screen stays.
 
 `AccountDeletionReceiptTests` (the receipt is in place while the sign-out runs, taken once, dropped on a failed
 sign-out) and `AccountDeletionConfirmationWiringTests` (a source check: the deletion screen's only
-`completeSession` goes through the receipt and carries the server date; the root takes the receipt in the
+`completeSession` goes through the receipt and carries the server date and the manual-steps flag; the root takes the receipt in the
 sign-out receiver, shows the sheet, and shows the alert only without a receipt), in
 `AccountDeletionCoordinatorTests.swift`. The sheet's presentation itself is checked on a device.

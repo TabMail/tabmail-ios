@@ -1559,6 +1559,50 @@ the AI choice and the epoch as they were, and sends no billing sync. `OneAISetti
 writes (the id-token and the code sign-in). The sheet itself (SwiftUI's `AuthorizationController`) is checked
 on a device.
 
+`AppleSignInRevokeTests` covers account deletion stopping TabMail's use of a Sign in with Apple account. An
+access token whose `app_metadata.providers` lists `apple` (alone or beside others) is an Apple account; other
+providers, no list, a list of the wrong type, no token, and tokens that are not three non-empty segments of
+base64url JSON are not; payloads using the base64url alphabet and no padding are read. The deletion sheet's
+request has no scopes and no nonce. A fresh code is the sheet's code as UTF-8 text; a closed or failed sheet, no
+data, empty data or data that is not UTF-8 gives none and never throws. `AppleIDSignIn.scheduleDeletion` runs the
+sheet once and then sends the deletion with the code for an Apple account; without a code (closed or failed sheet)
+it still sends the deletion, and any other account gets no sheet; a failed request passes through. Through
+`AccountDeletionSubscriptionCoordinator.execute` the order is both `/whoami` reads, then the sheet, then the
+request; a final re-read that blocks shows no sheet; the scheduled result carries billing's
+`apple_authorization_revoked` as it is (true, false or absent), and the status read-back gives nil
+(`AccountDeletionCoordinatorTests`). The request builders: `/account/delete` without a code has no body and with
+one exactly `apple_authorization_code`; `/account/age-ineligible` without a code is byte for byte
+`{"request_id":"..."}`, with one both keys; with or without a code the headers are exactly `Authorization` and
+`Content-Type` (the code goes only into the body). The manual steps show for an Apple account unless billing answered true. After a failed age check
+(`AgeAndTermsConsent.RefusalExit`, the screen's own state and decision): acknowledged at the check gives one sheet
+and one request with its code; a sheet with no code sends nothing more; a request never sent or unanswered is sent
+again without a code, then the sheet; still no answer stays on the refusal with no sheet, and the next OK asks
+again; a 409, a 400 or a gone session signs out with no sheet; any other account gets no sheet; an unanswered
+request with the code still signs out; after a sign-out decision a later OK (signing out failed on the device)
+signs out again with no request and no second sheet, whatever the code request's answer; with the request held in
+flight (sent at the check, or by OK on a device already blocked; the hold is one-shot, so a duplicate request
+shows) no sheet shows until its 2xx.
+`AppleSignInRevokeWireTests` sends through the real `BillingClient` methods over the `FakeHTTP` stub transport
+with a synthetic session: `/account/delete` has no body without a code and only the code with one, and the answer's
+revoke field is read; `/account/age-ineligible` (through `AgeAndTermsConsent.sendDeletionRequest`) has only
+`request_id` without a code (byte for byte) and both keys with one, both request ids UUIDs (billing refuses any
+other); every request goes to the exact URL with no query, and no URL, header name or header value carries the
+code (the stub's request handler records every header); the answer follows billing's status (2xx acknowledged,
+409 signs out, 503 asks again); with debug logging on, neither the sheet's code helper nor either deletion request
+(acknowledged or failed) writes the code to the app log. The request builders are checked for the exact URL,
+method, header set and timeout with and without a code.
+`AppleSignInRevokeWiringTests` is a source check on the two screens: Settings reads the account before the
+deletion starts, runs the sheet only inside the coordinator's scheduling step (one `performRequest`, no direct
+call), shows the manual steps and Apple's article only under `showsAppleManualStop` in `AccountDeletionConfirmation`
+(the one confirmation view), as a direct part of its content between the keep-account line and the error line (not
+inside the error branch, which the root's sheet never shows), sets the deletion screen's flag only from the tested
+predicate, directly in the scheduled case and before the receipt is built, and passes it to both confirmations (the screen's own after a failed sign-out, and `RootView`'s sheet
+through the receipt, which only passes it on), and says Apple's sheet comes next only under `isAppleAccount`; the code is the credential's `authorizationCode` on both screens (never the
+identity token); the age screen holds a `RefusalExit` over `sendDeletionRequest`, sends at the failed check without
+a code, ignores OK while one is under way, sends the decision for every account kept in the backend, leaves
+through `RefusalExit.leave` with the account read first, signs out once and only after a sign-out decision,
+and lets OK work again when signing out fails on the device, never calling billing directly.
+
 ## A failed SMTP STARTTLS upgrade keeps its cause
 
 `MailTransportEncryptionTests+STARTTLSFailures.swift` (part of `MailTransportEncryptionTests`, so serialized and
@@ -1583,10 +1627,12 @@ host name (STARTTLS and 465), a 454 reply, or a refused greeting leaves the erro
 
 `AccountDeletionReceiptTests` (in `AccountDeletionCoordinatorTests.swift`, serialized: one process-wide slot)
 covers the hand-off of the "Deletion Scheduled" confirmation to `RootView` across the deletion's sign-out: the
-receipt is in place while the sign-out runs (so the sign-out notification finds it) and carries the date; after
-a successful sign-out it is taken once and a later sign-out finds none; a failed sign-out drops it.
+receipt is in place while the sign-out runs (so the sign-out notification finds it) and carries the date and the
+manual-steps flag (`showsAppleManualStop`, checked true and false); after a successful sign-out it is taken once and
+a later sign-out finds none; a failed sign-out drops it.
 `AccountDeletionConfirmationWiringTests` is a source check on the two screens: the deletion screen's only
-sign-out is the one `completeSession` through `AccountDeletionReceipt.signOut` with the server's date (no
+sign-out is the one `completeSession` through `AccountDeletionReceipt.signOut` with the server's date and the
+manual-steps flag (no
 `TabMailAuthService.signOut()` either), and every scheduled deletion ends on the confirmation, with the error line
 after a failed sign-out; `RootView` takes the receipt at the end of its own `.tabMailDidSignOut` receiver, shows
 `AccountDeletionConfirmation` as a sheet from it, and touches the "Signed Out" alert's flag only there, without a

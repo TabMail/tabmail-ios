@@ -23,6 +23,9 @@ enum AccountDeletionReceipt {
         /// The server's deletion date, formatted for display; nil when it could
         /// not be read, and the confirmation then names no date.
         let scheduledDateText: String?
+        /// The confirmation shows how to stop using the Apple Account with
+        /// TabMail by hand (`AppleIDSignIn.showsManualStopLine`).
+        let showsAppleManualStop: Bool
     }
 
     private static var pending: Receipt?

@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import AuthenticationServices
 import SwiftUI
 
 /// The age and terms screen shown before first use (owner 2026-10-08): a
@@ -28,6 +29,8 @@ struct ConsentGateView: View {
     /// signs out (or leaves demo).
     var onIneligible: () async -> Void = {}
 
+    @Environment(\.authorizationController) private var authorizationController
+
     @State private var birthMonth: Int?
     @State private var birthDay: Int?
     @State private var birthYear: Int?
@@ -35,8 +38,10 @@ struct ConsentGateView: View {
     @State private var isSubmitting = false
     @State private var errorMessage: String?
     @State private var isIneligible = AgeAndTermsConsent.isDeviceBlocked()
-    /// The deletion request in flight or finished; OK waits for its answer.
-    @State private var deletionTask: Task<AgeAndTermsConsent.DeletionHandshake, Never>?
+    /// The deletion request in flight or finished, and OK's decision; OK waits for its answer.
+    @State private var refusalExit = AgeAndTermsConsent.RefusalExit(send: { appleAuthorizationCode in
+        await AgeAndTermsConsent.sendDeletionRequest(appleAuthorizationCode: appleAuthorizationCode)
+    })
     @State private var isLeaving = false
 
     private var birthDateEntered: Bool {
@@ -321,24 +326,32 @@ struct ConsentGateView: View {
         birthYear = nil
         agreedToTerms = false
         withAnimation { isIneligible = true }
-        if persistsToBackend { deletionTask = makeDeletionRequest() }
+        if persistsToBackend { refusalExit.requestDeletion() }
     }
 
     /// OK on the refusal: wait for billing's answer to the deletion request,
     /// sending it now if it was never sent (a device that was already blocked)
     /// or got no answer, and sign out only once billing has answered. With no
-    /// answer the person stays on the refusal and the next OK asks again.
+    /// answer the person stays on the refusal and the next OK asks again. An
+    /// account that signed in with Apple sees Apple's sheet once billing has
+    /// acknowledged the deletion (`AgeAndTermsConsent.RefusalExit`).
     private func leave() {
         guard !isLeaving else { return }
         isLeaving = true
         errorMessage = nil
         Task {
             if persistsToBackend {
-                var handshake = await deletionTask?.value
-                if handshake != .signOut {
-                    deletionTask = makeDeletionRequest()
-                    handshake = await deletionTask?.value
+                // Read at the start: signing out clears the session.
+                let appleAccount = AppleIDSignIn.isAppleAccount(
+                    accessToken: TabMailAuthService.getSession()?.accessToken
+                )
+                let authorize: AppleIDSignIn.CodeAuthorization = { request in
+                    AppleIDSignIn.authorizationCode(of: try await authorizationController.performRequest(request))
                 }
+                let handshake = await refusalExit.leave(
+                    isAppleAccount: appleAccount,
+                    appleAuthorizationCode: { await AppleIDSignIn.freshAuthorizationCode(authorize: authorize) }
+                )
                 guard handshake == .signOut else {
                     errorMessage = "We couldn\u{2019}t reach TabMail. Check your connection, then tap OK again."
                     isLeaving = false
@@ -347,19 +360,6 @@ struct ConsentGateView: View {
             }
             await onIneligible()
             isLeaving = false
-        }
-    }
-
-    private func makeDeletionRequest() -> Task<AgeAndTermsConsent.DeletionHandshake, Never> {
-        Task {
-            do {
-                try await BillingClient().requestAgeIneligibleDeletion()
-                BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible account deletion requested")
-                return AgeAndTermsConsent.deletionHandshake(after: nil)
-            } catch {
-                BackgroundSyncLogger.logDebug("[ConsentGate] Age-ineligible deletion request failed: \(error)")
-                return AgeAndTermsConsent.deletionHandshake(after: error)
-            }
         }
     }
 }
