@@ -24,9 +24,7 @@ actor BackendClient {
     /// timeoutIntervalForResource caps the TOTAL request time regardless of bytes received,
     /// preventing stalled connections from holding semaphore slots for 5-16 minutes.
     /// The shared ephemeral session doesn't have this because it serves all HTTP traffic.
-    /// Like it, it never follows a redirect from TabMail's servers (`OwnServerRedirectPolicy`);
-    /// tests read the session to check that.
-    let llmSession: URLSession
+    private let llmSession: URLSession
 
     /// Test seam: inject a mock `URLSession` (e.g. `FakeHTTP.makeSession()`) to drive
     /// the streaming/tool-loop path in unit tests. Production passes nil → the default
@@ -36,11 +34,11 @@ actor BackendClient {
     /// llmSession but with the long-op resource cap — a single compaction of a
     /// large user_action.md can legitimately run for minutes. Stall detection
     /// remains the SSE heartbeat watchdog.
-    private(set) lazy var llmLongOpSession: URLSession = {
+    private lazy var llmLongOpSession: URLSession = {
         if let longOpSessionOverride { return longOpSessionOverride }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForResource = SyncConfig.llmLongOpResourceTimeoutSeconds
-        return URLSession(configuration: config, delegate: OwnServerRedirectPolicy.shared, delegateQueue: nil)
+        return URLSession(configuration: config)
     }()
 
     /// The injected session also serves the maintenance-class calls, so a manual compaction is testable.
@@ -54,7 +52,7 @@ actor BackendClient {
         self.llmSession = llmSession ?? {
             let config = URLSessionConfiguration.ephemeral
             config.timeoutIntervalForResource = SyncConfig.llmResourceTimeoutSeconds
-            return URLSession(configuration: config, delegate: OwnServerRedirectPolicy.shared, delegateQueue: nil)
+            return URLSession(configuration: config)
         }()
         longOpSessionOverride = llmSession
         self.isAIOff = isAIOff
@@ -74,16 +72,17 @@ actor BackendClient {
         throw AIOffError()
     }
 
-    /// A streamed AI request (completions). `session` nil is the default LLM session.
+    /// A streamed AI request (completions). `session` nil is the default LLM session. Like every AI
+    /// request, it never follows a redirect from TabMail's servers (`OwnServerRedirectPolicy`).
     private func aiBytes(for request: URLRequest, session: URLSession? = nil) async throws -> (URLSession.AsyncBytes, URLResponse) {
         try refuseIfAIOff()
-        return try await (session ?? llmSession).bytes(for: request)
+        return try await (session ?? llmSession).bytes(for: request, delegate: OwnServerRedirectPolicy.shared)
     }
 
     /// A plain AI request (dictation transcription and its warm-up).
     private func aiData(for request: URLRequest) async throws -> (Data, URLResponse) {
         try refuseIfAIOff()
-        return try await llmSession.data(for: request)
+        return try await llmSession.data(for: request, delegate: OwnServerRedirectPolicy.shared)
     }
 
     // 403 exponential backoff state — shared across all completions requests.

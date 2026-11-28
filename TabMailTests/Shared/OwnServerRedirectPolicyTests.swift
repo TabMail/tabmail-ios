@@ -8,14 +8,14 @@ import Testing
 @testable import TabMail
 
 /// A plain HTTP/1.1 server on the loopback interface, in this process, that answers every request with
-/// one fixed response and counts the requests it received.
+/// one fixed response and records the method and body of each request it received.
 private final class LoopbackHTTPServer: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "loopback-http")
     /// Set before `start`; read on `queue` only afterwards.
     var response = ""
     /// Read and written on `queue` only.
-    private var requests = 0
+    private var requests: [(method: String, body: Data)] = []
 
     init() throws {
         let parameters = NWParameters.tcp
@@ -49,15 +49,15 @@ private final class LoopbackHTTPServer: @unchecked Sendable {
         }
     }
 
-    /// Reads until the end of the request's header block (the requests here have no body), then
-    /// answers and closes the connection.
+    /// Reads one request (its header block, then the body its Content-Length names), then answers and
+    /// closes the connection.
     private func readRequest(on connection: NWConnection, received: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             var received = received
             if let data { received.append(data) }
-            if received.range(of: Data("\r\n\r\n".utf8)) != nil {
-                self.requests += 1
+            if let request = Self.completeRequest(in: received) {
+                self.requests.append(request)
                 connection.send(content: Data(self.response.utf8), completion: .contentProcessed { _ in
                     connection.cancel()
                 })
@@ -69,45 +69,40 @@ private final class LoopbackHTTPServer: @unchecked Sendable {
         }
     }
 
-    var requestCount: Int { queue.sync { requests } }
+    /// The method and body of the request in `received`, or nil while part of it has not arrived.
+    private static func completeRequest(in received: Data) -> (method: String, body: Data)? {
+        guard let end = received.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let lines = String(decoding: received[..<end.lowerBound], as: UTF8.self).components(separatedBy: "\r\n")
+        let method = lines.first?.split(separator: " ").first.map(String.init) ?? ""
+        var length = 0
+        for line in lines.dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2, parts[0].lowercased() == "content-length" {
+                length = Int(parts[1].trimmingCharacters(in: .whitespaces)) ?? 0
+            }
+        }
+        let body = received[end.upperBound...]
+        guard body.count >= length else { return nil }
+        return (method, Data(body.prefix(length)))
+    }
+
+    var requestCount: Int { queue.sync { requests.count } }
+
+    /// The method and body of the last request received.
+    var lastRequest: (method: String, body: Data)? { queue.sync { requests.last } }
 
     func stop() { listener.cancel() }
 }
 
-/// A request to one of TabMail's own servers never follows a redirect: the redirect comes back to the
-/// caller as the answer and the host it names receives nothing. Requests to every other host follow
-/// redirects as before.
+/// A redirect answered by one of TabMail's own servers is never followed: it comes back to the caller as
+/// the answer and the address it names receives nothing, wherever the request started. Redirects answered
+/// by every other host are followed as before.
 @Suite("Requests to TabMail's own servers never follow a redirect", .serialized)
 struct OwnServerRedirectPolicyTests {
 
-    /// Two loopback servers: `first` answers 302 with `second` as the new address; `second` answers 200.
-    private struct Servers {
-        let first: LoopbackHTTPServer
-        let second: LoopbackHTTPServer
-        let firstPort: UInt16
-
-        var firstURL: URL { URL(string: "http://127.0.0.1:\(firstPort)/v1/call")! }
-
-        func stop() {
-            first.stop()
-            second.stop()
-        }
-    }
-
-    private static func servers() async throws -> Servers {
-        let second = try LoopbackHTTPServer()
-        second.response = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nlanded"
-        let secondPort = try await second.start()
-        let first = try LoopbackHTTPServer()
-        first.response = "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:\(secondPort)/landed\r\n"
-            + "Content-Length: 0\r\nConnection: close\r\n\r\n"
-        let firstPort = try await first.start()
-        return Servers(first: first, second: second, firstPort: firstPort)
-    }
-
-    /// How a request reaches the network: a session that holds the policy (the app's sessions), or
-    /// `URLSession.shared` with the policy passed for the one request (the notification service
-    /// extension).
+    /// How a request reaches the network: a session that holds the policy (`sharedEphemeralSession`), or
+    /// a session with the policy passed for the one request (the AI requests, the calls on
+    /// `URLSession.shared`).
     enum Route: String, CaseIterable, CustomTestStringConvertible {
         case sessionDelegate, perRequestDelegate
         var testDescription: String { rawValue }
@@ -124,38 +119,165 @@ struct OwnServerRedirectPolicyTests {
         }
     }
 
+    /// A redirect status and the request that meets it: a GET, or a POST with a body.
+    struct Wire: CustomTestStringConvertible {
+        let status: Int
+        let method: String
+        var testDescription: String { "\(status) \(method)" }
+
+        static let body = Data("payload-7e1".utf8)
+
+        /// The redirects a request to an own server meets: each redirect status, with a GET and with a
+        /// POST that carries a body.
+        static let ownServerCases = [
+            Wire(status: 302, method: "GET"),
+            Wire(status: 301, method: "POST"),
+            Wire(status: 302, method: "POST"),
+            Wire(status: 303, method: "POST"),
+            Wire(status: 307, method: "POST"),
+            Wire(status: 308, method: "POST"),
+        ]
+
+        func request(to url: URL) -> URLRequest {
+            var request = URLRequest(url: url)
+            request.httpMethod = method
+            if method == "POST" { request.httpBody = Self.body }
+            return request
+        }
+    }
+
+    /// A loopback server that answers every request with `status` and `body`, and with `location` as the
+    /// new address when one is given.
+    private static func server(status: Int, location: String? = nil, body: String) async throws -> (server: LoopbackHTTPServer, port: UInt16) {
+        let server = try LoopbackHTTPServer()
+        server.response = "HTTP/1.1 \(status) Answer\r\n" + (location.map { "Location: \($0)\r\n" } ?? "")
+            + "Content-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
+        let port = try await server.start()
+        return (server, port)
+    }
+
+    /// Two loopback servers: `first` answers `status` ("moved") with `second` as the new address; `second`
+    /// answers 200 ("landed").
+    private struct Pair {
+        let first: LoopbackHTTPServer
+        let second: LoopbackHTTPServer
+        let firstPort: UInt16
+
+        var firstURL: URL { URL(string: "http://127.0.0.1:\(firstPort)/v1/call")! }
+
+        func stop() {
+            first.stop()
+            second.stop()
+        }
+    }
+
+    private static func pair(status: Int) async throws -> Pair {
+        let second = try await server(status: 200, body: "landed")
+        let first = try await server(status: status, location: "http://127.0.0.1:\(second.port)/landed", body: "moved")
+        return Pair(first: first.server, second: second.server, firstPort: first.port)
+    }
+
     @Test("A redirect from an own server comes back as the answer, and its target receives nothing",
-          arguments: Route.allCases)
-    func ownServerRedirectIsNotFollowed(route: Route) async throws {
-        let servers = try await Self.servers()
-        defer { servers.stop() }
-        let port = Int(servers.firstPort)
+          arguments: Route.allCases, Wire.ownServerCases)
+    func ownServerRedirectIsNotFollowed(route: Route, wire: Wire) async throws {
+        let pair = try await Self.pair(status: wire.status)
+        defer { pair.stop() }
+        let port = Int(pair.firstPort)
         let policy = OwnServerRedirectPolicy(isOwnServer: { $0.port == port })
 
-        let (data, response) = try await route.send(URLRequest(url: servers.firstURL), policy: policy)
+        let (data, response) = try await route.send(wire.request(to: pair.firstURL), policy: policy)
 
         let status = (response as? HTTPURLResponse)?.statusCode
-        let firstCount = servers.first.requestCount
-        let secondCount = servers.second.requestCount
-        #expect(status == 302)
-        #expect(data.isEmpty)
+        let firstCount = pair.first.requestCount
+        let firstRequest = pair.first.lastRequest
+        let secondCount = pair.second.requestCount
+        let sentBody = wire.method == "POST" ? Wire.body : Data()
+        #expect(status == wire.status)
+        #expect(String(decoding: data, as: UTF8.self) == "moved")
         #expect(firstCount == 1)
+        #expect(firstRequest?.method == wire.method)
+        #expect(firstRequest?.body == sentBody)
         #expect(secondCount == 0, "the redirect target received the request")
+    }
+
+    @Test("A redirect answered by an own server is not followed after another host sent the request there",
+          arguments: Route.allCases)
+    func ownServerRedirectAfterOtherHostIsNotFollowed(route: Route) async throws {
+        let last = try await Self.server(status: 200, body: "landed")
+        let own = try await Self.server(status: 302, location: "http://127.0.0.1:\(last.port)/landed", body: "moved")
+        let other = try await Self.server(status: 302, location: "http://127.0.0.1:\(own.port)/v1/call", body: "")
+        defer {
+            last.server.stop()
+            own.server.stop()
+            other.server.stop()
+        }
+        let ownPort = Int(own.port)
+        let policy = OwnServerRedirectPolicy(isOwnServer: { $0.port == ownPort })
+        let start = try #require(URL(string: "http://127.0.0.1:\(other.port)/start"))
+
+        let (data, response) = try await route.send(URLRequest(url: start), policy: policy)
+
+        let status = (response as? HTTPURLResponse)?.statusCode
+        let otherCount = other.server.requestCount
+        let ownCount = own.server.requestCount
+        let lastCount = last.server.requestCount
+        #expect(status == 302)
+        #expect(String(decoding: data, as: UTF8.self) == "moved")
+        #expect(otherCount == 1)
+        #expect(ownCount == 1, "the other host's redirect to the own server was followed")
+        #expect(lastCount == 0, "the own server's redirect was followed")
+    }
+
+    @Test("A redirect from an own server to another path on itself is not followed either", arguments: Route.allCases)
+    func ownServerRelativeRedirectIsNotFollowed(route: Route) async throws {
+        let own = try await Self.server(status: 302, location: "/elsewhere", body: "moved")
+        defer { own.server.stop() }
+        let ownPort = Int(own.port)
+        let policy = OwnServerRedirectPolicy(isOwnServer: { $0.port == ownPort })
+        let url = try #require(URL(string: "http://127.0.0.1:\(own.port)/v1/call"))
+
+        let (data, response) = try await route.send(URLRequest(url: url), policy: policy)
+
+        let status = (response as? HTTPURLResponse)?.statusCode
+        let ownCount = own.server.requestCount
+        #expect(status == 302)
+        #expect(String(decoding: data, as: UTF8.self) == "moved")
+        #expect(ownCount == 1)
     }
 
     @Test("A redirect from any other host is followed as before", arguments: Route.allCases)
     func otherHostRedirectIsFollowed(route: Route) async throws {
-        let servers = try await Self.servers()
-        defer { servers.stop() }
+        let pair = try await Self.pair(status: 302)
+        defer { pair.stop() }
         let policy = OwnServerRedirectPolicy(isOwnServer: { _ in false })
 
-        let (data, response) = try await route.send(URLRequest(url: servers.firstURL), policy: policy)
+        let (data, response) = try await route.send(URLRequest(url: pair.firstURL), policy: policy)
 
         let status = (response as? HTTPURLResponse)?.statusCode
-        let secondCount = servers.second.requestCount
+        let secondCount = pair.second.requestCount
         #expect(status == 200)
         #expect(String(decoding: data, as: UTF8.self) == "landed")
         #expect(secondCount == 1)
+    }
+
+    @Test("Another host's 307 or 308 is followed with the same method and body",
+          arguments: Route.allCases, [307, 308])
+    func otherHostRedirectKeepsThePost(route: Route, status: Int) async throws {
+        let pair = try await Self.pair(status: status)
+        defer { pair.stop() }
+        let policy = OwnServerRedirectPolicy(isOwnServer: { _ in false })
+        let wire = Wire(status: status, method: "POST")
+
+        let (data, response) = try await route.send(wire.request(to: pair.firstURL), policy: policy)
+
+        let answered = (response as? HTTPURLResponse)?.statusCode
+        let secondCount = pair.second.requestCount
+        let secondRequest = pair.second.lastRequest
+        #expect(answered == 200)
+        #expect(String(decoding: data, as: UTF8.self) == "landed")
+        #expect(secondCount == 1)
+        #expect(secondRequest?.method == "POST")
+        #expect(secondRequest?.body == Wire.body)
     }
 
     // MARK: - Which servers are TabMail's own
@@ -164,11 +286,19 @@ struct OwnServerRedirectPolicyTests {
         ("https://api.tabmail.ai/v1/chat", true),
         ("https://dev.tabmail.ai/v1/chat", true),
         ("https://sync.tabmail.ai/ai-cache/probe", true),
+        ("https://sync-dev.tabmail.ai/ai-cache/probe", true),
+        ("wss://sync.tabmail.ai/ws", true),
         ("wss://sync-dev.tabmail.ai/ws", true),
         ("https://auth.tabmail.ai/auth/v1/token", true),
         ("https://push.tabmail.ai/register-device", true),
         ("https://billing.tabmail.ai/status", true),
+        ("https://billing-dev.tabmail.ai/status", true),
         ("https://templates.tabmail.ai/search", true),
+        ("https://templates-dev.tabmail.ai/search", true),
+        ("https://forms.tabmail.ai/feedback/trial", true),
+        ("https://forms-dev.tabmail.ai/feedback/trial", true),
+        ("https://apple-webhook.tabmail.ai/verify", true),
+        ("https://apple-webhook-dev.tabmail.ai/verify", true),
         ("https://API.TabMail.AI/v1/chat", true),
         ("https://tabmail.ai/docs/", false),
         ("https://gmail.googleapis.com/gmail/v1/users/me", false),
@@ -184,59 +314,93 @@ struct OwnServerRedirectPolicyTests {
         #expect(result == isOwn, "\(address)")
     }
 
-    /// The decision `delegate` makes for a request to `first` that is redirected to `target`.
-    @MainActor
-    private static func decision(
-        _ delegate: any URLSessionTaskDelegate, first: String, target: String
-    ) async throws -> URLRequest? {
-        let firstURL = try #require(URL(string: first))
-        let targetURL = try #require(URL(string: target))
-        let task = URLSession.shared.dataTask(with: firstURL)
-        defer { task.cancel() }
-        let response = try #require(HTTPURLResponse(
-            url: firstURL, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": target]))
-        return await withCheckedContinuation { continuation in
-            delegate.urlSession?(URLSession.shared, task: task, willPerformHTTPRedirection: response,
-                                 newRequest: URLRequest(url: targetURL)) { continuation.resume(returning: $0) }
+    @Test("Every TabMail endpoint the app is configured with is one of its own servers")
+    func configuredEndpointsAreOwn() throws {
+        var endpoints = [BackendConfig.apiBaseURL, BackendConfig.templatesBaseURL, BackendConfig.billingBaseURL,
+                         BackendConfig.trialFeedbackURL, BackendConfig.appleWebhookBaseURL]
+        for address in [BackendConfig.syncBaseURL, BackendConfig.syncWebSocketURL, PushConfig.baseURL] {
+            let url = try #require(URL(string: address))
+            endpoints.append(url)
+        }
+        #expect(endpoints.count == 8)
+        for url in endpoints {
+            let own = OwnServerRedirectPolicy.isTabMailServer(url)
+            #expect(own, "\(url)")
         }
     }
 
-    @Test("The shared policy refuses a redirect from TabMail's servers and passes every other one on")
-    func sharedPolicyDecides() async throws {
-        let own = try await Self.decision(OwnServerRedirectPolicy.shared,
-                                          first: "https://api.tabmail.ai/v1/chat", target: "https://example.com/next")
-        let other = try await Self.decision(OwnServerRedirectPolicy.shared,
-                                            first: "https://graph.microsoft.com/v1.0/me", target: "https://example.com/next")
-        let ownRefused = own == nil
-        let otherTarget = other?.url?.absoluteString
-        #expect(ownRefused)
-        #expect(otherTarget == "https://example.com/next")
+    // MARK: - The decision of the shared policy and of the device sync connection
+
+    /// What a delegate decided about a redirect.
+    enum Decision: Equatable {
+        case followed(URL?)
+        case refused
+        /// The delegate has no redirect callback.
+        case noCallback
     }
 
-    // MARK: - Every session that reaches TabMail's servers holds the policy
-
-    @Test("The shared session and the AI sessions hold the policy")
-    func sessionsHoldThePolicy() async {
-        let client = BackendClient()
-        let longOpSession = await client.llmLongOpSession
-        let shared = sharedEphemeralSession.delegate === OwnServerRedirectPolicy.shared
-        let llm = client.llmSession.delegate === OwnServerRedirectPolicy.shared
-        let longOp = longOpSession.delegate === OwnServerRedirectPolicy.shared
-        #expect(shared)
-        #expect(llm)
-        #expect(longOp)
-    }
-
-    @Test("The device sync connection refuses a redirect from the sync server")
+    /// The decision `delegate` makes for a request that started at `start` and was answered by
+    /// `answeredBy` with a redirect to `target`.
     @MainActor
-    func deviceSyncConnectionRefusesRedirect() async throws {
-        let own = try await Self.decision(DeviceSyncService.shared,
-                                          first: "wss://sync.tabmail.ai/ws", target: "wss://example.com/ws")
-        let ownRefused = own == nil
-        #expect(ownRefused)
+    private static func decision(
+        _ delegate: any URLSessionTaskDelegate, start: String, answeredBy: String, target: String
+    ) async throws -> Decision {
+        let startURL = try #require(URL(string: start))
+        let answeredURL = try #require(URL(string: answeredBy))
+        let targetURL = try #require(URL(string: target))
+        let task = URLSession.shared.dataTask(with: startURL)
+        defer { task.cancel() }
+        let response = try #require(HTTPURLResponse(
+            url: answeredURL, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": target]))
+        return await withCheckedContinuation { continuation in
+            let called: Void? = delegate.urlSession?(
+                URLSession.shared, task: task, willPerformHTTPRedirection: response,
+                newRequest: URLRequest(url: targetURL)
+            ) { request in
+                continuation.resume(returning: request.map { Decision.followed($0.url) } ?? Decision.refused)
+            }
+            if called == nil { continuation.resume(returning: Decision.noCallback) }
+        }
     }
 
-    // MARK: - Source fence
+    @Test("The shared policy decides by the address that answered, wherever the request started")
+    @MainActor
+    func sharedPolicyDecides() async throws {
+        let policy = OwnServerRedirectPolicy.shared
+        let next = "https://example.com/next"
+        let own = try await Self.decision(policy, start: "https://api.tabmail.ai/v1/chat",
+                                          answeredBy: "https://api.tabmail.ai/v1/chat", target: next)
+        let ownAfterOther = try await Self.decision(policy, start: "https://example.com/start",
+                                                    answeredBy: "https://push.tabmail.ai/start", target: next)
+        let other = try await Self.decision(policy, start: "https://graph.microsoft.com/v1.0/me",
+                                            answeredBy: "https://graph.microsoft.com/v1.0/me", target: next)
+        let otherAfterOwn = try await Self.decision(policy, start: "https://api.tabmail.ai/v1/chat",
+                                                    answeredBy: "https://example.com/start", target: next)
+        #expect(own == .refused)
+        #expect(ownAfterOther == .refused)
+        #expect(other == .followed(URL(string: next)))
+        #expect(otherAfterOwn == .followed(URL(string: next)))
+    }
+
+    @Test("The device sync connection passes the decision to the policy")
+    @MainActor
+    func deviceSyncConnectionDecides() async throws {
+        let sync = DeviceSyncService.shared
+        let own = try await Self.decision(sync, start: "wss://sync.tabmail.ai/ws",
+                                          answeredBy: "https://sync.tabmail.ai/ws", target: "wss://example.com/ws")
+        let other = try await Self.decision(sync, start: "wss://sync.tabmail.ai/ws",
+                                            answeredBy: "https://example.com/ws", target: "wss://example.com/next")
+        #expect(own == .refused)
+        #expect(other == .followed(URL(string: "wss://example.com/next")))
+    }
+
+    // MARK: - Every request that can reach TabMail's servers carries the policy
+
+    @Test("The shared session holds the policy")
+    func sharedSessionHoldsThePolicy() {
+        let holds = sharedEphemeralSession.delegate === OwnServerRedirectPolicy.shared
+        #expect(holds)
+    }
 
     private static func sources(under folders: [String]) throws -> [(path: String, lines: [Substring])] {
         let root = URL(fileURLWithPath: #filePath)
@@ -257,39 +421,65 @@ struct OwnServerRedirectPolicyTests {
         return files
     }
 
-    /// Sessions that need not hold the policy, and why: a CalDAV server (iCloud) sends its clients on to
-    /// another host; the device sync connection's delegate passes the decision to the policy.
-    private static let sessionsWithOwnDelegate: Set<String> = [
+    private static let policy = "delegate: OwnServerRedirectPolicy.shared"
+
+    /// Sessions created without the policy, and why: a CalDAV server (iCloud) sends its clients on to
+    /// another host; every request on the AI sessions passes the policy itself (checked below).
+    private static let sessionsWithoutPolicy: Set<String> = [
         "TabMail/Providers/CalDAV/CalDAVClient.swift",
-        "TabMail/Services/DeviceSyncService.swift",
+        "TabMail/Services/BackendClient.swift",
     ]
 
-    @Test("Every request on URLSession.shared and every new session in the app and the extension carries the policy")
-    func everySessionCarriesThePolicy() throws {
+    /// The device sync connection's session has the service as its delegate, which passes the decision
+    /// to the policy (`deviceSyncConnectionDecides`).
+    private static let deviceSyncFile = "TabMail/Services/DeviceSyncService.swift"
+
+    private static let backendClientFile = "TabMail/Services/BackendClient.swift"
+
+    /// The calls that send a request on a session.
+    private static let sendCalls = [".data(for:", ".bytes(for:", ".upload(for:", ".download(for:", "Task(with:"]
+
+    @Test("Every use of URLSession.shared, every new session and every AI request in the app and the extension carries the policy")
+    func everyRequestCarriesThePolicy() throws {
         let files = try Self.sources(under: ["TabMail", "Shared", "TabMailNotificationService"])
-        var sharedCalls: [String] = []
+        var sharedUses: [String] = []
         var newSessions: [String] = []
+        var deviceSyncSessions = 0
+        var aiSends = 0
         var misses: [String] = []
         for file in files {
             for line in file.lines {
                 let code = line.trimmingCharacters(in: .whitespaces)
                 if code.hasPrefix("//") { continue }
-                if code.contains("URLSession.shared.") {
-                    sharedCalls.append(file.path)
-                    if !code.contains("delegate: OwnServerRedirectPolicy.shared") { misses.append("\(file.path): \(code)") }
+                let usesShared = code.contains("URLSession.shared")
+                    || code.range(of: #"URLSession\??\s*=\s*\.shared"#, options: .regularExpression) != nil
+                if usesShared {
+                    sharedUses.append(file.path)
+                    if !code.contains(Self.policy) { misses.append("\(file.path): \(code)") }
                 }
                 if code.contains("URLSession(configuration:") {
                     newSessions.append(file.path)
-                    let exempt = Self.sessionsWithOwnDelegate.contains(file.path)
-                    if !code.contains("delegate: OwnServerRedirectPolicy.shared"), !exempt {
+                    if file.path == Self.deviceSyncFile {
+                        deviceSyncSessions += 1
+                        if !code.contains("delegate: self") { misses.append("\(file.path): \(code)") }
+                    } else if !code.contains(Self.policy), !Self.sessionsWithoutPolicy.contains(file.path) {
+                        misses.append("\(file.path): \(code)")
+                    }
+                }
+                if file.path == Self.backendClientFile, Self.sendCalls.contains(where: { code.contains($0) }) {
+                    if code.contains(Self.policy) {
+                        aiSends += 1
+                    } else if !code.contains("sharedEphemeralSession.") {
                         misses.append("\(file.path): \(code)")
                     }
                 }
             }
         }
         #expect(misses.isEmpty, "\(misses)")
-        let extensionCalls = Set(sharedCalls).filter { $0.hasPrefix("TabMailNotificationService/") }
-        #expect(extensionCalls.count >= 5, "the scan found the extension's requests: \(sharedCalls)")
+        let extensionUses = Set(sharedUses).filter { $0.hasPrefix("TabMailNotificationService/") }
+        #expect(extensionUses.count >= 5, "the scan found the extension's requests: \(sharedUses)")
         #expect(newSessions.count >= 5, "the scan found the app's sessions: \(newSessions)")
+        #expect(deviceSyncSessions == 1, "the scan found the device sync session")
+        #expect(aiSends >= 2, "the scan found the AI requests")
     }
 }
