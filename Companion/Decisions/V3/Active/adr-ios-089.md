@@ -15,7 +15,7 @@ whether this was a bug and chose "clear on account change" over clearing on ever
 **Decision:**
 
 1. `DeviceSyncService.ownerUserIdKey` records the TabMail user id whose synced state the device
-   holds. `DeviceSyncService.claimLocalState(for:)` runs at every session install (the three
+   holds. `DeviceSyncService.claimLocalState(for:)` runs at every session install (the two
    `installNewSession` sites in `TabMailAuthService`, right after `noteSignedIn`) and in
    `connect()`.
 2. Same account: nothing changes. No recorded owner (an install from before this ADR): the current

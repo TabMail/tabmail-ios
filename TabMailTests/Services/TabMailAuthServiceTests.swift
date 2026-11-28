@@ -233,13 +233,6 @@ struct TabMailSessionCodableTests {
 @Suite("TabMailAuthError")
 struct TabMailAuthErrorTests {
 
-    @Test("cancelled has non-empty description")
-    func cancelledDescription() {
-        let desc = TabMailAuthError.cancelled.errorDescription
-        #expect(desc != nil)
-        #expect(!desc!.isEmpty)
-    }
-
     @Test("noSession has non-empty description")
     func noSessionDescription() {
         let desc = TabMailAuthError.noSession.errorDescription
@@ -291,7 +284,7 @@ struct TabMailAuthErrorTests {
     @Test("All fixed cases produce distinct descriptions")
     func distinctDescriptions() {
         let cases: [TabMailAuthError] = [
-            .cancelled, .noSession, .invalidSession,
+            .noSession, .invalidSession,
             .invalidResponse, .emailNotRegistered, .invalidOTP,
         ]
         let descriptions = cases.compactMap(\.errorDescription)
@@ -302,7 +295,7 @@ struct TabMailAuthErrorTests {
 
     @Test("Conforms to LocalizedError — localizedDescription uses errorDescription")
     func localizedErrorConformance() {
-        let error: any Error = TabMailAuthError.cancelled
+        let error: any Error = TabMailAuthError.noSession
         // LocalizedError.localizedDescription should use errorDescription
         #expect(!error.localizedDescription.isEmpty)
     }

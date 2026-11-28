@@ -160,7 +160,7 @@ final class AISubscriptionGate: @unchecked Sendable {
     /// would still pass the un-bumped epoch and stamp the marker.
     ///
     /// Bumps ONLY on an actual identity change. The session-write sites also
-    /// fire when the SAME user re-authenticates (web auth, id-token, OTP);
+    /// fire when the SAME user re-authenticates (id-token, OTP);
     /// invalidating there would discard a known-good authoritative entitlement
     /// and widen the "unknown" window for nothing, leaving the latch consumer
     /// waiting on a `/whoami` it did not need.

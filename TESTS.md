@@ -1522,3 +1522,39 @@ noise, and `compare` writes the report and the manifest for every mode and stati
 build (105,000 headers) runs only when `TABMAIL_DB_PROOF_DIR` is set. The Mac side,
 `Scripts/db-proof-mac.py --self-test`, checks the same scan, seek and write properties with the host
 `sqlite3`.
+
+## Sign in with Apple — Apple's own sheet and the id_token exchange
+
+`AppleIDSignInTests` covers the native Sign in with Apple path that replaced the web sign-in for Apple.
+A raw nonce is 43 base64url characters (32 random bytes) and new on every call; its hash is SHA-256 in
+lowercase hex (two known vectors). The sheet's request asks for the email scope only and carries the
+hashed nonce, never the raw one. Apple's ID token is read as UTF-8 text; no token, an empty one or one
+that is not UTF-8 is `TabMailAuthError.noSession`. Closing the sheet ends as `CancellationError` (which
+the login view ignores), both as a typed `ASAuthorizationError.canceled` and as the bridged `NSError`;
+`.failed`, `.unknown` and a network error pass through unchanged. `TabMailAuthService.idTokenGrantRequest`
+for Apple posts to the auth server's `/auth/v1/token?grant_type=id_token` with the JSON content type, the
+publishable key as `apikey` and as the bearer, and a body of exactly the provider `apple`, the ID token and
+the raw nonce; for Google and Microsoft (`google`, `azure`) the body has no nonce. A sheet result that is
+not an Apple ID credential (a password credential) is `noSession`. The route cases run
+`TabMailAuthService.signInWithApple(authorize:)` with a stand-in sheet and a DEBUG stand-in for the sign-in's
+requests (`_setSignInTransportForTesting`, which covers the exchange and the billing sync) that records the
+request and refuses it with a 400, so no session is written: the sheet gets one email-only request, and the
+exchange sends the sheet's token as provider `apple` with a 43-character raw nonce whose SHA-256 is the
+request's nonce, ending as the server's message; a second attempt on the same service sends a different raw
+nonce, each matching its own sheet request's hash; a sheet that is closed (`CancellationError`), fails
+(`.failed` unchanged) or returns no token (`noSession`) sends nothing to the server. A Google or Microsoft
+`signInWithIdToken` that gives no nonce (the default) sends a body of exactly the provider and the token. The
+suite is serialized and runs under `.processGlobalState`, because its cases and the session suite below share
+that process-wide stand-in. A source check pins that the auth service has no
+`/auth/v1/authorize` URL, callback page or `ASWebAuthenticationSession`; the parsed `Info.plist` must have
+`CFBundleURLTypes`, lists no `tabmail-ios` URL scheme, and keeps exactly the Google and Microsoft redirect
+schemes and `mailto`; the parsed entitlements give `com.apple.developer.applesignin` exactly `["Default"]`.
+`AppleIDSignInSessionTests` (serialized, `.processGlobalState`: the real session slot, the App Group AI values
+and an empty app database) runs one Apple sign-in on a device signed in as an earlier test user with the AI
+choice made, and reads the device state at each request the sign-in sends. An accepted exchange (a synthetic
+200 session) leaves nothing written when the exchange is sent; by the billing sync, the new session is stored,
+the AI choice is cleared (no mail account), the sign-in epoch has moved on by one, and billing gets the new
+session's access token as the bearer. A refused exchange (400) or an unreadable 200 leaves the stored session,
+the AI choice and the epoch as they were, and sends no billing sync. `OneAISettingForTheDeviceTests` counts two session
+writes (the id-token and the code sign-in). The sheet itself (SwiftUI's `AuthorizationController`) is checked
+on a device.
