@@ -114,6 +114,47 @@ struct IMAPTLSFloorErrorTests {
         #expect(String(describing: mapped) == Self.connectionRefused.description)
     }
 
+    // MARK: - The token counts only inside the handshake's own failure
+
+    @Test("A below-floor STARTTLS handshake, in SwiftMail's upgrade-failure wording, names the TLS floor")
+    func belowFloorSTARTTLSIsNamed() throws {
+        let error = SMTPError.tlsFailed("STARTTLS upgrade failed: " + Self.belowFloor.description)
+        let mapped = IMAPProvider.mapTransportSecurityFailure(
+            error, host: "smtp.example.com", port: 587, encryptedPort: 465)
+        #expect(mapped as? IMAPTransportSecurityError
+                == IMAPTransportSecurityError.tlsFloorNotMet(host: "smtp.example.com"))
+    }
+
+    /// NIOSSL's host-name check repeats the configured name, and a server's reply is
+    /// its own words: the token in either is not the TLS layer refusing the version.
+    /// Each error comes back unchanged and keeps its own meaning.
+    @Test("The TLS-floor token in a host name or a server reply does not make a TLS-floor error")
+    func floorTokenOutsideTheHandshakeFailureIsNotRelabelled() throws {
+        let markedHost = IMAPProvider.tlsProtocolVersionAlert + ".example.com"
+        let hostCheck = "NIOSSLExtraError.serverHostnameImpossibleToMatch: The server hostname "
+            + "\(markedHost) cannot be matched due to containing non-DNS characters"
+        let hostCheckAfterSTARTTLS = SMTPError.tlsFailed("STARTTLS upgrade failed: " + hostCheck)
+        let hostCheckOnImplicitTLS = ObservedError(description: hostCheck)
+        let refusalForNow = SMTPError.tlsFailed("STARTTLS upgrade failed: SMTP TLS failed: STARTTLS failed: "
+            + "454 4.7.0 TLS not available: " + IMAPProvider.tlsProtocolVersionAlert)
+        let rejectedGreeting = SMTPError.connectionFailed(
+            "Server rejected connection: 554 5.7.0 " + IMAPProvider.tlsProtocolVersionAlert)
+
+        let notFloor: [any Error] = [hostCheckAfterSTARTTLS, hostCheckOnImplicitTLS, refusalForNow, rejectedGreeting]
+        for error in notFloor {
+            let mapped = IMAPProvider.mapTransportSecurityFailure(
+                error, host: markedHost, port: 587, encryptedPort: 465)
+            #expect(mapped as? IMAPTransportSecurityError == nil, "\(error)")
+            let renderedMapped = String(describing: mapped)
+            let renderedError = String(describing: error)
+            #expect(renderedMapped == renderedError)
+        }
+        // The host-name failures keep their strikes; the refusal for now keeps the send queued.
+        #expect(!AccountManager.isTransientSendError(hostCheckAfterSTARTTLS))
+        #expect(!AccountManager.isTransientSendError(hostCheckOnImplicitTLS))
+        #expect(AccountManager.isTransientSendError(refusalForNow))
+    }
+
     // MARK: - Send-path classification (Outbox Rules 7 / 9)
 
     /// The row must escalate to `.failed` and hand the user Retry/Discard, instead

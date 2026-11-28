@@ -109,13 +109,27 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
     /// wrapper with `CERTIFICATE_VERIFY_FAILED` inside, so matching on
     /// `handshakeFailed` — or on the NIOSSL error domain — would tell a user whose
     /// certificate expired that their server is too old. Only the reason token
-    /// separates them, which is why the match is on the token alone.
+    /// separates them, so the token decides, but only where the TLS layer put it:
+    /// inside that `handshakeFailed(` rendering (`isTLSFloorRefusal`). NIOSSL's
+    /// host-name check repeats the configured server name, and a server's reply
+    /// is its own words, so the same token in either says nothing about the version.
     ///
     /// It is matched in the RENDERED description rather than by importing NIOSSL
     /// so a rethrow that re-wraps the error in a provider type (`SMTPError`
     /// interpolates `"\(error)"`) still carries it — the same technique
     /// `SyncEngine.isConnectionError` uses for NIO's error families.
     static let tlsProtocolVersionAlert = "TLSV1_ALERT_PROTOCOL_VERSION"
+
+    /// How NIOSSL renders a failed handshake (`NIOSSLError.handshakeFailed`), the
+    /// observed outer shape above.
+    static let tlsHandshakeFailureRendering = "handshakeFailed("
+
+    /// Whether `rendered` carries the TLS-floor token inside NIOSSL's handshake
+    /// failure: after its `handshakeFailed(` opening, whatever wraps it.
+    nonisolated static func isTLSFloorRefusal(_ rendered: String) -> Bool {
+        guard let handshake = rendered.range(of: tlsHandshakeFailureRendering) else { return false }
+        return rendered[handshake.upperBound...].contains(tlsProtocolVersionAlert)
+    }
 
     /// Whether `error` is SwiftMail's own refusal when a connection that requires
     /// STARTTLS (`MailTransportPolicy`) finds the server not offering it, before
@@ -159,8 +173,7 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
         port: Int,
         encryptedPort: Int
     ) -> Error {
-        let rendered = String(describing: error)
-        if rendered.contains(tlsProtocolVersionAlert) {
+        if isTLSFloorRefusal(String(describing: error)) {
             return IMAPTransportSecurityError.tlsFloorNotMet(host: host)
         }
         if isStartTLSNotOffered(error, port: port) {

@@ -1568,9 +1568,13 @@ a raw protocol_version alert (what a server below TLS 1.2 sends), with plain tex
 SwiftMail reports the TLS layer's own error for a failed handshake (`SMTPServer.applyPostEHLOTLSPolicy`), so a
 below-floor server takes one strike per drain and is Failed on the third with the TLS-floor sentence, and any
 other failed handshake (the stand-in for a certificate that does not verify) or a hang-up takes the strikes as
-on port 465; a 454 refusal and an unanswered STARTTLS stay queued with no strike. A server that offers
+on port 465; a 454 refusal (also one whose words repeat the TLS-floor token) and an unanswered STARTTLS stay
+queued with no strike. A server that offers
 `starttls` in lower case is asked for STARTTLS. The stored error text is checked word for word, and
 `FakeSMTPServer.bytesAfterSTARTTLS` shows that after every accepted STARTTLS the client sent only a TLS
 handshake record, never a plain-text AUTH or MAIL FROM. `startTLSUpgradeFailureClassification` pins
 `AccountManager.isTransientSendError` on SwiftMail's exact wording, including the EHLO timeout after a completed
-upgrade, which no loopback fake can reach without a certificate, the closed connection before the handshake (pinned in SwiftMail by `connectionClosedBeforeTheHandshakeIsAConnectionFailure`; SwiftMail's `connectionResetDuringTheHandshakeIsReportedOverTheLaterEOF` pins that the first error before the handshake completes is the one reported), and NIOSSL's two host-name check failures for hosts whose names hold the transient words; `hostnameMismatchOnImplicitTLSIsNotTransient` checks the same error as it arrives bare on 465. `bytesAfterSTARTTLS(count:within:)` waits, bounded, for the fake to keep each connection's bytes, which it does only when the client hangs up.
+upgrade, which no loopback fake can reach without a certificate, the closed connection before the handshake (pinned in SwiftMail by `connectionClosedBeforeTheHandshakeIsAConnectionFailure`; SwiftMail's `socketErrorDuringTheHandshakeIsAConnectionFailureReportedOverTheLaterEOF` pins that the first error before the handshake completes is the one reported, and with `socketErrorBeforeTheHandshakeIsAConnectionFailure` that a socket error is reported as `SMTP connection failed: <socket error>`; the classifier checks NIO's text for a reset, a timed-out read and a network that went down), and NIOSSL's two host-name check failures for hosts whose names hold the transient words; `hostnameMismatchOnImplicitTLSIsNotTransient` checks the same error as it arrives bare on 465. In
+`IMAPTLSFloorErrorTests`, `belowFloorSTARTTLSIsNamed` maps the below-floor alert in SwiftMail's upgrade-failure
+wording to the TLS-floor error, and `floorTokenOutsideTheHandshakeFailureIsNotRelabelled` shows that the token in a
+host name (STARTTLS and 465), a 454 reply, or a refused greeting leaves the error unchanged. `bytesAfterSTARTTLS(count:within:)` waits, bounded, for the fake to keep each connection's bytes, which it does only when the client hangs up.

@@ -7,6 +7,13 @@ import Foundation
 import SwiftMail
 @testable import TabMail
 
+/// A server's STARTTLS refusal for now. At file scope because a test's arguments
+/// cannot name a static member of its own suite.
+private let temporaryRefusal = "454 4.7.0 TLS not available due to temporary reason"
+/// The same refusal repeating the TLS-floor token in the server's own words.
+private let temporaryRefusalNamingTheFloorToken =
+    "454 4.7.0 TLS not available: " + IMAPProvider.tlsProtocolVersionAlert
+
 /// **The system property: a send to an SMTP server whose STARTTLS upgrade can
 /// never succeed ends Failed with Retry/Discard instead of staying queued for
 /// good; a server below the TLS 1.2 floor is named; a failure that can clear by
@@ -21,7 +28,6 @@ extension MailTransportEncryptionTests {
 
     private static var queued: String { OutboxStatus.queued.rawValue }
     private static var failed: String { OutboxStatus.failed.rawValue }
-    private static let temporaryRefusal = "454 4.7.0 TLS not available due to temporary reason"
 
     private static func askedForSTARTTLS(_ lines: [String]) -> Int {
         lines.filter { $0.uppercased() == "STARTTLS" }.count
@@ -114,16 +120,19 @@ extension MailTransportEncryptionTests {
 
     // MARK: - Failures that can clear stay queued with no strike
 
-    @Test("Control: a server that refuses STARTTLS for now (454) keeps the send queued with no strike")
-    func temporaryRefusalStaysQueued() async throws {
-        let smtp = FakeSMTPServer(startTLSAnswer: .refuse(Self.temporaryRefusal))
+    /// The second reply repeats the TLS-floor token in the server's own words: a
+    /// reply is not the TLS layer refusing the version, so it stays a passing refusal.
+    @Test("Control: a server that refuses STARTTLS for now (454) keeps the send queued with no strike",
+          arguments: [temporaryRefusal, temporaryRefusalNamingTheFloorToken])
+    func temporaryRefusalStaysQueued(reply: String) async throws {
+        let smtp = FakeSMTPServer(startTLSAnswer: .refuse(reply))
         try smtp.start()
         defer { smtp.stop() }
 
         let (states, last) = try await Self.drainSend(smtpPort: smtp.port, drains: 2)
 
         #expect(states == ["\(Self.queued) 0", "\(Self.queued) 0"], "\(states)")
-        #expect(last?.errorMessage == Self.stored("SMTP TLS failed: STARTTLS failed: " + Self.temporaryRefusal),
+        #expect(last?.errorMessage == Self.stored("SMTP TLS failed: STARTTLS failed: " + reply),
                 "\(String(describing: last?.errorMessage))")
         #expect(Self.askedForSTARTTLS(smtp.receivedLines()) == 2)
     }
@@ -187,11 +196,19 @@ extension MailTransportEncryptionTests {
         let transient = [
             "STARTTLS upgrade failed: SMTP connection failed: EHLO timeout",
             "STARTTLS upgrade failed: SMTP connection failed: STARTTLS timeout",
-            "STARTTLS upgrade failed: SMTP TLS failed: STARTTLS failed: " + Self.temporaryRefusal,
+            "STARTTLS upgrade failed: SMTP TLS failed: STARTTLS failed: " + temporaryRefusal,
             "STARTTLS upgrade failed: SMTP connection failed: Connection closed",
             // The server closed after accepting STARTTLS, before any TLS byte.
             "STARTTLS upgrade failed: SMTP connection failed: Connection closed before the TLS handshake started",
-            "STARTTLS upgrade failed: IOError: Connection reset by peer (errno: 54)",
+            // A socket error during the upgrade, as SwiftMail reports it, whatever its
+            // words: NIO's `IOError` text for a reset, a read that timed out, and a
+            // network that went down (`SMTPStartTLSFailureTests` pins this wrapping).
+            "STARTTLS upgrade failed: SMTP connection failed: "
+                + "read(descriptor:pointer:size:): Connection reset by peer) (errno: 54)",
+            "STARTTLS upgrade failed: SMTP connection failed: "
+                + "read(descriptor:pointer:size:): Operation timed out) (errno: 60)",
+            "STARTTLS upgrade failed: SMTP connection failed: "
+                + "read(descriptor:pointer:size:): Network is down) (errno: 50)",
             // Not an upgrade failure: the bare refusal keeps today's reading.
             "Server rejected STARTTLS",
         ]

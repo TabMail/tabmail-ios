@@ -854,8 +854,9 @@ extension AccountManager {
 
     /// Whether an `SMTPError.tlsFailed` may clear by itself.
     ///
-    /// A failed STARTTLS upgrade whose cause came from the TLS layer (the
-    /// handshake, or the connection under it) is judged as the same error is on
+    /// A failed STARTTLS upgrade whose cause came from the TLS layer (its
+    /// handshake ended by an alert, a hang-up, or a certificate or host-name
+    /// check) is judged as the same error is on
     /// the implicit-TLS port 465, where it arrives bare: by
     /// `isTransientTransportText`. So a certificate that does not verify takes the
     /// bounded strikes and ends Failed with Retry/Discard, as on 465, instead of
@@ -863,9 +864,10 @@ extension AccountManager {
     /// here: `IMAPProvider.mapTransportSecurityFailure` names it first.)
     ///
     /// Every other TLS failure stays transient: the server refusing STARTTLS (a
-    /// 454 asks to try later), and the STARTTLS and EHLO timeouts. SwiftMail
-    /// reports each of those with one of its own `SMTPError`s after the prefix,
-    /// and every `SMTPError` renders starting with "SMTP ".
+    /// 454 asks to try later), the STARTTLS and EHLO timeouts, and a socket error
+    /// during the upgrade (a reset, a read that timed out, a network that went
+    /// down). SwiftMail reports each of those with one of its own `SMTPError`s
+    /// after the prefix, and every `SMTPError` renders starting with "SMTP ".
     nonisolated static func isTransientSTARTTLSFailure(_ reason: String) -> Bool {
         guard reason.hasPrefix(startTLSUpgradeFailurePrefix) else { return true }
         let cause = reason.dropFirst(startTLSUpgradeFailurePrefix.count)

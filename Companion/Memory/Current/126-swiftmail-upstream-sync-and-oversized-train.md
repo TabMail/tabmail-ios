@@ -555,7 +555,8 @@ serializer that writes recipients:
 - Fork branch `fix/smtp-starttls-error-detail` on fork `main` `64b294d`: "Report the TLS error when a STARTTLS
   upgrade fails" (`e4f5f9f0`) and the review follow-ups "Record only handshake errors and keep EHLO parameters
   as sent" (`fbfcddf0`) and "Report a close before the STARTTLS handshake as a connection failure"
-  (`43d9d191`), and "Test that a reset during the STARTTLS handshake beats the later EOF" (`439e3045`, the pin). It lands on fork `main` after review, and the same change, rebased on
+  (`43d9d191`), "Test that a reset during the STARTTLS handshake beats the later EOF" (`439e3045`), and "Report a socket error
+  during a STARTTLS upgrade as a connection failure" (`b2c81d37`, the pin). It lands on fork `main` after review, and the same change, rebased on
   `upstream/main`, becomes an upstream PR. Upstream had moved past the pin (#339, #341, #344); that
   resync is separate work and needs its own collision check.
 - Cause, measured: after STARTTLS the client sent its EHLO without waiting for the handshake. A failed
@@ -568,7 +569,10 @@ serializer that writes recipients:
   so a server's own reply (a 421 followed by a close without a TLS close notification) stays the result. No
   wait, timeout or reordering is added. A connection that closes after the 220 and before the TLS handler is in
   (`ChannelError.ioOnClosedChannel` while adding it) is reported as `SMTPError.connectionFailed("Connection closed
-  before the TLS handshake started")`, so it reads as the connection failure it is, not as a TLS verdict.
+  before the TLS handshake started")`, so it reads as the connection failure it is, not as a TLS verdict. Any
+  socket error the upgrade would report (NIO's `IOError`, kept by the recorder or thrown by the command) becomes
+  `SMTPError.connectionFailed("<socket error>")` while its type is known, so a read that timed out or a network
+  that went down reads as a connection failure whatever words the system uses.
 - Also: errors are kept as themselves in `Command failed: …` and in the channel error log, and EHLO keywords and
   SASL mechanism names are read in any case (other EHLO parameters keep the server's spelling). The transport-mode helpers moved unchanged to `SMTPServer+TransportMode.swift` to keep the
   file under the length limit.
@@ -576,5 +580,7 @@ serializer that writes recipients:
   relies on two pieces of library wording, the reason prefix `STARTTLS upgrade failed: ` and the "SMTP " that
   begins every `SMTPError` rendering. `isTransientTransportText` decides NIOSSL's two host-name check failures (`NIOSSLExtraError.failedToValidateHostname`
   and `.serverHostnameImpossibleToMatch`, whose texts name the host) by their kind first, so a host name holding
-  "connection" or "timeout" cannot make them transient. The app's end-to-end tests run both through the pinned library, so a
+  "connection" or "timeout" cannot make them transient. `IMAPProvider.isTLSFloorRefusal` counts the TLS-floor
+  token only inside NIOSSL's `handshakeFailed(` rendering, so the same token in a host name (the host-name check
+  repeats it) or in a server's reply is not a TLS-floor refusal. The app's end-to-end tests run both through the pinned library, so a
   wording change upstream fails them at the next re-pin. Detail: `IOS-TLS-002`, amendment 2026-11-28.
