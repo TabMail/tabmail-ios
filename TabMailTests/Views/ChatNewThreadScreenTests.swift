@@ -1032,8 +1032,8 @@ struct ChatNewThreadScreenTests {
         try await withScreen(model) { screen in
             // The user's addresses are every account's: this email's account and the other one.
             // The screen reads them as it opens (`loadOwnAddresses`). This read is the test's own:
-            // it confirms both accounts are in the database the screen reads, so the sheet would
-            // have them to refuse.
+            // it confirms both accounts are in the database the screen reads, so a sheet that
+            // refused the user's addresses would have had them to refuse.
             let ownAddresses = [fixture.account.emailAddress, otherAccount.emailAddress]
             try await Self.waitUntil { try await Set(Self.accountAddresses()).isSuperset(of: ownAddresses) }
             let known = try await Self.accountAddresses()
