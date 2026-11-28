@@ -1534,7 +1534,16 @@ the login view ignores), both as a typed `ASAuthorizationError.canceled` and as 
 `.failed`, `.unknown` and a network error pass through unchanged. `TabMailAuthService.idTokenGrantRequest`
 for Apple posts to the auth server's `/auth/v1/token?grant_type=id_token` with the JSON content type, the
 publishable key as `apikey` and as the bearer, and a body of exactly the provider `apple`, the ID token and
-the raw nonce; for Google and Microsoft (`google`, `azure`) the body has no nonce. A source check pins that
-the auth service has no `/auth/v1/authorize` URL, callback page or `ASWebAuthenticationSession`, that
-`Info.plist` declares no `tabmail-ios` URL scheme, and that the app's entitlements declare
-`com.apple.developer.applesignin`. The sheet itself (`ASAuthorizationController`) is checked on a device.
+the raw nonce; for Google and Microsoft (`google`, `azure`) the body has no nonce. A sheet result that is
+not an Apple ID credential (a password credential) is `noSession`. The route cases run
+`TabMailAuthService.signInWithApple(authorize:)` with a stand-in sheet and a DEBUG stand-in for the exchange
+(`_setIdTokenGrantTransportForTesting`) that records the request and refuses it with a 400, so no session is
+written: the sheet gets one email-only request, and the exchange sends the sheet's token as provider `apple`
+with a 43-character raw nonce whose SHA-256 is the request's nonce, ending as the server's message; a sheet
+that is closed (`CancellationError`), fails (`.failed` unchanged) or returns no token (`noSession`) sends
+nothing to the server. The suite is serialized because those cases share the stand-in. A source check pins
+that the auth service has no `/auth/v1/authorize` URL, callback page or `ASWebAuthenticationSession`; the
+parsed `Info.plist` lists no `tabmail-ios` URL scheme, and the parsed entitlements give
+`com.apple.developer.applesignin` exactly `["Default"]`. `OneAISettingForTheDeviceTests` counts two session
+writes (the id-token and the code sign-in). The sheet itself (SwiftUI's `AuthorizationController`) is checked
+on a device.

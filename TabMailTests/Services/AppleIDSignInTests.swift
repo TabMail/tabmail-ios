@@ -4,12 +4,15 @@
 
 import AuthenticationServices
 import Foundation
+import Synchronization
+import SwiftUI
 import Testing
 @testable import TabMail
 
 /// Sign in with Apple through Apple's own sheet: the request it sends, how its result and its errors are
-/// read, and the token exchange with the auth server.
-@Suite("Sign in with Apple")
+/// read, and the token exchange with the auth server. Serialized: the route cases share the exchange's
+/// test transport.
+@Suite("Sign in with Apple", .serialized)
 @MainActor
 struct AppleIDSignInTests {
 
@@ -111,6 +114,76 @@ struct AppleIDSignInTests {
         #expect(body == ["provider": wireName, "id_token": "test-id-token"])
     }
 
+    @Test("A sheet result that is not an Apple ID credential is no session")
+    func notAppleID() {
+        let isNoSession: Bool
+        do {
+            _ = try AppleIDSignIn.identityToken(of: .password(ASPasswordCredential(user: "user", password: "test-password")))
+            isNoSession = false
+        } catch TabMailAuthError.noSession {
+            isNoSession = true
+        } catch {
+            isNoSession = false
+        }
+        #expect(isNoSession)
+    }
+
+    @Test("The sheet gets the email-only request, and the exchange sends the sheet's token with the raw nonce behind the request's hash")
+    func appleRoute() async throws {
+        let exchange = ExchangeRecorder()
+        TabMailAuthService._setIdTokenGrantTransportForTesting(exchange.refuse)
+        defer { TabMailAuthService._setIdTokenGrantTransportForTesting(nil) }
+        var sheetRequests: [ASAuthorizationAppleIDRequest] = []
+
+        let outcome = await Self.outcome {
+            try await TabMailAuthService().signInWithApple { request in
+                sheetRequests.append(request)
+                return Data("header.payload.signature".utf8)
+            }
+        }
+
+        // The refusal ends the sign-in as the auth server's message, before any session is written.
+        #expect(outcome == "refused: test refusal")
+        #expect(sheetRequests.count == 1)
+        guard sheetRequests.count == 1 else { return }
+        let scopes = sheetRequests[0].requestedScopes
+        #expect(scopes == [.email])
+        let requests = exchange.requests
+        #expect(requests.count == 1)
+        guard requests.count == 1 else { return }
+        let path = requests[0].url?.path
+        #expect(path == "/auth/v1/token")
+        let body = try Self.body(of: requests[0])
+        #expect(body["provider"] == "apple")
+        #expect(body["id_token"] == "header.payload.signature")
+        let rawNonce = try #require(body["nonce"])
+        let sentHash = AppleIDSignIn.sha256Hex(rawNonce)
+        #expect(sheetRequests[0].nonce == sentHash)
+        #expect(rawNonce.count == 43)
+    }
+
+    @Test("A sheet that is closed, fails, or returns no token sends nothing to the auth server", arguments: ["closed", "failed", "no token"])
+    func sheetEndsWithoutExchange(how: String) async {
+        let exchange = ExchangeRecorder()
+        TabMailAuthService._setIdTokenGrantTransportForTesting(exchange.refuse)
+        defer { TabMailAuthService._setIdTokenGrantTransportForTesting(nil) }
+
+        let outcome = await Self.outcome {
+            try await TabMailAuthService().signInWithApple { _ in
+                switch how {
+                case "closed": throw ASAuthorizationError(.canceled)
+                case "failed": throw ASAuthorizationError(.failed)
+                default: return nil
+                }
+            }
+        }
+
+        let expected = ["closed": "cancelled", "failed": "sheet failed", "no token": "no session"][how]
+        #expect(outcome == expected)
+        let sent = exchange.requests.count
+        #expect(sent == 0)
+    }
+
     @Test("Apple sign-in no longer goes through the web: no authorize page, no callback page, no app URL scheme for it, and the app declares Sign in with Apple")
     func noWebSignIn() throws {
         let root = URL(fileURLWithPath: #filePath)
@@ -121,14 +194,62 @@ struct AppleIDSignInTests {
         #expect(!auth.contains("/auth/v1/authorize"))
         #expect(!auth.contains("ios-callback"))
         #expect(!auth.contains("ASWebAuthenticationSession"))
-        let plist = try String(contentsOf: root.appendingPathComponent("TabMail/Resources/Info.plist"), encoding: .utf8)
-        #expect(!plist.contains("<string>tabmail-ios</string>"))
-        let entitlements = try String(contentsOf: root.appendingPathComponent("TabMail/TabMail.entitlements"), encoding: .utf8)
-        #expect(entitlements.contains("<key>com.apple.developer.applesignin</key>"))
+
+        let info = try Self.plist(at: root.appendingPathComponent("TabMail/Resources/Info.plist"))
+        let urlTypes = info["CFBundleURLTypes"] as? [[String: Any]] ?? []
+        let schemes = urlTypes.flatMap { $0["CFBundleURLSchemes"] as? [String] ?? [] }
+        #expect(!schemes.contains("tabmail-ios"))
+
+        let entitlements = try Self.plist(at: root.appendingPathComponent("TabMail/TabMail.entitlements"))
+        let appleSignIn = entitlements["com.apple.developer.applesignin"] as? [String]
+        #expect(appleSignIn == ["Default"])
     }
 
     private static func body(of request: URLRequest) throws -> [String: String] {
         let object = try JSONSerialization.jsonObject(with: request.httpBody ?? Data())
         return object as? [String: String] ?? [:]
+    }
+
+    private static func plist(at url: URL) throws -> [String: Any] {
+        let object = try PropertyListSerialization.propertyList(from: Data(contentsOf: url), format: nil)
+        return object as? [String: Any] ?? [:]
+    }
+
+    /// How a sign-in ended, as one word the cases compare.
+    private static func outcome(_ signIn: () async throws -> TabMailSession) async -> String {
+        do {
+            _ = try await signIn()
+            return "signed in"
+        } catch is CancellationError {
+            return "cancelled"
+        } catch TabMailAuthError.noSession {
+            return "no session"
+        } catch TabMailAuthError.otpFailed(let message) {
+            return "refused: \(message)"
+        } catch let error as ASAuthorizationError where error.code == .failed {
+            return "sheet failed"
+        } catch {
+            return "other: \(error)"
+        }
+    }
+}
+
+/// Stands in for the auth server's token endpoint: records each exchange and refuses it with a 400 and a
+/// message, so a route case ends before any session is written.
+private final class ExchangeRecorder: Sendable {
+    private let recorded = Mutex<[URLRequest]>([])
+
+    var requests: [URLRequest] { recorded.withLock { $0 } }
+
+    func record(_ request: URLRequest) { recorded.withLock { $0.append(request) } }
+
+    var refuse: TabMailTokenCoordinator.DataForRequest {
+        { [self] request in
+            record(request)
+            guard let url = request.url,
+                  let response = HTTPURLResponse(url: url, statusCode: 400, httpVersion: nil, headerFields: ["Content-Type": "application/json"])
+            else { throw URLError(.badURL) }
+            return (Data(#"{"msg":"test refusal"}"#.utf8), response)
+        }
     }
 }

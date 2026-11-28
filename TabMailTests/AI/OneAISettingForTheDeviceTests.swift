@@ -199,7 +199,7 @@ struct OneAISettingForTheDeviceTests {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("//") }
         let writes = auth.indices.filter { auth[$0].contains("installNewSession(") }
-        #expect(writes.count == 3, "session writes: \(writes.map { auth[$0] })")
+        #expect(writes.count == 2, "session writes: \(writes.map { auth[$0] })")
         for index in writes {
             #expect(index > 0 && auth[index - 1] == "await Self.clearAIChoiceIfNoMailAccount()",
                     "before \(auth[index]): \(index > 0 ? auth[index - 1] : "")")
@@ -216,7 +216,7 @@ struct OneAISettingForTheDeviceTests {
                     .map { _ in file.lastPathComponent }
             }
         }
-        #expect(callers == Array(repeating: "TabMailAuthService.swift", count: 3), "\(callers)")
+        #expect(callers == Array(repeating: "TabMailAuthService.swift", count: 2), "\(callers)")
 
         // Only the sign-in step clears the device's AI answer.
         let clearers = try ["TabMail", "TabMailNotificationService", "Shared"].flatMap { dir -> [String] in

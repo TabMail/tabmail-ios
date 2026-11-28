@@ -2,9 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import AuthenticationServices
 import SwiftUI
 
 struct TabMailLoginView: View {
+    @Environment(\.authorizationController) private var authorizationController
     @Environment(\.colorScheme) private var colorScheme
     @Environment(NavigationStore.self) private var navigationStore
     @State private var loginState: LoginState = .providers
@@ -318,7 +320,9 @@ struct TabMailLoginView: View {
                     case .microsoft:
                         try await signInMicrosoft()
                     case .apple:
-                        let session = try await authService.signInWithApple()
+                        let session = try await authService.signInWithApple { request in
+                            try AppleIDSignIn.identityToken(of: await authorizationController.performRequest(request))
+                        }
                         // If the Apple ID's email is on an iCloud-managed
                         // domain (or an Apple private relay), stage the
                         // iCloud consent gate so the user is asked to set

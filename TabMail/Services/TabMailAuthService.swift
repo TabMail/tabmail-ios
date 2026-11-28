@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import AuthenticationServices
 import Foundation
 
 enum TabMailProvider: String {
@@ -29,6 +30,22 @@ final class TabMailAuthService {
     private static var signOutLogoutTransport: TabMailTokenCoordinator.DataForRequest {
         #if DEBUG
         if let signOutLogoutTransportOverride { return signOutLogoutTransportOverride }
+        #endif
+        return { request in try await sharedEphemeralSession.data(for: request) }
+    }
+
+    #if DEBUG
+    /// Test-only override for the transport behind the `grant_type=id_token` exchange. When nil, the shared
+    /// ephemeral session is used. Lets tests observe the exchange and refuse it without touching the network.
+    private static var idTokenGrantTransportOverride: TabMailTokenCoordinator.DataForRequest?
+    static func _setIdTokenGrantTransportForTesting(_ transport: TabMailTokenCoordinator.DataForRequest?) {
+        idTokenGrantTransportOverride = transport
+    }
+    #endif
+
+    private static var idTokenGrantTransport: TabMailTokenCoordinator.DataForRequest {
+        #if DEBUG
+        if let idTokenGrantTransportOverride { return idTokenGrantTransportOverride }
         #endif
         return { request in try await sharedEphemeralSession.data(for: request) }
     }
@@ -294,10 +311,22 @@ final class TabMailAuthService {
 
     // MARK: - Sign in with Apple
 
-    /// Sign in with Apple through Apple's own sheet, then exchange its ID token with the raw nonce.
-    func signInWithApple() async throws -> TabMailSession {
-        let credential = try await AppleIDSignIn().run()
-        return try await signInWithIdToken(provider: .apple, idToken: credential.idToken, nonce: credential.rawNonce)
+    /// Runs Apple's request on its sheet and returns the ID token data of the result. The login view passes
+    /// SwiftUI's `AuthorizationController`; tests pass a stand-in.
+    typealias AppleAuthorization = @MainActor (ASAuthorizationAppleIDRequest) async throws -> Data?
+
+    /// Sign in with Apple through Apple's own sheet, then exchange its ID token with the raw nonce whose
+    /// hash the sheet's request carried.
+    func signInWithApple(authorize: AppleAuthorization) async throws -> TabMailSession {
+        let rawNonce = AppleIDSignIn.makeRawNonce()
+        let tokenData: Data?
+        do {
+            tokenData = try await authorize(AppleIDSignIn.makeRequest(rawNonce: rawNonce))
+        } catch {
+            throw AppleIDSignIn.signInError(error)
+        }
+        let idToken = try AppleIDSignIn.idToken(from: tokenData)
+        return try await signInWithIdToken(provider: .apple, idToken: idToken, nonce: rawNonce)
     }
 
     // MARK: - ID Token Sign-In (merged OAuth flow)
@@ -311,7 +340,7 @@ final class TabMailAuthService {
 
         BackgroundSyncLogger.logDebug("[TabMailAuth] Signing in with \(provider.rawValue) id_token")
 
-        let (data, response) = try await sharedEphemeralSession.data(for: request)
+        let (data, response) = try await Self.idTokenGrantTransport(request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw TabMailAuthError.invalidResponse
         }
