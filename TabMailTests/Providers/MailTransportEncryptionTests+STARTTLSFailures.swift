@@ -31,6 +31,27 @@ extension MailTransportEncryptionTests {
         lines.contains { $0.uppercased().hasPrefix("AUTH") || $0.uppercased().hasPrefix("MAIL FROM") }
     }
 
+    /// The text the Outbox stores for a failed upgrade: `SMTPError.tlsFailed`'s
+    /// description around the pinned SwiftMail's reason.
+    private static func stored(_ reason: String) -> String {
+        "SMTP TLS failed: STARTTLS upgrade failed: " + reason
+    }
+
+    /// The first byte of a TLS handshake record (content type 22).
+    private static let tlsHandshakeRecordType: UInt8 = 0x16
+
+    /// After each accepted STARTTLS the client sent only TLS: its bytes begin
+    /// with a handshake record and carry no plain-text AUTH or MAIL FROM.
+    private static func expectOnlyTLSAfterUpgrade(_ smtp: FakeSMTPServer, connections: Int) {
+        let sessions = smtp.bytesAfterSTARTTLS()
+        #expect(sessions.count == connections, "\(sessions.count) upgraded connections")
+        for bytes in sessions {
+            #expect(bytes.first == tlsHandshakeRecordType, "\(Array(bytes.prefix(8)))")
+            let text = String(decoding: bytes, as: UTF8.self).uppercased()
+            #expect(!text.contains("AUTH") && !text.contains("MAIL FROM"), "plain-text command after STARTTLS")
+        }
+    }
+
     // MARK: - Failures that can never clear take the strikes
 
     @Test("A queued send to a STARTTLS server below TLS 1.2: one strike per drain, Failed with the TLS-floor sentence on the third, never sent")
@@ -49,6 +70,7 @@ extension MailTransportEncryptionTests {
         let lines = smtp.receivedLines()
         #expect(Self.askedForSTARTTLS(lines) == 3, "\(lines)")
         #expect(!Self.signedInOrSent(lines), "\(lines)")
+        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 3)
     }
 
     /// Stands in for a certificate that does not verify, which needs a real
@@ -64,10 +86,11 @@ extension MailTransportEncryptionTests {
 
         #expect(states == ["\(Self.queued) 1", "\(Self.queued) 2", "\(Self.failed) 3"], "\(states)")
         let message = try #require(last?.errorMessage)
-        #expect(message.contains("STARTTLS upgrade failed: handshakeFailed("), "\(message)")
-        #expect(message != IMAPTransportSecurityError.tlsFloorNotMet(host: "127.0.0.1").description)
+        #expect(message.hasPrefix(Self.stored("handshakeFailed(")), "\(message)")
+        #expect(message.contains("WRONG_VERSION_NUMBER"), "\(message)")
         #expect(last?.sentAt == nil)
         #expect(!Self.signedInOrSent(smtp.receivedLines()))
+        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 3)
     }
 
     @Test("A server that hangs up during the STARTTLS handshake costs the send a strike, as on port 465")
@@ -76,10 +99,14 @@ extension MailTransportEncryptionTests {
         try smtp.start()
         defer { smtp.stop() }
 
-        let (states, _) = try await Self.drainSend(smtpPort: smtp.port, drains: 1)
+        let (states, last) = try await Self.drainSend(smtpPort: smtp.port, drains: 1)
 
         #expect(states == ["\(Self.queued) 1"], "\(states)")
+        let message = try #require(last?.errorMessage)
+        #expect(message.hasPrefix(Self.stored("handshakeFailed(")), "\(message)")
+        #expect(message.contains("EOF during handshake"), "\(message)")
         #expect(Self.askedForSTARTTLS(smtp.receivedLines()) == 1)
+        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 1)
     }
 
     // MARK: - Failures that can clear stay queued with no strike
@@ -93,7 +120,7 @@ extension MailTransportEncryptionTests {
         let (states, last) = try await Self.drainSend(smtpPort: smtp.port, drains: 2)
 
         #expect(states == ["\(Self.queued) 0", "\(Self.queued) 0"], "\(states)")
-        #expect(last?.errorMessage?.contains(Self.temporaryRefusal) == true,
+        #expect(last?.errorMessage == Self.stored("SMTP TLS failed: STARTTLS failed: " + Self.temporaryRefusal),
                 "\(String(describing: last?.errorMessage))")
         #expect(Self.askedForSTARTTLS(smtp.receivedLines()) == 2)
     }
@@ -116,7 +143,8 @@ extension MailTransportEncryptionTests {
         }
 
         #expect(states == ["\(Self.queued) 0"], "\(states)")
-        #expect(last?.errorMessage?.contains("STARTTLS timeout") == true, "\(String(describing: last?.errorMessage))")
+        #expect(last?.errorMessage == Self.stored("SMTP connection failed: STARTTLS timeout"),
+                "\(String(describing: last?.errorMessage))")
     }
 
     // MARK: - EHLO keywords in any case
@@ -141,6 +169,7 @@ extension MailTransportEncryptionTests {
         let lines = smtp.receivedLines()
         #expect(Self.askedForSTARTTLS(lines) == 1, "\(lines)")
         #expect(!Self.signedInOrSent(lines), "\(lines)")
+        Self.expectOnlyTLSAfterUpgrade(smtp, connections: 1)
     }
 
     // MARK: - The classifier on SwiftMail's exact wording
@@ -148,8 +177,8 @@ extension MailTransportEncryptionTests {
     /// The EHLO timeout after a completed upgrade needs a real handshake, which
     /// no loopback fake gives without a certificate, so its text is written out
     /// here. SwiftMail's `SMTPStartTLSFailureTests` pins this exact text, and the
-    /// 454 and STARTTLS-timeout cases above run the same wrapping through the
-    /// pinned library.
+    /// 454 and STARTTLS-timeout cases above check the same wrapping, word for
+    /// word, through the pinned library.
     @Test("A failed STARTTLS upgrade is transient only when SwiftMail's own SMTP error or a connection problem ended it")
     func startTLSUpgradeFailureClassification() {
         let transient = [

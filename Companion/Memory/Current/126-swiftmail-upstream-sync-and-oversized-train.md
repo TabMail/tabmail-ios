@@ -552,17 +552,21 @@ serializer that writes recipients:
 
 ## 2026-11-28 — a failed SMTP STARTTLS upgrade keeps its cause
 
-- One fork commit on branch `fix/smtp-starttls-error-detail` ("Report the TLS error when a STARTTLS upgrade
-  fails", `e4f5f9f0`), on fork `main` `64b294d`. It lands on fork `main` after review, and the same change,
-  rebased on `upstream/main`, becomes an upstream PR. Upstream had moved past the pin (#339, #341, #344); that
+- Fork branch `fix/smtp-starttls-error-detail` on fork `main` `64b294d`: "Report the TLS error when a STARTTLS
+  upgrade fails" (`e4f5f9f0`) and the review follow-up "Record only handshake errors and keep EHLO parameters
+  as sent" (`fbfcddf0`, the pin). It lands on fork `main` after review, and the same change, rebased on
+  `upstream/main`, becomes an upstream PR. Upstream had moved past the pin (#339, #341, #344); that
   resync is separate work and needs its own collision check.
 - Cause, measured: after STARTTLS the client sent its EHLO without waiting for the handshake. A failed
   handshake reached the app only as the closed channel under that EHLO (`Command failed: … ChannelError error
   5`), so a below-TLS-1.2 server and a bad certificate read the same and stayed queued as transient
-  `.tlsFailed`. `TLSHandshakeErrorRecorder`, installed right after the TLS handler, keeps the first error the
-  channel reports, and the failed upgrade reports it. No wait, timeout or reordering is added.
-- Also: errors are kept as themselves in `Command failed: …` and in the channel error log, and EHLO keywords are
-  read in any case. The transport-mode helpers moved unchanged to `SMTPServer+TransportMode.swift` to keep the
+  `.tlsFailed`. `TLSHandshakeErrorRecorder`, added before the TLS handler (whose `handlerAdded` starts the
+  handshake at once) and so sitting right after it, keeps the first error the channel reports until
+  `TLSUserEvent.handshakeCompleted`, and the failed upgrade reports it. After the handshake nothing is recorded,
+  so a server's own reply (a 421 followed by a close without a TLS close notification) stays the result. No
+  wait, timeout or reordering is added.
+- Also: errors are kept as themselves in `Command failed: …` and in the channel error log, and EHLO keywords and
+  SASL mechanism names are read in any case (other EHLO parameters keep the server's spelling). The transport-mode helpers moved unchanged to `SMTPServer+TransportMode.swift` to keep the
   file under the length limit.
 - App side: re-pinned in `project.yml` and the root `Package.resolved`. `AccountManager.isTransientSTARTTLSFailure`
   relies on two pieces of library wording, the reason prefix `STARTTLS upgrade failed: ` and the "SMTP " that

@@ -52,6 +52,7 @@ final class FakeSMTPServer: @unchecked Sendable {
     private var acceptSource: DispatchSourceRead?
     private var clientFds: [Int32] = []
     private var lines: [String] = []
+    private var upgradeBytes: [[UInt8]] = []
     private let queue = DispatchQueue(label: "FakeSMTPServer")
 
     /// Every line received, in order, without its CRLF.
@@ -59,6 +60,14 @@ final class FakeSMTPServer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return lines
+    }
+
+    /// For each connection whose STARTTLS was accepted, every byte the client
+    /// sent after the STARTTLS line, including bytes it sent before the 220.
+    func bytesAfterSTARTTLS() -> [[UInt8]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return upgradeBytes
     }
 
     func start() throws {
@@ -145,7 +154,7 @@ final class FakeSMTPServer: @unchecked Sendable {
                 let offer = startTLSAnswer == nil ? "" : "250-\(startTLSKeyword)\r\n"
                 reply(fd, "250-smtp.example.com\r\n\(offer)250-AUTH PLAIN\r\n250 8BITMIME\r\n")
             case "STARTTLS" where startTLSAnswer != nil:
-                if !answerStartTLS(fd) { return }
+                if !answerStartTLS(fd, pending: buffer) { return }
             case "AUTH": reply(fd, "235 2.7.0 Accepted\r\n")
             case "DATA":
                 inData = true
@@ -158,8 +167,9 @@ final class FakeSMTPServer: @unchecked Sendable {
         }
     }
 
-    /// Answers STARTTLS; false when the connection is over.
-    private func answerStartTLS(_ fd: Int32) -> Bool {
+    /// Answers STARTTLS; false when the connection is over. `pending` is what
+    /// the client sent after the STARTTLS line and was already read.
+    private func answerStartTLS(_ fd: Int32, pending: Data) -> Bool {
         switch startTLSAnswer {
         case .refuse(let line)?:
             reply(fd, line + "\r\n")
@@ -168,15 +178,27 @@ final class FakeSMTPServer: @unchecked Sendable {
             return true
         case .acceptThenAnswerHandshake(let bytes)?:
             reply(fd, "220 2.0.0 Ready to start TLS\r\n")
+            var received = [UInt8](pending)
             var chunk = [UInt8](repeating: 0, count: 4096)
+            defer {
+                lock.lock()
+                upgradeBytes.append(received)
+                lock.unlock()
+            }
             // The client's first TLS bytes, then the scripted answer.
-            guard recv(fd, &chunk, chunk.count, 0) > 0 else { return false }
+            let count = recv(fd, &chunk, chunk.count, 0)
+            guard count > 0 else { return false }
+            received += chunk[0..<count]
             _ = bytes.withUnsafeBytes { send(fd, $0.baseAddress, $0.count, 0) }
             // Half-close and wait for the client to hang up, so unread client
             // bytes never turn the close into a reset that could discard the
             // answer before the client reads it.
             _ = shutdown(fd, SHUT_WR)
-            while recv(fd, &chunk, chunk.count, 0) > 0 {}
+            while true {
+                let more = recv(fd, &chunk, chunk.count, 0)
+                guard more > 0 else { break }
+                received += chunk[0..<more]
+            }
             return false
         case nil:
             return true

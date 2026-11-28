@@ -1569,6 +1569,8 @@ SwiftMail reports the TLS layer's own error for a failed handshake (`SMTPServer.
 below-floor server takes one strike per drain and is Failed on the third with the TLS-floor sentence, and any
 other failed handshake (the stand-in for a certificate that does not verify) or a hang-up takes the strikes as
 on port 465; a 454 refusal and an unanswered STARTTLS stay queued with no strike. A server that offers
-`starttls` in lower case is asked for STARTTLS. `startTLSUpgradeFailureClassification` pins
+`starttls` in lower case is asked for STARTTLS. The stored error text is checked word for word, and
+`FakeSMTPServer.bytesAfterSTARTTLS` shows that after every accepted STARTTLS the client sent only a TLS
+handshake record, never a plain-text AUTH or MAIL FROM. `startTLSUpgradeFailureClassification` pins
 `AccountManager.isTransientSendError` on SwiftMail's exact wording, including the EHLO timeout after a completed
 upgrade, which no loopback fake can reach without a certificate.
