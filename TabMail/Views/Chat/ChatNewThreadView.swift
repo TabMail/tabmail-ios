@@ -229,10 +229,10 @@ struct ChatNewThreadView: View {
         .safeAreaBar(edge: .bottom, spacing: 0) { bottomBar }
         // The user's addresses are captured as the body runs, so the body depends on them and runs
         // again when `loadOwnAddresses` fills them in. Read only inside the sheet's closure, they
-        // were not a dependency: the sheet opened with the value from before that read, empty, and
-        // added the user's own address.
+        // were not a dependency: the sheet opened with the value from before that read, empty, so
+        // its Recent section would list the user's own address.
         .sheet(isPresented: $showsAddRecipient) { [ownAddresses] in
-            ChatReplyToSheet(replyPeople: model.people, target: .replyAll, ownAddresses: ownAddresses,
+            ChatReplyToSheet(replyPeople: model.people, target: .replyAll,
                              title: ChatReplyToSheet.addRecipientTitle,
                              recentPeople: { await ChatRecentPeople.load(pool: AppDatabase.rawPool, ownAddresses: ownAddresses,
                                                                            demoActive: DemoModeStore.isDemoActive) }) { done in
@@ -632,8 +632,8 @@ struct ChatNewThreadView: View {
         }
     }
 
-    /// The user's own addresses, which "Add recipient" does not add, and the accounts a card may
-    /// open from.
+    /// The user's own addresses, which "Add recipient"'s Recent section leaves out, and the accounts
+    /// a card may open from.
     private func loadOwnAddresses() async {
         do {
             let accounts = try await AppDatabase.dbPool.read { db in try Account.fetchAll(db) }

@@ -97,7 +97,7 @@ struct ChatRecentPeopleTests {
         #expect(choice.unlisted([maria, sam, jordan]) == [sam, jordan], "Maria is picked already")
         choice.toggle(maria)
         #expect(choice.unlisted([maria, sam]) == [sam], "an unticked person is still in the list")
-        let added = choice.add(sam.address, name: sam.name, ownAddresses: Self.own)
+        let added = choice.add(sam.address, name: sam.name)
         #expect(added)
         #expect(choice.isTicked(sam), "added ticked, as a search result")
         #expect(choice.people.last == sam, "under the name the Recent row shows")
@@ -317,7 +317,7 @@ struct ChatRecentPeopleHostedTests {
 
     private func hostedRecentTapBody() async throws {
         let window = try Self.host(ChatReplyToSheet(
-            replyPeople: [Self.maria], target: .replyAll, ownAddresses: ChatRecentPeopleTests.own,
+            replyPeople: [Self.maria], target: .replyAll,
             title: ChatReplyToSheet.addRecipientTitle,
             recentPeople: { [Self.maria, Self.sam, Self.jordan] }) { _ in })
         defer { window.isHidden = true }
@@ -354,7 +354,7 @@ struct ChatRecentPeopleHostedTests {
     private func hostedRecentPickClearsSearchBody() async throws {
         let done = DoneRecorder()
         let window = try Self.host(ChatReplyToSheet(
-            replyPeople: [Self.maria], target: .replyAll, ownAddresses: ChatRecentPeopleTests.own,
+            replyPeople: [Self.maria], target: .replyAll,
             title: ChatReplyToSheet.addRecipientTitle,
             recentPeople: { [Self.sam] }) { done.targets.append($0) })
         defer { window.isHidden = true }
@@ -385,7 +385,7 @@ struct ChatRecentPeopleHostedTests {
     private func hostedCancelAfterRecentBody() async throws {
         let done = DoneRecorder()
         let window = try Self.host(ChatReplyToSheet(
-            replyPeople: [Self.maria], target: .replyAll, ownAddresses: ChatRecentPeopleTests.own,
+            replyPeople: [Self.maria], target: .replyAll,
             title: ChatReplyToSheet.addRecipientTitle,
             recentPeople: { [Self.sam] }) { done.targets.append($0) })
         defer { window.isHidden = true }
@@ -410,7 +410,7 @@ struct ChatRecentPeopleHostedTests {
         for recent in [[Self.maria], []] {
             let read = DoneRecorder()
             let window = try Self.host(ChatReplyToSheet(
-                replyPeople: [Self.maria], target: .replyAll, ownAddresses: ChatRecentPeopleTests.own,
+                replyPeople: [Self.maria], target: .replyAll,
                 title: ChatReplyToSheet.addRecipientTitle,
                 recentPeople: { read.reads += 1; return recent }) { _ in })
             defer { window.isHidden = true }
@@ -433,7 +433,7 @@ struct ChatRecentPeopleHostedTests {
 
     private func hostedNoRecentBody() async throws {
         let window = try Self.host(ChatReplyToSheet(
-            replyPeople: [Self.maria], target: .replyAll, ownAddresses: ChatRecentPeopleTests.own) { _ in })
+            replyPeople: [Self.maria], target: .replyAll) { _ in })
         defer { window.isHidden = true }
         // Once the list's row is drawn, a Recent section would be drawn too.
         _ = await Self.waitUntil { !Self.elements(ChatReplyToSheet.personId, in: window).isEmpty }
@@ -442,7 +442,223 @@ struct ChatRecentPeopleHostedTests {
         #expect(!HostedAccessibility.labels(in: window).contains(ChatReplyToSheet.recentTitle))
     }
 
+    /// The sheet as a new email's chat opens it (nobody picked yet) and as an email's chat opens it.
+    enum Mode: String, CaseIterable, CustomTestStringConvertible, Sendable {
+        case addRecipient, replyTo
+        var testDescription: String { rawValue }
+    }
+
+    /// One of the user's own addresses, typed: a note to self.
+    private static let typedOwn = "me@example.com"
+
+    @Test("Done takes a typed address, one of the user's own too, with nobody ticked before it",
+          arguments: Mode.allCases)
+    func hostedDoneTakesTyped(mode: Mode) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hostedDoneTakesTypedBody(mode: mode) }
+    }
+
+    private func hostedDoneTakesTypedBody(mode: Mode) async throws {
+        let done = DoneRecorder()
+        let thread = mode == .addRecipient ? [] : [Self.maria]
+        let title = mode == .addRecipient ? ChatReplyToSheet.addRecipientTitle : ChatReplyToSheet.replyToTitle
+        let window = try Self.host(ChatReplyToSheet(replyPeople: thread, target: .replyAll, title: title) {
+            done.targets.append($0)
+        })
+        defer { window.isHidden = true }
+        _ = await Self.waitUntil { Self.textField(in: window) != nil }
+        #expect(ThreadChatTests.type(Self.typedOwn, in: window), "the search takes typed text")
+        try? await Task.sleep(for: .milliseconds(100))
+
+        let doneElement = HostedAccessibility.elements(under: window).first { $0.accessibilityLabel == "Done" }
+        let doneButton = try #require(doneElement, "the sheet has Done")
+        #expect(doneButton.accessibilityActivate(), "Done takes a tap")
+        _ = await Self.waitUntil { !done.targets.isEmpty }
+        #expect(done.targets.count == 1, "Done gives the typed address back")
+        guard done.targets.count == 1 else { return }
+        let picked = done.targets[0].only?.map(\.address)
+        let expected = thread.map(\.address) + [Self.typedOwn]
+        #expect(picked == expected)
+    }
+
+    @Test("Return adds a typed address, one of the user's own too, ticked, and clears the search; Done then gives it back alone")
+    func hostedReturnAddsTyped() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hostedReturnAddsTypedBody() }
+    }
+
+    private func hostedReturnAddsTypedBody() async throws {
+        let done = DoneRecorder()
+        let window = try Self.host(ChatReplyToSheet(replyPeople: [], target: .replyAll,
+                                                    title: ChatReplyToSheet.addRecipientTitle) { done.targets.append($0) })
+        defer { window.isHidden = true }
+        try await Self.typeAndReturn(Self.typedOwn, in: window)
+
+        let rows = Self.elements(ChatReplyToSheet.personId, in: window)
+        let ownRow = rows.first { ($0.accessibilityLabel ?? "").contains(Self.typedOwn) }
+        let ticked = ownRow.map { $0.accessibilityTraits.contains(.selected) }
+        let query = Self.textField(in: window)?.text ?? ""
+        #expect(rows.count == 1, "\(rows.map { $0.accessibilityLabel ?? "" })")
+        #expect(ticked == true, "the typed address is in the list, ticked")
+        #expect(query.isEmpty, "Return cleared the search")
+        #expect(done.targets.isEmpty, "Return adds; it is not Done")
+
+        let doneElement = HostedAccessibility.elements(under: window).first { $0.accessibilityLabel == "Done" }
+        let doneButton = try #require(doneElement, "the sheet has Done")
+        #expect(doneButton.accessibilityActivate(), "Done takes a tap")
+        _ = await Self.waitUntil { !done.targets.isEmpty }
+        #expect(done.targets.count == 1)
+        guard done.targets.count == 1 else { return }
+        let picked = ChatNewDraft.people(after: done.targets[0], current: []).map(\.address)
+        #expect(picked == [Self.typedOwn], "the new email goes to the typed address alone")
+    }
+
+    @Test("In Reply to, with the thread's people unticked, a typed address alone is the answer, by Return then Done or by Done",
+          arguments: [false, true])
+    func hostedReplyToTypedReplacesThePeople(viaReturn: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hostedReplyToTypedReplacesThePeopleBody(viaReturn: viaReturn) }
+    }
+
+    private func hostedReplyToTypedReplacesThePeopleBody(viaReturn: Bool) async throws {
+        let done = DoneRecorder()
+        let window = try Self.host(ChatReplyToSheet(replyPeople: [Self.maria], target: .replyAll) { done.targets.append($0) })
+        defer { window.isHidden = true }
+        _ = await Self.waitUntil { !Self.elements(ChatReplyToSheet.personId, in: window).isEmpty }
+        let mariaRow = try #require(Self.elements(ChatReplyToSheet.personId, in: window).first, "the sheet lists Maria")
+        #expect(mariaRow.accessibilityActivate(), "Maria's row takes a tap")
+        _ = await Self.waitUntil {
+            Self.elements(ChatReplyToSheet.personId, in: window).first.map { !$0.accessibilityTraits.contains(.selected) } == true
+        }
+        let unticked = Self.elements(ChatReplyToSheet.personId, in: window).first.map { !$0.accessibilityTraits.contains(.selected) }
+        #expect(unticked == true, "control: Maria is unticked")
+
+        if viaReturn {
+            try await Self.typeAndReturn(Self.typedOwn, in: window)
+            let ownRow = Self.elements(ChatReplyToSheet.personId, in: window).first { ($0.accessibilityLabel ?? "").contains(Self.typedOwn) }
+            let ownTicked = ownRow.map { $0.accessibilityTraits.contains(.selected) }
+            let query = Self.textField(in: window)?.text ?? ""
+            #expect(ownTicked == true, "Return added the typed address, ticked")
+            #expect(query.isEmpty, "Return cleared the search")
+            #expect(done.targets.isEmpty, "Return adds; it is not Done")
+        } else {
+            _ = await Self.waitUntil { Self.textField(in: window) != nil }
+            #expect(ThreadChatTests.type(Self.typedOwn, in: window), "the search takes typed text")
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+
+        let doneButton = try #require(Self.doneButton(in: window), "the sheet has Done")
+        #expect(doneButton.accessibilityActivate(), "Done takes a tap")
+        _ = await Self.waitUntil { !done.targets.isEmpty }
+        #expect(done.targets.count == 1)
+        guard done.targets.count == 1 else { return }
+        let picked = done.targets[0].only?.map(\.address)
+        #expect(picked == [Self.typedOwn], "the typed address alone, none of the thread's people")
+    }
+
+    @Test("Text that names no address is kept to correct and adds nobody, Done then gives nothing back, and Done is off with nothing typed or ticked")
+    func hostedInvalidTypedIsKept() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hostedInvalidTypedIsKeptBody() }
+    }
+
+    private func hostedInvalidTypedIsKeptBody() async throws {
+        let done = DoneRecorder()
+        let window = try Self.host(ChatReplyToSheet(replyPeople: [], target: .replyAll,
+                                                    title: ChatReplyToSheet.addRecipientTitle) { done.targets.append($0) })
+        defer { window.isHidden = true }
+        _ = await Self.waitUntil { Self.textField(in: window) != nil && Self.doneButton(in: window) != nil }
+        let field = try #require(Self.textField(in: window), "the sheet has the search field")
+        let blankDone = try #require(Self.doneButton(in: window), "the sheet has Done")
+        let offWhenBlank = blankDone.accessibilityTraits.contains(.notEnabled)
+        #expect(offWhenBlank, "with nothing typed and nobody ticked, Done is off")
+
+        let invalid = "not an address"
+        #expect(ThreadChatTests.type(invalid, in: window), "the search takes typed text")
+        try? await Task.sleep(for: .milliseconds(100))
+        await Self.pressReturn(in: field)
+        try? await Task.sleep(for: .milliseconds(200))
+        let afterReturn = field.text ?? ""
+        let rowsAfterReturn = Self.elements(ChatReplyToSheet.personId, in: window).count
+        #expect(afterReturn == invalid, "Return keeps the text to correct")
+        #expect(rowsAfterReturn == 0, "Return adds nobody")
+
+        let typedDone = try #require(Self.doneButton(in: window), "the sheet has Done")
+        _ = typedDone.accessibilityActivate()
+        try? await Task.sleep(for: .milliseconds(200))
+        let afterDone = field.text ?? ""
+        #expect(done.targets.isEmpty, "Done gives nothing back")
+        #expect(afterDone == invalid, "Done keeps the text to correct")
+
+        // Control: an address in the same field completes.
+        #expect(ThreadChatTests.type("sam@example.com", in: window), "the search takes typed text")
+        try? await Task.sleep(for: .milliseconds(100))
+        let validDone = try #require(Self.doneButton(in: window), "the sheet has Done")
+        #expect(validDone.accessibilityActivate(), "Done takes a tap")
+        _ = await Self.waitUntil { !done.targets.isEmpty }
+        let picked = done.targets.first?.only?.map(\.address)
+        #expect(picked == ["sam@example.com"], "control: a typed address completes")
+    }
+
+    @Test("Cancel after Return adds a typed address gives nothing back")
+    func hostedCancelAfterTyped() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hostedCancelAfterTypedBody() }
+    }
+
+    private func hostedCancelAfterTypedBody() async throws {
+        let done = DoneRecorder()
+        let window = try Self.host(ChatReplyToSheet(replyPeople: [], target: .replyAll,
+                                                    title: ChatReplyToSheet.addRecipientTitle) { done.targets.append($0) })
+        defer { window.isHidden = true }
+        try await Self.typeAndReturn(Self.typedOwn, in: window)
+        let added = Self.elements(ChatReplyToSheet.personId, in: window).count
+        #expect(added == 1, "control: Return added the typed address")
+
+        let cancelElement = HostedAccessibility.elements(under: window).first { $0.accessibilityLabel == "Cancel" }
+        let cancelButton = try #require(cancelElement, "the sheet has Cancel")
+        #expect(cancelButton.accessibilityActivate(), "Cancel takes a tap")
+        try? await Task.sleep(for: .milliseconds(200))
+        #expect(done.targets.isEmpty, "Cancel leaves the picked people as they were")
+    }
+
     // MARK: - Helpers
+
+    /// The sheet's Done button.
+    private static func doneButton(in window: UIWindow) -> NSObject? {
+        HostedAccessibility.elements(under: window).first { $0.accessibilityLabel == "Done" }
+    }
+
+    /// The sheet's search field, as UIKit draws it.
+    private static func textField(in view: UIView) -> UITextField? {
+        if let field = view as? UITextField { return field }
+        for subview in view.subviews {
+            if let field = textField(in: subview) { return field }
+        }
+        return nil
+    }
+
+    /// Types `text` into the search field and presses Return, then waits for a row to be added.
+    private static func typeAndReturn(_ text: String, in window: UIWindow) async throws {
+        _ = await waitUntil { textField(in: window) != nil }
+        let field = try #require(textField(in: window), "the sheet has the search field")
+        #expect(ThreadChatTests.type(text, in: window), "the search takes typed text")
+        try? await Task.sleep(for: .milliseconds(100))
+        await pressReturn(in: field)
+        _ = await waitUntil { !elements(ChatReplyToSheet.personId, in: window).isEmpty && (field.text ?? "").isEmpty }
+    }
+
+    /// Presses Return in `field` as the keyboard does: in the focused field, UIKit asks the field's
+    /// delegate and then sends the end-on-exit action. Asking the delegate of an unfocused field
+    /// did not reach the sheet's `.onSubmit` in the test host.
+    private static func pressReturn(in field: UITextField) async {
+        field.becomeFirstResponder()
+        _ = await waitUntil { field.isFirstResponder }
+        #expect(field.isFirstResponder, "control: the search field is focused")
+        if field.delegate?.textFieldShouldReturn?(field) ?? true {
+            field.sendActions(for: .editingDidEndOnExit)
+        }
+    }
 
     /// What the sheet gave back through Done, and how many times it read its recent people.
     @MainActor

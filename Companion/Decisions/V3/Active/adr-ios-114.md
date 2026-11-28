@@ -1008,6 +1008,16 @@ same AI result, kept as long as the email itself is shown.
    (`MessageHeader.accountId`), so the reply from B goes to A, then B; a Sent copy, held by the
    account it came from, is unchanged. Test: `ChatThreadTests.receivedOwnCopyAnswersItsSender`
    (header == envelope; the Sent copy unchanged).
+   *Amended 2026-11-28 (adding the user's own address):* "never the user" above is withdrawn. In
+   Reply to, and in a new email's Add recipient (below), an address of the user's that they type or
+   pick is added and ticked like anyone's (`ChatReplyToChoice.add(_:name:)`), so a note to self can
+   be started and a reply can copy one of their own accounts; the sheet refused it silently before
+   (Return and Done did nothing), which a simulator smoke test of 2026-11-28 found. This is an explicit
+   add, so the own-only rule above does not touch it: that rule drops only own addresses that came
+   from the email's Reply All when a change adds someone else, and people chosen in Reply to stay as
+   chosen. Recent still lists only other people (`ChatRecentPeople`). Tests:
+   `ChatNewThreadTests.addRecipientAddsOwnAddress`, `ChatReplyFieldTests.replyToChoice`,
+   `ChatNewThreadScreenTests.pickedPeople` (typed into the real sheet).
    **Product choices of who gets the reply, decided 2026-11-08:** an email that only adds someone new is
    not "only" (the new person joins the chat's people), and an email is never "only" for someone who
    joined after it; a new newest email resets the choice to Reply All; with recipients chosen the
@@ -2198,7 +2208,9 @@ by `ChatSwipeTests.bubbleSwipeWiring` and `ChatReplyFieldTests.recipientsWiring`
      contact search and typed address; Done needs someone ticked (`ChatReplyToChoice.canFinish`), and
      its result replaces the picked people (`ChatNewDraft.people(after:current:)`). The user's own
      addresses (every account's address, read as the chat opens) are never added
-     (`ChatReplyToChoice.add(_:name:ownAddresses:)`), as in the "Reply to" sheet. Cancel closes the
+     (`ChatReplyToChoice.add(_:name:ownAddresses:)`), as in the "Reply to" sheet. **Amended
+     2026-11-28:** they are added when typed or picked, as anyone is (decision 11's amendment of that
+     date; `ChatReplyToChoice.add(_:name:)`). Cancel closes the
      sheet and leaves the picked people as they were. No "Recent" section: a recent-people source is
      separate work. **Amended 2026-11-22 (ios#1177):** the sheet now has it.
    - *Recent people.* Below "Add someone", a "Recent" section lists the people the user recently
