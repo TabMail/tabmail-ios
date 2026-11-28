@@ -2393,18 +2393,13 @@ struct ComposeView: View {
     // MARK: - Inline Edit
 
     /// The email this compose's AI work answers (the inline editor, Recompute and the stores of their
-    /// answers): the one its Send threads against (`ComposeDraftGuards.sendReplyTarget`), so the AI
-    /// and the Send never work on two different emails. A saved draft's row wins: the email it
-    /// resolved to at open (`Draft.resolveReplyQuote`), also when compose reopens it with no caller
-    /// email (Undo Send). Without a row, the email compose was opened for. `.blocked`: the row names
-    /// an email that no longer resolves, so its Send is blocked and every AI request is refused.
-    private var aiReplyTarget: ComposeDraftGuards.SendReplyTarget {
-        ComposeDraftGuards.sendReplyTarget(composeParameter: replyTo, persistedRowClaim: persistedReplyTargetClaim)
-    }
-
-    /// `aiReplyTarget`'s email. Nil: a new message, or a draft whose email no longer resolves.
+    /// answers): `sendReplyTarget`'s, the one its Send threads against, so the AI and the Send never
+    /// work on two different emails. A saved draft's row wins: the email it resolved to at open
+    /// (`Draft.resolveReplyQuote`), also when compose reopens it with no caller email (Undo Send).
+    /// Without a row, the email compose was opened for. Nil: a new message, or a draft whose email no
+    /// longer resolves (`.blocked`: its Send is blocked and every AI request is refused).
     private var aiReplyEmail: MessageHeader? {
-        if case .send(let email) = aiReplyTarget { return email }
+        if case .send(let email) = sendReplyTarget { return email }
         return nil
     }
 
@@ -2420,12 +2415,12 @@ struct ComposeView: View {
     }
 
     /// A compose edit request's context, read after the request is admitted: the email replied to
-    /// or forwarded (`aiReplyTarget`, taken once) with its body, through the one identity-checked
+    /// or forwarded (`sendReplyTarget`, taken once) with its body, through the one identity-checked
     /// read (`ComposeEditContext.relatedBodyText`); that same email is the one the context names.
     /// Nil refuses the request: the draft's email no longer resolves, another email is seated at
     /// its address, or the read failed, so no other email's body is ever sent with this draft.
     private func composeEditContextForRequest() async -> ComposeEditContext? {
-        guard case .send(let related) = aiReplyTarget else {
+        guard case .send(let related) = sendReplyTarget else {
             BackgroundSyncLogger.logDebug("[ComposeView] compose edit refused: the draft's email no longer resolves")
             return nil
         }

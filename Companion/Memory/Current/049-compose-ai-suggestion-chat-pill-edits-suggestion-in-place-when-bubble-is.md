@@ -48,8 +48,8 @@
 >
 > **Chat-view amendment (2026-11-28, the chat view's sync with main):** the chat view keeps the same
 > promise with its one identity check (`AIWriteTarget.stillHolds`) instead of `confirmedReply`. One
-> email serves every AI step after open, `ComposeView.aiReplyTarget`, the Send's own disposition
-> (`ComposeDraftGuards.sendReplyTarget`): a saved draft's resolved row wins over the compose argument (as
+> email serves every AI step after open: the Send's own target (`ComposeView.sendReplyTarget`, which
+> asks `ComposeDraftGuards.sendReplyTarget`), with no second copy of the selection: a saved draft's resolved row wins over the compose argument (as
 > `confirmedReply` does on main); a row whose email no longer resolves (`.blocked`) refuses the inline
 > edit and Recompute, as it blocks Send. The editor, Recompute (`ComposeView.recomputedReply`, stored
 > through `writeCachedReplyToDB`) and the inline edit's store all take that email, and a request's

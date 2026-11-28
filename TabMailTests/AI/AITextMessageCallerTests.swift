@@ -24,6 +24,9 @@ import Synchronization
 ///     message, and asks the model nothing.
 ///
 /// `.processGlobalState`: the AI opt-out flag and `AppDatabase.shared` are process-wide.
+/// The providers whose numbering can be reset under an email (main's `epochProviders`).
+private let recomputeEpochProviders: [AccountProvider] = [.imap, .icloud]
+
 @Suite("AI text messages through their producers", .serialized, .processGlobalState)
 struct AITextMessageCallerTests {
 
@@ -138,9 +141,9 @@ struct AITextMessageCallerTests {
         /// `summarized`: the email already has its summary and action, so opening it asks only
         /// for the reply.
         init(fromAddress: String = "sender@example.com", replyTextMessage: String? = nil, summarized: Bool = false,
-             messageId: String = "1") throws {
+             messageId: String = "1", provider: AccountProvider = .imap) throws {
             (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
-            account = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: .imap, pool: pool)
+            account = try FolderEpochTestFixture.makeAccount(id: "acc1", provider: provider, pool: pool)
             try FolderEpochTestFixture.insertFolder(accountId: "acc1", path: "INBOX", role: .inbox, pool: pool)
             var header = MessageHeader(
                 messageId: messageId, subject: "Plans", from: "Sender", fromAddress: fromAddress,
@@ -970,18 +973,33 @@ struct AITextMessageCallerTests {
 
     /// THE SYSTEM PROPERTY (main's `recomputeDoesNotStoreOnAReplacementSeatedDuringTheModelCall`):
     /// another email seated at the address while the model writes keeps its own suggestion, and the
-    /// card, whose stored suggestion is the email's own, shows nothing it could not store.
-    @Test("A different email seated at the address while the model runs keeps its own suggestion")
-    func composeRecomputeReplacedDuringTheModelCall() async throws {
+    /// card, whose stored suggestion is the email's own, shows nothing it could not store. The
+    /// original and the replacement hold the SAME stored suggestion, so the whole-value compare alone
+    /// would let the write through: only the identity check keeps the answer off the replacement.
+    @Test("A different email seated at the address while the model runs keeps its own suggestion",
+          arguments: recomputeEpochProviders)
+    func composeRecomputeReplacedDuringTheModelCall(provider: AccountProvider) async throws {
         try await withAIEnabled {
-            let fixture = try Fixture()
-            let original = fixture.header
+            let fixture = try Fixture(provider: provider)
+            let shared = ReplyResult(body: "The shared earlier reply", textMessage: "The shared earlier text")
+            let id = fixture.header.id
+            try await fixture.pool.write { db in
+                try db.execute(sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
+                               arguments: [shared.body, shared.textMessage, id])
+            }
+            let seeded = try fixture.row()
+            let original = try #require(seeded)
+            #expect(original.suggestion == shared)
+            var replacement = Self.successor(of: original)
+            replacement.cachedReply = shared.body
+            replacement.replyTextMessage = shared.textMessage
+            let seat = replacement
             let pool = fixture.pool
             let backend = Backend(duringReply: {
                 // A UIDVALIDITY reset purges the email and a resync seats another at its address.
                 try? pool.write { db in
                     _ = try MessageHeader.deleteOne(db, key: original.id)
-                    try Self.successor(of: original).insert(db)
+                    try seat.insert(db)
                 }
             })
             defer { backend.close(); fixture.close() }
@@ -996,16 +1014,34 @@ struct AITextMessageCallerTests {
             let fetched = try fixture.row()
             let row = try #require(fetched)
             #expect(row.rfc822MessageId == "different@example.com")
-            #expect(row.suggestion == ReplyResult(body: "The other email's reply", textMessage: "The other email's text"),
-                    "the answer was stored on another email")
+            #expect(row.suggestion == shared, "the answer was stored on another email")
+        }
+    }
 
-            // Non-vacuity: the replacement is writable, so the check, not a failed write, kept the
-            // answer off it.
+    /// The positive control for the test above: with no replacement, the same seeded email takes the
+    /// whole answer, so the refusal above is the identity check's and not a compare or write failure.
+    @Test("With no replacement, the same seeded email takes the answer", arguments: recomputeEpochProviders)
+    func composeRecomputeKeptEmailTakesTheAnswer(provider: AccountProvider) async throws {
+        try await withAIEnabled {
+            let fixture = try Fixture(provider: provider)
+            let id = fixture.header.id
             try await fixture.pool.write { db in
-                try db.execute(sql: "UPDATE messageHeader SET cachedReply = 'control' WHERE id = ?", arguments: [original.id])
+                try db.execute(sql: "UPDATE messageHeader SET cachedReply = ?, replyTextMessage = ? WHERE id = ?",
+                               arguments: ["The shared earlier reply", "The shared earlier text", id])
             }
-            let control = try fixture.row()
-            #expect(control?.cachedReply == "control")
+            let seeded = try fixture.row()
+            let original = try #require(seeded)
+            let backend = Backend()
+            defer { backend.close(); fixture.close() }
+
+            let suggestion = await ComposeView.recomputedReply(
+                for: original, account: fixture.account, kbText: "", compositionPrompt: "",
+                aiService: backend.service, dbPool: AppDatabase.dbPool)
+
+            #expect(suggestion?.body == Self.replyBody)
+            let fetched = try fixture.row()
+            let row = try #require(fetched)
+            #expect(row.suggestion == ReplyResult(body: Self.replyBody, textMessage: Self.replyText, changeCommand: Self.replyCommand))
         }
     }
 

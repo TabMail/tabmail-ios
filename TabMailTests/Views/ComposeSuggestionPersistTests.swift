@@ -226,9 +226,11 @@ struct ComposeSuggestionPersistTests {
                 "the card's own choice decides whether it may read the row's reply")
         // A chat card reads no stored suggestion (`offersStoredSuggestion`): it shows the chat's or none.
         let closure = try #require(prepopulate.range(of: "guard offersStoredSuggestion, let reply = replyTo else { return nil }"))
-        let stored = try #require(prepopulate.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
+        // The read itself (identity check, then the row at reply.id) is `storedSuggestionAtOpen`, pinned by
+        // `prefillReadsTheStoredSuggestionThroughTheIdentityCheck`.
+        let stored = try #require(prepopulate.range(of: "try Self.storedSuggestionAtOpen(for: reply, db: db)"))
         #expect(closure.lowerBound < stored.lowerBound,
-                "the closure reads the stored suggestion from the row at reply.id")
+                "the closure reads the stored suggestion of the email at reply")
     }
 
     @Test("Use Suggestion then Save writes the card's own draft with the suggestion; the saved reply draft is untouched")
@@ -974,9 +976,14 @@ struct ComposeSuggestionPersistTests {
     /// The stored suggestion a reply card opened without a given one shows: `prepopulate`'s
     /// `freshSuggestion` read, the production one (`ComposeView.storedSuggestionAtOpen`, which
     /// `prefillReadsTheStoredSuggestionThroughTheIdentityCheck` pins as `prepopulate`'s read).
-    private func storedSuggestionAtOpen(for held: MessageHeader, in db: DatabaseQueue) throws -> String? {
-        try db.read { db in try ComposeView.storedSuggestionAtOpen(for: held, db: db)?.body }
+    /// The WHOLE value (body, text version, change command), so a body-only read of the row fails.
+    private func storedSuggestionAtOpen(for held: MessageHeader, in db: DatabaseQueue) throws -> ReplyResult? {
+        try db.read { db in try ComposeView.storedSuggestionAtOpen(for: held, db: db) }
     }
+
+    /// A whole stored AI Suggestion, every field set.
+    private static let storedWhole = ReplyResult(
+        body: "updated since the caller captured it", textMessage: "Updated text", changeCommand: "Make it shorter.")
 
     /// The email at the shared address after a reset seated `replacement` there: present, holding its
     /// own suggestion.
@@ -1002,11 +1009,13 @@ struct ComposeSuggestionPersistTests {
         let db = try epochFixture(provider, folderEpoch: 111)
         let held = header(rfc822: "<x@example.com>", epoch: 111)
         var stored = held
-        stored.cachedReply = "updated since the caller captured it"
+        stored.cachedReply = Self.storedWhole.body
+        stored.replyTextMessage = Self.storedWhole.textMessage
+        stored.replyChangeCommand = Self.storedWhole.changeCommand
         let storedRow = stored
         try db.write { try storedRow.insert($0) }
         let updated = try storedSuggestionAtOpen(for: held, in: db)
-        #expect(updated == "updated since the caller captured it")
+        #expect(updated == Self.storedWhole, "the whole stored value, not just its body")
 
         // Cleared since the capture: the cleared answer stands.
         try db.write { db in
@@ -1051,10 +1060,34 @@ struct ComposeSuggestionPersistTests {
         let held = header(rfc822: "<x@example.com>", epoch: 111)
         let stored = try storedSuggestionAtOpen(for: held, in: db)
         #expect(stored == nil)
+        let given = ReplyResult(body: Self.earlier, textMessage: "Earlier text", changeCommand: "Earlier command")
         let shown = ComposeDraftGuards.suggestionToShow(
-            given: ReplyResult(body: Self.earlier, textMessage: nil), isReply: true, onlyToChosen: false,
-            freshSuggestion: { stored.map { ReplyResult(body: $0, textMessage: nil) } })
-        #expect(shown?.body == Self.earlier)
+            given: given, isReply: true, onlyToChosen: false, freshSuggestion: { stored })
+        #expect(shown == given)
+    }
+
+    /// The chat view's rule for a renumbered email (a difference from main, listed in the merge's PR):
+    /// a card that holds the OLD address shows nothing stored, since nothing proves the row there is
+    /// its email; a draft that resolves the email at its NEW address (`Draft.resolveReplyQuote`) holds
+    /// that row, and its card shows the whole stored suggestion.
+    @Test("After a renumbering, the old address shows nothing stored and the email at its new address shows its whole suggestion",
+          arguments: epochProviders)
+    func openingSuggestionAfterARenumberingTakesOnlyTheNewAddress(provider: AccountProvider) throws {
+        let db = try epochFixture(provider, folderEpoch: 222)
+        let held = header(rfc822: "<x@example.com>", epoch: 111)
+        var moved = header(rfc822: "<x@example.com>", epoch: 222, uid: "9001")
+        moved.cachedReply = Self.storedWhole.body
+        moved.replyTextMessage = Self.storedWhole.textMessage
+        moved.replyChangeCommand = Self.storedWhole.changeCommand
+        let movedRow = moved
+        try db.write { try movedRow.insert($0) }
+        #expect(movedRow.id != held.id, "setup: the email moved to another address")
+
+        let atOldAddress = try storedSuggestionAtOpen(for: held, in: db)
+        #expect(atOldAddress == nil, "a card holding the old address shows nothing stored")
+        let resolved = try row(db, movedRow.id)
+        let atNewAddress = try storedSuggestionAtOpen(for: resolved, in: db)
+        #expect(atNewAddress == Self.storedWhole, "the draft resolved to the new address shows the whole stored value")
     }
 
     // MARK: - What the inline editor is told
@@ -1084,10 +1117,16 @@ struct ComposeSuggestionPersistTests {
         #expect(ComposeDraftGuards.editorMode(related: resolved, isForward: false) == "edit_reply")
 
         let source = try composeSource()
+        // One selection serves Send and the AI: the AI's email is the Send's own target, never a
+        // second copy of the same rule.
+        let sendTarget = try functionBody(
+            "private var sendReplyTarget: ComposeDraftGuards.SendReplyTarget {", before: "private var replyTargetBlocksSend", in: source)
+        #expect(sendTarget.contains("ComposeDraftGuards.sendReplyTarget("))
+        #expect(sendTarget.contains("composeParameter: replyTo, persistedRowClaim: persistedReplyTargetClaim)"))
         let selection = try functionBody(
-            "private var aiReplyTarget: ComposeDraftGuards.SendReplyTarget {", before: "private func buildComposeEditContext(", in: source)
-        #expect(selection.contains(
-            "ComposeDraftGuards.sendReplyTarget(composeParameter: replyTo, persistedRowClaim: persistedReplyTargetClaim)"))
+            "private var aiReplyEmail: MessageHeader? {", before: "private func buildComposeEditContext(", in: source)
+        #expect(selection.contains("if case .send(let email) = sendReplyTarget { return email }"))
+        #expect(!source.contains("aiReplyTarget"), "a second target property would let the AI and Send split again")
         let edit = try functionBody("private func applyInlineEdit(", before: "struct SuggestionEdit {", in: source)
         let gate = try #require(edit.range(of: "let edit = Self.suggestionEdit("))
         let call = String(edit[gate.lowerBound...].prefix(400))
@@ -1097,8 +1136,20 @@ struct ComposeSuggestionPersistTests {
         let recompute = try functionBody("private func recomputeReply() {", before: "// MARK: - Agent Toast", in: source)
         #expect(recompute.contains("guard let reply = aiReplyEmail, let account = resolvedAccount,"))
         let reader = try functionBody("private func composeEditContextForRequest()", before: "\n    }\n", in: source)
-        #expect(reader.contains("guard case .send(let related) = aiReplyTarget else {"))
+        #expect(reader.contains("guard case .send(let related) = sendReplyTarget else {"))
         #expect(reader.contains("return buildComposeEditContext(related: reply, relatedBodyText: bodyText)"))
+    }
+
+    /// Production wiring for `WriteTierRoutingTests.recomputeStoreIsAdmittedThroughTheWriteQueue`, which
+    /// drives the store itself: Recompute's answer reaches the database only through that queued,
+    /// identity-checked store, compared against the value read with the body.
+    @Test("Recompute stores its answer only through the queued, identity-checked store")
+    func recomputeStoresOnlyThroughTheQueuedStore() throws {
+        let body = try functionBody(
+            "nonisolated static func recomputedReply(", before: "nonisolated static func recomputedReplyForChosen(", in: composeSource())
+        #expect(body.contains("outcome = await writeCachedReplyToDB(result, replacing: read.1, replyTo: reply, db: dbPool)"))
+        #expect(body.components(separatedBy: "writeCachedReplyToDB(").count - 1 == 1, "one store, the queued one")
+        #expect(!body.contains("dbPool.write"), "no direct write beside the queued store")
     }
 
     @Test("A saved reply reopened with no caller email (Undo Send) still gives the editor its email and mode; a refused one refuses")

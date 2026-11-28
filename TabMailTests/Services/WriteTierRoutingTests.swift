@@ -459,6 +459,8 @@ struct WriteTierRoutingTests {
     private static let recomputed = ReplyResult(
         body: "recomputed", textMessage: "recomputed text", changeCommand: "recomputed command")
 
+    /// The opened email and the one seated at its address hold the SAME stored suggestion, so the
+    /// whole-value compare alone would admit the write: only the identity check keeps it off.
     @Test("Recompute's store through the write queue leaves a different IMAP email seated at the same address alone")
     func recomputeStoreSkipsADifferentEmailAtTheSameAddress() async throws {
         let (fixture, restore) = try makeTestDB()
@@ -466,6 +468,7 @@ struct WriteTierRoutingTests {
         var opened = fixture
         opened.rfc822MessageId = "<opened@example.com>"
         opened.observedUidValidity = 111
+        opened.cachedReply = "the other email's own suggestion"
         let other: MessageHeader = {
             var row = fixture
             row.rfc822MessageId = "<other@example.com>"
@@ -473,6 +476,7 @@ struct WriteTierRoutingTests {
             row.cachedReply = "the other email's own suggestion"
             return row
         }()
+        #expect(opened.suggestion == other.suggestion, "the compared value matches, so only the identity check can refuse")
         try await AppDatabase.rawPool.write { db in
             let storedAccount = try Account.fetchOne(db, key: "acc1")
             var account = try #require(storedAccount)
