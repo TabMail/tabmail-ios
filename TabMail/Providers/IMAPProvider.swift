@@ -6483,12 +6483,13 @@ actor IMAPProvider: EmailProvider, MessageExistenceProbe {
             do {
                 try await smtpServer.openConnection()
             } catch {
-                // IOS-TLS-002, send path. Without this the row stays `.queued`
-                // FOREVER: `isTransientSendError` reads `.tlsFailed`/connection
-                // shapes as transient, so a message addressed to a server that can
-                // never accept it was retried indefinitely and the user was never
-                // given the Retry/Discard agency Outbox Rules 7/9 promise. The same
-                // holds for a server that offers no STARTTLS (`.tlsFailed`).
+                // IOS-TLS-002, send path. The mapping gives a server below the TLS
+                // floor its own sentence, and it keeps a server that offers no
+                // STARTTLS from staying `.queued` forever: `isTransientSendError`
+                // reads that bare `.tlsFailed` refusal as transient, so without the
+                // mapping the user would never get the Retry/Discard agency Outbox
+                // Rules 7/9 promise. Any other failed STARTTLS upgrade is judged by
+                // `AccountManager.isTransientSTARTTLSFailure`.
                 throw Self.mapTransportSecurityFailure(
                     error, host: self.smtpHost, port: self.smtpPort,
                     encryptedPort: MailTransportPolicy.smtpImplicitTLSPort)
