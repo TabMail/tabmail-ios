@@ -39,13 +39,10 @@ enum PushCleanupIdentity {
 actor PushClient {
     private let baseURL: URL
     private let session: URLSession
-    private let encryptIMAP: @Sendable (IMAPCredPayload, IMAPSubscribeContext) throws -> String
     private let authTokenProvider: @Sendable () async -> String?
 
     init(baseURL: URL = URL(string: PushConfig.baseURL)!, session: URLSession = sharedEphemeralSession,
-         encryptIMAP: @escaping @Sendable (IMAPCredPayload, IMAPSubscribeContext) throws -> String = {
-             try IMAPCredCrypto.encrypt($0, context: $1)
-         }, authTokenProvider: @escaping @Sendable () async -> String? = {
+         authTokenProvider: @escaping @Sendable () async -> String? = {
              switch await TabMailTokenCoordinator.shared.validToken() {
              case .success(let token): return token
              case .permanentFailure, .transientFailure, .noSession: return nil
@@ -53,7 +50,6 @@ actor PushClient {
          }) {
         self.baseURL = baseURL
         self.session = session
-        self.encryptIMAP = encryptIMAP
         self.authTokenProvider = authTokenProvider
     }
 
@@ -362,11 +358,10 @@ actor PushClient {
 
     /// Subscribe an IMAP account for push via the IMAP IDLE proxy.
     ///
-    /// AES-GCM binds the transient credential envelope to this request's
-    /// installation/account context. The worker reserves an exact generation
-    /// before forwarding to the proxy; only the proxy decrypts, after consuming
-    /// that admission. Success requires committed active authority. Neither
-    /// side persists the envelope or decrypted IMAP credentials.
+    /// The transient credential envelope is sealed to the proxy's public key and
+    /// bound to this request's installation/account context; only the proxy can
+    /// open it. Success requires committed active authority. Neither side
+    /// persists the envelope or decrypted IMAP credentials.
     ///
     /// The proxy always connects with implicit TLS (`MailTransportPolicy`),
     /// and the payload says so outright.
@@ -387,12 +382,10 @@ actor PushClient {
         )
         let credsCiphertext: String
         do {
-            credsCiphertext = try encryptIMAP(payload, context)
+            credsCiphertext = try IMAPCredCrypto.encrypt(payload, context: context)
         } catch {
-            // Don't print the error — its type (e.g. keyMissing, sealFailed)
-            // is itself build-config-sensitive information. A generic line
-            // is enough for the device console; the thrown PushError tells
-            // the caller exactly which path failed.
+            // A generic line is enough for the device console; the thrown
+            // PushError tells the caller which path failed.
             BackgroundSyncLogger.logDebug("[PushClient] subscribeIMAP: credential encryption failed")
             throw PushError.requestFailed(statusCode: 0)
         }

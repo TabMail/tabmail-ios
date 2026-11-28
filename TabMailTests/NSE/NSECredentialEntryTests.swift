@@ -129,6 +129,10 @@ struct NSECredentialEntryTests {
 
     enum ReconnectScenario: String, CaseIterable, Sendable {
         case active, iCloudActive, inProgress, refused, missingPassword, accountRemoved, passwordChanged, signedOut, expiredDuringRefresh
+        /// An eligible account whose seal fails: the proxy key does not parse.
+        case malformedKey
+        /// An eligible account whose sealed credentials exceed the request cap.
+        case oversizedEnvelope
     }
 
     @MainActor
@@ -141,15 +145,23 @@ struct NSECredentialEntryTests {
         let accountId = "imap-entry-" + UUID().uuidString
         let suiteName = "imap-entry." + UUID().uuidString
         let defaults = UserDefaults(suiteName: suiteName)!
+        // A unique account, so its push-health stamp is this case's alone.
+        let email = "imap-entry-" + UUID().uuidString + "@example.com"
+        // Twice the request's 65,536-byte envelope cap.
+        let password = scenario == .oversizedEnvelope
+            ? String(repeating: "a", count: 131_072) : "synthetic-app-password"
+        let host = scenario == .iCloudActive ? "imap.mail.me.com" : "imap.example.com"
         if scenario != .missingPassword {
-            try KeychainHelper.save("synthetic-app-password", for: KeychainHelper.passwordKey(accountId: accountId))
+            try KeychainHelper.save(password, for: KeychainHelper.passwordKey(accountId: accountId))
         }
         defer {
             KeychainHelper.delete(key: KeychainHelper.passwordKey(accountId: accountId))
             UserDefaults.standard.removePersistentDomain(forName: suiteName)
+            clearPushHealth(for: email)
         }
-        defaults.set("{\"user@example.com\":\"\(accountId)\"}", forKey: SharedNSEData.accountMapKey)
-        let config: [String: Any] = [accountId: ["host": scenario == .iCloudActive ? "imap.mail.me.com" : "imap.example.com", "port": 993, "username": "user@example.com"]]
+        #expect(PushHealthStore.lastNonReconnectPushAt(accountEmail: email) == nil)
+        defaults.set("{\"\(email)\":\"\(accountId)\"}", forKey: SharedNSEData.accountMapKey)
+        let config: [String: Any] = [accountId: ["host": host, "port": 993, "username": "user@example.com"]]
         defaults.set(String(data: try JSONSerialization.data(withJSONObject: config), encoding: .utf8), forKey: SharedNSEData.imapAccountsKey)
         defaults.set(true, forKey: SharedNSEData.imapPushEnabledKey)
         defaults.set(true, forKey: "nse.reconnectEnabled")
@@ -158,11 +170,14 @@ struct NSECredentialEntryTests {
         defaults.set(true, forKey: "nse.apnsSandbox")
         defaults.set("https://push.example.com", forKey: SharedNSEData.pushWorkerURLKey)
         let refreshes = Mutex(0), subscriptions = Mutex(0), restored = Mutex(false), deliveries = Mutex(0)
+        let deliveredBody = Mutex("")
+        let recipient = try SyntheticProxyKey.a()
+        let sealingKey = scenario == .malformedKey ? "" : SyntheticProxyKey.encoded(recipient)
         let delivered = CredentialTestLatch(), refreshStarted = CredentialTestLatch(), releaseRefresh = CredentialTestLatch()
         let service = NotificationService()
         let content = UNMutableNotificationContent()
         content.title = "TabMail"; content.body = "Reconnecting"
-        content.userInfo = ["provider": "imap_reconnect", "accountEmail": "user@example.com", "final": final]
+        content.userInfo = ["provider": "imap_reconnect", "accountEmail": email, "final": final]
         await SharedNSEData.$suiteOverride.withValue(.init(defaults: defaults)) {
             await NSETokenManager.$storeOverride.withValue(sessionStore) {
                 await NSETokenManager.$transport.withValue({ request in
@@ -174,13 +189,20 @@ struct NSECredentialEntryTests {
                     return (try CredentialTestHarness.sessionData(access: "fresh-session", refresh: "rotated-session", expired: false),
                             HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
                 }) {
+                    await IMAPCredCrypto.$sealingKey.withValue(sealingKey) {
                     await NotificationService.$visualCapability.withValue({ true }) {
                         await NotificationService.$reconnectTransport.withValue({ request in
                             subscriptions.withLock { $0 += 1 }
                             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer fresh-session")
                             #expect(request.url?.path == "/subscribe")
-                            let body = try JSONSerialization.jsonObject(with: request.httpBody!) as? [String: Any]
-                            #expect((body?["credsCiphertext"] as? String)?.hasPrefix("v2:") == true)
+                            let sentBody = try #require(request.httpBody)
+                            let body = try JSONSerialization.jsonObject(with: sentBody) as? [String: Any]
+                            #expect(body?["deviceToken"] as? String == "synthetic-apns")
+                            #expect(body?["accountEmail"] as? String == email)
+                            // What the proxy would open, authenticated by the fields this request carries.
+                            let opened = try SyntheticProxyKey.openSentBody(sentBody, with: recipient)
+                            #expect(opened.host == host && opened.port == 993 && opened.username == "user@example.com")
+                            #expect(opened.password == password && opened.security == MailTransportPolicy.pushSubscriptionSecurity)
                             if scenario == .passwordChanged {
                                 try KeychainHelper.save("replacement-app-password", for: KeychainHelper.passwordKey(accountId: accountId))
                             }
@@ -192,6 +214,7 @@ struct NSECredentialEntryTests {
                             service.didReceive(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) { @Sendable result in
                                 deliveries.withLock { $0 += 1 }
                                 restored.withLock { $0 = result.userInfo["reconnect_state"] as? String == "ok" }
+                                deliveredBody.withLock { $0 = result.body }
                                 Task { await delivered.signal() }
                             }
                             if scenario == .expiredDuringRefresh && !final {
@@ -210,14 +233,23 @@ struct NSECredentialEntryTests {
                             }
                         }
                     }
+                    }
                 }
             }
         }
         service.serviceExtensionTimeWillExpire()
         #expect(deliveries.withLock { $0 } == 1)
         #expect(refreshes.withLock { $0 } == (final || scenario == .missingPassword ? 0 : 1))
-        #expect(subscriptions.withLock { $0 } == (final || scenario == .missingPassword || scenario == .accountRemoved || scenario == .expiredDuringRefresh ? 0 : 1))
-        #expect(restored.withLock { $0 } == (!final && (scenario == .active || scenario == .iCloudActive)))
+        #expect(subscriptions.withLock { $0 } == (final || scenario == .missingPassword || scenario == .accountRemoved
+            || scenario == .expiredDuringRefresh || scenario == .malformedKey || scenario == .oversizedEnvelope ? 0 : 1))
+        let restoredExpected = !final && (scenario == .active || scenario == .iCloudActive)
+        #expect(restored.withLock { $0 } == restoredExpected)
+        // Only a restored subscription changes the alert and stamps push health;
+        // any failure keeps the payload's neutral copy and leaves health alone.
+        let expectedBody = restoredExpected ? "Restored push notification connection for \(email)" : "Reconnecting"
+        #expect(deliveredBody.withLock { $0 } == expectedBody)
+        let stamped = PushHealthStore.lastNonReconnectPushAt(accountEmail: email) != nil
+        #expect(stamped == restoredExpected)
         if !final && scenario == .signedOut {
             #expect(sessionStore.loadActiveSession() == nil)
         } else {
@@ -225,7 +257,17 @@ struct NSECredentialEntryTests {
             #expect(persisted.refreshToken == (final || scenario == .missingPassword ? "refresh-1" : "rotated-session"))
         }
         let expectedPassword = scenario == .missingPassword ? nil :
-            (!final && scenario == .passwordChanged ? "replacement-app-password" : "synthetic-app-password")
+            (!final && scenario == .passwordChanged ? "replacement-app-password" : password)
         #expect(SharedKeychain.getPassword(for: accountId) == expectedPassword)
     }
+}
+
+/// Removes a test account's entry from the shared push-health map
+/// (`PushHealthStore`'s app-group suite and key), so cases leave nothing behind.
+private func clearPushHealth(for email: String) {
+    let defaults = UserDefaults(suiteName: "group.ai.tabmail") ?? .standard
+    let key = "tabmail.notif.lastNonReconnectPushAt"
+    guard var map = defaults.dictionary(forKey: key) else { return }
+    map.removeValue(forKey: email)
+    defaults.set(map, forKey: key)
 }

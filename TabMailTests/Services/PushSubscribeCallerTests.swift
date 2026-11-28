@@ -31,9 +31,13 @@ struct PushSubscribeCallerTests {
         }
     }
 
+    /// `seal_malformed_key` and `seal_oversized`: an eligible account whose seal
+    /// fails (the bound key does not parse; the sealed credentials exceed the
+    /// request cap) reports no subscription and sends no subscribe request.
     @Test(arguments: [(AccountProvider.gmail, "rotate"), (.outlook, "remove"),
         (.imap, "rotate"), (.imap, "remove"), (.imap, "token_callback"), (.icloud, "token_callback"),
-        (.imap, "token_callback_disabled"), (.icloud, "token_callback_disabled")])
+        (.imap, "token_callback_disabled"), (.icloud, "token_callback_disabled"),
+        (.imap, "seal_malformed_key"), (.imap, "seal_oversized")])
     func contextChangesDuringAuthentication(provider: AccountProvider, change: String) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -86,7 +90,9 @@ struct PushSubscribeCallerTests {
         }()
         try await pool.write { db in try account.insert(db) }
         let passwordKey = KeychainHelper.passwordKey(accountId: account.id)
-        try KeychainHelper.save("synthetic-password", for: passwordKey)
+        // Twice the 65,536-byte envelope cap for the oversized case.
+        let password = change == "seal_oversized" ? String(repeating: "a", count: 131_072) : "synthetic-password"
+        try KeychainHelper.save(password, for: passwordKey)
         defer { KeychainHelper.delete(key: passwordKey) }
 
         PushRequestProtocol.reset()
@@ -96,18 +102,20 @@ struct PushSubscribeCallerTests {
         defer { session.invalidateAndCancel() }
         let gate = SubscriptionAuthGate()
         let client = PushClient(baseURL: URL(string: "https://push.example.test")!, session: session,
-            encryptIMAP: { payload, context in
-                try IMAPCredCrypto.sealAuthorityPayload(payload, context: context,
-                    key: SymmetricKey(data: Data(repeating: 42, count: 32)))
-            }, authTokenProvider: { await gate.waitOnce(); return "synthetic-worker-token" })
+            authTokenProvider: { await gate.waitOnce(); return "synthetic-worker-token" })
         let service = PushNotificationService(pushClient: client, subscriptionAccessToken: { _ in "synthetic-provider-token" })
         await service._setNotificationSettingsProviderForTesting(VisibleSettings())
-        let running = Task {
-            if change.hasPrefix("token_callback") {
-                await service.reregisterAllDeviceAccounts()
-                return true
+        // The task inherits the synthetic key, so the app's real sealer seals to it.
+        let recipient = try SyntheticProxyKey.a()
+        let sealingKey = change == "seal_malformed_key" ? "" : SyntheticProxyKey.encoded(recipient)
+        let running = IMAPCredCrypto.$sealingKey.withValue(sealingKey) {
+            Task {
+                if change.hasPrefix("token_callback") {
+                    await service.reregisterAllDeviceAccounts()
+                    return true
+                }
+                return await service.subscribeAccount(account)
             }
-            return await service.subscribeAccount(account)
         }
         for _ in 0..<200 {
             if await gate.entered { break }
@@ -123,7 +131,7 @@ struct PushSubscribeCallerTests {
             case "remove":
                 try await client.unregisterDeviceAccount(deviceId: "test-device", accountEmail: account.emailAddress)
                 _ = try await pool.write { db in try Account.deleteOne(db, key: account.id) }
-            case "token_callback", "token_callback_disabled":
+            case "token_callback", "token_callback_disabled", "seal_malformed_key", "seal_oversized":
                 break
             default:
                 Issue.record("Unexpected regression case")
@@ -135,13 +143,21 @@ struct PushSubscribeCallerTests {
         let succeeded = await running.value
         let requests = PushRequestProtocol.observed()
         let subscriptions = requests.filter { $0.path == "/subscribe" }
-        let shouldSubscribe = change != "remove" && change != "token_callback_disabled"
-        #expect(succeeded == (change != "remove"))
+        let sealFails = change == "seal_malformed_key" || change == "seal_oversized"
+        let shouldSubscribe = change != "remove" && change != "token_callback_disabled" && !sealFails
+        #expect(succeeded == (change != "remove" && !sealFails))
         #expect(subscriptions.count == (shouldSubscribe ? 1 : 0))
         if let sent = subscriptions.first {
             let body = try #require(JSONSerialization.jsonObject(with: sent.body) as? [String: Any])
             #expect(body["deviceToken"] as? String == (change == "rotate" ? "token-new" : "token-old"))
             #expect(body["nseCapable"] as? Bool == true)
+            if provider == .imap || provider == .icloud {
+                // Opened with the fields this request carries: a context sealed before a
+                // device-token rotation would not open under the rotated body.
+                let opened = try SyntheticProxyKey.openSentBody(sent.body, with: recipient)
+                #expect(opened.host == "imap.example.test" && opened.port == 993)
+                #expect(opened.password == password)
+            }
         }
         if change == "rotate" { #expect(requests.first?.path == "/register-device") }
         if change == "remove" { #expect(requests.map(\.path) == ["/register-account-device"]) }
