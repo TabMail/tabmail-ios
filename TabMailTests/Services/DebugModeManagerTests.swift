@@ -171,9 +171,28 @@ struct DebugModeManagerTests {
         UserDefaults.standard.set(true, forKey: devServersKey) // would be dev, but locked
         #expect(BackendConfig.apiBaseURL.absoluteString == "https://api.tabmail.ai")
         #expect(BackendConfig.syncBaseURL == "https://sync.tabmail.ai")
-        #expect(BackendConfig.syncWebSocketURL == "wss://sync.tabmail.ai/ws")
+        #expect(BackendConfig.syncEndpoints.webSocket == "wss://sync.tabmail.ai/ws")
         #expect(BackendConfig.templatesBaseURL.absoluteString == "https://templates.tabmail.ai")
         #expect(BackendConfig.billingBaseURL.absoluteString == "https://billing.tabmail.ai")
+    }
+
+    /// One read gives Device Sync's HTTPS base and socket address on the same server; locking debug mode
+    /// moves both back to production together.
+    @Test("Device Sync's two addresses follow the dev setting as one pair, and locking resets both")
+    func syncEndpointsFollowTheDevSettingAsOnePair() {
+        cleanUp()
+        defer { cleanUp() }
+        let mgr = DebugModeManager.shared
+        mgr.isUnlocked = true
+        BackendConfig.useDevServers = true
+        let dev = BackendConfig.syncEndpoints
+        #expect(dev.base == "https://sync-dev.tabmail.ai")
+        #expect(dev.webSocket == "wss://sync-dev.tabmail.ai/ws")
+
+        mgr.isUnlocked = false
+        let production = BackendConfig.syncEndpoints
+        #expect(production.base == "https://sync.tabmail.ai")
+        #expect(production.webSocket == "wss://sync.tabmail.ai/ws")
     }
 }
 

@@ -10,8 +10,10 @@ import UIKit
 /// Syncs prompt settings between TabMail instances (iOS ↔ TB) automatically.
 ///
 /// Protocol:
-/// 1. Connect to Device Sync worker via WebSocket (wss://sync.tabmail.ai/ws)
-/// 2. Authenticate with TabMail session JWT token
+/// 1. Ask the Device Sync worker for a one-time pass (HTTPS, TabMail session JWT in the
+///    Authorization header: `BackendClient.requestSyncConnectPass`)
+/// 2. Connect via WebSocket with that pass (wss://sync.tabmail.ai/ws?pass=...); the JWT never
+///    goes in the socket's address
 /// 3. The knowledge base, composition rules and action rules sync as labelled bullets
 ///    (`bullet_state`, `PromptBulletSync`): each is sent on connect, after a local change, and after
 ///    a merge of a peer's state that differed from this device's (DS-SEND, DS-MERGE).
@@ -56,7 +58,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     private var urlSession: URLSession?
     private var pingTimer: Timer?
     private var probeTimer: Timer?
-    private var connectTask: Task<Void, Never>?
+    /// The connect in progress; tests wait on it to see what a superseded connect left behind.
+    private(set) var connectTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var receiveTask: Task<Void, Never>?
 
@@ -65,7 +68,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     private let reconnectBaseDelay: TimeInterval = 5
     private let reconnectMaxDelay: TimeInterval = 300 // 5 minutes
     private let maxReconnectAttempts = 10
-    private var reconnectAttempts = 0
+    private(set) var reconnectAttempts = 0
 
     /// When true, the receive loop should NOT schedule a reconnect (user pressed disconnect or app backgrounded).
     private var intentionalDisconnect = false
@@ -94,16 +97,50 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
     private let broadcastDebounceMs: UInt64 = 500
 
-    private var baseURL: String { BackendConfig.syncWebSocketURL }
+    /// What one connect takes from outside the service: the relay's two addresses (read once, at the
+    /// start of the connect), a sign-in token, a one-time pass for that token from the relay's
+    /// HTTPS base, and whether the app is in the foreground (a retry is scheduled only then). Tests
+    /// replace it.
+    struct ConnectEnvironment {
+        var relay: @MainActor () -> (base: String, webSocket: String)
+        var token: @MainActor () async -> TabMailTokenCoordinator.RefreshResult
+        /// nil on any failure.
+        var pass: @MainActor (_ token: String, _ relayBaseURL: String) async -> String?
+        var foreground: @MainActor () -> Bool
+
+        static var live: ConnectEnvironment {
+            ConnectEnvironment(
+                relay: { BackendConfig.syncEndpoints },
+                token: { await TabMailTokenCoordinator.shared.validToken() },
+                pass: { token, relayBaseURL in
+                    await BackendClient.requestSyncConnectPass(token: token, relayBaseURL: relayBaseURL)
+                },
+                foreground: { UIApplication.shared.applicationState == .active }
+            )
+        }
+    }
+
+    @ObservationIgnored var connectEnvironment = ConnectEnvironment.live
+
+    /// The socket's address for one connect: the connect's socket address with its one-time pass,
+    /// never the sign-in token.
+    nonisolated static func socketURL(webSocketBase: String, pass: String) -> URL? {
+        guard var components = URLComponents(string: webSocketBase) else { return nil }
+        components.queryItems = [URLQueryItem(name: "pass", value: pass)]
+        return components.url
+    }
 
     /// Epoch zero — used for new devices that have no per-field timestamps yet.
     private static let epochZero = "1970-01-01T00:00:00.000Z"
 
     /// Log-safe rendering of a transport error. URLSession errors carry the
     /// failing URL in userInfo (`NSErrorFailingURLStringKey`) — for this
-    /// service that URL embeds the auth token as a query parameter
-    /// (`ws?token=JWT`), so interpolating the raw error leaked a live
-    /// credential into the console capture (observed 2026-06-09). Render only
+    /// service that URL once embedded the auth token as a query parameter
+    /// (`ws?token=JWT`), so interpolating the raw error put a live
+    /// credential into the console capture. The URL now
+    /// carries a one-time connect pass instead (`socketURL`): a redeemed pass is
+    /// spent, but one whose handshake failed can stay good for a few seconds,
+    /// and a query is nothing a log needs anyway. Render only
     /// domain + code + description, with any query string stripped
     /// defensively. Use this for EVERY error originating from the WebSocket /
     /// URLSession layer; never interpolate those errors raw.
@@ -268,9 +305,21 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     }
 
     private func connectWithFreshToken() async {
+        let environment = connectEnvironment
+        // Both relay addresses come from one snapshot taken here: the pass is asked of the host the
+        // socket then opens, even if the server setting changes during this connect.
+        let relay = environment.relay()
+
         // Get a valid token via the shared coordinator (deduplicates concurrent refreshes)
+        let tokenResult = await environment.token()
+
+        // Superseded by forceReconnect() / disconnect() during the token fetch. Whoever cancelled
+        // this connect already reset isConnecting, and forceReconnect() may have started the next
+        // connect since, so this one leaves it alone, whatever the token result.
+        guard !Task.isCancelled else { return }
+
         let token: String
-        switch await TabMailTokenCoordinator.shared.validToken() {
+        switch tokenResult {
         case .success(let t):
             token = t
         case .noSession:
@@ -292,27 +341,26 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        // Check if superseded by forceReconnect() / disconnect() during token fetch
-        guard !Task.isCancelled else {
+        // A fresh one-time pass for this connect; the token never goes in the socket's address.
+        let pass = await environment.pass(token, relay.base)
+
+        // Superseded during the pass request: as above (a cancelled request also gives no pass).
+        guard !Task.isCancelled else { return }
+
+        // No pass takes the same path as a failed token refresh.
+        guard let pass, let url = Self.socketURL(webSocketBase: relay.webSocket, pass: pass) else {
+            BackgroundSyncLogger.logDebug("[DeviceSync] No connect pass, scheduling reconnect")
+            DeviceSyncLogger.log("CONNECT_FAIL no connect pass")
             isConnecting = false
+            scheduleReconnect()
             return
         }
 
         // Initialize per-field timestamps if this is a new device
         initTimestampsIfNeeded()
 
-        guard var components = URLComponents(string: baseURL) else {
-            isConnecting = false
-            return
-        }
-        components.queryItems = [URLQueryItem(name: "token", value: token)]
-        guard let url = components.url else {
-            isConnecting = false
-            return
-        }
-
-        BackgroundSyncLogger.logDebug("[DeviceSync] Connecting to \(baseURL)...")
-        DeviceSyncLogger.log("CONNECT → \(baseURL)")
+        BackgroundSyncLogger.logDebug("[DeviceSync] Connecting to \(relay.webSocket)...")
+        DeviceSyncLogger.log("CONNECT → \(relay.webSocket)")
 
         let config = URLSessionConfiguration.default
         let wsSession = URLSession(configuration: config, delegate: self, delegateQueue: nil)
@@ -635,7 +683,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             switch msg.type {
             case "connected":
                 BackgroundSyncLogger.logDebug("[DeviceSync] Connected as user \(msg.userId?.prefix(8) ?? "?")")
-                DeviceSyncLogger.log("CONNECTED as user \(msg.userId?.prefix(8) ?? "?") via \(baseURL)")
+                // The address is in the CONNECT line of this attempt; reading the setting again here could
+                // name the other server.
+                DeviceSyncLogger.log("CONNECTED as user \(msg.userId?.prefix(8) ?? "?")")
                 isConnecting = false
                 isConnected = true
                 reconnectAttempts = 0
@@ -1007,7 +1057,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         guard reconnectTask == nil else { return }
         // Don't reconnect in background — iOS gives no execution time for WebSocket + token fetch.
         // Foreground return (RootView scenePhase .active) calls reconnectIfNeeded().
-        guard UIApplication.shared.applicationState == .active else {
+        guard connectEnvironment.foreground() else {
             BackgroundSyncLogger.logDebug("[DeviceSync] Skipping reconnect — app not in foreground")
             return
         }
@@ -1022,7 +1072,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
             // Re-check foreground after delay — app may have backgrounded during sleep
-            guard UIApplication.shared.applicationState == .active else {
+            guard connectEnvironment.foreground() else {
                 BackgroundSyncLogger.logDebug("[DeviceSync] Skipping reconnect — app backgrounded during delay")
                 reconnectTask = nil
                 return
