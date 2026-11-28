@@ -1536,14 +1536,24 @@ for Apple posts to the auth server's `/auth/v1/token?grant_type=id_token` with t
 publishable key as `apikey` and as the bearer, and a body of exactly the provider `apple`, the ID token and
 the raw nonce; for Google and Microsoft (`google`, `azure`) the body has no nonce. A sheet result that is
 not an Apple ID credential (a password credential) is `noSession`. The route cases run
-`TabMailAuthService.signInWithApple(authorize:)` with a stand-in sheet and a DEBUG stand-in for the exchange
-(`_setIdTokenGrantTransportForTesting`) that records the request and refuses it with a 400, so no session is
-written: the sheet gets one email-only request, and the exchange sends the sheet's token as provider `apple`
-with a 43-character raw nonce whose SHA-256 is the request's nonce, ending as the server's message; a sheet
-that is closed (`CancellationError`), fails (`.failed` unchanged) or returns no token (`noSession`) sends
-nothing to the server. The suite is serialized because those cases share the stand-in. A source check pins
-that the auth service has no `/auth/v1/authorize` URL, callback page or `ASWebAuthenticationSession`; the
-parsed `Info.plist` lists no `tabmail-ios` URL scheme, and the parsed entitlements give
-`com.apple.developer.applesignin` exactly `["Default"]`. `OneAISettingForTheDeviceTests` counts two session
+`TabMailAuthService.signInWithApple(authorize:)` with a stand-in sheet and a DEBUG stand-in for the sign-in's
+requests (`_setSignInTransportForTesting`, which covers the exchange and the billing sync) that records the
+request and refuses it with a 400, so no session is written: the sheet gets one email-only request, and the
+exchange sends the sheet's token as provider `apple` with a 43-character raw nonce whose SHA-256 is the
+request's nonce, ending as the server's message; a second attempt on the same service sends a different raw
+nonce, each matching its own sheet request's hash; a sheet that is closed (`CancellationError`), fails
+(`.failed` unchanged) or returns no token (`noSession`) sends nothing to the server. A Google or Microsoft
+`signInWithIdToken` that gives no nonce (the default) sends a body of exactly the provider and the token. The
+suite is serialized because those cases share the stand-in. A source check pins that the auth service has no
+`/auth/v1/authorize` URL, callback page or `ASWebAuthenticationSession`; the parsed `Info.plist` must have
+`CFBundleURLTypes`, lists no `tabmail-ios` URL scheme, and keeps exactly the Google and Microsoft redirect
+schemes and `mailto`; the parsed entitlements give `com.apple.developer.applesignin` exactly `["Default"]`.
+`AppleIDSignInSessionTests` (serialized, `.processGlobalState`: the real session slot, the App Group AI values
+and an empty app database) runs one Apple sign-in on a device signed in as an earlier test user with the AI
+choice made, and reads the device state at each request the sign-in sends. An accepted exchange (a synthetic
+200 session) leaves nothing written when the exchange is sent; by the billing sync, the new session is stored,
+the AI choice is cleared (no mail account), the sign-in epoch has moved on by one, and billing gets the new
+session's access token as the bearer. A refused exchange (400) or an unreadable 200 leaves the stored session,
+the AI choice and the epoch as they were, and sends no billing sync. `OneAISettingForTheDeviceTests` counts two session
 writes (the id-token and the code sign-in). The sheet itself (SwiftUI's `AuthorizationController`) is checked
 on a device.

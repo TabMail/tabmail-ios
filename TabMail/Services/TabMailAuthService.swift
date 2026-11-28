@@ -35,17 +35,18 @@ final class TabMailAuthService {
     }
 
     #if DEBUG
-    /// Test-only override for the transport behind the `grant_type=id_token` exchange. When nil, the shared
-    /// ephemeral session is used. Lets tests observe the exchange and refuse it without touching the network.
-    private static var idTokenGrantTransportOverride: TabMailTokenCoordinator.DataForRequest?
-    static func _setIdTokenGrantTransportForTesting(_ transport: TabMailTokenCoordinator.DataForRequest?) {
-        idTokenGrantTransportOverride = transport
+    /// Test-only override for the transport behind a sign-in's requests: the `grant_type=id_token`
+    /// exchange and the billing sync after a session is written. When nil, the shared ephemeral session
+    /// is used. Lets tests answer both and observe them without touching the network.
+    private static var signInTransportOverride: TabMailTokenCoordinator.DataForRequest?
+    static func _setSignInTransportForTesting(_ transport: TabMailTokenCoordinator.DataForRequest?) {
+        signInTransportOverride = transport
     }
     #endif
 
-    private static var idTokenGrantTransport: TabMailTokenCoordinator.DataForRequest {
+    private static var signInTransport: TabMailTokenCoordinator.DataForRequest {
         #if DEBUG
-        if let idTokenGrantTransportOverride { return idTokenGrantTransportOverride }
+        if let signInTransportOverride { return signInTransportOverride }
         #endif
         return { request in try await sharedEphemeralSession.data(for: request) }
     }
@@ -340,7 +341,7 @@ final class TabMailAuthService {
 
         BackgroundSyncLogger.logDebug("[TabMailAuth] Signing in with \(provider.rawValue) id_token")
 
-        let (data, response) = try await Self.idTokenGrantTransport(request)
+        let (data, response) = try await Self.signInTransport(request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw TabMailAuthError.invalidResponse
         }
@@ -561,7 +562,7 @@ final class TabMailAuthService {
             request.httpMethod = "POST"
             request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
 
-            let (_, response) = try await sharedEphemeralSession.data(for: request)
+            let (_, response) = try await Self.signInTransport(request)
             if let httpResponse = response as? HTTPURLResponse {
                 BackgroundSyncLogger.logDebug("[TabMailAuth] Stripe sync: HTTP \(httpResponse.statusCode)")
             }
