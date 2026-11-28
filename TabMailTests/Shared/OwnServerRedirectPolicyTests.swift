@@ -495,7 +495,8 @@ struct OwnServerRedirectPolicyTests {
     private static let policy = "delegate: OwnServerRedirectPolicy.shared"
 
     /// Sessions created without the policy, and why: a CalDAV server (iCloud) sends its clients on to
-    /// another host; every request on the AI sessions passes the policy itself (checked below).
+    /// another host; every request BackendClient sends on a session other than the shared one (the AI
+    /// sessions, a caller's session for the sync connect pass) passes the policy itself (checked below).
     private static let sessionsWithoutPolicy: Set<String> = [
         "TabMail/Providers/CalDAV/CalDAVClient.swift",
         "TabMail/Services/BackendClient.swift",
@@ -515,7 +516,7 @@ struct OwnServerRedirectPolicyTests {
     /// rewritten so that it no longer passes the policy lowers its file's count.
     private static let policyUses: [String: Int] = [
         "Shared/HTTP/HTTPClient.swift": 1,                          // sharedEphemeralSession
-        "TabMail/Services/BackendClient.swift": 2,                  // the AI requests: aiBytes, aiData
+        "TabMail/Services/BackendClient.swift": 3,                  // aiBytes, aiData, requestSyncConnectPass
         "TabMail/Views/Account/PlanPickerView.swift": 1,            // verifyPurchaseWithBackend
         "TabMailNotificationService/BackendNSEClient.swift": 1,     // transport
         "TabMailNotificationService/NSEAICacheProbe.swift": 1,      // probe
