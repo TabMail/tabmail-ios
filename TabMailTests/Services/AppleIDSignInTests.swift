@@ -12,7 +12,7 @@ import Testing
 /// Sign in with Apple through Apple's own sheet: the request it sends, how its result and its errors are
 /// read, and the token exchange with the auth server. Serialized: the route cases share the exchange's
 /// test transport.
-@Suite("Sign in with Apple", .serialized)
+@Suite("Sign in with Apple", .serialized, .processGlobalState)
 @MainActor
 struct AppleIDSignInTests {
 

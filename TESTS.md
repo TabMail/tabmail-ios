@@ -1544,7 +1544,8 @@ request's nonce, ending as the server's message; a second attempt on the same se
 nonce, each matching its own sheet request's hash; a sheet that is closed (`CancellationError`), fails
 (`.failed` unchanged) or returns no token (`noSession`) sends nothing to the server. A Google or Microsoft
 `signInWithIdToken` that gives no nonce (the default) sends a body of exactly the provider and the token. The
-suite is serialized because those cases share the stand-in. A source check pins that the auth service has no
+suite is serialized and runs under `.processGlobalState`, because its cases and the session suite below share
+that process-wide stand-in. A source check pins that the auth service has no
 `/auth/v1/authorize` URL, callback page or `ASWebAuthenticationSession`; the parsed `Info.plist` must have
 `CFBundleURLTypes`, lists no `tabmail-ios` URL scheme, and keeps exactly the Google and Microsoft redirect
 schemes and `mailto`; the parsed entitlements give `com.apple.developer.applesignin` exactly `["Default"]`.

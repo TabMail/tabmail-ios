@@ -376,8 +376,8 @@ struct AISubscriptionGateTests {
 
     // MARK: - Sign-in epoch: the bump is CONDITIONAL on an identity change
     //
-    // The three session-write sites also fire when the SAME user
-    // re-authenticates (web auth, id-token, OTP). Bumping there would discard a
+    // The two session-write sites also fire when the SAME user
+    // re-authenticates (id-token, OTP). Bumping there would discard a
     // known-good authoritative entitlement and leave the latch consumer waiting
     // on a `/whoami` it did not need. The epoch must track IDENTITY CHANGES,
     // not session writes.
