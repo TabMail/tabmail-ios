@@ -101,10 +101,10 @@ private final class LoopbackHTTPServer: @unchecked Sendable {
 struct OwnServerRedirectPolicyTests {
 
     /// How a request reaches the network: a session that holds the policy (`sharedEphemeralSession`), or
-    /// a session with the policy passed for the one request (the AI requests, the calls on
-    /// `URLSession.shared`).
+    /// a session with the policy passed for the one request, on `data(for:delegate:)` (`aiData`, the
+    /// calls on `URLSession.shared`) or on `bytes(for:delegate:)` (`aiBytes`, the streamed AI answers).
     enum Route: String, CaseIterable, CustomTestStringConvertible {
-        case sessionDelegate, perRequestDelegate
+        case sessionDelegate, perRequestDelegate, perRequestBytes
         var testDescription: String { rawValue }
 
         func send(_ request: URLRequest, policy: OwnServerRedirectPolicy) async throws -> (Data, URLResponse) {
@@ -115,6 +115,11 @@ struct OwnServerRedirectPolicyTests {
                 return try await session.data(for: request)
             case .perRequestDelegate:
                 return try await URLSession.shared.data(for: request, delegate: policy)
+            case .perRequestBytes:
+                let (bytes, response) = try await URLSession.shared.bytes(for: request, delegate: policy)
+                var data = Data()
+                for try await byte in bytes { data.append(byte) }
+                return (data, response)
             }
         }
     }
