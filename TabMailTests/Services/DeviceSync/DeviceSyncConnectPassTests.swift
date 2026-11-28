@@ -7,14 +7,16 @@ import Synchronization
 import Testing
 @testable import TabMail
 
-/// The Device Sync socket opens with a one-time pass, never with the sign-in token in its address. A WebSocket
-/// request carries no Authorization header, so the token goes only in the header of the HTTPS request that
-/// gets the pass (`POST /ws/pass`); without a pass there is no address to open, and the connect takes the
-/// reconnect path a failed token refresh takes.
+/// The Device Sync socket opens with a one-time pass, never with the sign-in token in its address. The token
+/// goes only in the Authorization header of the HTTPS request that gets the pass (`POST /ws/pass`); without a
+/// pass there is no address to open. The relay's addresses here are fixed test values: the connect passes in
+/// its own snapshot, so nothing reads the server setting.
 @Suite("Device Sync connect pass")
 struct DeviceSyncConnectPassTests {
     private static let token = "header.payload.signature"
     private static let pass = "0123abcd.c2VjcmV0LXBhcnQtb2YtdGhlLXBhc3M"
+    private static let relayBase = "https://relay.example.com"
+    private static let socketBase = "wss://relay.example.com/ws"
 
     private static var repositoryRoot: URL {
         URL(fileURLWithPath: #filePath)
@@ -24,67 +26,93 @@ struct DeviceSyncConnectPassTests {
             .deletingLastPathComponent() // repository root
     }
 
-    @Test("The socket's address carries only a fresh pass; the token goes only in the pass request's Authorization header")
-    func socketOpensWithAPass() async throws {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        let seen = Mutex<[FakeHTTP.Request]>([])
+    /// Registers `response` for the pass request and counts how often the fake actually served it (a request
+    /// with no matching route is answered 599 without reaching this handler).
+    private static func servePass(
+        _ http: FakeHTTP.Scenario,
+        _ response: FakeHTTP.CannedResponse
+    ) -> Mutex<[FakeHTTP.Request]> {
+        let served = Mutex<[FakeHTTP.Request]>([])
         http.register(path: "/ws/pass", method: "POST") { request in
-            seen.withLock { $0.append(request) }
-            return .json(raw: #"{"pass":"\#(Self.pass)"}"#)
+            served.withLock { $0.append(request) }
+            return response
         }
-
-        let socketURL = await DeviceSyncService.socketURL(token: Self.token, session: http.session)
-
-        let url = try #require(socketURL)
-        let requests = seen.withLock { $0 }
-        #expect(requests.count == 1)
-        guard requests.count == 1 else { return }
-        let passURL = try #require(URL(string: "\(BackendConfig.syncBaseURL)/ws/pass"))
-        #expect(requests[0].url == passURL)
-        #expect(requests[0].header("Authorization") == "Bearer \(Self.token)")
-
-        let socketBase = try #require(URLComponents(string: BackendConfig.syncWebSocketURL))
-        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
-        #expect(components.scheme == socketBase.scheme)
-        #expect(components.host == socketBase.host)
-        #expect(components.path == socketBase.path)
-        #expect(components.queryItems == [URLQueryItem(name: "pass", value: Self.pass)])
-        #expect(!url.absoluteString.contains(Self.token))
+        return served
     }
 
-    @Test("A refused pass request gives no address", arguments: [401, 403, 429, 500, 503])
-    func refusedPassRequestGivesNoAddress(status: Int) async {
+    @Test("The pass request goes to the given relay; the token goes only in its Authorization header")
+    func passRequestCarriesTheTokenInItsHeader() async throws {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/ws/pass", method: "POST", response: .status(status))
+        let served = Self.servePass(http, .json(raw: #"{"pass":"\#(Self.pass)"}"#))
 
-        let socketURL = await DeviceSyncService.socketURL(token: Self.token, session: http.session)
+        let pass = await BackendClient.requestSyncConnectPass(
+            token: Self.token, relayBaseURL: Self.relayBase, session: http.session
+        )
 
-        #expect(socketURL == nil)
+        #expect(pass == Self.pass)
+        let requests = served.withLock { $0 }
+        #expect(requests.count == 1)
+        guard requests.count == 1 else { return }
+        #expect(requests[0].method == "POST")
+        #expect(requests[0].url == URL(string: "\(Self.relayBase)/ws/pass"))
+        #expect(requests[0].header("Authorization") == "Bearer \(Self.token)")
+        #expect((requests[0].body ?? Data()).isEmpty, "the request has no body; the token is in the header only")
+        #expect(!requests[0].url.absoluteString.contains(Self.token))
         #expect(http.servedCallSequence() == ["POST /ws/pass"])
     }
 
-    @Test("An answer without a pass gives no address", arguments: ["{}", #"{"pass":""}"#, "not json"])
-    func answerWithoutAPassGivesNoAddress(body: String) async {
-        let http = FakeHTTP.Scenario()
-        defer { http.close() }
-        http.register(path: "/ws/pass", method: "POST", response: .json(raw: body))
+    @Test("The socket's address is the connect's socket address with the pass, and nothing else")
+    func socketAddressCarriesOnlyThePass() throws {
+        let url = try #require(DeviceSyncService.socketURL(webSocketBase: Self.socketBase, pass: Self.pass))
 
-        let socketURL = await DeviceSyncService.socketURL(token: Self.token, session: http.session)
-
-        #expect(socketURL == nil)
+        #expect(url.absoluteString == "\(Self.socketBase)?pass=\(Self.pass)")
+        let components = try #require(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        #expect(components.queryItems == [URLQueryItem(name: "pass", value: Self.pass)])
     }
 
-    @Test("A pass request that never reaches the server gives no address")
-    func transportFailureGivesNoAddress() async {
+    /// The refused answers carry a well-formed pass, so only the status check can refuse them.
+    @Test("A refused pass request gives no pass, even with a pass in its body", arguments: [401, 403, 429, 500, 503])
+    func refusedPassRequestGivesNoPass(status: Int) async {
         let http = FakeHTTP.Scenario()
         defer { http.close() }
-        http.register(path: "/ws/pass", method: "POST", response: .transportError(.notConnectedToInternet))
+        let served = Self.servePass(http, .json(raw: #"{"pass":"\#(Self.pass)"}"#, statusCode: status))
 
-        let socketURL = await DeviceSyncService.socketURL(token: Self.token, session: http.session)
+        let pass = await BackendClient.requestSyncConnectPass(
+            token: Self.token, relayBaseURL: Self.relayBase, session: http.session
+        )
 
-        #expect(socketURL == nil)
+        #expect(pass == nil)
+        #expect(served.withLock { $0.count } == 1, "the refusal came from the registered answer")
+        #expect(http.servedCallSequence() == ["POST /ws/pass"])
+    }
+
+    @Test("An answer without a pass gives no pass", arguments: ["{}", #"{"pass":""}"#, #"{"pass":7}"#, "not json"])
+    func answerWithoutAPassGivesNoPass(body: String) async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let served = Self.servePass(http, .json(raw: body))
+
+        let pass = await BackendClient.requestSyncConnectPass(
+            token: Self.token, relayBaseURL: Self.relayBase, session: http.session
+        )
+
+        #expect(pass == nil)
+        #expect(served.withLock { $0.count } == 1, "the answer read was the registered one")
+    }
+
+    @Test("A pass request that never reaches the server gives no pass")
+    func transportFailureGivesNoPass() async {
+        let http = FakeHTTP.Scenario()
+        defer { http.close() }
+        let served = Self.servePass(http, .transportError(.notConnectedToInternet))
+
+        let pass = await BackendClient.requestSyncConnectPass(
+            token: Self.token, relayBaseURL: Self.relayBase, session: http.session
+        )
+
+        #expect(pass == nil)
+        #expect(served.withLock { $0.count } == 1, "the failure came from the registered transport error")
     }
 
     /// No source in the app, the shared code or the notification extension puts a sign-in token in a URL's
@@ -100,7 +128,9 @@ struct DeviceSyncConnectPassTests {
             for case let file as URL in files where file.pathExtension == "swift" {
                 let source = try String(contentsOf: file, encoding: .utf8)
                 scanned += 1
-                if source.contains(#"URLQueryItem(name: "token""#) {
+                // A query item, or a query written into a string with the token interpolated.
+                if source.contains(#"URLQueryItem(name: "token""#)
+                    || source.contains(#"?token=\("#) || source.contains(#"&token=\("#) {
                     offenders.append(file.lastPathComponent)
                 }
             }

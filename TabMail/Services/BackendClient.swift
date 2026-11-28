@@ -1548,13 +1548,14 @@ extension BackendClient {
         }
     }
 
-    /// A one-time pass for one Device Sync connect. A WebSocket request carries no Authorization
-    /// header, so the sign-in token goes in the header of this HTTPS request instead, and the
-    /// socket opens with the pass (`DeviceSyncService.socketURL`); the token never goes in a URL.
-    /// The pass is good for one connect, for a few seconds. nil on any failure: the caller retries
-    /// through its own reconnect.
+    /// A one-time pass for one Device Sync connect, from `relayBaseURL` (the connect's own snapshot of
+    /// the relay, `BackendConfig.syncEndpoints`). Device Sync's socket does not send the sign-in token:
+    /// the token goes only in the Authorization header of this HTTPS request, and the socket opens
+    /// with the pass (`DeviceSyncService.socketURL`). The pass is good for one connect, for a few
+    /// seconds. nil on any failure: the caller retries through its own reconnect.
     static func requestSyncConnectPass(
         token: String,
+        relayBaseURL: String,
         session: URLSession = sharedEphemeralSession
     ) async -> String? {
         guard let url = URL(string: "\(relayBaseURL)/ws/pass") else { return nil }

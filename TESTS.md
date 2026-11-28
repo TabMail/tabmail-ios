@@ -515,10 +515,17 @@ delete) ending as the user's last gesture. `DeviceSyncReceiveTests` covers arriv
 re-apply, the connection end dropping everything waiting, the bound (messages plus held parts) renewing
 the connection, and an older `prompt_state` never landing on a newer edit. `DeviceSyncSocketBoundaryTests`
 runs a loopback WebSocket server to show a message read after its connection was replaced is dropped.
-`DeviceSyncConnectPassTests` drives `DeviceSyncService.socketURL` on `FakeHTTP`: the socket's address
-carries only the one-time pass from `POST /ws/pass`, the sign-in token goes only in that request's
-Authorization header, a refused, empty or unreachable pass request gives no address, and no source puts
-a token in a URL query.
+`DeviceSyncConnectPassTests` drives `BackendClient.requestSyncConnectPass` on `FakeHTTP` with fixed relay
+addresses: `POST /ws/pass` goes to the given relay with the sign-in token only in its Authorization
+header and no body; a refused status (even with a pass in its body), an answer without a pass and an
+unreachable request give no pass, each from the served fixture; the socket's address
+(`DeviceSyncService.socketURL`) carries only the pass; and no source puts a token in a URL query.
+`DeviceSyncConnectTests` drives the service's own connect with a scripted token, pass and relay
+(`DeviceSyncService.ConnectEnvironment`) and a loopback listener that records the upgrade request: the
+socket opens with a fresh pass and its upgrade has no token and no Authorization header; no pass opens
+nothing and takes the retry step, and the next connect gets a new pass; a token answer or a pass that
+lands after the connect was replaced changes nothing for the replacement and schedules no retry; and
+both legs use the relay read at the connect's start, the next connect the new one.
 
 ## Gmail thread binding — Send and draft uploads
 
