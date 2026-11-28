@@ -52,6 +52,7 @@ tabmail-ios/
 │   │   ├── BackendClient.swift      # Cloudflare Workers API client
 │   │   ├── GoogleAuthService.swift  # Google OAuth 2.0
 │   │   ├── TabMailAuthService.swift # TabMail native auth
+│   │   ├── AppleIDSignIn.swift      # Sign in with Apple sheet (ID token + nonce for the id_token exchange)
 │   │   ├── KeychainHelper.swift     # Secure credential storage
 │   │   ├── SyncEngine.swift         # Email sync orchestration
 │   │   ├── SyncScheduler.swift      # Background sync scheduling

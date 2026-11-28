@@ -565,7 +565,8 @@ and terms screen keeps its demo key, `demo.hasCompletedConsentGate`.
 
 So that an answer given while trying the demo is not applied to the person's own mail without asking again, signing
 in to TabMail on a device with no mail account clears the AI choice and Opt Out of AI, the choice first
-(`TabMailAuthService.clearAIChoiceIfNoMailAccount`, on the line before each of the three session writes). Mail
+(`TabMailAuthService.clearAIChoiceIfNoMailAccount`, on the line before each session write: three when written, two since
+2026-11-28, when Apple sign-in moved from the web sign-in to Apple's own sheet and the id_token exchange). Mail
 accounts are counted with the sidebar's definition (`Account.sidebarRequest(demoActive: false)`: active, not
 calendar-only, not the demo's account, so a demo row left by an unfinished cleanup does not count); a count that
 cannot be read clears too. The AI screen is then shown after the first account is added, and AI stays off until it is

@@ -163,7 +163,8 @@ notification that merely announces it.** The same principle produced the sibling
 from ambient state) — both are "bind identity to the work, not to whatever is ambient later".
 
 **The bump is CONDITIONAL, and that is not an optimization.** Those three save sites also fire when
-the SAME user re-authenticates (web auth, id-token, OTP). An unconditional bump would discard a
+the SAME user re-authenticates (web auth, id-token, OTP; since 2026-11-28 two sites, id-token and OTP: Apple
+sign-in uses Apple's own sheet and the id-token exchange, and the web sign-in is gone). An unconditional bump would discard a
 known-good authoritative entitlement and widen the "unknown" window for nothing, leaving the
 consumer waiting on a `/whoami` it did not need. `noteSignedIn(userId:previousUserId:)` bumps only
 when the incoming subject differs from the established one (`lastSignedInUserId`, falling back to

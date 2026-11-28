@@ -1522,3 +1522,19 @@ noise, and `compare` writes the report and the manifest for every mode and stati
 build (105,000 headers) runs only when `TABMAIL_DB_PROOF_DIR` is set. The Mac side,
 `Scripts/db-proof-mac.py --self-test`, checks the same scan, seek and write properties with the host
 `sqlite3`.
+
+## Sign in with Apple — Apple's own sheet and the id_token exchange
+
+`AppleIDSignInTests` covers the native Sign in with Apple path that replaced the web sign-in for Apple.
+A raw nonce is 43 base64url characters (32 random bytes) and new on every call; its hash is SHA-256 in
+lowercase hex (two known vectors). The sheet's request asks for the email scope only and carries the
+hashed nonce, never the raw one. Apple's ID token is read as UTF-8 text; no token, an empty one or one
+that is not UTF-8 is `TabMailAuthError.noSession`. Closing the sheet ends as `CancellationError` (which
+the login view ignores), both as a typed `ASAuthorizationError.canceled` and as the bridged `NSError`;
+`.failed`, `.unknown` and a network error pass through unchanged. `TabMailAuthService.idTokenGrantRequest`
+for Apple posts to the auth server's `/auth/v1/token?grant_type=id_token` with the JSON content type, the
+publishable key as `apikey` and as the bearer, and a body of exactly the provider `apple`, the ID token and
+the raw nonce; for Google and Microsoft (`google`, `azure`) the body has no nonce. A source check pins that
+the auth service has no `/auth/v1/authorize` URL, callback page or `ASWebAuthenticationSession`, that
+`Info.plist` declares no `tabmail-ios` URL scheme, and that the app's entitlements declare
+`com.apple.developer.applesignin`. The sheet itself (`ASAuthorizationController`) is checked on a device.

@@ -2,9 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-import AuthenticationServices
 import Foundation
-import UIKit
 
 enum TabMailProvider: String {
     case apple
@@ -13,12 +11,10 @@ enum TabMailProvider: String {
 }
 
 @MainActor
-final class TabMailAuthService: NSObject {
+final class TabMailAuthService {
     private static let supabaseURL = "https://auth.tabmail.ai"
     private static let supabaseAnonKey = "sb_publishable_1mtT87g-94P0yxFgM19Itw_P3ih9PUD"
-    private static let callbackURL = "https://tabmail.ai/auth/ios-callback"
     private static let billingURL = "https://billing.tabmail.ai"
-    private var currentSession: ASWebAuthenticationSession?
 
     #if DEBUG
     /// Test-only override for the transport behind the sign-out logout request.
@@ -296,52 +292,24 @@ final class TabMailAuthService: NSObject {
         await service.checkPushConsentStatusForForeground()
     }
 
-    // MARK: - OAuth Providers
+    // MARK: - Sign in with Apple
 
-    /// Sign in with an OAuth provider (Apple, Google, Microsoft)
-    func signInWithProvider(_ provider: TabMailProvider) async throws -> TabMailSession {
-        var components = URLComponents(string: "\(Self.supabaseURL)/auth/v1/authorize")!
-        components.queryItems = [
-            URLQueryItem(name: "provider", value: provider.rawValue),
-            URLQueryItem(name: "redirect_to", value: Self.callbackURL),
-        ]
-
-        // Google: request account selection
-        if provider == .google {
-            components.queryItems?.append(
-                URLQueryItem(name: "prompt", value: "select_account")
-            )
-        }
-
-        let authURL = components.url!
-        BackgroundSyncLogger.logDebug("[TabMailAuth] Opening \(provider.rawValue) OAuth: \(LoggableURL.address(authURL))")
-
-        return try await performWebAuth(url: authURL)
+    /// Sign in with Apple through Apple's own sheet, then exchange its ID token with the raw nonce.
+    func signInWithApple() async throws -> TabMailSession {
+        let credential = try await AppleIDSignIn().run()
+        return try await signInWithIdToken(provider: .apple, idToken: credential.idToken, nonce: credential.rawNonce)
     }
 
     // MARK: - ID Token Sign-In (merged OAuth flow)
 
-    /// Sign in with an ID token obtained from a direct OAuth flow (Google/Microsoft).
-    /// This calls Supabase's `grant_type=id_token` endpoint instead of opening a second browser popup.
-    func signInWithIdToken(provider: TabMailProvider, idToken: String) async throws -> TabMailSession {
-        let providerName: String
-        switch provider {
-        case .google: providerName = "google"
-        case .microsoft: providerName = "azure"
-        case .apple: throw TabMailAuthError.invalidSession // Apple doesn't use this flow
-        }
+    /// Sign in with an ID token obtained from the provider's own sign-in (Apple's sheet, Google, Microsoft).
+    /// This calls Supabase's `grant_type=id_token` endpoint instead of opening a browser popup.
+    /// `nonce` is the RAW nonce whose SHA-256 the provider's request carried (Apple); Supabase hashes it
+    /// and compares it with the token's `nonce` claim.
+    func signInWithIdToken(provider: TabMailProvider, idToken: String, nonce: String? = nil) async throws -> TabMailSession {
+        let request = try Self.idTokenGrantRequest(provider: provider, idToken: idToken, nonce: nonce)
 
-        let url = URL(string: "\(Self.supabaseURL)/auth/v1/token?grant_type=id_token")!
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(Self.supabaseAnonKey, forHTTPHeaderField: "apikey")
-        request.setValue("Bearer \(Self.supabaseAnonKey)", forHTTPHeaderField: "Authorization")
-
-        let body: [String: Any] = ["provider": providerName, "id_token": idToken]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        BackgroundSyncLogger.logDebug("[TabMailAuth] Signing in with \(providerName) id_token")
+        BackgroundSyncLogger.logDebug("[TabMailAuth] Signing in with \(provider.rawValue) id_token")
 
         let (data, response) = try await sharedEphemeralSession.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -382,6 +350,22 @@ final class TabMailAuthService: NSObject {
 
         BackgroundSyncLogger.logDebug("[TabMailAuth] ID token sign-in successful, signed in as: \(session.userEmail)")
         return session
+    }
+
+    /// The `grant_type=id_token` exchange: the provider's wire name (its raw value), the ID token, and the
+    /// raw nonce only when one is given (Google and Microsoft send none).
+    static func idTokenGrantRequest(provider: TabMailProvider, idToken: String, nonce: String?) throws -> URLRequest {
+        let url = URL(string: "\(Self.supabaseURL)/auth/v1/token?grant_type=id_token")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(Self.supabaseAnonKey, forHTTPHeaderField: "apikey")
+        request.setValue("Bearer \(Self.supabaseAnonKey)", forHTTPHeaderField: "Authorization")
+
+        var body: [String: Any] = ["provider": provider.rawValue, "id_token": idToken]
+        if let nonce { body["nonce"] = nonce }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        return request
     }
 
     // MARK: - Email OTP (native)
@@ -541,49 +525,6 @@ final class TabMailAuthService: NSObject {
 
     // MARK: - Private
 
-    private func performWebAuth(url: URL) async throws -> TabMailSession {
-        let callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
-            let session = ASWebAuthenticationSession(
-                url: url,
-                callback: .customScheme("tabmail-ios")
-            ) { url, error in
-                if let error { continuation.resume(throwing: error) }
-                else if let url { continuation.resume(returning: url) }
-                else { continuation.resume(throwing: TabMailAuthError.cancelled) }
-            }
-            session.prefersEphemeralWebBrowserSession = false
-            session.presentationContextProvider = self
-            self.currentSession = session
-            session.start()
-        }
-
-        // Extract session from: tabmail-ios://auth#s=<base64>
-        guard let fragment = callbackURL.fragment,
-              fragment.hasPrefix("s=") else {
-            throw TabMailAuthError.noSession
-        }
-
-        let base64 = String(fragment.dropFirst(2))
-        guard let data = Data(base64Encoded: base64) else {
-            throw TabMailAuthError.invalidSession
-        }
-
-        let session = try JSONDecoder().decode(TabMailSession.self, from: data)
-
-        // Persist in Keychain (survives app restarts)
-        // Epoch advances at the identity change — see `signInWithIdToken`.
-        let previousUserId = Self.getSession()?.userId
-        let encoded = try JSONEncoder().encode(session)
-        await Self.clearAIChoiceIfNoMailAccount()
-        _ = try TabMailSessionStore.shared.installNewSession(encoded)
-        AISubscriptionGate.shared.noteSignedIn(userId: session.userId, previousUserId: previousUserId)
-        // Session identity changed — re-evaluate the debug-logging gate.
-        DebugModeManager.invalidateLoggingCache()
-
-        BackgroundSyncLogger.logDebug("[TabMailAuth] Signed in as: \(session.userEmail)")
-        return session
-    }
-
     private func syncStripeCustomer(accessToken: String) async {
         do {
             let url = URL(string: "\(Self.billingURL)/billing/sync-customer")!
@@ -601,18 +542,7 @@ final class TabMailAuthService: NSObject {
     }
 }
 
-extension TabMailAuthService: ASWebAuthenticationPresentationContextProviding {
-    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
-        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        if let keyWindow = scenes.flatMap(\.windows).first(where: \.isKeyWindow) {
-            return keyWindow
-        }
-        return ASPresentationAnchor(windowScene: scenes.first!)
-    }
-}
-
 enum TabMailAuthError: LocalizedError {
-    case cancelled
     case noSession
     case invalidSession
     case invalidResponse
@@ -623,7 +553,6 @@ enum TabMailAuthError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .cancelled: return "Sign in was cancelled."
         case .noSession: return "No session received."
         case .invalidSession: return "Invalid session data."
         case .invalidResponse: return "Invalid response from server."

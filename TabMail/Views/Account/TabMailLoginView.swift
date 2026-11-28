@@ -318,7 +318,7 @@ struct TabMailLoginView: View {
                     case .microsoft:
                         try await signInMicrosoft()
                     case .apple:
-                        let session = try await authService.signInWithProvider(provider)
+                        let session = try await authService.signInWithApple()
                         // If the Apple ID's email is on an iCloud-managed
                         // domain (or an Apple private relay), stage the
                         // iCloud consent gate so the user is asked to set
@@ -338,7 +338,8 @@ struct TabMailLoginView: View {
             } catch is CancellationError {
                 // User cancelled
             } catch let nsError as NSError where nsError.domain == "com.apple.AuthenticationServices.WebAuthenticationSession" && nsError.code == 1 {
-                // ASWebAuthenticationSession cancelled (code 1)
+                // ASWebAuthenticationSession cancelled (code 1): Google and Microsoft pass it on as it is.
+                // Apple's sheet ends a cancel as CancellationError, caught above.
             } catch {
                 errorMessage = SyncEngine.isConnectionError(error) ? "Connection failed. Please check your network and try again." : "Sign in failed: \(error.userFacingDescription)"
             }

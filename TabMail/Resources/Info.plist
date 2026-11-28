@@ -39,14 +39,6 @@
 		</dict>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>TabMail Auth</string>
-			<key>CFBundleURLSchemes</key>
-			<array>
-				<string>tabmail-ios</string>
-			</array>
-		</dict>
-		<dict>
-			<key>CFBundleURLName</key>
 			<string>Mail</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
