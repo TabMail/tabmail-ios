@@ -54,9 +54,22 @@ final class OAuthService: NSObject {
     /// browser that answers the page itself.
     let signInBrowser: SignInBrowser?
 
-    init(tokenSession: URLSession = sharedEphemeralSession, signInBrowser: SignInBrowser? = nil) {
+    /// Fills `count` bytes at `bytes` with random bytes and returns its status,
+    /// as `SecRandomCopyBytes` does.
+    typealias RandomFill = @MainActor (_ count: Int, _ bytes: UnsafeMutableRawPointer) -> OSStatus
+
+    /// The app uses the system's cryptographically secure generator; a test
+    /// passes one that fails or fills fixed bytes.
+    let randomFill: RandomFill
+
+    init(
+        tokenSession: URLSession = sharedEphemeralSession,
+        signInBrowser: SignInBrowser? = nil,
+        randomFill: @escaping RandomFill = { SecRandomCopyBytes(kSecRandomDefault, $0, $1) }
+    ) {
         self.tokenSession = tokenSession
         self.signInBrowser = signInBrowser
+        self.randomFill = randomFill
         super.init()
     }
 
@@ -111,9 +124,9 @@ final class OAuthService: NSObject {
             throw OAuthError.notConfigured("Google OAuth client ID not set")
         }
 
-        let codeVerifier = generateCodeVerifier()
+        let codeVerifier = try generateCodeVerifier()
         let codeChallenge = generateCodeChallenge(from: codeVerifier)
-        let state = generateState()
+        let state = try generateState()
 
         var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
         var queryItems: [URLQueryItem] = [
@@ -138,41 +151,51 @@ final class OAuthService: NSObject {
         components.queryItems = queryItems
 
         let authURL = components.url!
-        BackgroundSyncLogger.logDebug("[OAuth] authURL: \(LoggableURL.address(authURL))")
+        BackgroundSyncLogger.logDebug("[OAuth] authURL: \(LoggableURL.address(authURL)) (scope=\(scope))")
 
-        let callbackURL: URL
-        if let signInBrowser {
-            callbackURL = try await signInBrowser(authURL, redirectScheme)
-        } else {
-            callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
-                let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
-                    if let error {
-                        let nsError = error as NSError
-                        BackgroundSyncLogger.logDebug("[OAuth] callback ERROR — domain=\(nsError.domain), code=\(nsError.code), userInfo=\(nsError.userInfo), description=\(nsError.localizedDescription)")
-                        continuation.resume(throwing: error)
-                    } else if let url {
-                        if DebugModeManager.isLoggingEnabled() {
-                            let queryItems = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
-                            let hasCode = queryItems.contains(where: { $0.name == "code" })
-                            let hasError = queryItems.first(where: { $0.name == "error" })?.value
-                            BackgroundSyncLogger.logDebug("[OAuth] callback received — hasCode=\(hasCode), googleError=\(hasError ?? "nil")")
-                        }
-                        continuation.resume(returning: url)
-                    } else {
-                        BackgroundSyncLogger.logDebug("[OAuth] callback received — url: nil, error: nil (treating as cancel)")
-                        continuation.resume(throwing: OAuthError.cancelled)
-                    }
-                }
-                session.prefersEphemeralWebBrowserSession = false
-                session.presentationContextProvider = self
-                self.currentSession = session
-                let started = session.start()
-                BackgroundSyncLogger.logDebug("[OAuth] session.start() returned: \(started) (scope=\(scope))")
-            }
-        }
-
+        let callbackURL = try await openSignInPage(authURL, callbackScheme: redirectScheme, logPrefix: "[OAuth]")
         let code = try Self.authorizationCode(from: callbackURL, state: state)
         return try await exchangeGoogleCode(code, codeVerifier: codeVerifier)
+    }
+
+    /// Shows a provider's sign-in `page` (the system sign-in sheet, or a
+    /// test's browser) and returns the address the provider sends the user
+    /// back to. The debug log names only which items the reply holds, or the
+    /// domain and code of the error that ended the sheet, never a value: the
+    /// reply carries this sign-in's code and state.
+    func openSignInPage(_ page: URL, callbackScheme: String, logPrefix: String) async throws -> URL {
+        let reply: URL
+        do {
+            if let signInBrowser {
+                reply = try await signInBrowser(page, callbackScheme)
+            } else {
+                reply = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
+                    let session = ASWebAuthenticationSession(url: page, callback: .customScheme(callbackScheme)) { url, error in
+                        if let error { continuation.resume(throwing: error) }
+                        else if let url { continuation.resume(returning: url) }
+                        else { continuation.resume(throwing: OAuthError.cancelled) }
+                    }
+                    session.prefersEphemeralWebBrowserSession = false
+                    session.presentationContextProvider = self
+                    self.currentSession = session
+                    let started = session.start()
+                    BackgroundSyncLogger.logDebug("\(logPrefix) session.start() returned: \(started)")
+                }
+            }
+        } catch {
+            let nsError = error as NSError
+            BackgroundSyncLogger.logDebug("\(logPrefix) sign-in ended — domain=\(nsError.domain), code=\(nsError.code)")
+            throw error
+        }
+        BackgroundSyncLogger.logDebug("\(logPrefix) callback received — \(Self.replyItems(reply))")
+        return reply
+    }
+
+    /// Which of `code`, `state` and `error` a sign-in reply holds, never their
+    /// values.
+    nonisolated static func replyItems(_ reply: URL) -> String {
+        let names = Set((URLComponents(url: reply, resolvingAgainstBaseURL: false)?.queryItems ?? []).map(\.name))
+        return ["code", "state", "error"].map { "\($0)=\(names.contains($0))" }.joined(separator: ", ")
     }
 
     func exchangeGoogleCode(_ code: String, codeVerifier: String) async throws -> OAuthTokens {
@@ -332,44 +355,59 @@ final class OAuthService: NSObject {
 
     // MARK: - PKCE Helpers
 
-    func generateCodeVerifier() -> String {
-        var bytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        return Data(bytes).base64EncodedString()
+    /// Random bytes in one code verifier or one sign-in state: 256 bits.
+    nonisolated static let secretByteCount = 32
+
+    /// `count` bytes from `randomFill`. Throws when it reports a failure, so a
+    /// code verifier or a state is never built from bytes that were not filled.
+    func randomBytes(_ count: Int) throws -> Data {
+        var bytes = [UInt8](repeating: 0, count: count)
+        let status = bytes.withUnsafeMutableBytes { buffer -> OSStatus in
+            guard let base = buffer.baseAddress else { return errSecParam }
+            return randomFill(buffer.count, base)
+        }
+        guard status == errSecSuccess else { throw OAuthError.noSecureRandomBytes }
+        return Data(bytes)
+    }
+
+    /// `data` as base64url without padding (RFC 4648 section 5), the form PKCE
+    /// and the sign-in state use.
+    nonisolated static func base64url(_ data: Data) -> String {
+        data.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
     }
 
+    /// A fresh PKCE code verifier (RFC 7636): `secretByteCount` random bytes,
+    /// base64url.
+    func generateCodeVerifier() throws -> String {
+        Self.base64url(try randomBytes(Self.secretByteCount))
+    }
+
     func generateCodeChallenge(from verifier: String) -> String {
-        let hash = SHA256.hash(data: Data(verifier.utf8))
-        return Data(hash).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+        Self.base64url(Data(SHA256.hash(data: Data(verifier.utf8))))
     }
 
     // MARK: - Sign-in state
 
-    /// A fresh `state` for one sign-in (RFC 6749 section 4.1): 256 bits from
-    /// the system's cryptographically secure generator, base64url. The reply
-    /// must carry it back (`authorizationCode(from:state:)`).
-    func generateState() -> String {
-        let bytes = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
-        return bytes.base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
+    /// A fresh `state` for one sign-in (RFC 6749 section 4.1):
+    /// `secretByteCount` random bytes, base64url. The reply must carry it back
+    /// (`authorizationCode(from:state:)`).
+    func generateState() throws -> String {
+        Self.base64url(try randomBytes(Self.secretByteCount))
     }
 
     /// The authorization code in a sign-in reply. A reply whose `state` is
     /// missing, different from this sign-in's, or given more than once is not
     /// the answer to this sign-in (it may come from another page), so it is
-    /// refused before any code from it reaches a token endpoint.
+    /// refused before any code from it reaches a token endpoint. The state is
+    /// compared byte for byte: Swift's `==` also accepts a different but
+    /// canonically equivalent spelling.
     nonisolated static func authorizationCode(from callbackURL: URL, state: String) throws -> String {
         let items = URLComponents(url: callbackURL, resolvingAgainstBaseURL: false)?.queryItems ?? []
         let replied = items.filter { $0.name == "state" }.map(\.value)
-        guard replied.count == 1, replied[0] == state else {
+        guard replied.count == 1, let echoed = replied[0], echoed.utf8.elementsEqual(state.utf8) else {
             throw OAuthError.stateMismatch
         }
         guard let code = items.first(where: { $0.name == "code" })?.value else {
@@ -400,6 +438,8 @@ enum OAuthError: Error {
     case noAuthCode
     /// The sign-in reply did not carry this sign-in's `state`.
     case stateMismatch
+    /// The system's secure random generator failed, so no sign-in was started.
+    case noSecureRandomBytes
     case tokenExchangeFailed(String)
     case consentFailed(String)
 }

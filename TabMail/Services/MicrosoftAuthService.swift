@@ -37,9 +37,9 @@ extension OAuthService {
             throw OAuthError.notConfigured("Microsoft OAuth client ID not set")
         }
 
-        let codeVerifier = generateCodeVerifier()
+        let codeVerifier = try generateCodeVerifier()
         let codeChallenge = generateCodeChallenge(from: codeVerifier)
-        let state = generateState()
+        let state = try generateState()
         let redirectUri = "\(redirectScheme)://auth"
 
         var components = URLComponents(string: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize")!
@@ -65,25 +65,7 @@ extension OAuthService {
         let authURL = components.url!
         BackgroundSyncLogger.logDebug("[OAuth] Microsoft authURL: \(LoggableURL.address(authURL))")
 
-        let callbackURL: URL
-        if let signInBrowser {
-            callbackURL = try await signInBrowser(authURL, redirectScheme)
-        } else {
-            callbackURL = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Error>) in
-                let session = ASWebAuthenticationSession(url: authURL, callback: .customScheme(redirectScheme)) { url, error in
-                    BackgroundSyncLogger.logDebug("[OAuth] Microsoft callback — url: \(LoggableURL.address(url)), error: \(String(describing: error))")
-                    if let error { continuation.resume(throwing: error) }
-                    else if let url { continuation.resume(returning: url) }
-                    else { continuation.resume(throwing: OAuthError.cancelled) }
-                }
-                session.prefersEphemeralWebBrowserSession = false
-                session.presentationContextProvider = self
-                self.currentSession = session
-                let started = session.start()
-                BackgroundSyncLogger.logDebug("[OAuth] Microsoft session.start() returned: \(started)")
-            }
-        }
-
+        let callbackURL = try await openSignInPage(authURL, callbackScheme: redirectScheme, logPrefix: "[OAuth] Microsoft")
         let code = try Self.authorizationCode(from: callbackURL, state: state)
         return try await exchangeMicrosoftCode(code, codeVerifier: codeVerifier, scope: scope)
     }

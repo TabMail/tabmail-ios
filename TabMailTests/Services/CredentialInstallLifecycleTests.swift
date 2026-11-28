@@ -108,6 +108,68 @@ struct CredentialInstallLifecycleTests {
         #expect(store.current(accountId: account.id)?.refreshToken == "current-grant")
     }
 
+    @Test("A re-sign-in whose reply is refused keeps the installed credentials and does not reconnect",
+          arguments: [false, true])
+    @MainActor
+    func refusedSignInReplyKeepsCredentials(outlook: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("credential-state-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let pool = try DatabasePool(path: directory.appendingPathComponent("test.sqlite").path)
+        defer { TestDatabaseTeardown.retire(pool: pool, directory: directory) }
+        try AppDatabase.runMigrations(on: pool)
+        let account = Account(emailAddress: "state@example.com", displayName: "Synthetic", provider: outlook ? .outlook : .gmail)
+        let store = ProviderCredentialStore.shared
+        defer { try? store.remove(accountId: account.id) }
+        _ = try await AccountManager.persistNewOAuthAccount(account, database: .init(pool: pool)) { _ in }
+        try await AccountManager.shared.installOAuthCredentials(accountId: account.id,
+            tokens: OAuthTokens(accessToken: "installed-access", refreshToken: "installed-grant", expiresAt: nil, idToken: nil))
+        let installed = try #require(store.activation(accountId: account.id))
+
+        // The provider's reply carries a foreign state until `echoes` is set.
+        let flow: OAuthSignInStateTests.Flow = outlook ? .microsoft : .google
+        let echoes = Mutex(false)
+        let http = OAuthSignInStateTests.tokenEndpoint()
+        defer { http.close() }
+        let service = OAuthService(tokenSession: http.session, signInBrowser: { page, _ in
+            let sent = OAuthSignInStateTests.states(in: page).compactMap { $0 }.first ?? ""
+            let state = echoes.withLock { $0 } ? sent : OAuthSignInStateTests.ForeignReply.other
+            return OAuthSignInStateTests.reply(to: flow, code: "code-1", states: [state])
+        })
+        let reconnects = Mutex(0)
+        let reconnect: @Sendable (Account) async throws -> Void = { _ in reconnects.withLock { $0 += 1 } }
+        let authenticate: @Sendable () async throws -> OAuthTokens = {
+            if outlook { return try await service.authenticateMicrosoft() }
+            return try await service.authenticateGoogle()
+        }
+        func reauthenticate() async throws {
+            if outlook {
+                try await AccountManager.shared.reauthenticateMicrosoft(for: account, authenticate: authenticate, reconnect: reconnect)
+            } else {
+                try await AccountManager.shared.reauthenticateGmail(for: account, authenticate: authenticate, reconnect: reconnect)
+            }
+        }
+
+        var refusal: (any Error)?
+        do { try await reauthenticate() } catch { refusal = error }
+
+        let refused: Bool
+        if let error = refusal as? OAuthError, case .stateMismatch = error { refused = true } else { refused = false }
+        let tokenRequests = http.recordedCalls().count
+        #expect(refused, "thrown: \(String(describing: refusal))")
+        #expect(tokenRequests == 0)
+        #expect(reconnects.withLock { $0 } == 0)
+        #expect(store.activation(accountId: account.id) == installed)
+        #expect(store.current(accountId: account.id)?.accessToken == "installed-access")
+        #expect(store.current(accountId: account.id)?.refreshToken == "installed-grant")
+
+        // The same re-sign-in answered with its own state installs and reconnects.
+        echoes.withLock { $0 = true }
+        try await reauthenticate()
+        #expect(reconnects.withLock { $0 } == 1)
+        #expect(store.current(accountId: account.id)?.accessToken == "access")
+        #expect(store.current(accountId: account.id)?.refreshToken == "refresh")
+    }
+
     enum Failure: CaseIterable, Sendable { case pointerAdd, verification, pointerRollback, grantRollback, rollback, interruption, database }
 
     @Test("Every partial credential write retains a durable retry and cleanup owner", arguments: Failure.allCases)
