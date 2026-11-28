@@ -21,11 +21,12 @@ struct BackendConfigTests {
         #expect(BackendConfig.syncBaseURL.contains("tabmail.ai"))
     }
 
-    @Test("syncWebSocketURL is valid WSS string")
+    @Test("The Device Sync socket address is a valid WSS string")
     func syncWebSocketURLValid() {
-        #expect(BackendConfig.syncWebSocketURL.hasPrefix("wss://"))
-        #expect(BackendConfig.syncWebSocketURL.contains("tabmail.ai"))
-        #expect(BackendConfig.syncWebSocketURL.hasSuffix("/ws"))
+        let webSocket = BackendConfig.syncEndpoints.webSocket
+        #expect(webSocket.hasPrefix("wss://"))
+        #expect(webSocket.contains("tabmail.ai"))
+        #expect(webSocket.hasSuffix("/ws"))
     }
 
     @Test("templatesBaseURL is valid HTTPS URL")

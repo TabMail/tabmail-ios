@@ -1547,6 +1547,42 @@ extension BackendClient {
             return nil
         }
     }
+
+    /// A one-time pass for one Device Sync connect, from `relayBaseURL` (the connect's own snapshot of
+    /// the relay, `BackendConfig.syncEndpoints`). Device Sync's socket does not send the sign-in token:
+    /// the token goes only in the Authorization header of this HTTPS request, and the socket opens
+    /// with the pass (`DeviceSyncService.socketURL`). The pass is good for one connect, for a few
+    /// seconds. nil on any failure: the caller retries through its own reconnect.
+    static func requestSyncConnectPass(
+        token: String,
+        relayBaseURL: String,
+        session: URLSession = sharedEphemeralSession
+    ) async -> String? {
+        guard let url = URL(string: "\(relayBaseURL)/ws/pass") else { return nil }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  200..<300 ~= httpResponse.statusCode else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                BackgroundSyncLogger.logDebug("[BackendClient] Sync connect pass HTTP \(code)")
+                return nil
+            }
+
+            struct PassResponse: Decodable {
+                let pass: String
+            }
+            let pass = try JSONDecoder().decode(PassResponse.self, from: data).pass
+            return pass.isEmpty ? nil : pass
+        } catch {
+            BackgroundSyncLogger.logDebug("[BackendClient] Sync connect pass error: \(error)")
+            return nil
+        }
+    }
 }
 
 // MARK: - Account & Usage API
