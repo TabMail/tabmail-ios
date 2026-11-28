@@ -576,8 +576,7 @@ struct ChatRecentPeopleHostedTests {
         let invalid = "not an address"
         #expect(ThreadChatTests.type(invalid, in: window), "the search takes typed text")
         try? await Task.sleep(for: .milliseconds(100))
-        let returned = field.delegate?.textFieldShouldReturn?(field)
-        #expect(returned != nil, "control: the field answers Return")
+        await Self.pressReturn(in: field)
         try? await Task.sleep(for: .milliseconds(200))
         let afterReturn = field.text ?? ""
         let rowsAfterReturn = Self.elements(ChatReplyToSheet.personId, in: window).count
@@ -645,10 +644,20 @@ struct ChatRecentPeopleHostedTests {
         let field = try #require(textField(in: window), "the sheet has the search field")
         #expect(ThreadChatTests.type(text, in: window), "the search takes typed text")
         try? await Task.sleep(for: .milliseconds(100))
-        // What UIKit asks the field's delegate when the Return key is pressed.
-        let returned = field.delegate?.textFieldShouldReturn?(field)
-        #expect(returned != nil, "control: the field answers Return")
+        await pressReturn(in: field)
         _ = await waitUntil { !elements(ChatReplyToSheet.personId, in: window).isEmpty && (field.text ?? "").isEmpty }
+    }
+
+    /// Presses Return in `field` as the keyboard does: in the focused field, UIKit asks the field's
+    /// delegate and then sends the end-on-exit action. Asking the delegate of an unfocused field
+    /// did not reach the sheet's `.onSubmit` in the test host.
+    private static func pressReturn(in field: UITextField) async {
+        field.becomeFirstResponder()
+        _ = await waitUntil { field.isFirstResponder }
+        #expect(field.isFirstResponder, "control: the search field is focused")
+        if field.delegate?.textFieldShouldReturn?(field) ?? true {
+            field.sendActions(for: .editingDidEndOnExit)
+        }
     }
 
     /// What the sheet gave back through Done, and how many times it read its recent people.
