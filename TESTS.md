@@ -1558,3 +1558,17 @@ session's access token as the bearer. A refused exchange (400) or an unreadable 
 the AI choice and the epoch as they were, and sends no billing sync. `OneAISettingForTheDeviceTests` counts two session
 writes (the id-token and the code sign-in). The sheet itself (SwiftUI's `AuthorizationController`) is checked
 on a device.
+
+## A failed SMTP STARTTLS upgrade keeps its cause
+
+`MailTransportEncryptionTests+STARTTLSFailures.swift` (part of `MailTransportEncryptionTests`, so serialized and
+`.processGlobalState`) runs the real Outbox drain against `FakeSMTPServer` in its STARTTLS modes: the server
+offers STARTTLS, then refuses it, never answers it, or accepts it and answers the client's first TLS bytes with
+a raw protocol_version alert (what a server below TLS 1.2 sends), with plain text, or by hanging up. The pinned
+SwiftMail reports the TLS layer's own error for a failed handshake (`SMTPServer.applyPostEHLOTLSPolicy`), so a
+below-floor server takes one strike per drain and is Failed on the third with the TLS-floor sentence, and any
+other failed handshake (the stand-in for a certificate that does not verify) or a hang-up takes the strikes as
+on port 465; a 454 refusal and an unanswered STARTTLS stay queued with no strike. A server that offers
+`starttls` in lower case is asked for STARTTLS. `startTLSUpgradeFailureClassification` pins
+`AccountManager.isTransientSendError` on SwiftMail's exact wording, including the EHLO timeout after a completed
+upgrade, which no loopback fake can reach without a certificate.

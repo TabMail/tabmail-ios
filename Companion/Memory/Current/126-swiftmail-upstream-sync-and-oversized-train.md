@@ -549,3 +549,22 @@ serializer that writes recipients:
 - Collision check: every app `logout()` call is `try?`, so no caller depends on the old reconnect.
 - App and NSE pin `d286942929e361e73215fcc1418d01791f3b2826` (#951, PR #955). The related cancellation
   behaviour (a cancelled in-flight command closes the channel before any LOGOUT) is tracked in #954.
+
+## 2026-11-28 — a failed SMTP STARTTLS upgrade keeps its cause
+
+- One fork commit on branch `fix/smtp-starttls-error-detail` ("Report the TLS error when a STARTTLS upgrade
+  fails", `e4f5f9f0`), on fork `main` `64b294d`. It lands on fork `main` after review, and the same change,
+  rebased on `upstream/main`, becomes an upstream PR. Upstream had moved past the pin (#339, #341, #344); that
+  resync is separate work and needs its own collision check.
+- Cause, measured: after STARTTLS the client sent its EHLO without waiting for the handshake. A failed
+  handshake reached the app only as the closed channel under that EHLO (`Command failed: … ChannelError error
+  5`), so a below-TLS-1.2 server and a bad certificate read the same and stayed queued as transient
+  `.tlsFailed`. `TLSHandshakeErrorRecorder`, installed right after the TLS handler, keeps the first error the
+  channel reports, and the failed upgrade reports it. No wait, timeout or reordering is added.
+- Also: errors are kept as themselves in `Command failed: …` and in the channel error log, and EHLO keywords are
+  read in any case. The transport-mode helpers moved unchanged to `SMTPServer+TransportMode.swift` to keep the
+  file under the length limit.
+- App side: re-pinned in `project.yml` and the root `Package.resolved`. `AccountManager.isTransientSTARTTLSFailure`
+  relies on two pieces of library wording, the reason prefix `STARTTLS upgrade failed: ` and the "SMTP " that
+  begins every `SMTPError` rendering. The app's end-to-end tests run both through the pinned library, so a
+  wording change upstream fails them at the next re-pin. Detail: `IOS-TLS-002`, amendment 2026-11-28.

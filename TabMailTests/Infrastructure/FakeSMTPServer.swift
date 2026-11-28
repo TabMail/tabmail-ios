@@ -7,10 +7,10 @@ import Foundation
 /// A minimal SMTP server on a loopback ephemeral port that speaks plain TCP
 /// only and records every line a client sends.
 ///
-/// It never offers STARTTLS (it could not upgrade), and it advertises
-/// `AUTH PLAIN` and answers a whole submission, so a client willing to send
-/// without encryption goes all the way through: its AUTH line and message are
-/// recorded here.
+/// By default it offers no STARTTLS, and it advertises `AUTH PLAIN` and answers
+/// a whole submission, so a client willing to send without encryption goes all
+/// the way through: its AUTH line and message are recorded here. Given a
+/// `StartTLSAnswer` it offers STARTTLS but never completes a TLS handshake.
 ///
 /// Socket ownership follows `FakeIMAPServer`: only a connection's own thread
 /// closes its descriptor; `stop()` shuts the sockets down, so a descriptor
@@ -18,7 +18,34 @@ import Foundation
 final class FakeSMTPServer: @unchecked Sendable {
     enum ServerError: Error { case setup(String) }
 
+    /// How the server answers STARTTLS when it offers it.
+    enum StartTLSAnswer {
+        /// Refuse the upgrade with this reply line (CRLF appended).
+        case refuse(String)
+        /// Never answer, but keep the connection open and keep reading.
+        case silence
+        /// Accept with 220, wait for the client's first TLS bytes, answer them
+        /// with these raw bytes instead of a handshake, then close once the
+        /// client has.
+        case acceptThenAnswerHandshake([UInt8])
+    }
+
+    /// A fatal TLS alert record (type 21, version 3.1, length 2, level fatal,
+    /// description protocol_version): what a server that cannot speak the
+    /// client's minimum TLS version answers its ClientHello with.
+    static let protocolVersionAlert: [UInt8] = [0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x46]
+
     private(set) var port: Int = 0
+
+    private let startTLSAnswer: StartTLSAnswer?
+    private let startTLSKeyword: String
+
+    /// `startTLSKeyword` is the EHLO line that offers STARTTLS, as the server
+    /// spells it; it is advertised only with a `startTLSAnswer`.
+    init(startTLSAnswer: StartTLSAnswer? = nil, startTLSKeyword: String = "STARTTLS") {
+        self.startTLSAnswer = startTLSAnswer
+        self.startTLSKeyword = startTLSKeyword
+    }
 
     private let lock = NSLock()
     private var listenFd: Int32 = -1
@@ -114,7 +141,11 @@ final class FakeSMTPServer: @unchecked Sendable {
                 continue
             }
             switch line.split(separator: " ").first.map({ $0.uppercased() }) ?? "" {
-            case "EHLO": reply(fd, "250-smtp.example.com\r\n250-AUTH PLAIN\r\n250 8BITMIME\r\n")
+            case "EHLO":
+                let offer = startTLSAnswer == nil ? "" : "250-\(startTLSKeyword)\r\n"
+                reply(fd, "250-smtp.example.com\r\n\(offer)250-AUTH PLAIN\r\n250 8BITMIME\r\n")
+            case "STARTTLS" where startTLSAnswer != nil:
+                if !answerStartTLS(fd) { return }
             case "AUTH": reply(fd, "235 2.7.0 Accepted\r\n")
             case "DATA":
                 inData = true
@@ -124,6 +155,31 @@ final class FakeSMTPServer: @unchecked Sendable {
                 return
             default: reply(fd, "250 2.0.0 OK\r\n")
             }
+        }
+    }
+
+    /// Answers STARTTLS; false when the connection is over.
+    private func answerStartTLS(_ fd: Int32) -> Bool {
+        switch startTLSAnswer {
+        case .refuse(let line)?:
+            reply(fd, line + "\r\n")
+            return true
+        case .silence?:
+            return true
+        case .acceptThenAnswerHandshake(let bytes)?:
+            reply(fd, "220 2.0.0 Ready to start TLS\r\n")
+            var chunk = [UInt8](repeating: 0, count: 4096)
+            // The client's first TLS bytes, then the scripted answer.
+            guard recv(fd, &chunk, chunk.count, 0) > 0 else { return false }
+            _ = bytes.withUnsafeBytes { send(fd, $0.baseAddress, $0.count, 0) }
+            // Half-close and wait for the client to hang up, so unread client
+            // bytes never turn the close into a reset that could discard the
+            // answer before the client reads it.
+            _ = shutdown(fd, SHUT_WR)
+            while recv(fd, &chunk, chunk.count, 0) > 0 {}
+            return false
+        case nil:
+            return true
         }
     }
 

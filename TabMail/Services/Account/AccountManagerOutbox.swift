@@ -704,10 +704,10 @@ extension AccountManager {
             // Send failed — three-tier error classification:
             // 1. Fatal (invalid recipient, message too large): immediately mark 'failed',
             //    no retries. These will never succeed without user intervention.
-            // 2. Transient (connection, TLS, timeout): keep 'queued' indefinitely
-            //    without incrementing retryCount. Resolves on its own.
-            // 3. Permanent (auth, command rejected): increment retryCount, mark
-            //    'failed' after 3 attempts so user can retry or discard.
+            // 2. Transient (connection, timeout, STARTTLS refused for now): keep
+            //    'queued' indefinitely without incrementing retryCount. Resolves on its own.
+            // 3. Permanent (auth, command rejected, a TLS handshake that failed):
+            //    increment retryCount, mark 'failed' after 3 attempts so user can retry or discard.
             if !(error is CancellationError) && !SyncEngine.isConnectionError(error) {
                 BackgroundSyncLogger.logError("Send failed for \(current.id): \(error)", source: "outbox:\(current.accountId)")
             }
@@ -806,8 +806,10 @@ extension AccountManager {
         // SMTPError cases
         if let smtpError = error as? SMTPError {
             switch smtpError {
-            case .connectionFailed, .tlsFailed, .sendFailed:
-                // Connection issues, TLS negotiation, send failures are transient
+            case .tlsFailed(let reason):
+                return isTransientSTARTTLSFailure(reason)
+            case .connectionFailed, .sendFailed:
+                // Connection issues and send failures are transient
                 return true
             case .authenticationFailed, .invalidEmailAddress, .commandFailed, .messageTooLarge, .invalidResponse, .unexpectedResponse:
                 // Auth failures, bad addresses, server rejections are permanent
@@ -825,10 +827,40 @@ extension AccountManager {
         // URL/network errors are transient
         if (error as NSError).domain == NSURLErrorDomain { return true }
         // NIO connection errors are transient
-        let desc = String(describing: error)
-        if desc.contains("connection") || desc.contains("timeout") || desc.contains("Connection") { return true }
+        if isTransientTransportText(String(describing: error)) { return true }
         // Default: treat as permanent to avoid infinite retries on truly broken sends
         return false
+    }
+
+    /// Whether the rendered text of a transport error (NIO, NIOSSL) reads as a
+    /// passing connection problem or a timeout.
+    nonisolated static func isTransientTransportText(_ text: String) -> Bool {
+        text.contains("connection") || text.contains("timeout") || text.contains("Connection")
+    }
+
+    /// How SwiftMail begins its reason for a failed SMTP STARTTLS upgrade; the
+    /// error that ended the upgrade follows (`SMTPServer.applyPostEHLOTLSPolicy`).
+    nonisolated static let startTLSUpgradeFailurePrefix = "STARTTLS upgrade failed: "
+
+    /// Whether an `SMTPError.tlsFailed` may clear by itself.
+    ///
+    /// A failed STARTTLS upgrade whose cause came from the TLS layer (the
+    /// handshake, or the connection under it) is judged as the same error is on
+    /// the implicit-TLS port 465, where it arrives bare: by
+    /// `isTransientTransportText`. So a certificate that does not verify takes the
+    /// bounded strikes and ends Failed with Retry/Discard, as on 465, instead of
+    /// staying queued for good. (A server below the TLS 1.2 floor never reaches
+    /// here: `IMAPProvider.mapTransportSecurityFailure` names it first.)
+    ///
+    /// Every other TLS failure stays transient: the server refusing STARTTLS (a
+    /// 454 asks to try later), and the STARTTLS and EHLO timeouts. SwiftMail
+    /// reports each of those with one of its own `SMTPError`s after the prefix,
+    /// and every `SMTPError` renders starting with "SMTP ".
+    nonisolated static func isTransientSTARTTLSFailure(_ reason: String) -> Bool {
+        guard reason.hasPrefix(startTLSUpgradeFailurePrefix) else { return true }
+        let cause = reason.dropFirst(startTLSUpgradeFailurePrefix.count)
+        if cause.hasPrefix("SMTP ") { return true }
+        return isTransientTransportText(String(cause))
     }
 
     // MARK: - Optimistic Sent Header
