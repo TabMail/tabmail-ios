@@ -1859,9 +1859,15 @@ extension SyncEngine {
                                         // text is the server's and can read like a
                                         // connection error ("timed out", "command failed").
                                         if !(error is IMAPSearchRefused),
-                                           Self.isConnectionError(error) || Self.isSelectFailedError(error) {
+                                           Self.isConnectionError(error) || Self.isSelectFailedError(error)
+                                            || error is IMAPTransportSecurityError {
                                             // Return the range for retry; this worker stops,
                                             // and the pass declines the folder for the call.
+                                            // A server that refuses an encrypted connection
+                                            // refuses every range's SEARCH the same way, so it
+                                            // stops the worker like an unreachable server
+                                            // (`BackfillEncryptionRefusalTests`); walking on
+                                            // opened one refused connection per range.
                                             await cursor.failRange(from: range.from, to: range.to)
                                             outcome.stoppedOnFailure = true
                                             BackgroundSyncLogger.logDebug("[Backfill] \(folderCaptured.name) w\(workerIndex) SEARCH connection error: \(error)")

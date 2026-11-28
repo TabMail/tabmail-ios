@@ -379,6 +379,10 @@ struct MailTransportEncryptionTests {
         let accountId = "older-mail-encryption-refused"
         _ = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
         try FolderEpochTestFixture.insertFolder(accountId: accountId, path: "INBOX", role: .inbox, pool: pool)
+        // Exactly one full page on the device: the first page fills, the next
+        // local page is empty, so scrolling on asks the server for older mail.
+        try FolderEpochTestFixture.insertHeaders(
+            accountId: accountId, path: "INBOX", uids: Array(1...SyncConfig.inboxPageSize), pool: pool)
         let read = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
         let inbox = try #require(read)
         // No test override: the transport comes from the port, as in production.
@@ -390,8 +394,9 @@ struct MailTransportEncryptionTests {
             accountId: accountId, provider: provider,
             workQueue: ProviderWorkQueue(provider: provider, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
 
-        // No local mail, so the scroll asks the server for older mail.
         let vm = InboxViewModel(folders: [inbox])
+        let pageFilled = vm.hasMoreMessages
+        #expect(pageFilled, "the first page did not fill, so the scroll would not ask the server")
         vm.loadMoreMessages()
         var polls = 0
         while vm.error == nil, polls < 1000 {
@@ -403,6 +408,9 @@ struct MailTransportEncryptionTests {
         try? await provider.disconnect()
 
         #expect(line == InboxErrorBanner.encryptionMessage, "got \(String(describing: line))")
+        // Two-sided: the scroll reached the server, and never signed in there.
+        let connections = server.acceptedConnectionCount()
+        #expect(connections >= 1, "the scroll never reached the server")
         let commands = server.recordedCommands()
         #expect(!Self.sentSignIn(commands), "\(commands)")
     }

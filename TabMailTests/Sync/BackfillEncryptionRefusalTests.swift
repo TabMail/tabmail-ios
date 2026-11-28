@@ -5,19 +5,25 @@
 import Testing
 import Foundation
 import GRDB
+import Synchronization
 @testable import TabMail
 
 /// A mail server that refuses an encrypted connection (it offers no STARTTLS on
 /// a port where TabMail requires it, `MailTransportPolicy`) must not make the
-/// backfill walk reconnect at network rate. The walk's first read of a folder
-/// it has not started yet (no walk position: after Settings > Smart Reindex, or
-/// a folder never walked) is refused there every time; a walk that picked the
-/// same folder straight back after each refusal opened a new connection per
-/// iteration, and a call with no deadline (the foreground worker's) never
-/// returned.
+/// backfill walk reconnect at network rate.
 ///
-/// The property: after the walk's first connection, a full observation window
-/// passes with no second one.
+/// - The walk's first read of a folder it has not started yet (no walk
+///   position: after Settings > Smart Reindex, or a folder never walked) is
+///   refused there every time; a walk that picked the same folder straight back
+///   after each refusal opened a new connection per iteration, and a call with
+///   no deadline (the foreground worker's) never returned.
+/// - A folder with a walk position but no UIDVALIDITY stamp passes the
+///   walk-start gate, and every range's SEARCH is refused; a worker that set
+///   each refused range aside and walked on opened one connection per range,
+///   down to UID 1, on every call.
+///
+/// The property: the walk's connections to such a server are bounded by its
+/// own retry pace and its workers, never by the folder's size.
 ///
 /// Timing test: run this suite on its own. `.serialized, .processGlobalState`:
 /// replaces `AppDatabase.shared` and binds a listening socket via
@@ -34,20 +40,44 @@ struct BackfillEncryptionRefusalTests {
     private static let firstConnectionBoundSeconds = 10.0
     /// How long the walk may take to end once cancelled.
     private static let endBoundSeconds = 10.0
+    /// How long a resumed walk of a refused folder may take to end on its own.
+    private static let resumedEndBoundSeconds = 30.0
+    /// The resumed folder's walk position: at least this divided by the largest
+    /// chunk size (1000) ranges lie below it, far more than the walk's workers.
+    private static let resumedCursor = 100_000
 
-    /// Whether `call` ended within `bound` seconds.
+    /// Set once by the waiter in `ends(_:within:)`.
+    private final class Flag: Sendable {
+        private let state = Mutex(false)
+        func set() { state.withLock { $0 = true } }
+        var isSet: Bool { state.withLock { $0 } }
+    }
+
+    /// Whether `call` ended within `bound` seconds. An unstructured waiter sets
+    /// a flag that this polls, so a call that never ends returns false here
+    /// instead of hanging the test (awaiting `Task.value` ignores the waiter's
+    /// own cancellation).
     private static func ends(_ call: Task<Bool, Never>, within bound: TimeInterval) async -> Bool {
-        await withTaskGroup(of: Bool.self) { group in
-            group.addTask { _ = await call.value; return true }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(bound))
-                return false
-            }
-            let first = await group.next() ?? false
-            group.cancelAll()
-            for await _ in group {}
-            return first
+        let ended = Flag()
+        Task { _ = await call.value; ended.set() }
+        let start = ContinuousClock.now
+        while !ended.isSet, ContinuousClock.now - start < .seconds(bound) {
+            try? await Task.sleep(for: .milliseconds(10))
         }
+        return ended.isSet
+    }
+
+    private static func signedIn(_ commands: [String]) -> Bool {
+        commands.contains { $0.uppercased().contains("LOGIN") || $0.uppercased().contains("AUTHENTICATE") }
+    }
+
+    /// An IMAP provider for `server` with no test override: the transport comes
+    /// from the port, as in production, and the fake offers no STARTTLS (its
+    /// default capabilities have none) on a port that is not 993.
+    private static func provider(for server: FakeIMAPServer) -> IMAPProvider {
+        IMAPProvider(
+            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
+            smtpHost: "127.0.0.1", smtpPort: MailTransportPolicy.smtpImplicitTLSPort)
     }
 
     @Test("A walk with no deadline connects once to a server that offers no STARTTLS, then does not reconnect at once")
@@ -55,8 +85,6 @@ struct BackfillEncryptionRefusalTests {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
 
-        // Offers no STARTTLS (the default capabilities have none) on a port that
-        // is not 993, so the real transport policy requires STARTTLS there.
         let server = FakeIMAPServer(mailboxes: ["INBOX": []])
         try server.start()
         defer { server.stop() }
@@ -70,10 +98,7 @@ struct BackfillEncryptionRefusalTests {
             folder.backfillUidCursor = nil
             try folder.insert(db)
         }
-        // No test override: the transport comes from the port, as in production.
-        let imap = IMAPProvider(
-            host: "127.0.0.1", port: server.port, username: server.username, password: server.password,
-            smtpHost: "127.0.0.1", smtpPort: MailTransportPolicy.smtpImplicitTLSPort)
+        let imap = Self.provider(for: server)
         defer { Task { try? await imap.disconnect() } }
         let engine = SyncEngine()
         await engine.register(
@@ -97,10 +122,59 @@ struct BackfillEncryptionRefusalTests {
         #expect(connections == 1, "the walk opened \(connections) connections in \(Self.observeSeconds) s")
         #expect(ended, "the walk did not end after it was cancelled")
         let commands = server.recordedCommands()
-        let signedIn = commands.contains { $0.uppercased().contains("LOGIN") || $0.uppercased().contains("AUTHENTICATE") }
-        #expect(!signedIn, "\(commands)")
+        #expect(!Self.signedIn(commands), "\(commands)")
         let read = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
         let row = try #require(read)
         #expect(!row.backfillComplete, "a refused folder was marked complete")
+    }
+
+    @Test("A resumed walk with no UIDVALIDITY stamp stops each worker at its first refusal, not one connection per range")
+    func refusedServerIsNotAskedOncePerRange() async throws {
+        let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
+        defer { AppDatabase.shared.withLock { $0 = previous }; TestDatabaseTeardown.retire(pool: pool, directory: dir) }
+
+        let server = FakeIMAPServer(mailboxes: ["INBOX": []])
+        try server.start()
+        defer { server.stop() }
+
+        let accountId = "walk-encryption-refused-resumed"
+        let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
+        let startCursor = Self.resumedCursor
+        try await pool.write { db in
+            // A folder with a walk position and no UIDVALIDITY stamp: the
+            // walk-start gate lets it through even though the walk-start read
+            // is refused, so the workers ask the server range by range.
+            var folder = Folder(name: "INBOX", path: "INBOX", role: .inbox, accountId: accountId)
+            folder.backfillComplete = false
+            folder.backfillUidCursor = startCursor
+            folder.lastKnownUidValidity = nil
+            try folder.insert(db)
+        }
+        let imap = Self.provider(for: server)
+        defer { Task { try? await imap.disconnect() } }
+        // The walk runs this many workers; each may meet the refusal once.
+        let workers = await imap.poolMaxConnections()
+        let engine = SyncEngine()
+        await engine.register(
+            accountId: accountId, provider: imap,
+            workQueue: ProviderWorkQueue(provider: imap, maxConcurrency: SyncConfig.imapMaxConnectionCeiling))
+
+        // No deadline: the walk declines the folder for the call and ends by itself.
+        let call = Task { await engine.runBackfillWalk(account: account) }
+        let ended = await Self.ends(call, within: Self.resumedEndBoundSeconds)
+        if !ended { call.cancel() }
+        let connections = server.acceptedConnectionCount()
+
+        #expect(ended, "the walk did not end within \(Self.resumedEndBoundSeconds) s")
+        #expect(connections >= 1, "the walk never reached the server")
+        // The walk-start read, then at most one refused SEARCH per worker.
+        #expect(connections <= 1 + workers,
+                "the walk opened \(connections) connections with \(workers) workers over \(startCursor) UIDs")
+        let commands = server.recordedCommands()
+        #expect(!Self.signedIn(commands), "\(commands)")
+        let read = try FolderEpochTestFixture.readFolder(accountId: accountId, path: "INBOX", pool: pool)
+        let row = try #require(read)
+        #expect(!row.backfillComplete, "a refused folder was marked complete")
+        #expect(row.backfillUidCursor == startCursor, "the walk position moved past ranges the server never answered")
     }
 }
