@@ -793,7 +793,11 @@ struct RootView: View {
         }
         .sheet(item: $deletionReceipt) { receipt in
             ScrollView {
-                AccountDeletionConfirmation(scheduledDateText: receipt.scheduledDateText, errorMessage: nil) {
+                AccountDeletionConfirmation(
+                    scheduledDateText: receipt.scheduledDateText,
+                    showsAppleManualStop: receipt.showsAppleManualStop,
+                    errorMessage: nil
+                ) {
                     deletionReceipt = nil
                 }
             }

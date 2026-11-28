@@ -47,6 +47,19 @@ enum AccountDeletionCopy {
     static let keepAccountConsequence =
         "Keep Account stops the account deletion only. If a subscription or trial was active, " +
         "renewal stays off, and an ended trial isn’t restored."
+
+    /// Shown before scheduling to an account that signed in with Apple: Apple's sheet comes next.
+    static let appleSignInConfirmNotice =
+        "You signed in with Apple, so Apple asks you to confirm once more when you schedule the deletion. " +
+        "This lets TabMail stop using your Apple Account. If you close Apple’s sheet, the deletion still goes ahead."
+
+    /// Shown on the confirmation when TabMail could not stop using the Apple Account itself.
+    static let appleSignInManualStop =
+        "To stop TabMail from using your Apple Account, open Settings, tap your name, then Sign in with Apple, " +
+        "choose TabMail and tap Delete."
+
+    /// Apple's support article for stopping an app's use of your Apple Account.
+    static let appleSignInSupportURL = "https://support.apple.com/102571"
 }
 
 enum AccountDeletionSubscriptionPolicy {
@@ -144,7 +157,9 @@ enum AccountDeletionSubscriptionCoordinator {
     }
 
     enum ExecutionResult {
-        case scheduled(deletionDate: String?)
+        /// `appleAuthorizationRevoked` is billing's answer to an Apple authorization code sent with the
+        /// request; nil when none was sent or the answer was lost (the status read-back does not carry it).
+        case scheduled(deletionDate: String?, appleAuthorizationRevoked: Bool?)
         case blocked(Outcome)
         case schedulingNotConfirmed
     }
@@ -207,7 +222,10 @@ enum AccountDeletionSubscriptionCoordinator {
         progress(.schedulingDeletion)
         do {
             let response = try await scheduleDeletion()
-            return .scheduled(deletionDate: response.deletion_date)
+            return .scheduled(
+                deletionDate: response.deletion_date,
+                appleAuthorizationRevoked: response.apple_authorization_revoked
+            )
         } catch {
             // The request may have committed before its response was lost.
             // Resolve that ambiguity through the existing read-only status
@@ -215,7 +233,7 @@ enum AccountDeletionSubscriptionCoordinator {
             do {
                 let status = try await fetchDeletionStatus()
                 if status.pending {
-                    return .scheduled(deletionDate: status.deletion_date)
+                    return .scheduled(deletionDate: status.deletion_date, appleAuthorizationRevoked: nil)
                 }
                 // A negative read can race a request that is still resolving
                 // provider state before it creates the pending deletion. Only

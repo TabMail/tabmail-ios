@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+import AuthenticationServices
 import SwiftUI
 
 struct AccountDeletionView: View {
@@ -13,6 +14,7 @@ struct AccountDeletionView: View {
     private static let gracePeriodDays = 30
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.authorizationController) private var authorizationController
     @Environment(StoreKitManager.self) private var storeKit
     @State private var confirmed = false
     @State private var deletionAttemptGate = AccountDeletionAttemptGate()
@@ -23,11 +25,20 @@ struct AccountDeletionView: View {
     /// timestamp could not be parsed — we then omit the date rather than
     /// promise one we don't have.
     @State private var scheduledDateText: String?
+    /// The account signed in with Apple (from its access token, read when the screen appears): the form says
+    /// Apple's sheet comes next.
+    @State private var isAppleAccount = false
+    /// The confirmation says how to stop using the Apple Account with TabMail by hand.
+    @State private var showsAppleManualStop = false
 
     var body: some View {
         ScrollView {
             if deletionComplete {
-                AccountDeletionConfirmation(scheduledDateText: scheduledDateText, errorMessage: errorMessage) {
+                AccountDeletionConfirmation(
+                    scheduledDateText: scheduledDateText,
+                    showsAppleManualStop: showsAppleManualStop,
+                    errorMessage: errorMessage
+                ) {
                     dismiss()
                 }
             } else {
@@ -39,6 +50,9 @@ struct AccountDeletionView: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(deletionComplete || deletionAttemptGate.isRunning)
         .dismissKeyboardOnTap()
+        .task {
+            isAppleAccount = AppleIDSignIn.isAppleAccount(accessToken: TabMailAuthService.getSession()?.accessToken)
+        }
     }
 
     // MARK: - Deletion form
@@ -129,6 +143,17 @@ struct AccountDeletionView: View {
                     .font(.headline)
             }
 
+            if isAppleAccount {
+                GroupBox {
+                    Text(AccountDeletionCopy.appleSignInConfirmNotice)
+                        .font(.subheadline)
+                        .padding(.vertical, 4)
+                } label: {
+                    Label("Sign in with Apple", systemImage: "apple.logo")
+                        .font(.headline)
+                }
+            }
+
             Divider()
 
             // Confirmation toggle
@@ -194,6 +219,11 @@ private extension AccountDeletionView {
             deletionAttemptGate.finish()
             progressMessage = "Schedule Deletion"
         }
+        // Read at the start: the session is cleared once the deletion is scheduled.
+        let appleAccount = AppleIDSignIn.isAppleAccount(accessToken: TabMailAuthService.getSession()?.accessToken)
+        let authorize: AppleIDSignIn.CodeAuthorization = { request in
+            AppleIDSignIn.authorizationCode(of: try await authorizationController.performRequest(request))
+        }
 
         do {
             let billingClient = BillingClient()
@@ -210,15 +240,25 @@ private extension AccountDeletionView {
                     )
                 },
                 manageAppleSubscription: { await presentAppleSubscriptions() },
-                scheduleDeletion: { try await billingClient.requestAccountDeletion() },
+                scheduleDeletion: {
+                    try await AppleIDSignIn.scheduleDeletion(
+                        isAppleAccount: appleAccount,
+                        authorize: authorize,
+                        request: { try await billingClient.requestAccountDeletion(appleAuthorizationCode: $0) }
+                    )
+                },
                 fetchDeletionStatus: { try await billingClient.checkDeletionStatus() },
                 progress: { progressMessage = $0.buttonLabel }
             )
 
             let deletionDate: String?
             switch execution {
-            case .scheduled(let scheduledDate):
+            case .scheduled(let scheduledDate, let appleAuthorizationRevoked):
                 deletionDate = scheduledDate
+                showsAppleManualStop = AppleIDSignIn.showsManualStopLine(
+                    isAppleAccount: appleAccount,
+                    appleAuthorizationRevoked: appleAuthorizationRevoked
+                )
             case .schedulingNotConfirmed:
                 errorMessage = AccountDeletionCopy.schedulingNotConfirmed
                 return
@@ -236,7 +276,10 @@ private extension AccountDeletionView {
             // A successful sign-out removes this screen; RootView then shows the
             // confirmation from the receipt.
             let localSignOutCompleted = await scopedTabMailCleanup(
-                receipt: AccountDeletionReceipt.Receipt(scheduledDateText: scheduledDateText)
+                receipt: AccountDeletionReceipt.Receipt(
+                    scheduledDateText: scheduledDateText,
+                    showsAppleManualStop: showsAppleManualStop
+                )
             )
             if !localSignOutCompleted {
                 errorMessage = "Deletion is scheduled, but local sign-out could not finish. Please tap Done and try signing out again."
@@ -316,6 +359,8 @@ private extension AccountDeletionView {
 struct AccountDeletionConfirmation: View {
     /// The server's deletion date, formatted; nil names no date.
     let scheduledDateText: String?
+    /// Shows how to stop using the Apple Account with TabMail by hand.
+    let showsAppleManualStop: Bool
     let errorMessage: String?
     let onDone: () -> Void
 
@@ -358,6 +403,20 @@ struct AccountDeletionConfirmation: View {
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal)
+
+            if showsAppleManualStop {
+                VStack(spacing: 6) {
+                    Text(AccountDeletionCopy.appleSignInManualStop)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    if let supportURL = URL(string: AccountDeletionCopy.appleSignInSupportURL) {
+                        Link("How to stop using Sign in with Apple", destination: supportURL)
+                            .font(.subheadline)
+                    }
+                }
+                .padding(.horizontal)
+            }
 
             if let errorMessage {
                 Text(errorMessage)

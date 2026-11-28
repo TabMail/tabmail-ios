@@ -572,11 +572,12 @@ struct DeletionCoordinatorRequestBoundaryTests {
             progress: { _ in }
         )
 
-        guard case .scheduled(let confirmedDate) = execution else {
+        guard case .scheduled(let confirmedDate, let appleAuthorizationRevoked) = execution else {
             Issue.record("Expected status reconciliation to confirm scheduling")
             return
         }
         #expect(confirmedDate == DeletionCoordinatorFixtures.futureDeletionDate)
+        #expect(appleAuthorizationRevoked == nil, "the status read-back does not carry billing's revoke answer")
         #expect(events == ["fetch", "cancel", "fetch", "fetch", "delete", "status"])
         #expect(snapshots.isEmpty)
     }
@@ -905,7 +906,7 @@ struct AccountDeletionProductionWiringTests {
 struct AccountDeletionReceiptTests {
     @Test("The receipt is waiting before the sign-out runs, so the sign-out notification finds it")
     func handedBeforeTheSignOut() {
-        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: "date-1")
+        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: "date-1", showsAppleManualStop: true)
         var seen: AccountDeletionReceipt.Receipt?
         let signedOut = AccountDeletionReceipt.signOut(handing: receipt) {
             seen = AccountDeletionReceipt.take()
@@ -914,11 +915,12 @@ struct AccountDeletionReceiptTests {
         #expect(signedOut)
         #expect(seen == receipt)
         #expect(seen?.scheduledDateText == "date-1")
+        #expect(seen?.showsAppleManualStop == true)
     }
 
     @Test("After a successful sign-out the root takes the receipt once")
     func keptForTheRootOnce() {
-        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: nil)
+        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: nil, showsAppleManualStop: false)
         var signOutCalls = 0
         let signedOut = AccountDeletionReceipt.signOut(handing: receipt) {
             signOutCalls += 1
@@ -928,13 +930,14 @@ struct AccountDeletionReceiptTests {
         #expect(signOutCalls == 1)
         let taken = AccountDeletionReceipt.take()
         #expect(taken == receipt)
+        #expect(taken?.showsAppleManualStop == false)
         let later = AccountDeletionReceipt.take()
         #expect(later == nil, "a later sign-out shows the ordinary alert")
     }
 
     @Test("A failed sign-out drops the receipt, so no later sign-out shows a deletion confirmation")
     func failedSignOutDropsTheReceipt() {
-        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: "date-1")
+        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: "date-1", showsAppleManualStop: true)
         var signOutCalls = 0
         let signedOut = AccountDeletionReceipt.signOut(handing: receipt) {
             signOutCalls += 1
@@ -974,7 +977,8 @@ struct AccountDeletionConfirmationWiringTests {
         let date = try #require(text.range(of: "scheduledDateText = deletionDate.flatMap(Date.fromISO8601)"))
         let cleanup = try #require(text.range(of:
             "let localSignOutCompleted = await scopedTabMailCleanup( " +
-            "receipt: AccountDeletionReceipt.Receipt(scheduledDateText: scheduledDateText) )"))
+            "receipt: AccountDeletionReceipt.Receipt( scheduledDateText: scheduledDateText, " +
+            "showsAppleManualStop: showsAppleManualStop ) )"))
         #expect(date.upperBound < cleanup.lowerBound, "the receipt carries the server's date")
         // A failed sign-out leaves this screen up, and it shows the confirmation with its error line.
         let failed = try #require(text.range(of:
@@ -985,8 +989,8 @@ struct AccountDeletionConfirmationWiringTests {
                 "the confirmation follows every scheduled deletion")
         #expect(Self.count("deletionComplete = true", in: text) == 1)
         #expect(text.contains(
-            "if deletionComplete { AccountDeletionConfirmation(scheduledDateText: scheduledDateText, " +
-            "errorMessage: errorMessage) { dismiss() } }"),
+            "if deletionComplete { AccountDeletionConfirmation( scheduledDateText: scheduledDateText, " +
+            "showsAppleManualStop: showsAppleManualStop, errorMessage: errorMessage ) { dismiss() } }"),
             "a failed sign-out still shows the confirmation on the screen")
     }
 
@@ -1009,7 +1013,8 @@ struct AccountDeletionConfirmationWiringTests {
         #expect(Self.count("showSignedOutAlert", in: text) == 3, "the alert only when no receipt")
         #expect(text.contains(
             ".sheet(item: $deletionReceipt) { receipt in ScrollView { " +
-            "AccountDeletionConfirmation(scheduledDateText: receipt.scheduledDateText, errorMessage: nil) { " +
+            "AccountDeletionConfirmation( scheduledDateText: receipt.scheduledDateText, " +
+            "showsAppleManualStop: receipt.showsAppleManualStop, errorMessage: nil ) { " +
             "deletionReceipt = nil } }"))
         // The sheet hangs on the root's own chain, straight after the alert it replaces: inside `routedContent`
         // (defined before `body`) it would leave with the branch the sign-out removes.

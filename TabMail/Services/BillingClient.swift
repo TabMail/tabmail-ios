@@ -56,9 +56,22 @@ private struct ExactDeletionCancellationRequest: Encodable {
 
 private struct AgeIneligibleDeletionRequest: Encodable {
     let requestId: String
+    /// Left out of the body when nil (synthesized `encodeIfPresent`), so a request without it is unchanged.
+    let appleAuthorizationCode: String?
 
     enum CodingKeys: String, CodingKey {
         case requestId = "request_id"
+        case appleAuthorizationCode = "apple_authorization_code"
+    }
+}
+
+/// The body of an account deletion request that carries a fresh Sign in with Apple authorization code; a
+/// request without a code has no body.
+private struct AccountDeletionRequest: Encodable {
+    let appleAuthorizationCode: String
+
+    enum CodingKeys: String, CodingKey {
+        case appleAuthorizationCode = "apple_authorization_code"
     }
 }
 
@@ -67,7 +80,12 @@ actor BillingClient {
     typealias CancellationResponse = BillingCancellationResponse
 
     private var baseURL: URL { BackendConfig.billingBaseURL }
-    private let session = sharedEphemeralSession
+    private let session: URLSession
+
+    /// `session` carries every request; tests pass a stub transport.
+    init(session: URLSession = sharedEphemeralSession) {
+        self.session = session
+    }
 
     private func currentAuthToken() async -> String? {
         switch await TabMailTokenCoordinator.shared.validToken() {
@@ -85,6 +103,10 @@ actor BillingClient {
         let deletion_date: String
         // swiftlint:disable:next identifier_name
         let requested_at: String?
+        /// Present only when the request carried an Apple authorization code: whether billing revoked the
+        /// app's Sign in with Apple authorization with it.
+        // swiftlint:disable:next identifier_name
+        let apple_authorization_revoked: Bool?
     }
 
     struct CancelDeletionResponse: Decodable {
@@ -180,17 +202,19 @@ actor BillingClient {
         )
     }
 
-    func requestAccountDeletion() async throws -> DeletionResponse {
+    /// Schedule the signed-in account's deletion. `appleAuthorizationCode` is a fresh code from Apple's sheet,
+    /// for an account that signed in with Apple: billing revokes the app's authorization with it once the
+    /// deletion is scheduled. The code is sent only in the body and never logged.
+    func requestAccountDeletion(appleAuthorizationCode: String? = nil) async throws -> DeletionResponse {
         guard let token = await currentAuthToken() else {
             throw BackendError.unauthorized
         }
 
-        var request = URLRequest(url: baseURL.appending(path: "/account/delete"))
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
-
+        let request = try Self.makeAccountDeletionRequest(
+            baseURL: baseURL,
+            token: token,
+            appleAuthorizationCode: appleAuthorizationCode
+        )
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               200..<300 ~= httpResponse.statusCode else {
@@ -201,16 +225,40 @@ actor BillingClient {
         return try JSONDecoder().decode(DeletionResponse.self, from: data)
     }
 
+    nonisolated static func makeAccountDeletionRequest(
+        baseURL: URL,
+        token: String,
+        appleAuthorizationCode: String?
+    ) throws -> URLRequest {
+        var request = URLRequest(url: baseURL.appending(path: "/account/delete"))
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 30
+        if let appleAuthorizationCode {
+            request.httpBody = try JSONEncoder().encode(
+                AccountDeletionRequest(appleAuthorizationCode: appleAuthorizationCode)
+            )
+        }
+        return request
+    }
+
     /// Delete the signed-in account after a failed age check (`ConsentGateView`).
-    /// Only a request id is sent — never the date of birth. The worker re-reads
-    /// the account live and refuses (409) one that has already agreed.
+    /// Only a request id is sent — never the date of birth — plus, on the one
+    /// extra request an account that signed in with Apple sends after billing
+    /// acknowledged the first, a fresh Apple authorization code (billing revokes
+    /// the app's authorization with it). The worker re-reads the account live
+    /// and refuses (409) one that has already agreed.
     ///
     /// A token that could not be refreshed for a transient reason means
     /// billing was never asked, so it throws a retriable error (status 0), not
     /// `.unauthorized`: the refusal's OK must ask again rather than sign out
     /// (`AgeAndTermsConsent.deletionHandshake`). A session that is gone or
     /// revoked can never ask, so that stays `.unauthorized`.
-    func requestAgeIneligibleDeletion(requestId: String = UUID().uuidString.lowercased()) async throws {
+    func requestAgeIneligibleDeletion(
+        requestId: String = UUID().uuidString.lowercased(),
+        appleAuthorizationCode: String? = nil
+    ) async throws {
         let token: String
         switch await TabMailTokenCoordinator.shared.validToken() {
         case .success(let fresh): token = fresh
@@ -218,7 +266,12 @@ actor BillingClient {
         case .permanentFailure, .noSession: throw BackendError.unauthorized
         }
 
-        let request = try Self.makeAgeIneligibleDeletionRequest(baseURL: baseURL, token: token, requestId: requestId)
+        let request = try Self.makeAgeIneligibleDeletionRequest(
+            baseURL: baseURL,
+            token: token,
+            requestId: requestId,
+            appleAuthorizationCode: appleAuthorizationCode
+        )
         let (_, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
               200..<300 ~= httpResponse.statusCode else {
@@ -231,14 +284,18 @@ actor BillingClient {
     nonisolated static func makeAgeIneligibleDeletionRequest(
         baseURL: URL,
         token: String,
-        requestId: String
+        requestId: String,
+        appleAuthorizationCode: String? = nil
     ) throws -> URLRequest {
         var request = URLRequest(url: baseURL.appending(path: "/account/age-ineligible"))
         request.httpMethod = "POST"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
-        request.httpBody = try JSONEncoder().encode(AgeIneligibleDeletionRequest(requestId: requestId))
+        request.httpBody = try JSONEncoder().encode(AgeIneligibleDeletionRequest(
+            requestId: requestId,
+            appleAuthorizationCode: appleAuthorizationCode
+        ))
         return request
     }
 
