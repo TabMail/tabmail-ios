@@ -540,8 +540,8 @@ next connect the new one; the live pass request, sent to a loopback HTTP listene
 its Authorization header and in no other line; and with the shipping pass request against a loopback relay
 that accepts the upgrade and sends its `connected` frame, a setting change during the token wait leaves both
 the pass request and the upgrade at the relay read at the start (the other relay sees nothing), the frame
-confirms the connection, the CONNECT log line names that relay, the confirmation line names no address and
-no line carries the pass or the token. `DebugModeManagerTests` pins the real dev and production
+confirms the connection, the CONNECT log line names that relay, the one confirmation line ends at the user
+("CONNECTED as user" and the id's prefix, nothing after it) and no line carries the pass or the token. `DebugModeManagerTests` pins the real dev and production
 address pairs and that locking debug mode resets both; `DeviceSyncErrorRedactionTests` strips a pass from a
 failing URL as it does a token.
 

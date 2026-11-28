@@ -735,15 +735,14 @@ struct DeviceSyncConnectTests {
 
             let lines = AppLogStore.read(channel: .deviceSync).split(separator: "\n").map(String.init)
             let connectLines = lines.filter { $0.contains("CONNECT →") }
-            let confirmationLines = lines.filter { $0.contains("CONNECTED as user user-5e1") }
+            let confirmationLines = lines.filter { $0.contains("CONNECTED as user") }
             let expectedConnect = "CONNECT → ws://127.0.0.1:\(port)/ws"
             let connectNamesTheRelay = connectLines.count == 1 && connectLines[0].hasSuffix(expectedConnect)
             #expect(connectNamesTheRelay, "the CONNECT line names the relay the socket opened at: \(connectLines)")
-            #expect(confirmationLines.count == 1, "the confirmation is logged")
-            let confirmationNamesAnAddress = confirmationLines.contains { line in
-                ["127.0.0.1", "ws://", "http://", "relay"].contains { line.contains($0) }
-            }
-            #expect(!confirmationNamesAnAddress, "the confirmation names no relay address")
+            // The whole confirmation is the user: it ends there, so no address of any scheme follows it.
+            let confirmationIsTheUserOnly = confirmationLines.count == 1
+                && confirmationLines[0].hasSuffix("CONNECTED as user user-5e1")
+            #expect(confirmationIsTheUserOnly, "one confirmation, naming the user and nothing else: \(confirmationLines)")
             let credentialLogged = lines.contains { $0.contains("pass-from-relay") || $0.contains(Self.token) }
             #expect(!credentialLogged, "no log line carries the pass or the token")
         }
