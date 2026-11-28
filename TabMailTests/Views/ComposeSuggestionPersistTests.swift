@@ -884,18 +884,19 @@ struct ComposeSuggestionPersistTests {
         let prepopulate = try functionBody("private func prepopulate() {", before: "private func clearAttachmentPreparationFailures() {", in: source)
         let branch = try #require(prepopulate.range(of: "freshSuggestion: {\n"))
         let rest = prepopulate[branch.upperBound...]
-        let read = try #require(rest.range(of: "return try? dbPool.read { db -> ReplyResult? in\n"))
-        let guardLine = try #require(rest.range(of: "guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }\n"))
-        let fetch = try #require(rest.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
-        // The end of the stored-suggestion read's closure.
-        let otherwise = try #require(rest.range(of: "})\n"))
-        #expect(read.lowerBound < guardLine.lowerBound && guardLine.lowerBound < fetch.lowerBound
-                && fetch.lowerBound < otherwise.lowerBound,
-                "the identity check guards the stored-suggestion read, inside it, before the value")
+        let read = try #require(rest.range(
+            of: "return try? dbPool.read { db -> ReplyResult? in try Self.storedSuggestionAtOpen(for: reply, db: db) }\n"))
         let shown = try #require(rest.range(of: "shownSuggestion = suggested"))
-        #expect(fetch.lowerBound < shown.lowerBound, "the guarded value is the one shown")
-        #expect(rest[..<otherwise.lowerBound].components(separatedBy: "MessageHeader.fetchOne").count == 2,
-                "the branch has one read of the stored suggestion, the guarded one")
+        #expect(read.lowerBound < shown.lowerBound, "the guarded value is the one shown")
+        #expect(prepopulate.components(separatedBy: "MessageHeader.fetchOne").count == 1,
+                "prepopulate reads the stored suggestion only through the guarded read")
+        // That read: the identity check, then the row's suggestion.
+        let helper = try functionBody(
+            "nonisolated static func storedSuggestionAtOpen(for reply: MessageHeader, db: Database) throws -> ReplyResult? {",
+            before: "private func prepopulate() {", in: source)
+        let guardLine = try #require(helper.range(of: "guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }\n"))
+        let fetch = try #require(helper.range(of: "return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion"))
+        #expect(guardLine.lowerBound < fetch.lowerBound, "the identity check guards the stored-suggestion read, before the value")
     }
 
     /// Backstop for what no active test can drive (the hosted card's pill and Recompute take no
@@ -958,24 +959,23 @@ struct ComposeSuggestionPersistTests {
 
         await ComposeView.writeOverCurrent(ReplyResult(body: "my edit", textMessage: nil, changeCommand: nil), replyTo: held, db: db)
 
-        #expect(try row(db, other.id).cachedReply == Self.replacementsOwn, "the edit landed on the email now at the old address")
+        let afterEdit = try row(db, other.id)
+        #expect(afterEdit.cachedReply == Self.replacementsOwn, "the edit landed on the email now at the old address")
 
         // Control: the email the row does hold takes the same write, so the check, not a failed
         // write, kept the edit off it.
         await ComposeView.writeOverCurrent(ReplyResult(body: "control", textMessage: nil, changeCommand: nil), replyTo: other, db: db)
-        #expect(try row(db, other.id).cachedReply == "control")
+        let afterControl = try row(db, other.id)
+        #expect(afterControl.cachedReply == "control")
     }
 
     // MARK: - What a reply card shows at open for the email it opened for
 
     /// The stored suggestion a reply card opened without a given one shows: `prepopulate`'s
-    /// `freshSuggestion` read, which `prefillReadsTheStoredSuggestionThroughTheIdentityCheck` pins
-    /// to this shape (the identity check inside the read, then the row's suggestion).
+    /// `freshSuggestion` read, the production one (`ComposeView.storedSuggestionAtOpen`, which
+    /// `prefillReadsTheStoredSuggestionThroughTheIdentityCheck` pins as `prepopulate`'s read).
     private func storedSuggestionAtOpen(for held: MessageHeader, in db: DatabaseQueue) throws -> String? {
-        try db.read { db -> String? in
-            guard try AIWriteTarget.stillHolds(held, db: db) else { return nil }
-            return try MessageHeader.fetchOne(db, key: held.id)?.suggestion?.body
-        }
+        try db.read { db in try ComposeView.storedSuggestionAtOpen(for: held, db: db)?.body }
     }
 
     /// The email at the shared address after a reset seated `replacement` there: present, holding its
@@ -1071,57 +1071,66 @@ struct ComposeSuggestionPersistTests {
         return email
     }
 
-    /// The editor is told about the email compose was opened for, before any email a saved row
-    /// names, and the card's edit is stored on that same email (`suggestionEdit` is handed
-    /// `replyTo`), so an answer about one email is never stored on another.
-    @Test("The editor is told about the email compose opened for, and its edit is stored on that same email")
+    /// The editor, Recompute and the stores of their answers work on the email the Send threads
+    /// against (`ComposeDraftGuards.sendReplyTarget`): a saved row's resolved email wins over the
+    /// compose argument, as on main, so the model is never told about an email other than the one
+    /// the draft shows and sends to, and the card's edit is stored on that same email.
+    @Test("The editor is told about the email the saved draft resolved to, and its edit is stored on that same email")
     func editorIsToldAboutTheEmailItsEditIsStoredOn() throws {
         let argument = email(subject: "argument", from: "second@example.com", snippet: "argument snippet")
         let resolved = email(subject: "resolved", from: "first@example.com", snippet: "resolved snippet")
-        let related = ComposeDraftGuards.relatedEmail(composeArgument: argument, persistedRowClaim: .resolved(resolved))
-        #expect(related?.subject == "argument")
-        #expect(related?.fromAddress == "second@example.com")
-        #expect(ComposeDraftGuards.editorMode(related: related, isForward: false) == "edit_reply")
+        let target = ComposeDraftGuards.sendReplyTarget(composeParameter: argument, persistedRowClaim: .resolved(resolved))
+        #expect(target == .send(resolved))
+        #expect(ComposeDraftGuards.editorMode(related: resolved, isForward: false) == "edit_reply")
 
         let source = try composeSource()
         let selection = try functionBody(
-            "private var relatedEmail: MessageHeader? {", before: "private func buildComposeEditContext(", in: source)
+            "private var aiReplyTarget: ComposeDraftGuards.SendReplyTarget {", before: "private func buildComposeEditContext(", in: source)
         #expect(selection.contains(
-            "ComposeDraftGuards.relatedEmail(composeArgument: replyTo, persistedRowClaim: persistedReplyTargetClaim)"))
+            "ComposeDraftGuards.sendReplyTarget(composeParameter: replyTo, persistedRowClaim: persistedReplyTargetClaim)"))
         let edit = try functionBody("private func applyInlineEdit(", before: "struct SuggestionEdit {", in: source)
         let gate = try #require(edit.range(of: "let edit = Self.suggestionEdit("))
         let call = String(edit[gate.lowerBound...].prefix(400))
-        #expect(call.contains("replyTo: replyTo,"), "the edit's store target is the email the editor is told about: \(call)")
+        #expect(call.contains("replyTo: aiReplyEmail,"), "the edit's store target is the email the editor is told about: \(call)")
+        // Recompute and the request's context take the same email; the context names the email
+        // whose body was read.
+        let recompute = try functionBody("private func recomputeReply() {", before: "// MARK: - Agent Toast", in: source)
+        #expect(recompute.contains("guard let reply = aiReplyEmail, let account = resolvedAccount,"))
+        let reader = try functionBody("private func composeEditContextForRequest()", before: "\n    }\n", in: source)
+        #expect(reader.contains("guard case .send(let related) = aiReplyTarget else {"))
+        #expect(reader.contains("return buildComposeEditContext(related: reply, relatedBodyText: bodyText)"))
     }
 
-    @Test("A saved reply reopened with no caller email (Undo Send) still gives the editor its email and mode")
+    @Test("A saved reply reopened with no caller email (Undo Send) still gives the editor its email and mode; a refused one refuses")
     func editorKeepsTheReplyWhenReopenedWithoutAnArgument() {
         let resolved = email(subject: "resolved", from: "first@example.com", snippet: "resolved snippet")
-        let related = ComposeDraftGuards.relatedEmail(composeArgument: nil, persistedRowClaim: .resolved(resolved))
-        #expect(related?.subject == "resolved")
-        #expect(ComposeDraftGuards.editorMode(related: related, isForward: false) == "edit_reply")
-        #expect(ComposeDraftGuards.editorMode(related: related, isForward: true) == "edit_forward")
+        let reopened = ComposeDraftGuards.sendReplyTarget(composeParameter: nil, persistedRowClaim: .resolved(resolved))
+        #expect(reopened == .send(resolved))
+        #expect(ComposeDraftGuards.editorMode(related: resolved, isForward: false) == "edit_reply")
+        #expect(ComposeDraftGuards.editorMode(related: resolved, isForward: true) == "edit_forward")
 
-        // A row whose email was refused, or that names none, gives the editor no email.
-        for claim in [ComposeDraftGuards.PersistedReplyTargetClaim.unresolved, .noClaim] {
-            let none = ComposeDraftGuards.relatedEmail(composeArgument: nil, persistedRowClaim: claim)
-            let isNewMessage = none == nil
-            #expect(isNewMessage, "\(claim)")
-        }
+        // A row that names no email is a new message. A row whose email was refused blocks the Send
+        // and every AI request (`composeEditContextForRequest`); the compose argument never stands
+        // in for it.
+        let noClaim = ComposeDraftGuards.sendReplyTarget(composeParameter: nil, persistedRowClaim: .noClaim)
+        #expect(noClaim == .send(nil))
+        let refused = ComposeDraftGuards.sendReplyTarget(composeParameter: nil, persistedRowClaim: .unresolved)
+        #expect(refused == .blocked)
+        let refusedWithArgument = ComposeDraftGuards.sendReplyTarget(composeParameter: resolved, persistedRowClaim: .unresolved)
+        #expect(refusedWithArgument == .blocked)
     }
 
     @Test("Without a saved row the editor takes the compose argument; a new message gives none")
     func editorFallsBackToTheArgumentAlone() {
         let argument = email(subject: "argument", from: "second@example.com", snippet: "argument snippet")
-        let related = ComposeDraftGuards.relatedEmail(composeArgument: argument, persistedRowClaim: nil)
-        #expect(related?.subject == "argument")
-        #expect(ComposeDraftGuards.editorMode(related: related, isForward: true) == "edit_forward")
+        let fresh = ComposeDraftGuards.sendReplyTarget(composeParameter: argument, persistedRowClaim: nil)
+        #expect(fresh == .send(argument))
+        #expect(ComposeDraftGuards.editorMode(related: argument, isForward: true) == "edit_forward")
 
-        let none = ComposeDraftGuards.relatedEmail(composeArgument: nil, persistedRowClaim: nil)
-        let isNewMessage = none == nil
-        #expect(isNewMessage)
-        #expect(ComposeDraftGuards.editorMode(related: none, isForward: false) == "edit_new")
-        #expect(ComposeDraftGuards.editorMode(related: none, isForward: true) == "edit_forward")
+        let none = ComposeDraftGuards.sendReplyTarget(composeParameter: nil, persistedRowClaim: nil)
+        #expect(none == .send(nil))
+        #expect(ComposeDraftGuards.editorMode(related: nil, isForward: false) == "edit_new")
+        #expect(ComposeDraftGuards.editorMode(related: nil, isForward: true) == "edit_forward")
     }
 
     @Test("The editor reads only the email's own body, without an attached email's text", arguments: epochProviders)

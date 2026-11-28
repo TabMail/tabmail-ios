@@ -963,21 +963,7 @@ enum ComposeDraftGuards {
         confirmedBodyHTML
     }
 
-    /// The email a compose's AI work answers (the inline editor's mode and context): the email
-    /// compose was opened for (`composeArgument`), else, for a saved reply or forward reopened with
-    /// none (Undo Send), the one its draft row names as resolved at open (`persistedRowClaim`,
-    /// `Draft.resolveReplyQuote`), so the editor still works on that reply. Nil: a new message, or
-    /// a row whose email could not be resolved. The editor reads the email's body through the one
-    /// identity-checked read (`ComposeEditContext.relatedBodyText`) whichever it is.
-    static func relatedEmail(
-        composeArgument: MessageHeader?, persistedRowClaim: PersistedReplyTargetClaim?
-    ) -> MessageHeader? {
-        if let composeArgument { return composeArgument }
-        if case .resolved(let header) = persistedRowClaim { return header }
-        return nil
-    }
-
-    /// The inline editor's mode: a forward, a reply to the related email (`relatedEmail`), else a
+    /// The inline editor's mode: a forward, a reply to the related email (`ComposeView.aiReplyEmail`), else a
     /// new message (a forward with no email to forward keeps the forward mode).
     static func editorMode(related: MessageHeader?, isForward: Bool) -> String {
         if isForward { return "edit_forward" }
@@ -1868,7 +1854,7 @@ struct ComposeView: View {
                         // Bubble visible → edit the suggestion; otherwise edit the body.
                         draftBody: showingSuggestion ? (currentSuggestion ?? "") : messageBody,
                         draftSuggestion: showingSuggestion ? shownSuggestion : nil,
-                        composeContext: buildComposeEditContext(relatedBodyText: nil),
+                        composeContext: buildComposeEditContext(related: aiReplyEmail, relatedBodyText: nil),
                         composeEditContext: { await composeEditContextForRequest() },
                         draftId: draftId,
                         draftReplyToId: replyTo?.id,
@@ -2341,14 +2327,14 @@ struct ComposeView: View {
         .padding(.top, 4)
     }
 
-    // MARK: - Recompute reply (debug — direct LLM, skips Device Sync)
+    // MARK: - Recompute reply
 
     /// Admitted through the compose agent fence, as an inline edit is: one of the two runs at a
     /// time, so the last gesture admitted lands last and neither replaces the other's newer value.
     /// In a reply only to the people chosen (`onlyToChosen`) the new reply is written for the
     /// card's people and stored nowhere (`recomputedReplyForChosen`).
     private func recomputeReply() {
-        guard let reply = replyTo, let account = resolvedAccount, agentSendFence.beginAgent() else { return }
+        guard let reply = aiReplyEmail, let account = resolvedAccount, agentSendFence.beginAgent() else { return }
         isRecomputing = true
 
         let fence = agentSendFence
@@ -2406,18 +2392,27 @@ struct ComposeView: View {
 
     // MARK: - Inline Edit
 
-    /// The email the inline editor works on (`ComposeDraftGuards.relatedEmail`): the one compose was
-    /// opened for, else the email a reopened saved reply or forward names (Undo Send).
-    private var relatedEmail: MessageHeader? {
-        ComposeDraftGuards.relatedEmail(composeArgument: replyTo, persistedRowClaim: persistedReplyTargetClaim)
+    /// The email this compose's AI work answers (the inline editor, Recompute and the stores of their
+    /// answers): the one its Send threads against (`ComposeDraftGuards.sendReplyTarget`), so the AI
+    /// and the Send never work on two different emails. A saved draft's row wins: the email it
+    /// resolved to at open (`Draft.resolveReplyQuote`), also when compose reopens it with no caller
+    /// email (Undo Send). Without a row, the email compose was opened for. `.blocked`: the row names
+    /// an email that no longer resolves, so its Send is blocked and every AI request is refused.
+    private var aiReplyTarget: ComposeDraftGuards.SendReplyTarget {
+        ComposeDraftGuards.sendReplyTarget(composeParameter: replyTo, persistedRowClaim: persistedReplyTargetClaim)
+    }
+
+    /// `aiReplyTarget`'s email. Nil: a new message, or a draft whose email no longer resolves.
+    private var aiReplyEmail: MessageHeader? {
+        if case .send(let email) = aiReplyTarget { return email }
+        return nil
     }
 
     /// The compose edit context for the DynamicIslandChat inline editor, with `relatedBodyText` as
     /// the email's body. Built at render without a read (it tells the pill it edits a draft, and
     /// from which sender); a request's own context comes from `composeEditContextForRequest`.
-    private func buildComposeEditContext(relatedBodyText bodyText: String?) -> ComposeEditContext {
-        let related = relatedEmail
-        return ComposeEditContext.make(
+    private func buildComposeEditContext(related: MessageHeader?, relatedBodyText bodyText: String?) -> ComposeEditContext {
+        ComposeEditContext.make(
             recipients: recipients, account: resolvedAccount,
             mode: ComposeDraftGuards.editorMode(related: related, isForward: isForward), related: related,
             relatedBodyText: bodyText, compositionPrompt: PromptStore.shared.compositionMarkdown(),
@@ -2425,17 +2420,22 @@ struct ComposeView: View {
     }
 
     /// A compose edit request's context, read after the request is admitted: the email replied to
-    /// or forwarded with its body, through the one identity-checked read
-    /// (`ComposeEditContext.relatedBodyText`). Nil refuses the request: another email is seated at
-    /// its address (or the read failed), so its body is never sent with this draft.
+    /// or forwarded (`aiReplyTarget`, taken once) with its body, through the one identity-checked
+    /// read (`ComposeEditContext.relatedBodyText`); that same email is the one the context names.
+    /// Nil refuses the request: the draft's email no longer resolves, another email is seated at
+    /// its address, or the read failed, so no other email's body is ever sent with this draft.
     private func composeEditContextForRequest() async -> ComposeEditContext? {
-        guard let reply = relatedEmail else { return buildComposeEditContext(relatedBodyText: nil) }
+        guard case .send(let related) = aiReplyTarget else {
+            BackgroundSyncLogger.logDebug("[ComposeView] compose edit refused: the draft's email no longer resolves")
+            return nil
+        }
+        guard let reply = related else { return buildComposeEditContext(related: nil, relatedBodyText: nil) }
         let read = try? await dbPool.read { db in try ComposeEditContext.relatedBodyText(of: reply, db: db) }
         guard case .some(let bodyText) = read else {
             BackgroundSyncLogger.logDebug("[ComposeView] compose edit refused: the row is no longer \(reply.messageId)")
             return nil
         }
-        return buildComposeEditContext(relatedBodyText: bodyText)
+        return buildComposeEditContext(related: reply, relatedBodyText: bodyText)
     }
 
     /// Apply an inline edit result, or a resend's or rewind's restore, as one operation awaited by
@@ -2472,7 +2472,7 @@ struct ComposeView: View {
         let previous = shownSuggestion
         let edit = Self.suggestionEdit(
             body: newBody, textMessage: textMessage, changeCommand: changeCommand,
-            showingSuggestion: showingSuggestion, isForward: isForward, onlyToChosen: onlyToChosen, replyTo: replyTo,
+            showingSuggestion: showingSuggestion, isForward: isForward, onlyToChosen: onlyToChosen, replyTo: aiReplyEmail,
             recipients: recipients.pendingCommitted, subject: newSubject ?? subject,
             accountId: selectedAccount?.id, accounts: navigationStore.accounts)
         if let s = newSubject {
@@ -3307,6 +3307,15 @@ struct ComposeView: View {
 
     // MARK: - Prepopulate
 
+    /// The AI Suggestion a reply card shows at open when the caller gave none (`prepopulate`'s
+    /// `freshSuggestion`): the row's own, read only while the row is still the email replied to.
+    /// Another email seated at its address (a UIDVALIDITY reset) never lends the card its
+    /// suggestion. Internal for testability.
+    nonisolated static func storedSuggestionAtOpen(for reply: MessageHeader, db: Database) throws -> ReplyResult? {
+        guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }
+        return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion
+    }
+
     private func prepopulate() {
         // Set initial From account
         if selectedAccount == nil {
@@ -3410,12 +3419,7 @@ struct ComposeView: View {
             onlyToChosen: onlyToChosen,
             freshSuggestion: {
                 guard offersStoredSuggestion, let reply = replyTo else { return nil }
-                // Only while the row is still the email replied to: another email seated at its
-                // address (a UIDVALIDITY reset) never lends this card its suggestion.
-                return try? dbPool.read { db -> ReplyResult? in
-                    guard try AIWriteTarget.stillHolds(reply, db: db) else { return nil }
-                    return try MessageHeader.fetchOne(db, key: reply.id)?.suggestion
-                }
+                return try? dbPool.read { db -> ReplyResult? in try Self.storedSuggestionAtOpen(for: reply, db: db) }
             })
         if DebugModeManager.isLoggingEnabled() {
             BackgroundSyncLogger.logDebug("[ComposeView] suggestion instance=\(instanceToken) draftId=\(draftId) suggestionLen=\(suggestionToShow?.body.count ?? -1)")

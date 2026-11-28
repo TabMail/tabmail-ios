@@ -266,6 +266,32 @@ struct ChatFieldComposeTests {
         }
     }
 
+    /// A failed read of the email's body is not a missing body: the field's reply is refused, so
+    /// its failure path keeps the user's words, and the AI is never asked from the snippet instead.
+    /// (The agent's reply and forward tools alone read a failed body as missing,
+    /// `ComposeEditRecipientRolesTests.replyAndForwardSurviveAFailedBodyRead`.)
+    @Test("A failed read of the email's body asks nothing and opens no card", arguments: [true, false])
+    func failedBodyReadWritesNothing(fails: Bool) async throws {
+        let fixture = try await fixture()
+        if fails {
+            try await fixture.db.write { db in try db.execute(sql: "DROP TABLE messageBody") }
+        }
+        let asked = Asked()
+        let compose = compose(fixture, asked: asked, answer: Self.answer())
+        let invocation = invocation(fixture.header)
+        let task = Task { @MainActor in await compose.reply(Self.words, invocation: invocation) }
+        let card = await waitForCard(fixture.router)
+        card?.onOutcome(.cancelled)
+        let written = await task.value
+        if fails {
+            #expect(asked.all.isEmpty, "the AI was asked without the email's body")
+            #expect(card == nil, "a card opened from a failed read")
+            #expect(written == .failed("the email could not be read; nothing was done"))
+        } else {
+            #expect(asked.all.count == 1 && card != nil, "control: with the body readable the reply is written")
+        }
+    }
+
     @Test("A Send with no screen to open the card on asks nothing")
     func noOriginAsksNothing() async throws {
         let fixture = try await fixture()

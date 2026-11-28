@@ -1917,8 +1917,8 @@ struct ChatReplyFieldTests {
         }
         let inbox = try Self.source("TabMail/Views/Inbox/InboxView.swift")
         let detail = try Self.source("TabMail/Views/Message/MessageDetailView.swift")
-        #expect(Self.count("onAgentCompose: { agentCompose = $0 }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
-                "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert")
+        #expect(Self.count("onAgentCompose: { req in guard AgentToolRouter.shared.canOpen(req, accounts: navigationStore.accounts) else { return } agentCompose = req }, composeHostCovered: isAnyPresentation, composeHostShown: composeHostShown)", in: inbox) == 1,
+                "the inbox says from its navigation whether it shows, and passes its own sheets, covers and alert; a new email's bound account is looked up as the card is taken")
         #expect(Self.count("private var composeHostShown: Bool { emailsOpenBeside || (selectedMessageId == nil && pushedMessageId == nil) }", in: inbox) == 1)
         // Whether an opened email shows beside the inbox comes from the split view's own width, read
         // outside its columns, and reaches the inbox through the content column.

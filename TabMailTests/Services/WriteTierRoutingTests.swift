@@ -441,15 +441,23 @@ struct WriteTierRoutingTests {
         let recorded = Mutex<[(WritePriority, String?)]>([])
         let clearObserver = await installObserver { priority, label in recorded.withLock { $0.append((priority, label)) } }
 
-        await ComposeView.storeRecomputedReply("recomputed", replyTo: header, db: AppDatabase.dbPool)
+        // The store `ComposeView.recomputedReply` makes with the model's answer.
+        let outcome = await ComposeView.writeCachedReplyToDB(
+            Self.recomputed, replacing: header.suggestion, replyTo: header, db: AppDatabase.dbPool)
         await clearObserver()
+
+        #expect(outcome == .written)
 
         let snapshot = recorded.withLock { $0 }
         #expect(snapshot.count == 1, "one queued write, got \(snapshot.map(\.0))")
         #expect(snapshot.allSatisfy { $0.0 == .priority })
         let stored = try await AppDatabase.rawPool.read { db in try MessageHeader.fetchOne(db, key: header.id) }
-        #expect(stored?.cachedReply == "recomputed", "sanity: the write actually landed")
+        #expect(stored?.suggestion == Self.recomputed, "sanity: the write actually landed")
     }
+
+    /// A recomputed AI Suggestion, whole (body, text version, change command).
+    private static let recomputed = ReplyResult(
+        body: "recomputed", textMessage: "recomputed text", changeCommand: "recomputed command")
 
     @Test("Recompute's store through the write queue leaves a different IMAP email seated at the same address alone")
     func recomputeStoreSkipsADifferentEmailAtTheSameAddress() async throws {
@@ -479,7 +487,9 @@ struct WriteTierRoutingTests {
             try other.insert(db)
         }
 
-        await ComposeView.storeRecomputedReply("recomputed", replyTo: opened, db: AppDatabase.dbPool)
+        let outcome = await ComposeView.writeCachedReplyToDB(
+            Self.recomputed, replacing: opened.suggestion, replyTo: opened, db: AppDatabase.dbPool)
+        #expect(outcome == .dropped)
 
         let seated = try await AppDatabase.rawPool.read { db in try MessageHeader.fetchOne(db, key: fixture.id) }
         let after = try #require(seated)

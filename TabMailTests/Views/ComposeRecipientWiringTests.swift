@@ -163,14 +163,14 @@ struct ComposeRecipientWiringTests {
         #expect(Self.count("writeCachedReplyToDB", in: action) == 0, "the action never stores a suggestion itself")
         // Its context is the card's own: its recipients now and its From account, with the body
         // through the identity-checked read.
-        let builder = try #require(text.range(of: "private func buildComposeEditContext(relatedBodyText bodyText: String?) -> ComposeEditContext {"))
+        let builder = try #require(text.range(of: "private func buildComposeEditContext(related: MessageHeader?, relatedBodyText bodyText: String?) -> ComposeEditContext {"))
         let builderBody = String(text[builder.upperBound...].prefix(600))
         #expect(builderBody.contains("ComposeEditContext.make( recipients: recipients, account: resolvedAccount,"),
                 "the card's recipients and From account: \(builderBody)")
         let reader = try #require(text.range(of: "private func composeEditContextForRequest() async -> ComposeEditContext? {"))
         let readerBody = String(text[reader.upperBound...].prefix(700))
         #expect(readerBody.contains("ComposeEditContext.relatedBodyText(of: reply, db: db)")
-                    && readerBody.contains("return buildComposeEditContext(relatedBodyText: bodyText)"),
+                    && readerBody.contains("return buildComposeEditContext(related: reply, relatedBodyText: bodyText)"),
                 "the body through the identity-checked read, into the card's context: \(readerBody)")
     }
 

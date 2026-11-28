@@ -57,6 +57,8 @@ struct HTMLCachePairFenceTests {
         "TabMail/Services/Demo/DemoSeed.swift\tDemoSeed.wipe": Allowed(count: 2, reason: "demo: " + deletesHTML),
         "TabMail/Services/MessageContentStore.swift\tMessageContentStore.release": Allowed(count: 2, reason: deletesHTML),
         "TabMail/Services/MessageHeaderRekey.swift\tMessageHeaderRekey.apply": Allowed(count: 2, reason: carries),
+        "TabMail/Services/MessageHeaderRekey.swift\tMessageHeaderRekey.finishMove":
+            Allowed(count: 1, reason: "a move retired with no proven destination drops its remnant's body: " + deletesHTML),
         "TabMail/Services/NSEDataBridge.swift\tNSEDataBridge.persistRenderedBodyFromStaging": Allowed(count: 1, reason: writesHTML),
         "TabMail/Services/StartupMigrations.swift\tStartupMigrations.run":
             Allowed(count: 4, reason: "one-shot startup migrations: " + deletesHTML),

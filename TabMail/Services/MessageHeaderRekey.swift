@@ -821,7 +821,9 @@ enum MessageHeaderRekey {
                     // recorder reads `droppedRemnants`.
                     //
                     // The row's AI state is the one thing the server does not
-                    // hold. The COPYUID path keeps it by re-keying the row in
+                    // hold: the summary with its text message, the user's own
+                    // words for a sent email, the action and the whole AI
+                    // Suggestion. The COPYUID path keeps it by re-keying the row in
                     // place; here it is written to the AI cache under the row's
                     // DESTINATION folder in this same write, and both sync
                     // insert paths restore it into the row they create
@@ -832,8 +834,10 @@ enum MessageHeaderRekey {
                         rfc822MessageId: row.rfc822MessageId,
                         summaryBlurb: row.summaryBlurb, summaryTodos: row.summaryTodos,
                         reminderDate: row.reminderDate, reminderTime: row.reminderTime,
-                        reminderContent: row.reminderContent, actionTag: row.actionTag,
-                        cachedReply: row.cachedReply, db: db)
+                        reminderContent: row.reminderContent,
+                        summaryTextMessage: row.summaryTextMessage,
+                        userTextMessage: row.userTextMessage, actionTag: row.actionTag,
+                        reply: row.suggestion, db: db)
                     // A copy a sync already stored in this folder (a lost reply,
                     // a sync, then the retry) was inserted before the cache held
                     // this row's AI state, so no insert will restore it: fill it

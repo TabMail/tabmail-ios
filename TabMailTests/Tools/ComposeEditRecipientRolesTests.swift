@@ -572,7 +572,7 @@ struct ComposeEditRecipientRolesTests {
         #expect(bodyReads == 0, "the body of a row that no longer holds the email was read")
     }
 
-    @Test("relatedBodyText: a failed body read gives the held email no body text")
+    @Test("relatedBodyText: a failed body read is thrown, unless the caller reads it as no body")
     func relatedBodyTextSurvivesAFailedBodyRead() throws {
         let db = try TestDatabase.make()
         try TestDatabase.insertAccount(db)
@@ -580,9 +580,17 @@ struct ComposeEditRecipientRolesTests {
         let header = try TestDatabase.insertMessageHeader(db, messageId: "src4", subject: "Offsite")
         try db.write { db in try db.execute(sql: "DROP TABLE messageBody") }
 
-        let read = try db.read { db in try ComposeEditContext.relatedBodyText(of: header, db: db) }
+        // The agent's reply and forward tools read it as no body.
+        let read = try db.read { db in
+            try ComposeEditContext.relatedBodyText(of: header, onBodyReadFailure: .readsAsMissing, db: db)
+        }
         let heldWithNoBody = read.map { $0 == nil } ?? false
         #expect(heldWithNoBody, "a failed body read is read as no body, not a refusal or an error")
+
+        // Every other caller (the compose card's editor, the chat field's reply) gets the error.
+        #expect(throws: (any Error).self) {
+            try db.read { db in try ComposeEditContext.relatedBodyText(of: header, db: db) }
+        }
     }
 
     @Test("email_reply and email_forward: a failed body read still sends the edit request, with the email's own snippet")
@@ -662,8 +670,8 @@ struct ComposeEditRecipientRolesTests {
             let text = try source("TabMail/Services/AI/Tools/\(file)")
             let lowered = text.lowercased()
             #expect(count("try MessageHeader.fetchOne(db, key: realId)", in: text) == 1, "\(file): one header read")
-            #expect(count("try ComposeEditContext.relatedBodyText(of: header, db: db)", in: text) == 1,
-                    "\(file): the body only through the checked read of that header")
+            #expect(count("try ComposeEditContext.relatedBodyText(of: header, onBodyReadFailure: .readsAsMissing, db: db)", in: text) == 1,
+                    "\(file): the body only through the checked read of that header, a failed body read as no body")
             #expect(!lowered.contains("messagebody"), "\(file)")
             #expect(count("messageheader.fetch", in: lowered) == 1, "\(file)")
             #expect(!lowered.contains("messageheader.filter"), "\(file)")
@@ -671,7 +679,7 @@ struct ComposeEditRecipientRolesTests {
         // The checked read: the identity check and the body read share one database snapshot, the
         // check first.
         let inline = try source("TabMail/Services/AI/AIInlineEdit.swift")
-        let start = try #require(inline.range(of: "static func relatedBodyText(of header: MessageHeader, db: Database)"))
+        let start = try #require(inline.range(of: "static func relatedBodyText(\n        of header: MessageHeader, onBodyReadFailure: BodyReadFailure = .refuse, db: Database\n    )"))
         let check = try #require(inline.range(of: "guard try AIWriteTarget.stillHolds(header, db: db) else { return nil }", range: start.upperBound..<inline.endIndex))
         let body = try #require(inline.range(of: "MessageBody.fetchOne(db, key: header.id)", range: start.upperBound..<inline.endIndex))
         #expect(check.upperBound <= body.lowerBound, "the identity check runs before the body read")

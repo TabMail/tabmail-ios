@@ -100,7 +100,7 @@ struct EmailForwardTool: AgentTool, Sendable {
             // The related email's body for context, through the one identity-checked read: another
             // email seated at its address since it was read refuses the request.
             guard let relatedBodyText = try await ctx.db.read({ db in
-                try ComposeEditContext.relatedBodyText(of: header, db: db)
+                try ComposeEditContext.relatedBodyText(of: header, onBodyReadFailure: .readsAsMissing, db: db)
             }) else {
                 return ComposeOutcome.failed("the email changed since it was read; nothing was done").describeForLLM
             }

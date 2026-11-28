@@ -1121,25 +1121,25 @@ struct ThreadDetectionTests {
 
         let now = Date()
         let source = try insertHeaderWithComputedThreadId(
-            pool, messageId: "1", subject: "Plans", rfc822MessageId: "<a-source@test.com>",
+            pool, messageId: "1", subject: "Plans", rfc822MessageId: "<a-source@example.com>",
             date: now.addingTimeInterval(-7200))
         let sourceCopy = try insertHeaderWithComputedThreadId(
-            pool, messageId: "1", subject: "Plans", rfc822MessageId: "<a-source@test.com>",
+            pool, messageId: "1", subject: "Plans", rfc822MessageId: "<a-source@example.com>",
             date: now.addingTimeInterval(-7200), folderId: "acc2:INBOX", accountId: "acc2")
         let reply = try insertHeaderWithComputedThreadId(
-            pool, messageId: "2", subject: "Re: Plans", rfc822MessageId: "<b-reply@test.com>",
-            inReplyTo: "<a-source@test.com>", references: ["<a-source@test.com>"],
+            pool, messageId: "2", subject: "Re: Plans", rfc822MessageId: "<b-reply@example.com>",
+            inReplyTo: "<a-source@example.com>", references: ["<a-source@example.com>"],
             date: now.addingTimeInterval(-5400))
         let forward = try insertHeaderWithComputedThreadId(
-            pool, messageId: "3", subject: "Fwd: Plans", rfc822MessageId: "<f-forward@test.com>",
-            references: ["<a-source@test.com>"], date: now.addingTimeInterval(-3600))
+            pool, messageId: "3", subject: "Fwd: Plans", rfc822MessageId: "<f-forward@example.com>",
+            references: ["<a-source@example.com>"], date: now.addingTimeInterval(-3600))
         let forwardCopy = try insertHeaderWithComputedThreadId(
-            pool, messageId: "3", subject: "Fwd: Plans", rfc822MessageId: "<f-forward@test.com>",
-            references: ["<a-source@test.com>"], date: now.addingTimeInterval(-3600),
+            pool, messageId: "3", subject: "Fwd: Plans", rfc822MessageId: "<f-forward@example.com>",
+            references: ["<a-source@example.com>"], date: now.addingTimeInterval(-3600),
             folderId: "acc2:INBOX", accountId: "acc2")
         let forwardReply = try insertHeaderWithComputedThreadId(
-            pool, messageId: "4", subject: "Re: Fwd: Plans", rfc822MessageId: "<r-forward-reply@test.com>",
-            inReplyTo: "<f-forward@test.com>", references: ["<a-source@test.com>", "<f-forward@test.com>"],
+            pool, messageId: "4", subject: "Re: Fwd: Plans", rfc822MessageId: "<r-forward-reply@example.com>",
+            inReplyTo: "<f-forward@example.com>", references: ["<a-source@example.com>", "<f-forward@example.com>"],
             date: now.addingTimeInterval(-1800))
         #expect(forward.computedThreadId != source.computedThreadId, "control: the forward starts its own thread")
         #expect(Set([reply, sourceCopy].map(\.computedThreadId)) == [source.computedThreadId], "control: the source's side")

@@ -133,7 +133,9 @@ struct EmailReplyTool: AgentTool, Sendable {
             // The email's body, read with the check that the row is still that email
             // (`ComposeEditContext.relatedBodyText`): a UIDVALIDITY reset can seat another email at
             // its address, and its body is never sent as this email's context.
-            guard let bodyText = try await ctx.db.read({ db in try ComposeEditContext.relatedBodyText(of: header, db: db) }) else {
+            guard let bodyText = try await ctx.db.read({ db in
+                try ComposeEditContext.relatedBodyText(of: header, onBodyReadFailure: .readsAsMissing, db: db)
+            }) else {
                 return ComposeOutcome.failed("the email changed since the request was sent; nothing was done").describeForLLM
             }
             let context = await Self.editContext(

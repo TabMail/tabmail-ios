@@ -456,7 +456,9 @@ struct FinishTheMoveLocallyTests {
         seeded.reminderDate = "2099-01-02"
         seeded.reminderTime = "09:30"
         seeded.reminderContent = "reminder of the moved message"
-        seeded.cachedReply = "reply to the moved message"
+        seeded.summaryTextMessage = "text summary of the moved message"
+        seeded.userTextMessage = "the user's own words for the moved message"
+        _ = seeded.replaceSuggestion(with: Self.movedSuggestion, ifStill: nil)
         let summarized = seeded
         try await f.pool.write { db in try summarized.update(db) }
 
@@ -470,7 +472,7 @@ struct FinishTheMoveLocallyTests {
             $0.folderPath == "Archive" && $0.rfc822MessageId == target && $0.id != summarized.id
         }
         let storedWithoutAI = storedBefore.count == 1
-            && storedBefore.allSatisfy { $0.summaryBlurb == nil && $0.cachedReply == nil }
+            && storedBefore.allSatisfy { $0.summaryBlurb == nil && $0.cachedReply == nil && $0.userTextMessage == nil }
         #expect(storedWithoutAI,
                 "precondition: the copy is not stored exactly once without AI content before the retry: \(storedBefore.map(\.id))")
         try await drainToQuiescence(f)
@@ -486,11 +488,19 @@ struct FinishTheMoveLocallyTests {
         #expect(moved[0].reminderDate == "2099-01-02")
         #expect(moved[0].reminderTime == "09:30")
         #expect(moved[0].reminderContent == "reminder of the moved message")
-        #expect(moved[0].cachedReply == "reply to the moved message")
+        #expect(moved[0].summaryTextMessage == "text summary of the moved message")
+        #expect(moved[0].userTextMessage == "the user's own words for the moved message")
+        #expect(moved[0].suggestion == Self.movedSuggestion)
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()
         await finish(f)
     }
+
+    /// The whole AI Suggestion of a moved message: body, text version and change command, each
+    /// distinct, so a handoff that drops one of them fails.
+    private static let movedSuggestion = ReplyResult(
+        body: "reply to the moved message", textMessage: "text reply to the moved message",
+        changeCommand: "change command of the moved message")
 
     /// **THE PROPERTY: existing AI content survives a move whatever the server
     /// reports about the destination.** The COPYUID path keeps it by re-keying
@@ -517,10 +527,12 @@ struct FinishTheMoveLocallyTests {
         var seeded = try seedHeader(f, uid: 88, rfc: target)
         seeded.summaryBlurb = "summary of the moved message"
         seeded.summaryTodos = "todo of the moved message"
-        seeded.cachedReply = "reply to the moved message"
+        _ = seeded.replaceSuggestion(with: Self.movedSuggestion, ifStill: nil)
         seeded.reminderDate = "2099-01-02"
         seeded.reminderTime = "09:30"
         seeded.reminderContent = "reminder of the moved message"
+        seeded.summaryTextMessage = "text summary of the moved message"
+        seeded.userTextMessage = "the user's own words for the moved message"
         let summarized = seeded
         // As the AI path leaves it: on the row, and in the cache under the
         // folder the row was in when the AI ran.
@@ -531,7 +543,9 @@ struct FinishTheMoveLocallyTests {
                 summaryBlurb: summarized.summaryBlurb, summaryTodos: summarized.summaryTodos,
                 reminderDate: summarized.reminderDate, reminderTime: summarized.reminderTime,
                 reminderContent: summarized.reminderContent,
-                cachedReply: summarized.cachedReply, db: db)
+                summaryTextMessage: summarized.summaryTextMessage,
+                userTextMessage: summarized.userTextMessage,
+                reply: summarized.suggestion, db: db)
         }
 
         await AccountManager.shared.move([summarized], to: "Archive")
@@ -546,10 +560,12 @@ struct FinishTheMoveLocallyTests {
         #expect(moved[0].observedUidValidity == 10, "the row in Archive is not the synced copy")
         #expect(moved[0].summaryBlurb == "summary of the moved message")
         #expect(moved[0].summaryTodos == "todo of the moved message")
-        #expect(moved[0].cachedReply == "reply to the moved message")
+        #expect(moved[0].suggestion == Self.movedSuggestion)
         #expect(moved[0].reminderDate == "2099-01-02")
         #expect(moved[0].reminderTime == "09:30")
         #expect(moved[0].reminderContent == "reminder of the moved message")
+        #expect(moved[0].summaryTextMessage == "text summary of the moved message")
+        #expect(moved[0].userTextMessage == "the user's own words for the moved message")
         #expect(server.wrongMessageViolations().isEmpty)
         try? await provider.disconnect()
         await finish(f)

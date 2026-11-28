@@ -45,6 +45,21 @@
 > edit as a new message (tabmail-ios #1608). Tests:
 > `ComposeSuggestionPersistTests`, `ComposeEditRecipientRolesTests` (the source email),
 > `WriteTierRoutingTests` (Recompute's store).
+>
+> **Chat-view amendment (2026-11-28, the chat view's sync with main):** the chat view keeps the same
+> promise with its one identity check (`AIWriteTarget.stillHolds`) instead of `confirmedReply`. One
+> email serves every AI step after open, `ComposeView.aiReplyTarget`, the Send's own disposition
+> (`ComposeDraftGuards.sendReplyTarget`): a saved draft's resolved row wins over the compose argument (as
+> `confirmedReply` does on main); a row whose email no longer resolves (`.blocked`) refuses the inline
+> edit and Recompute, as it blocks Send. The editor, Recompute (`ComposeView.recomputedReply`, stored
+> through `writeCachedReplyToDB`) and the inline edit's store all take that email, and a request's
+> context is built from the one email captured, its body read with the check in one snapshot
+> (`ComposeEditContext.relatedBodyText`). A failed body read refuses the compose card's edit and the
+> chat field's reply; only the assistant's `email_reply` and `email_forward` read it as no body
+> (`onBodyReadFailure: .readsAsMissing`, main's policy). A reply card's suggestion at open is the row's
+> own while the row still holds the email (`ComposeView.storedSuggestionAtOpen`). Tests:
+> `ComposeSuggestionPersistTests`, `AITextMessageCallerTests` (Recompute),
+> `ChatFieldComposeTests.failedBodyReadWritesNothing`, `WriteTierRoutingTests`.
 <!-- COMPANION-CURRENT-NOTE-END -->
 
 ### Compose AI Suggestion — chat pill edits suggestion in place when bubble is visible
