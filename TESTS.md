@@ -1590,6 +1590,7 @@ sign-out is the one `completeSession` through `AccountDeletionReceipt.signOut` w
 `TabMailAuthService.signOut()` either), and every scheduled deletion ends on the confirmation, with the error line
 after a failed sign-out; `RootView` takes the receipt at the end of its own `.tabMailDidSignOut` receiver, shows
 `AccountDeletionConfirmation` as a sheet from it, and touches the "Signed Out" alert's flag only there, without a
-receipt; the failed-age-check sign-out still arms the flag that shows neither notice. The shared
+receipt; the one sheet hangs on `RootView`'s own `body`, straight after the alert it replaces, not inside the
+routed content the sign-out removes; the failed-age-check sign-out still arms the flag that shows neither notice. The shared
 `AccountDeletionConfirmation` names the server's date when it has one and none otherwise, shows the error line,
 and its Done runs the caller's action. The sheet's presentation is checked on a device.

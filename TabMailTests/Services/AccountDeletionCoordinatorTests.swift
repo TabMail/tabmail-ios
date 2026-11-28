@@ -1011,6 +1011,15 @@ struct AccountDeletionConfirmationWiringTests {
             ".sheet(item: $deletionReceipt) { receipt in ScrollView { " +
             "AccountDeletionConfirmation(scheduledDateText: receipt.scheduledDateText, errorMessage: nil) { " +
             "deletionReceipt = nil } }"))
+        // The sheet hangs on the root's own chain, straight after the alert it replaces: inside `routedContent`
+        // (defined before `body`) it would leave with the branch the sign-out removes.
+        #expect(Self.count(".sheet(item: $deletionReceipt)", in: text) == 1)
+        let rootBody = try #require(text.range(of: "var body: some View {"))
+        let sheet = try #require(text.range(of: ".sheet(item: $deletionReceipt)"))
+        #expect(rootBody.upperBound < receiver.lowerBound && rootBody.upperBound < sheet.lowerBound,
+                "on the root's body, not in routedContent")
+        #expect(text.contains("Sign in again to use AI features and push notifications.\") } .sheet(item: $deletionReceipt)"),
+                "straight after the Signed Out alert")
         // The failed-age-check sign-out still shows neither notice.
         #expect(text.contains(
             "private func signOutAfterFailedAgeCheck() async { suppressNextSignedOutAlert = true " +
