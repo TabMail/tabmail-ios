@@ -26,15 +26,26 @@ struct DeviceSyncConnectPassTests {
             .deletingLastPathComponent() // repository root
     }
 
-    /// Registers `response` for the pass request and counts how often the fake actually served it (a request
-    /// with no matching route is answered 599 without reaching this handler).
+    /// The pass requests the registered answer actually served (a request with no matching route is answered
+    /// 599 without reaching it).
+    private final class ServedRequests: Sendable {
+        private let requests = Mutex<[FakeHTTP.Request]>([])
+
+        func append(_ request: FakeHTTP.Request) {
+            requests.withLock { $0.append(request) }
+        }
+
+        var all: [FakeHTTP.Request] { requests.withLock { $0 } }
+    }
+
+    /// Registers `response` for the pass request; what it served.
     private static func servePass(
         _ http: FakeHTTP.Scenario,
         _ response: FakeHTTP.CannedResponse
-    ) -> Mutex<[FakeHTTP.Request]> {
-        let served = Mutex<[FakeHTTP.Request]>([])
+    ) -> ServedRequests {
+        let served = ServedRequests()
         http.register(path: "/ws/pass", method: "POST") { request in
-            served.withLock { $0.append(request) }
+            served.append(request)
             return response
         }
         return served
@@ -51,7 +62,7 @@ struct DeviceSyncConnectPassTests {
         )
 
         #expect(pass == Self.pass)
-        let requests = served.withLock { $0 }
+        let requests = served.all
         #expect(requests.count == 1)
         guard requests.count == 1 else { return }
         #expect(requests[0].method == "POST")
@@ -83,7 +94,7 @@ struct DeviceSyncConnectPassTests {
         )
 
         #expect(pass == nil)
-        #expect(served.withLock { $0.count } == 1, "the refusal came from the registered answer")
+        #expect(served.all.count == 1, "the refusal came from the registered answer")
         #expect(http.servedCallSequence() == ["POST /ws/pass"])
     }
 
@@ -98,7 +109,7 @@ struct DeviceSyncConnectPassTests {
         )
 
         #expect(pass == nil)
-        #expect(served.withLock { $0.count } == 1, "the answer read was the registered one")
+        #expect(served.all.count == 1, "the answer read was the registered one")
     }
 
     @Test("A pass request that never reaches the server gives no pass")
@@ -112,7 +123,7 @@ struct DeviceSyncConnectPassTests {
         )
 
         #expect(pass == nil)
-        #expect(served.withLock { $0.count } == 1, "the failure came from the registered transport error")
+        #expect(served.all.count == 1, "the failure came from the registered transport error")
     }
 
     /// No source in the app, the shared code or the notification extension puts a sign-in token in a URL's

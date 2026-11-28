@@ -58,7 +58,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
     private var urlSession: URLSession?
     private var pingTimer: Timer?
     private var probeTimer: Timer?
-    private var connectTask: Task<Void, Never>?
+    /// The connect in progress; tests wait on it to see what a superseded connect left behind.
+    private(set) var connectTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
     private var receiveTask: Task<Void, Never>?
 
@@ -96,16 +97,16 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
 
     private let broadcastDebounceMs: UInt64 = 500
 
-    private var baseURL: String { BackendConfig.syncWebSocketURL }
-
     /// What one connect takes from outside the service: the relay's two addresses (read once, at the
-    /// start of the connect), a sign-in token, and a one-time pass for that token from the relay's
-    /// HTTPS base. Tests replace it.
+    /// start of the connect), a sign-in token, a one-time pass for that token from the relay's
+    /// HTTPS base, and whether the app is in the foreground (a retry is scheduled only then). Tests
+    /// replace it.
     struct ConnectEnvironment {
         var relay: @MainActor () -> (base: String, webSocket: String)
         var token: @MainActor () async -> TabMailTokenCoordinator.RefreshResult
         /// nil on any failure.
         var pass: @MainActor (_ token: String, _ relayBaseURL: String) async -> String?
+        var foreground: @MainActor () -> Bool
 
         static var live: ConnectEnvironment {
             ConnectEnvironment(
@@ -113,7 +114,8 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
                 token: { await TabMailTokenCoordinator.shared.validToken() },
                 pass: { token, relayBaseURL in
                     await BackendClient.requestSyncConnectPass(token: token, relayBaseURL: relayBaseURL)
-                }
+                },
+                foreground: { UIApplication.shared.applicationState == .active }
             )
         }
     }
@@ -668,7 +670,9 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             switch msg.type {
             case "connected":
                 BackgroundSyncLogger.logDebug("[DeviceSync] Connected as user \(msg.userId?.prefix(8) ?? "?")")
-                DeviceSyncLogger.log("CONNECTED as user \(msg.userId?.prefix(8) ?? "?") via \(baseURL)")
+                // The address is in the CONNECT line of this attempt; reading the setting again here could
+                // name the other server.
+                DeviceSyncLogger.log("CONNECTED as user \(msg.userId?.prefix(8) ?? "?")")
                 isConnecting = false
                 isConnected = true
                 reconnectAttempts = 0
@@ -1040,7 +1044,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         guard reconnectTask == nil else { return }
         // Don't reconnect in background — iOS gives no execution time for WebSocket + token fetch.
         // Foreground return (RootView scenePhase .active) calls reconnectIfNeeded().
-        guard UIApplication.shared.applicationState == .active else {
+        guard connectEnvironment.foreground() else {
             BackgroundSyncLogger.logDebug("[DeviceSync] Skipping reconnect — app not in foreground")
             return
         }
@@ -1055,7 +1059,7 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
             // Re-check foreground after delay — app may have backgrounded during sleep
-            guard UIApplication.shared.applicationState == .active else {
+            guard connectEnvironment.foreground() else {
                 BackgroundSyncLogger.logDebug("[DeviceSync] Skipping reconnect — app backgrounded during delay")
                 reconnectTask = nil
                 return

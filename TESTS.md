@@ -520,12 +520,21 @@ addresses: `POST /ws/pass` goes to the given relay with the sign-in token only i
 header and no body; a refused status (even with a pass in its body), an answer without a pass and an
 unreachable request give no pass, each from the served fixture; the socket's address
 (`DeviceSyncService.socketURL`) carries only the pass; and no source puts a token in a URL query.
-`DeviceSyncConnectTests` drives the service's own connect with a scripted token, pass and relay
-(`DeviceSyncService.ConnectEnvironment`) and a loopback listener that records the upgrade request: the
-socket opens with a fresh pass and its upgrade has no token and no Authorization header; no pass opens
-nothing and takes the retry step, and the next connect gets a new pass; a token answer or a pass that
-lands after the connect was replaced changes nothing for the replacement and schedules no retry; and
-both legs use the relay read at the connect's start, the next connect the new one.
+`DeviceSyncConnectTests` drives the service's own connect with a scripted token, pass, relay and
+foreground state (`DeviceSyncService.ConnectEnvironment`), whose requests a test can hold and answer later,
+and a loopback listener that records each request and can answer it: the socket opens with a fresh pass and
+its upgrade has no token and no Authorization header; no pass opens nothing, and the retry the backoff
+schedules (nothing else connects) opens the socket with a new pass; a socket refused at the upgrade (401)
+ends and the scheduled retry connects with a new pass; no session ends a connect with no retry and a failed
+refresh takes the retry step, neither writing new-device state; every late answer (three token failures, a
+token, a pass, no pass) to a connect a network change replaced or a disconnect ended, delivered after that
+and waited out, opens nothing, asks for no pass, schedules no retry and writes no new-device timestamps,
+while the replacement goes on to open its socket with its own pass and set the new device up; both legs use
+the relay read at the connect's start whether the setting changes during the token or the pass wait, the
+next connect the new one; and the live pass request, sent to a loopback HTTP listener, carries the token in
+its Authorization header and in no other line. `DebugModeManagerTests` pins the real dev and production
+address pairs and that locking debug mode resets both; `DeviceSyncErrorRedactionTests` strips a pass from a
+failing URL as it does a token.
 
 ## Gmail thread binding — Send and draft uploads
 

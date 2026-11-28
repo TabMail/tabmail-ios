@@ -22,9 +22,10 @@ that credential to disk and off the device when the user shares the log.
   which keeps the code the retry classification reads and drops the userInfo.
 - **Device sync WebSocket** (`DeviceSyncService.redactedTransportError`, live credential leaked this
   way, observed 2026-06-09): a log-side redaction, because those errors are logged, not propagated.
-  Since 2026-11-27 the socket opens with a one-time pass (`DeviceSyncService.socketURL`, from
+  The socket now opens with a one-time pass (`DeviceSyncService.socketURL`, from
   `BackendClient.requestSyncConnectPass`, the token only in that HTTPS request's Authorization
-  header), so its URL holds a spent pass rather than the sign-in token; the redaction stays.
+  header), so its URL holds a short-lived pass rather than the sign-in token. A pass whose handshake
+  failed before the relay took it can stay valid for a few seconds, so the redaction stays.
 
 Choose by where the error goes: one that is thrown into shared code is redacted at the throw, since
 the code that logs it cannot know which URL was secret; one that is only logged locally may be

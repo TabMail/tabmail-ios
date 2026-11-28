@@ -46,8 +46,6 @@ enum BackendConfig {
 
     static var syncBaseURL: String { syncEndpoints.base }
 
-    static var syncWebSocketURL: String { syncEndpoints.webSocket }
-
     static var templatesBaseURL: URL {
         useDevServers
             ? URL(string: "https://templates-dev.tabmail.ai")!

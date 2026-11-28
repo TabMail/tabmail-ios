@@ -244,6 +244,27 @@ struct DeviceSyncErrorRedactionTests {
         #expect(rendered.contains("\(NSURLErrorCancelled)"))
     }
 
+    /// The socket's address now carries a one-time pass; a failed handshake's error names that address.
+    @Test("Failing-URL pass query never reaches the log string")
+    func passStrippedFromFailingURL() throws {
+        let failingURL = "wss://sync.tabmail.ai/ws?pass=0123abcd.c2VjcmV0LXBhcnQ"
+        let error = NSError(
+            domain: NSURLErrorDomain,
+            code: NSURLErrorBadServerResponse,
+            userInfo: [
+                NSURLErrorFailingURLErrorKey: try #require(URL(string: failingURL)),
+                NSLocalizedDescriptionKey: "There was a bad response from the server. (\(failingURL))",
+            ]
+        )
+
+        let rendered = DeviceSyncService.redactedTransportError(error)
+
+        #expect(!rendered.contains("pass="))
+        #expect(!rendered.contains("c2VjcmV0LXBhcnQ"))
+        #expect(rendered.contains("?<redacted>"))
+        #expect(rendered.contains("code=\(NSURLErrorBadServerResponse)"))
+    }
+
     @Test("Plain errors render domain, code, and description")
     func plainErrorRendered() {
         let error = NSError(
