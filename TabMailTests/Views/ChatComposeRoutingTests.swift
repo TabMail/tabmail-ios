@@ -368,11 +368,14 @@ struct ChatComposeRoutingTests {
         window.rootViewController = controller
         window.makeKeyAndVisible()
         // The registry's tools keep the database they were made with, which is an earlier test's
-        // once one has run; the agent's email_reply reads this database.
+        // once one has run; the agent's email_reply reads this database, and its email_compose picks
+        // the new email's account from this database's accounts (`EmailComposeTool.sendingAccount`).
         let registry = ToolRegistry.shared
         await registry.ensureDefaultToolsRegistered()
         let registeredReply = await registry.tool(named: "email_reply")
+        let registeredCompose = await registry.tool(named: "email_compose")
         await registry.register(EmailReplyTool(context: ToolContext(db: pool, translator: ChatIdTranslator.shared)))
+        await registry.register(EmailComposeTool(context: ToolContext(db: pool, translator: ChatIdTranslator.shared)))
         // A card left open keeps its turn going: closing cancels it, and clears the working mark a
         // cancelled turn leaves.
         func close() async throws {
@@ -387,6 +390,7 @@ struct ChatComposeRoutingTests {
             await queue.clearForTesting()
             await queue.setDispatchSuppressedForTesting(false)
             if let registeredReply { await registry.register(registeredReply) }
+            if let registeredCompose { await registry.register(registeredCompose) }
         }
         let screens = Screens(controller: controller, route: route, email: email, threadKey: threadKey, earlier: earlierEmail,
                               navigationStore: navigationStore)
