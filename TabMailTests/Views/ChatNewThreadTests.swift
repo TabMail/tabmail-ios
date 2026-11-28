@@ -335,7 +335,7 @@ struct ChatNewThreadTests {
     }
 
     @Test("Add recipient adds the user's own address when it is typed or picked, so a new email can go to themselves")
-    func addRecipientAddsOwnAddress() {
+    func addRecipientAddsOwnAddress() throws {
         // me@example.com is the account's own address in these tests.
         var typed = ChatReplyToChoice(replyPeople: [], target: .replyAll)
         let addedTyped = typed.add("Me@Example.com")
@@ -343,6 +343,18 @@ struct ChatNewThreadTests {
         #expect(typed.canFinish, "Done can start a new email to the user alone")
         let toSelf = ChatNewDraft.people(after: typed.target(replyPeople: []), current: []).map(\.address)
         #expect(toSelf == ["me@example.com"])
+
+        // Unticked, then typed again: ticked again, still one row.
+        let ownRow = try #require(typed.people.first)
+        typed.toggle(ownRow)
+        let untickedCanFinish = typed.canFinish
+        #expect(!untickedCanFinish, "control: unticked, nobody is picked")
+        let addedAgain = typed.add("me@example.com")
+        let rows = typed.people.map(\.address)
+        let toSelfAgain = ChatNewDraft.people(after: typed.target(replyPeople: []), current: []).map(\.address)
+        #expect(addedAgain, "typed again, it is ticked again")
+        #expect(rows == ["me@example.com"], "one row")
+        #expect(toSelfAgain == ["me@example.com"])
 
         // Picked (a contact or a Recent row) beside someone already picked: both stay.
         let current = [Self.maria]

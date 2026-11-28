@@ -513,6 +513,94 @@ struct ChatRecentPeopleHostedTests {
         #expect(picked == [Self.typedOwn], "the new email goes to the typed address alone")
     }
 
+    @Test("In Reply to, with the thread's people unticked, a typed address alone is the answer, by Return then Done or by Done",
+          arguments: [false, true])
+    func hostedReplyToTypedReplacesThePeople(viaReturn: Bool) async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hostedReplyToTypedReplacesThePeopleBody(viaReturn: viaReturn) }
+    }
+
+    private func hostedReplyToTypedReplacesThePeopleBody(viaReturn: Bool) async throws {
+        let done = DoneRecorder()
+        let window = try Self.host(ChatReplyToSheet(replyPeople: [Self.maria], target: .replyAll) { done.targets.append($0) })
+        defer { window.isHidden = true }
+        _ = await Self.waitUntil { !Self.elements(ChatReplyToSheet.personId, in: window).isEmpty }
+        let mariaRow = try #require(Self.elements(ChatReplyToSheet.personId, in: window).first, "the sheet lists Maria")
+        #expect(mariaRow.accessibilityActivate(), "Maria's row takes a tap")
+        _ = await Self.waitUntil {
+            Self.elements(ChatReplyToSheet.personId, in: window).first.map { !$0.accessibilityTraits.contains(.selected) } == true
+        }
+        let unticked = Self.elements(ChatReplyToSheet.personId, in: window).first.map { !$0.accessibilityTraits.contains(.selected) }
+        #expect(unticked == true, "control: Maria is unticked")
+
+        if viaReturn {
+            try await Self.typeAndReturn(Self.typedOwn, in: window)
+            let ownRow = Self.elements(ChatReplyToSheet.personId, in: window).first { ($0.accessibilityLabel ?? "").contains(Self.typedOwn) }
+            let ownTicked = ownRow.map { $0.accessibilityTraits.contains(.selected) }
+            let query = Self.textField(in: window)?.text ?? ""
+            #expect(ownTicked == true, "Return added the typed address, ticked")
+            #expect(query.isEmpty, "Return cleared the search")
+            #expect(done.targets.isEmpty, "Return adds; it is not Done")
+        } else {
+            _ = await Self.waitUntil { Self.textField(in: window) != nil }
+            #expect(ThreadChatTests.type(Self.typedOwn, in: window), "the search takes typed text")
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+
+        let doneButton = try #require(Self.doneButton(in: window), "the sheet has Done")
+        #expect(doneButton.accessibilityActivate(), "Done takes a tap")
+        _ = await Self.waitUntil { !done.targets.isEmpty }
+        #expect(done.targets.count == 1)
+        guard done.targets.count == 1 else { return }
+        let picked = done.targets[0].only?.map(\.address)
+        #expect(picked == [Self.typedOwn], "the typed address alone, none of the thread's people")
+    }
+
+    @Test("Text that names no address is kept to correct and adds nobody, Done then gives nothing back, and Done is off with nothing typed or ticked")
+    func hostedInvalidTypedIsKept() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await hostedInvalidTypedIsKeptBody() }
+    }
+
+    private func hostedInvalidTypedIsKeptBody() async throws {
+        let done = DoneRecorder()
+        let window = try Self.host(ChatReplyToSheet(replyPeople: [], target: .replyAll,
+                                                    title: ChatReplyToSheet.addRecipientTitle) { done.targets.append($0) })
+        defer { window.isHidden = true }
+        _ = await Self.waitUntil { Self.textField(in: window) != nil && Self.doneButton(in: window) != nil }
+        let field = try #require(Self.textField(in: window), "the sheet has the search field")
+        let blankDone = try #require(Self.doneButton(in: window), "the sheet has Done")
+        let offWhenBlank = blankDone.accessibilityTraits.contains(.notEnabled)
+        #expect(offWhenBlank, "with nothing typed and nobody ticked, Done is off")
+
+        let invalid = "not an address"
+        #expect(ThreadChatTests.type(invalid, in: window), "the search takes typed text")
+        try? await Task.sleep(for: .milliseconds(100))
+        let returned = field.delegate?.textFieldShouldReturn?(field)
+        #expect(returned != nil, "control: the field answers Return")
+        try? await Task.sleep(for: .milliseconds(200))
+        let afterReturn = field.text ?? ""
+        let rowsAfterReturn = Self.elements(ChatReplyToSheet.personId, in: window).count
+        #expect(afterReturn == invalid, "Return keeps the text to correct")
+        #expect(rowsAfterReturn == 0, "Return adds nobody")
+
+        let typedDone = try #require(Self.doneButton(in: window), "the sheet has Done")
+        _ = typedDone.accessibilityActivate()
+        try? await Task.sleep(for: .milliseconds(200))
+        let afterDone = field.text ?? ""
+        #expect(done.targets.isEmpty, "Done gives nothing back")
+        #expect(afterDone == invalid, "Done keeps the text to correct")
+
+        // Control: an address in the same field completes.
+        #expect(ThreadChatTests.type("sam@example.com", in: window), "the search takes typed text")
+        try? await Task.sleep(for: .milliseconds(100))
+        let validDone = try #require(Self.doneButton(in: window), "the sheet has Done")
+        #expect(validDone.accessibilityActivate(), "Done takes a tap")
+        _ = await Self.waitUntil { !done.targets.isEmpty }
+        let picked = done.targets.first?.only?.map(\.address)
+        #expect(picked == ["sam@example.com"], "control: a typed address completes")
+    }
+
     @Test("Cancel after Return adds a typed address gives nothing back")
     func hostedCancelAfterTyped() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
@@ -536,6 +624,11 @@ struct ChatRecentPeopleHostedTests {
     }
 
     // MARK: - Helpers
+
+    /// The sheet's Done button.
+    private static func doneButton(in window: UIWindow) -> NSObject? {
+        HostedAccessibility.elements(under: window).first { $0.accessibilityLabel == "Done" }
+    }
 
     /// The sheet's search field, as UIKit draws it.
     private static func textField(in view: UIView) -> UITextField? {

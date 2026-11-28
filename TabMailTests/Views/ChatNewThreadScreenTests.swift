@@ -1068,6 +1068,40 @@ struct ChatNewThreadScreenTests {
         }
     }
 
+    @Test("With nobody picked, Cancel after typing the user's own address closes the sheet and picks nobody; Done makes that address the one recipient")
+    func firstRecipientIsOwn() async throws {
+        #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
+        try await HostedAccessibility.withAutomation { try await firstRecipientIsOwnBody() }
+    }
+
+    private func firstRecipientIsOwnBody() async throws {
+        let fixture = try fixture()
+        defer { finish(fixture) }
+        let model = ChatNewThreadModel(account: fixture.account, queueDraftSave: { _, _ in true })
+        let own = fixture.account.emailAddress
+        try await withScreen(model) { screen in
+            #expect(model.people.isEmpty, "control: nobody is picked yet")
+            for button in ["Cancel", "Done"] {
+                let names = try #require(Self.names(in: screen.view))
+                #expect(names.accessibilityActivate())
+                try await Self.waitUntil { Self.sheetIsUp(screen) }
+                let sheet = try #require(Self.topPresented(screen)?.view)
+                try await Self.settle()
+                #expect(ThreadChatTests.type(own, in: sheet), "the sheet takes an address")
+                try await Self.settle()
+                let element = HostedAccessibility.elements(under: sheet).first { $0.accessibilityLabel == button }
+                let tapped = try #require(element, "the sheet has \(button)")
+                #expect(tapped.accessibilityActivate(), "\(button) takes a tap")
+                try await Self.waitUntil { Self.topPresented(screen) == nil }
+                let closed = Self.topPresented(screen) == nil
+                let people = model.people.map(\.address)
+                let expected = button == "Done" ? [own.lowercased()] : []
+                #expect(closed, "\(button) closes the sheet")
+                #expect(people == expected, "after \(button)")
+            }
+        }
+    }
+
     @Test("Back saves, then leaves; the chat's session ends and its draft is given back to eviction")
     func backSavesAndCloses() async throws {
         #expect(HostedAccessibility.isAvailable, "control: accessibility automation is available")
