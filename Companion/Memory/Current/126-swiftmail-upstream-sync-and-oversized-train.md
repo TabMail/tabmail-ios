@@ -556,7 +556,7 @@ serializer that writes recipients:
   upgrade fails" (`e4f5f9f0`) and the review follow-ups "Record only handshake errors and keep EHLO parameters
   as sent" (`fbfcddf0`) and "Report a close before the STARTTLS handshake as a connection failure"
   (`43d9d191`), "Test that a reset during the STARTTLS handshake beats the later EOF" (`439e3045`), and "Report a socket error
-  during a STARTTLS upgrade as a connection failure" (`b2c81d37`, the pin). It lands on fork `main` after review, and the same change, rebased on
+  during a STARTTLS upgrade as a connection failure" (`b2c81d37`), and a test-only follow-up running the pre-handshake socket-error test on a thread-safe test channel (`5f21d262`, the pin). It lands on fork `main` after review, and the same change, rebased on
   `upstream/main`, becomes an upstream PR. Upstream had moved past the pin (#339, #341, #344); that
   resync is separate work and needs its own collision check.
 - Cause, measured: after STARTTLS the client sent its EHLO without waiting for the handshake. A failed
