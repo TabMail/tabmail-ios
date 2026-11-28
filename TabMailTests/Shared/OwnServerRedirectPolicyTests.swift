@@ -280,6 +280,39 @@ struct OwnServerRedirectPolicyTests {
         #expect(secondRequest?.body == Wire.body)
     }
 
+    @Test("Another host's 303 after a POST is followed as a GET, as it is with no policy", arguments: Route.allCases)
+    func otherHostSeeOtherIsFollowedAsAGet(route: Route) async throws {
+        let pair = try await Self.pair(status: 303)
+        let control = try await Self.pair(status: 303)
+        defer {
+            pair.stop()
+            control.stop()
+        }
+        let policy = OwnServerRedirectPolicy(isOwnServer: { _ in false })
+        let wire = Wire(status: 303, method: "POST")
+        // What Foundation does on its own: the same request on a session with no delegate.
+        let plain = URLSession(configuration: .ephemeral)
+        defer { plain.finishTasksAndInvalidate() }
+
+        let (data, response) = try await route.send(wire.request(to: pair.firstURL), policy: policy)
+        let (controlData, _) = try await plain.data(for: wire.request(to: control.firstURL))
+
+        let answered = (response as? HTTPURLResponse)?.statusCode
+        let firstRequest = pair.first.lastRequest
+        let secondCount = pair.second.requestCount
+        let secondRequest = pair.second.lastRequest
+        let controlRequest = control.second.lastRequest
+        #expect(answered == 200)
+        #expect(String(decoding: data, as: UTF8.self) == "landed")
+        #expect(firstRequest?.method == "POST")
+        #expect(firstRequest?.body == Wire.body)
+        #expect(secondCount == 1)
+        #expect(secondRequest?.method == "GET", "a 303 turns the POST into a GET")
+        #expect(String(decoding: controlData, as: UTF8.self) == "landed", "control: the plain session followed")
+        #expect(secondRequest?.method == controlRequest?.method)
+        #expect(secondRequest?.body == controlRequest?.body)
+    }
+
     // MARK: - Which servers are TabMail's own
 
     @Test("TabMail's own servers are the subdomains of its domain", arguments: [
@@ -339,19 +372,35 @@ struct OwnServerRedirectPolicyTests {
         case noCallback
     }
 
+    /// A redirect answer with no address, as `HTTPURLResponse.url` allows.
+    private final class AddresslessRedirect: HTTPURLResponse, @unchecked Sendable {
+        override var url: URL? { nil }
+    }
+
     /// The decision `delegate` makes for a request that started at `start` and was answered by
-    /// `answeredBy` with a redirect to `target`.
+    /// `answeredBy` (nil: an answer with no address) with a redirect to `target`, on a data task, or on
+    /// a web socket task when `socket` is true.
     @MainActor
     private static func decision(
-        _ delegate: any URLSessionTaskDelegate, start: String, answeredBy: String, target: String
+        _ delegate: any URLSessionTaskDelegate, start: String, answeredBy: String?, target: String,
+        socket: Bool = false
     ) async throws -> Decision {
         let startURL = try #require(URL(string: start))
-        let answeredURL = try #require(URL(string: answeredBy))
         let targetURL = try #require(URL(string: target))
-        let task = URLSession.shared.dataTask(with: startURL)
+        let task: URLSessionTask = socket
+            ? URLSession.shared.webSocketTask(with: startURL)
+            : URLSession.shared.dataTask(with: startURL)
         defer { task.cancel() }
-        let response = try #require(HTTPURLResponse(
-            url: answeredURL, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": target]))
+        let headers = ["Location": target]
+        let response: HTTPURLResponse
+        if let answeredBy {
+            let answeredURL = try #require(URL(string: answeredBy))
+            response = try #require(HTTPURLResponse(
+                url: answeredURL, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: headers))
+        } else {
+            response = try #require(AddresslessRedirect(
+                url: startURL, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: headers))
+        }
         return await withCheckedContinuation { continuation in
             let called: Void? = delegate.urlSession?(
                 URLSession.shared, task: task, willPerformHTTPRedirection: response,
@@ -387,11 +436,28 @@ struct OwnServerRedirectPolicyTests {
     func deviceSyncConnectionDecides() async throws {
         let sync = DeviceSyncService.shared
         let own = try await Self.decision(sync, start: "wss://sync.tabmail.ai/ws",
-                                          answeredBy: "https://sync.tabmail.ai/ws", target: "wss://example.com/ws")
+                                          answeredBy: "https://sync.tabmail.ai/ws", target: "wss://example.com/ws",
+                                          socket: true)
         let other = try await Self.decision(sync, start: "wss://sync.tabmail.ai/ws",
-                                            answeredBy: "https://example.com/ws", target: "wss://example.com/next")
+                                            answeredBy: "https://example.com/ws", target: "wss://example.com/next",
+                                            socket: true)
         #expect(own == .refused)
         #expect(other == .followed(URL(string: "wss://example.com/next")))
+    }
+
+    @Test("A redirect answer with no address is refused, wherever the request started")
+    @MainActor
+    func redirectWithNoAddressIsRefused() async throws {
+        let addressless = AddresslessRedirect(
+            url: try #require(URL(string: "https://example.com/start")), statusCode: 302, httpVersion: nil, headerFields: nil)
+        let hasNoAddress = addressless?.url == nil
+        #expect(hasNoAddress, "control: the answer has no address")
+        let shared = try await Self.decision(OwnServerRedirectPolicy.shared, start: "https://example.com/start",
+                                             answeredBy: nil, target: "https://example.com/next")
+        let sync = try await Self.decision(DeviceSyncService.shared, start: "wss://example.com/ws",
+                                           answeredBy: nil, target: "wss://example.com/next", socket: true)
+        #expect(shared == .refused)
+        #expect(sync == .refused)
     }
 
     // MARK: - Every request that can reach TabMail's servers carries the policy
@@ -439,6 +505,20 @@ struct OwnServerRedirectPolicyTests {
     /// The calls that send a request on a session.
     private static let sendCalls = [".data(for:", ".bytes(for:", ".upload(for:", ".download(for:", "Task(with:"]
 
+    /// Where the policy is passed, per file, and how many times: the shared session, and each request
+    /// that carries a token, a refresh token or a signed purchase on a session of its own. A send
+    /// rewritten so that it no longer passes the policy lowers its file's count.
+    private static let policyUses: [String: Int] = [
+        "Shared/HTTP/HTTPClient.swift": 1,                          // sharedEphemeralSession
+        "TabMail/Services/BackendClient.swift": 2,                  // the AI requests: aiBytes, aiData
+        "TabMail/Views/Account/PlanPickerView.swift": 1,            // verifyPurchaseWithBackend
+        "TabMailNotificationService/BackendNSEClient.swift": 1,     // transport
+        "TabMailNotificationService/NSEAICacheProbe.swift": 1,      // probe
+        "TabMailNotificationService/NSEAuthSource.swift": 1,        // transport
+        "TabMailNotificationService/NSETokenManager.swift": 1,      // transport
+        "TabMailNotificationService/NotificationService.swift": 1,  // reconnectTransport
+    ]
+
     @Test("Every use of URLSession.shared, every new session and every AI request in the app and the extension carries the policy")
     func everyRequestCarriesThePolicy() throws {
         let files = try Self.sources(under: ["TabMail", "Shared", "TabMailNotificationService"])
@@ -447,10 +527,12 @@ struct OwnServerRedirectPolicyTests {
         var deviceSyncSessions = 0
         var aiSends = 0
         var misses: [String] = []
+        var uses: [String: Int] = [:]
         for file in files {
             for line in file.lines {
                 let code = line.trimmingCharacters(in: .whitespaces)
                 if code.hasPrefix("//") { continue }
+                if code.contains(Self.policy) { uses[file.path, default: 0] += 1 }
                 let usesShared = code.contains("URLSession.shared")
                     || code.range(of: #"URLSession\??\s*=\s*\.shared"#, options: .regularExpression) != nil
                 if usesShared {
@@ -476,6 +558,7 @@ struct OwnServerRedirectPolicyTests {
             }
         }
         #expect(misses.isEmpty, "\(misses)")
+        #expect(uses == Self.policyUses, "where the policy is passed: \(uses)")
         let extensionUses = Set(sharedUses).filter { $0.hasPrefix("TabMailNotificationService/") }
         #expect(extensionUses.count >= 5, "the scan found the extension's requests: \(sharedUses)")
         #expect(newSessions.count >= 5, "the scan found the app's sessions: \(newSessions)")
