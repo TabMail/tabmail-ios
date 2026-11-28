@@ -20,7 +20,8 @@ struct SendRecipientNamesTests {
     private static func fields() throws -> ComposeDraftGuards.Recipients {
         let to = try #require(ComposeDraftGuards.committing("Sam Lee <sam@example.com>,", to: .init(), room: 10))
         let cc = ComposeDraftGuards.picking("ann@example.com", name: "Lee, Ann", to: .init(), room: 10)
-        let edit = AIService.parseInlineEditResponse("+Bcc: \"Zoë Kim\" <zoe@example.com>\nBody: Body")
+        let written = ComposeEditJSON.make(addBcc: [["name": "Zoë Kim", "email": "zoe@example.com"]], body: "Body")
+        let edit = try #require(AIService.parseInlineEditResponse(written))
         let bcc = ComposeDraftGuards.applying(try #require(edit.bccDelta), to: .init())
         return ComposeDraftGuards.Recipients(to: to, cc: cc, bcc: bcc)
     }
