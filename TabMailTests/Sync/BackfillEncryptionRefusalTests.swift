@@ -18,9 +18,10 @@ import Synchronization
 ///   after each refusal opened a new connection per iteration, and a call with
 ///   no deadline (the foreground worker's) never returned.
 /// - A folder with a walk position but no UIDVALIDITY stamp passes the
-///   walk-start gate, and every range's SEARCH is refused; a worker that set
-///   each refused range aside and walked on opened one connection per range,
-///   down to UID 1, on every call.
+///   walk-start gate, and every range's SEARCH is refused; workers that set
+///   each refused range aside and walked on opened about one refused
+///   connection per round of workers (they share each refused attempt), down
+///   to UID 1, on every call.
 ///
 /// The property: the walk's connections to such a server are bounded by its
 /// own retry pace and its workers, never by the folder's size.
@@ -42,9 +43,22 @@ struct BackfillEncryptionRefusalTests {
     private static let endBoundSeconds = 10.0
     /// How long a resumed walk of a refused folder may take to end on its own.
     private static let resumedEndBoundSeconds = 30.0
-    /// The resumed folder's walk position: at least this divided by the largest
-    /// chunk size (1000) ranges lie below it, far more than the walk's workers.
-    private static let resumedCursor = 100_000
+    /// The largest walk chunk (`BackfillProfile.backfillChunkSize`).
+    private static let largestChunk = 1000
+    /// How many rounds of workers beyond the fixed walk's bound the walk
+    /// position holds, at the largest chunk.
+    private static let roundsMargin = 4
+
+    /// The resumed folder's walk position for `workers` workers. Workers that
+    /// walk on after a refusal share each refused connection attempt, so the
+    /// unfixed walk opens about one connection per ROUND of workers
+    /// (ranges / workers), not one per range. This position holds at least
+    /// `roundsMargin` × (1 + workers) rounds at the largest chunk, so even with
+    /// every attempt shared the unfixed walk opens several times the fixed
+    /// walk's bound (1 + workers).
+    private static func resumedCursor(workers: Int) -> Int {
+        largestChunk * workers * (1 + workers) * roundsMargin
+    }
 
     /// Set once by the waiter in `ends(_:within:)`.
     private final class Flag: Sendable {
@@ -139,7 +153,11 @@ struct BackfillEncryptionRefusalTests {
 
         let accountId = "walk-encryption-refused-resumed"
         let account = try FolderEpochTestFixture.makeAccount(id: accountId, provider: .imap, pool: pool)
-        let startCursor = Self.resumedCursor
+        let imap = Self.provider(for: server)
+        defer { Task { try? await imap.disconnect() } }
+        // The walk runs this many workers; each may meet the refusal once.
+        let workers = await imap.poolMaxConnections()
+        let startCursor = Self.resumedCursor(workers: workers)
         try await pool.write { db in
             // A folder with a walk position and no UIDVALIDITY stamp: the
             // walk-start gate lets it through even though the walk-start read
@@ -150,10 +168,6 @@ struct BackfillEncryptionRefusalTests {
             folder.lastKnownUidValidity = nil
             try folder.insert(db)
         }
-        let imap = Self.provider(for: server)
-        defer { Task { try? await imap.disconnect() } }
-        // The walk runs this many workers; each may meet the refusal once.
-        let workers = await imap.poolMaxConnections()
         let engine = SyncEngine()
         await engine.register(
             accountId: accountId, provider: imap,
@@ -162,8 +176,12 @@ struct BackfillEncryptionRefusalTests {
         // No deadline: the walk declines the folder for the call and ends by itself.
         let call = Task { await engine.runBackfillWalk(account: account) }
         let ended = await Self.ends(call, within: Self.resumedEndBoundSeconds)
-        if !ended { call.cancel() }
         let connections = server.acceptedConnectionCount()
+        if !ended {
+            // Let a cancelled walk end before the database is restored.
+            call.cancel()
+            _ = await Self.ends(call, within: Self.endBoundSeconds)
+        }
 
         #expect(ended, "the walk did not end within \(Self.resumedEndBoundSeconds) s")
         #expect(connections >= 1, "the walk never reached the server")
