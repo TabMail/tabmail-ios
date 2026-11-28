@@ -730,6 +730,43 @@ struct AppleSignInRevokeWireTests {
             #expect(answer.0 == .retry)
         }
     }
+
+    @Test("With debug logging on, no log line carries the authorization code")
+    func codeNeverLogged() async throws {
+        let code = "code-\(UUID().uuidString)"
+        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("applerevoke_\(UUID().uuidString).log")
+        AppLogStore.fileURLOverride.withLock { $0 = logURL }
+        DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = true }
+        defer {
+            DebugModeManager.loggingEnabledOverrideForTesting.withLock { $0 = nil }
+            AppLogStore._resetForTesting()
+            try? FileManager.default.removeItem(at: logURL)
+        }
+        let date = ISO8601DateFormatter().string(from: Date.now.addingTimeInterval(30 * 24 * 60 * 60))
+        let scheduled = FakeHTTP.Scenario()
+        defer { scheduled.close() }
+        scheduled.register(path: "/account/delete", method: "POST", response: .json(
+            raw: "{\"status\":\"scheduled\",\"deletion_date\":\"\(date)\",\"apple_authorization_revoked\":false}"))
+        scheduled.register(path: "/account/age-ineligible", method: "POST", response: .status(200))
+        let unavailable = FakeHTTP.Scenario()
+        defer { unavailable.close() }
+        unavailable.register(path: "/account/age-ineligible", method: "POST", response: .status(503))
+        let fresh = await AppleIDSignIn.freshAuthorizationCode { _ in Data(code.utf8) }
+        #expect(fresh == code)
+        let acknowledged = try await withSession {
+            let client = BillingClient(session: scheduled.session)
+            _ = try await client.requestAccountDeletion(appleAuthorizationCode: code)
+            let first = await AgeAndTermsConsent.sendDeletionRequest(appleAuthorizationCode: code, client: client)
+            let second = await AgeAndTermsConsent.sendDeletionRequest(
+                appleAuthorizationCode: code, client: BillingClient(session: unavailable.session))
+            return (first.error == nil, second.error == nil)
+        }
+        #expect(acknowledged.0 && !acknowledged.1, "one acknowledged request and one failed one, both logged")
+        let log = AppLogStore.read()
+        #expect(log.contains("[ConsentGate] Age-ineligible account deletion requested"), "debug logging was on")
+        #expect(log.contains("[ConsentGate] Age-ineligible deletion request failed"), "debug logging was on")
+        #expect(!log.contains(code), "no log line carries the code")
+    }
 }
 
 /// The two screens cannot be hosted in a unit test with their environment, so this is a scoped source fence

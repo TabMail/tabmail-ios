@@ -1588,8 +1588,9 @@ revoke field is read; `/account/age-ineligible` (through `AgeAndTermsConsent.sen
 `request_id` without a code (byte for byte) and both keys with one, both request ids UUIDs (billing refuses any
 other); every request goes to the exact URL with no query, and no URL, header name or header value carries the
 code (the stub's request handler records every header); the answer follows billing's status (2xx acknowledged,
-409 signs out, 503 asks again). The request builders are checked for the exact URL, method, header set and
-timeout with and without a code.
+409 signs out, 503 asks again); with debug logging on, neither the sheet's code helper nor either deletion request
+(acknowledged or failed) writes the code to the app log. The request builders are checked for the exact URL,
+method, header set and timeout with and without a code.
 `AppleSignInRevokeWiringTests` is a source check on the two screens: Settings reads the account before the
 deletion starts, runs the sheet only inside the coordinator's scheduling step (one `performRequest`, no direct
 call), shows the manual steps and Apple's article only under `showsAppleManualStop` in `AccountDeletionConfirmation`
