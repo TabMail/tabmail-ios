@@ -60,8 +60,8 @@ struct IMAPContentIdPartWireTests {
             try? await provider.disconnect()
             throw error
         }
-        let nse = try #require(await NSEIMAPConnection.fetch(
-            accountId: "content-id-part", host: "127.0.0.1", port: server.port, useTLS: false,
+        let nse = try #require(await NSEIMAPConnection.fetchFromPlainTextTestServer(
+            accountId: "content-id-part", host: "127.0.0.1", port: server.port,
             username: server.username, password: server.password, rfc822MessageId: messageID))
         return Reads(app: app, appFiles: appFiles, nse: nse)
     }

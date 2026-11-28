@@ -236,8 +236,8 @@ struct SearchAnswerRefusalCallerTests {
             server.answerNextUIDSearch(in: "INBOX", esearchData: Self.noMatch)
             server.answerNextUIDSearch(in: "INBOX", esearchData: Self.onlyFive)
         }
-        let result = await NSEIMAPConnection.fetch(
-            accountId: "nse-\(which)", host: "127.0.0.1", port: server.port, useTLS: false,
+        let result = await NSEIMAPConnection.fetchFromPlainTextTestServer(
+            accountId: "nse-\(which)", host: "127.0.0.1", port: server.port,
             username: server.username, password: server.password, rfc822MessageId: messageId)
         let searchCount = which == "bracketedMatch" ? 1 : 2
         #expect(server.compactUIDSearchAnswersServed() == searchCount, "precondition: every answer under test was served")

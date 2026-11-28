@@ -700,7 +700,11 @@ enum AccountReauthAlert {
     /// closed (offline, as before).
     static func passwordUpdateLine(for error: Error, host: String) -> String? {
         if case ReauthenticationError.accountChanged = error { return accountChangedLine }
-        if error is IMAPTransportSecurityError { return tlsLine(host: host) }
+        if let securityError = error as? IMAPTransportSecurityError {
+            if case .tlsFloorNotMet = securityError { return tlsLine(host: host) }
+            // Built from the account's own host and ports, never from server text.
+            return securityError.description
+        }
         if SyncEngine.isConnectionError(error) { return nil }
         // `updatePassword` reports a refused password as this typed case: the
         // mail probe's own sign-in reporter, or a refused calendar sign-in.

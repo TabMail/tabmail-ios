@@ -1496,8 +1496,8 @@ actor AccountManager {
     #if DEBUG
     /// Test seam: `IMAPProvider`'s TLS override for providers this factory and
     /// `addIMAPAccount` build, so the factory, `updatePassword` and the IMAP add
-    /// can be driven against the plain-TCP `FakeIMAPServer`. `nil` (production)
-    /// lets SwiftMail choose.
+    /// can be driven against the plain-TCP `FakeIMAPServer`. `nil` (production):
+    /// the transport comes from `MailTransportPolicy`.
     private nonisolated let imapUseTLSOverrideBox = Mutex<Bool?>(nil)
     nonisolated func setIMAPUseTLSOverrideForTesting(_ useTLS: Bool?) {
         imapUseTLSOverrideBox.withLock { $0 = useTLS }

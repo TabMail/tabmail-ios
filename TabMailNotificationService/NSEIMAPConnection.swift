@@ -41,16 +41,52 @@ enum NSEIMAPConnection {
         accountId: String,
         host: String,
         port: Int,
-        useTLS: Bool?,
         username: String,
         password: String,
         rfc822MessageId: String,
         folderPath: String = "INBOX"
     ) async -> (metadata: NSEMessageMetadata, body: RenderedBody)? {
+        // Always an encrypted connection, chosen from the port exactly as the
+        // app's `IMAPProvider` chooses it.
+        await fetch(
+            accountId: accountId, host: host, port: port, username: username, password: password,
+            rfc822MessageId: rfc822MessageId, folderPath: folderPath,
+            transportSecurity: MailTransportPolicy.imapSecurity(port: port))
+    }
+
+    #if DEBUG
+    /// Test fixtures only: the same fetch from the plain-TCP loopback fake IMAP
+    /// server, which cannot upgrade. Absent from release builds.
+    static func fetchFromPlainTextTestServer(
+        accountId: String,
+        host: String,
+        port: Int,
+        username: String,
+        password: String,
+        rfc822MessageId: String,
+        folderPath: String = "INBOX"
+    ) async -> (metadata: NSEMessageMetadata, body: RenderedBody)? {
+        await fetch(
+            accountId: accountId, host: host, port: port, username: username, password: password,
+            rfc822MessageId: rfc822MessageId, folderPath: folderPath,
+            transportSecurity: MailTransportSecurity.plainText)
+    }
+    #endif
+
+    private static func fetch(
+        accountId: String,
+        host: String,
+        port: Int,
+        username: String,
+        password: String,
+        rfc822MessageId: String,
+        folderPath: String,
+        transportSecurity: MailTransportSecurity
+    ) async -> (metadata: NSEMessageMetadata, body: RenderedBody)? {
         let server = IMAPServer(
             host: host,
             port: port,
-            useTLS: useTLS,
+            transportSecurity: transportSecurity,
             responseBufferLimit: IMAPFetchMapping.responseBufferLimit
         )
 

@@ -100,7 +100,7 @@ enum BodyFetchProcessor {
     ///      subject and sender. ⚠️ That bound is FIRST-PARTY, not an upstream dependency —
     ///      earlier wording here said "until a raised parser bound ships upstream", which
     ///      is wrong: it is `IMAPFetchMapping.responseBufferLimit`, a constant in this
-    ///      repo passed to `IMAPServer(host:port:useTLS:responseBufferLimit:)` by both IMAP
+    ///      repo passed to `IMAPServer(host:port:transportSecurity:responseBufferLimit:)` by both IMAP
     ///      entry points. Upstream PR #179 already made it a constructor parameter, so the
     ///      SwiftMail fork is a pure mirror and raising the value needs no upstream work.
     ///      (Found by audit.)

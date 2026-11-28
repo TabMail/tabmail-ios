@@ -1844,8 +1844,8 @@ final class InboxViewModel {
             AccountManagerState.shared.lastSyncFailed = true
             // The run's outcome is the one error it sees; a failed refresh never clears.
             AccountManagerState.shared.failRefresh(
-                countedFailure: InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: false)
-                    && InboxErrorBanner.text(for: error) != nil)
+                line: InboxErrorBanner.countsAsFailure(error, accountMarkedSignInNeeded: false)
+                    ? InboxErrorBanner.text(for: error) : nil)
         }
 
         // Refresh loaded messages to pick up changes from sync.

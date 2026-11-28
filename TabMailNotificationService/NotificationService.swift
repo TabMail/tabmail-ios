@@ -1170,7 +1170,7 @@ final class NotificationService: UNNotificationServiceExtension {
             port: imap.port,
             username: imap.username,
             password: password,
-            security: (imap.useTLS == false) ? "starttls" : nil
+            security: MailTransportPolicy.pushSubscriptionSecurity
         )
         let ciphertext: String
         do {
@@ -1242,7 +1242,6 @@ final class NotificationService: UNNotificationServiceExtension {
             accountId: accountId,
             host: imap.host,
             port: imap.port,
-            useTLS: imap.useTLS,
             username: imap.username,
             password: password,
             rfc822MessageId: rfc822MessageId

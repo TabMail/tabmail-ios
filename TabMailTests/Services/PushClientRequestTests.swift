@@ -4,6 +4,7 @@
 
 import CryptoKit
 import Foundation
+import Synchronization
 import Testing
 @testable import TabMail
 
@@ -57,13 +58,19 @@ final class PushRequestProtocol: URLProtocol, @unchecked Sendable {
 
 @Suite("Push client wire contracts", .serialized, .processGlobalState)
 struct PushClientRequestTests {
-    private func client() -> (PushClient, URLSession) {
+    /// The IMAP credential payloads the client sealed, in order.
+    private final class SealedPayloads: Sendable {
+        let payloads = Mutex<[IMAPCredPayload]>([])
+    }
+
+    private func client(sealed: SealedPayloads? = nil) -> (PushClient, URLSession) {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [PushRequestProtocol.self]
         let session = URLSession(configuration: config)
         return (PushClient(baseURL: URL(string: "https://push.example.test")!, session: session,
             encryptIMAP: { payload, context in
-                try IMAPCredCrypto.sealAuthorityPayload(payload, context: context,
+                sealed?.payloads.withLock { $0.append(payload) }
+                return try IMAPCredCrypto.sealAuthorityPayload(payload, context: context,
                     key: SymmetricKey(data: Data(repeating: 42, count: 32)))
             }), session)
     }
@@ -111,6 +118,24 @@ struct PushClientRequestTests {
         #expect(body["deviceId"] as? String == "device-a")
         #expect((body["credsCiphertext"] as? String)?.hasPrefix("v2:") == true)
         #expect(String(decoding: sent.body, as: UTF8.self).contains("synthetic-password") == false)
+    }
+
+    @Test("the IMAP subscription asks the proxy for implicit TLS to the account's server")
+    func imapPayloadAsksForImplicitTLS() async throws {
+        PushRequestProtocol.reset(body: #"{"outcome":"active"}"#)
+        let sealed = SealedPayloads()
+        let (client, session) = client(sealed: sealed)
+        defer { session.invalidateAndCancel() }
+        try await client.subscribeIMAP(context: IMAPSubscribeContext(userId: "user-a", deviceId: "device-a",
+            accountEmail: "mail@example.test", deviceToken: "token-new", apnsSandbox: false, nseCapable: true),
+            host: "imap.example.test", port: 993, username: "synthetic", password: "synthetic-password",
+            authToken: "synthetic-worker-token")
+        let payloads = sealed.payloads.withLock { $0 }
+        #expect(payloads.count == 1)
+        guard payloads.count == 1 else { return }
+        #expect(payloads[0].security == "tls")
+        #expect(payloads[0].host == "imap.example.test")
+        #expect(payloads[0].port == 993)
     }
 
     @Test func consentAndRemovalCarryInstallation() async throws {

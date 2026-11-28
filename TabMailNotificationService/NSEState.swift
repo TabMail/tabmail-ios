@@ -101,7 +101,6 @@ enum NSEState {
         let host: String
         let port: Int
         let username: String
-        let useTLS: Bool?
     }
 
     static func getIMAPAccount(for accountId: String) -> IMAPAccountInfo? {
@@ -113,13 +112,10 @@ enum NSEState {
               let username = entry["username"] as? String else {
             return nil
         }
-        let port = (entry["port"] as? Int) ?? 993
-        // `useTLS` stored as a Bool or Int(0/1). nil = "let SwiftMail decide".
-        let useTLS: Bool?
-        if let b = entry["useTLS"] as? Bool { useTLS = b }
-        else if let n = entry["useTLS"] as? Int { useTLS = n != 0 }
-        else { useTLS = nil }
-        return IMAPAccountInfo(host: host, port: port, username: username, useTLS: useTLS)
+        let port = (entry["port"] as? Int) ?? MailTransportPolicy.imapImplicitTLSPort
+        // The transport is chosen from the port (`MailTransportPolicy`), never
+        // from a stored flag.
+        return IMAPAccountInfo(host: host, port: port, username: username)
     }
 
     /// Whether Apple has approved the filtering entitlement (can fully suppress).
