@@ -14,7 +14,8 @@ struct IMAPSubscribeContext: Codable, Sendable, Equatable {
     let apnsSandbox: Bool
     let nseCapable: Bool
 
-    /// UTF-8 compact ordered JSON, byte-compatible with the proxy's v2 AAD.
+    /// UTF-8 compact ordered JSON, byte-compatible with the proxy's credential AAD.
+    /// The leading label is the context format's name and stays as is.
     func credentialContext() throws -> Data {
         let strings = [userId, deviceId, accountEmail, deviceToken]
         guard strings.allSatisfy({ value in
@@ -33,7 +34,7 @@ struct IMAPSubscribeContext: Codable, Sendable, Equatable {
     /// The returned data is transient and must never become persisted retry work.
     func requestBody(credentialEnvelope: String) throws -> Data {
         _ = try credentialContext()
-        guard credentialEnvelope.hasPrefix("v2:"), credentialEnvelope.utf8.count > 3,
+        guard credentialEnvelope.hasPrefix("v3:"), credentialEnvelope.utf8.count > 3,
               credentialEnvelope.utf8.count <= 65_536 else {
             throw IMAPCredCryptoError.invalidContext
         }

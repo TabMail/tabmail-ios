@@ -6,53 +6,47 @@ import Foundation
 import CryptoKit
 
 // =============================================================================
-// IMAPCredCrypto — AES-GCM encryption of IMAP credentials for transmission
-// to the IMAP IDLE proxy via the push-worker.
+// IMAPCredCrypto — seals IMAP credentials to the IMAP push proxy's public key
+// for one subscribe request through the push worker.
 //
 // Contract:
-//   • iOS encrypts a JSON-serialized `{host, port?, username, password, security?}`
-//     blob with AES-GCM using a 32-byte symmetric key pre-shared between iOS
-//     and the IDLE proxy (`IMAP_CRED_ENCRYPTION_KEY`).
-//   • iOS authenticates the unified subscribe context as AES-GCM AAD.
-//     The worker reserves a generation before forwarding the ciphertext;
-//     it never holds the decryption key or persists IMAP credentials.
-//   • The IDLE proxy consumes admission before decrypting and constructing
-//     the connection, then clears transient credential buffers.
+//   • The app seals a JSON-serialized `{host, port?, username, password, security?}`
+//     blob with HPKE base mode (RFC 9180): DHKEM(X25519, HKDF-SHA256),
+//     HKDF-SHA256, ChaCha20-Poly1305. The recipient is the proxy's public key,
+//     which ships in the app; only the proxy holds the private key, so the app
+//     carries nothing that can open an envelope.
+//   • The unified subscribe context is the authenticated data, so the envelope
+//     is bound to user, device, account, device token, sandbox flag and NSE
+//     capability. The worker forwards the envelope unopened; it holds no key.
 //
-// Ciphertext format (matches the push-worker's credential-encryption module):
-//   "v2:" + base64(iv ‖ ciphertext ‖ authTag)
-//     • iv:       12 bytes, freshly random per encryption call (AES-GCM
-//                 nonce reuse is catastrophic — NEVER reuse an iv/key pair).
-//     • authTag:  16 bytes, CryptoKit appends it to the sealed ciphertext
-//                 automatically via `combined`.
+// Envelope format:
+//   "v3:" + base64(keyId ‖ enc ‖ ciphertext ‖ tag)
+//     • keyId: the first 8 bytes of SHA-256 over the raw 32-byte public key,
+//              derived from the key, never configured. The HPKE info is
+//              "tabmail-imap-subscribe-v3" ‖ 0x00 ‖ keyId, which binds it, and
+//              the proxy uses it to pick its key while it holds two.
+//     • enc:   the 32-byte encapsulated key; one seal per envelope.
+//     • tag:   16 bytes, appended to the ciphertext by CryptoKit.
 //
-// The proxy checks the version and exact authenticated request context.
-//
-// Key selection: always read `IMAP_CRED_ENCRYPTION_KEY_PROD`. Per the
-// global CLAUDE.md rules #9 and #10 (one shared backend entitlement store, one Stripe env),
-// all shared infrastructure — push-worker, IDLE proxy, entitlement store — is prod-only.
-// A dev/prod split on this key would mean a Debug iOS build can't talk
-// to the prod IDLE proxy. The xcconfig still ships a _DEV variant for
-// future isolation, but the runtime always picks _PROD.
+// One key for every build: the app always talks to the prod push worker and
+// proxy, Debug builds included. A new key pair reaches the app in a release;
+// the proxy keeps the previous key until clients have moved.
 //
 // Shared across main-app + NSE targets via the `Shared/` glob. The NSE's
-// silent-reconnect flow needs to encrypt too.
+// silent-reconnect flow needs to seal too.
 // =============================================================================
 
 enum IMAPCredCryptoError: Error {
     case invalidContext
-    /// Info.plist key missing or empty. Project config broke — shouldn't
-    /// happen in a properly-built binary, but surface it loudly if it does.
-    case keyMissing
-    /// Decoded key is not exactly 32 bytes (AES-256).
-    case keyWrongSize(Int)
-    /// CryptoKit sealing threw.
-    case sealFailed
+    /// The shipped proxy key is not a 32-byte X25519 public key. A build
+    /// problem: the subscribe fails without sending anything, and the
+    /// shipped-key test (`shippedProxyKeySeals`) catches it before release.
+    case invalidProxyKey
 }
 
-/// IMAP credential plaintext shape. Matches the IDLE proxy's `/start-idle`
-/// body schema (minus `userId`/`accountEmail` which stay on the outer
-/// envelope). Keeping them in sync by hand is fine — there are five
+/// IMAP credential plaintext shape. Matches the IDLE proxy's credential
+/// payload schema (minus `userId`/`accountEmail` which stay on the outer
+/// request). Keeping them in sync by hand is fine — there are five
 /// fields and both sides have a schema guard.
 struct IMAPCredPayload: Codable {
     let host: String
@@ -71,54 +65,53 @@ struct IMAPCredPayload: Codable {
 }
 
 enum IMAPCredCrypto {
-    /// V2 binds the envelope to the inputs of one unified subscribe request;
+    /// The IMAP push proxy's public key: raw X25519, base64. Not a secret.
+    static let proxyPublicKey = "z3K5rZvDFFUDkENNlcSA807/uZbQrzRrJ22cHaFvLQ4="
+
+    /// The key `encrypt` seals to: the shipped proxy key. Only tests bind another,
+    /// so both callers' real wiring can be opened with a synthetic key.
+    @TaskLocal static var sealingKey = proxyPublicKey
+
+    /// V3 binds the envelope to the inputs of one unified subscribe request;
     /// neither the payload nor the returned envelope belongs in persistent retry state.
     static func encrypt(_ payload: IMAPCredPayload, context: IMAPSubscribeContext) throws -> String {
-        try sealAuthorityPayload(payload, context: context, key: loadKey())
+        try sealAuthorityPayload(payload, context: context, to: proxyKey(sealingKey))
     }
 
-    /// Explicit-key seam also permits cross-platform tests without loading app secrets.
+    /// Explicit-recipient seam also permits cross-platform tests with test keys.
     static func sealAuthorityPayload(
-        _ payload: IMAPCredPayload, context: IMAPSubscribeContext, key: SymmetricKey
+        _ payload: IMAPCredPayload, context: IMAPSubscribeContext,
+        to recipient: Curve25519.KeyAgreement.PublicKey
     ) throws -> String {
-        guard key.bitCount == 256 else { throw IMAPCredCryptoError.keyWrongSize(key.bitCount / 8) }
         let authenticatedContext = try context.credentialContext()
+        let id = keyId(of: recipient)
+        var sender = try HPKE.Sender(recipientKey: recipient,
+            ciphersuite: .Curve25519_SHA256_ChachaPoly, info: envelopeInfo(keyId: id))
         var plaintext = try JSONEncoder().encode(payload)
         defer { plaintext.resetBytes(in: 0..<plaintext.count) }
-        let sealed = try AES.GCM.seal(plaintext, using: key, authenticating: authenticatedContext)
-        guard let combined = sealed.combined else { throw IMAPCredCryptoError.sealFailed }
-        // CryptoKit generates a fresh nonce; the default 12-byte nonce precedes
-        // ciphertext and tag in combined, matching the proxy's wire contract.
-        return "v2:" + combined.base64EncodedString()
+        let sealed = try sender.seal(plaintext, authenticating: authenticatedContext)
+        var packed = id
+        packed.append(sender.encapsulatedKey)
+        packed.append(sealed)
+        return "v3:" + packed.base64EncodedString()
     }
 
-    // MARK: - Key loading
-
-    /// Load the AES key bytes from Info.plist. Target-agnostic: works the
-    /// same in main app + NSE because Info.plist is per-bundle and both
-    /// bundles get the same xcconfig substitution.
-    private static func loadKey() throws -> SymmetricKey {
-        // Always use the PROD key — the push-worker and IDLE proxy are
-        // prod-only (see file-level comment).
-        let plistKey = "IMAP_CRED_ENCRYPTION_KEY_PROD"
-
-        // Bundle.main resolves to the NSE binary when this code runs inside
-        // the NSE (appex). That's intentional — both Info.plists get the
-        // same xcconfig values, so the key is present either way.
-        guard
-            let raw = Bundle.main.object(forInfoDictionaryKey: plistKey) as? String,
-            !raw.isEmpty
-        else {
-            throw IMAPCredCryptoError.keyMissing
-        }
-
-        guard let keyData = Data(base64Encoded: raw) else {
-            throw IMAPCredCryptoError.keyMissing
-        }
-        guard keyData.count == 32 else {
-            throw IMAPCredCryptoError.keyWrongSize(keyData.count)
-        }
-        return SymmetricKey(data: keyData)
+    /// The first 8 bytes of SHA-256 over the raw public key.
+    static func keyId(of key: Curve25519.KeyAgreement.PublicKey) -> Data {
+        Data(SHA256.hash(data: key.rawRepresentation).prefix(8))
     }
 
+    static func envelopeInfo(keyId: Data) -> Data {
+        var info = Data("tabmail-imap-subscribe-v3".utf8)
+        info.append(0)
+        info.append(keyId)
+        return info
+    }
+
+    static func proxyKey(_ encoded: String) throws -> Curve25519.KeyAgreement.PublicKey {
+        guard let raw = Data(base64Encoded: encoded), raw.count == 32 else {
+            throw IMAPCredCryptoError.invalidProxyKey
+        }
+        return try Curve25519.KeyAgreement.PublicKey(rawRepresentation: raw)
+    }
 }

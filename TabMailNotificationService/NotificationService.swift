@@ -1125,8 +1125,8 @@ final class NotificationService: UNNotificationServiceExtension {
         deliverPassive(c: c, deliver: deliver)
     }
 
-    /// Encrypt the account's IMAP creds with the shared
-    /// `IMAP_CRED_ENCRYPTION_KEY` and POST to the push-worker's
+    /// Seal the account's IMAP creds to the IMAP push proxy's public key
+    /// (`IMAPCredCrypto`) and POST to the push-worker's
     /// unified `/subscribe`. Only committed active is restored success.
     private static func attemptSilentResubscribe(
         accountId: String, accountEmail: String

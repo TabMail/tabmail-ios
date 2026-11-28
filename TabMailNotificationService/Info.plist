@@ -18,10 +18,6 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
-	<key>IMAP_CRED_ENCRYPTION_KEY_DEV</key>
-	<string>$(IMAP_CRED_ENCRYPTION_KEY_DEV)</string>
-	<key>IMAP_CRED_ENCRYPTION_KEY_PROD</key>
-	<string>$(IMAP_CRED_ENCRYPTION_KEY_PROD)</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>

@@ -4,7 +4,6 @@
 
 import CryptoKit
 import Foundation
-import Synchronization
 import Testing
 @testable import TabMail
 
@@ -58,22 +57,15 @@ final class PushRequestProtocol: URLProtocol, @unchecked Sendable {
 
 @Suite("Push client wire contracts", .serialized, .processGlobalState)
 struct PushClientRequestTests {
-    /// The IMAP credential payloads the client sealed, in order.
-    private final class SealedPayloads: Sendable {
-        let payloads = Mutex<[IMAPCredPayload]>([])
-    }
-
-    private func client(sealed: SealedPayloads? = nil) -> (PushClient, URLSession) {
+    private func client() -> (PushClient, URLSession) {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [PushRequestProtocol.self]
         let session = URLSession(configuration: config)
-        return (PushClient(baseURL: URL(string: "https://push.example.test")!, session: session,
-            encryptIMAP: { payload, context in
-                sealed?.payloads.withLock { $0.append(payload) }
-                return try IMAPCredCrypto.sealAuthorityPayload(payload, context: context,
-                    key: SymmetricKey(data: Data(repeating: 42, count: 32)))
-            }), session)
+        return (PushClient(baseURL: URL(string: "https://push.example.test")!, session: session), session)
     }
+
+    private let imapContext = IMAPSubscribeContext(userId: "user-a", deviceId: "device-a",
+        accountEmail: "mail@example.test", deviceToken: "token-new", apnsSandbox: false, nseCapable: true)
 
     @Test(arguments: ["gmail", "outlook"])
     func providerRequest(provider: String) async throws {
@@ -102,12 +94,14 @@ struct PushClientRequestTests {
         PushRequestProtocol.reset(code: code, body: code == 200 ? #"{"outcome":"active"}"# : #"{"outcome":"in_progress"}"#)
         let (client, session) = client()
         defer { session.invalidateAndCancel() }
+        let recipient = try SyntheticProxyKey.a()
         var succeeded = false
         do {
-            try await client.subscribeIMAP(context: IMAPSubscribeContext(userId: "user-a", deviceId: "device-a",
-                accountEmail: "mail@example.test", deviceToken: "token-new", apnsSandbox: false, nseCapable: true),
-                host: "imap.example.test", port: 993, username: "synthetic", password: "synthetic-password",
-                authToken: "synthetic-worker-token")
+            try await IMAPCredCrypto.$sealingKey.withValue(SyntheticProxyKey.encoded(recipient)) {
+                try await client.subscribeIMAP(context: imapContext,
+                    host: "imap.example.test", port: 993, username: "synthetic", password: "synthetic-password",
+                    authToken: "synthetic-worker-token")
+            }
             succeeded = true
         } catch { #expect(code != 200) }
         #expect(succeeded == (code == 200))
@@ -116,26 +110,81 @@ struct PushClientRequestTests {
         let body = try #require(JSONSerialization.jsonObject(with: sent.body) as? [String: Any])
         #expect(body["protocolVersion"] as? Int == 2)
         #expect(body["deviceId"] as? String == "device-a")
-        #expect((body["credsCiphertext"] as? String)?.hasPrefix("v2:") == true)
+        #expect((body["credsCiphertext"] as? String)?.hasPrefix("v3:") == true)
         #expect(String(decoding: sent.body, as: UTF8.self).contains("synthetic-password") == false)
+        // What the proxy would open, authenticated by the fields this request carries.
+        let opened = try SyntheticProxyKey.openSentBody(sent.body, with: recipient)
+        #expect(opened.host == "imap.example.test" && opened.port == 993 && opened.username == "synthetic")
+        #expect(opened.password == "synthetic-password" && opened.security == MailTransportPolicy.pushSubscriptionSecurity)
+    }
+
+    /// An eligible subscribe whose seal fails sends nothing and does not succeed; the same
+    /// request under a parsable key is the control.
+    @Test(arguments: ["", "not base64!", Data(repeating: 7, count: 31).base64EncodedString(), "control"])
+    func imapSealFailureSendsNothing(key: String) async throws {
+        PushRequestProtocol.reset(body: #"{"outcome":"active"}"#)
+        let (client, session) = client()
+        defer { session.invalidateAndCancel() }
+        let control = key == "control"
+        let sealingKey = try control ? SyntheticProxyKey.encoded(SyntheticProxyKey.a()) : key
+        var succeeded = false
+        do {
+            try await IMAPCredCrypto.$sealingKey.withValue(sealingKey) {
+                try await client.subscribeIMAP(context: imapContext,
+                    host: "imap.example.test", port: 993, username: "synthetic", password: "synthetic-password",
+                    authToken: "synthetic-worker-token")
+            }
+            succeeded = true
+        } catch PushError.requestFailed(statusCode: 0) {
+            #expect(!control)
+        }
+        #expect(succeeded == control)
+        #expect(PushRequestProtocol.observed().count == (control ? 1 : 0))
+    }
+
+    /// Credentials whose seal exceeds the request's envelope cap send nothing; the
+    /// same request with an ordinary password is the control.
+    @Test(arguments: [false, true])
+    func imapOversizedSealSendsNothing(oversized: Bool) async throws {
+        PushRequestProtocol.reset(body: #"{"outcome":"active"}"#)
+        let (client, session) = client()
+        defer { session.invalidateAndCancel() }
+        // Twice the 65,536-byte envelope cap.
+        let password = oversized ? String(repeating: "a", count: 131_072) : "synthetic-password"
+        var succeeded = false
+        do {
+            try await IMAPCredCrypto.$sealingKey.withValue(SyntheticProxyKey.encoded(SyntheticProxyKey.a())) {
+                try await client.subscribeIMAP(context: imapContext,
+                    host: "imap.example.test", port: 993, username: "synthetic", password: password,
+                    authToken: "synthetic-worker-token")
+            }
+            succeeded = true
+        } catch IMAPCredCryptoError.invalidContext {
+            #expect(oversized)
+        }
+        #expect(succeeded == !oversized)
+        #expect(PushRequestProtocol.observed().count == (oversized ? 0 : 1))
     }
 
     @Test("the IMAP subscription asks the proxy for implicit TLS to the account's server")
     func imapPayloadAsksForImplicitTLS() async throws {
         PushRequestProtocol.reset(body: #"{"outcome":"active"}"#)
-        let sealed = SealedPayloads()
-        let (client, session) = client(sealed: sealed)
+        let (client, session) = client()
         defer { session.invalidateAndCancel() }
-        try await client.subscribeIMAP(context: IMAPSubscribeContext(userId: "user-a", deviceId: "device-a",
-            accountEmail: "mail@example.test", deviceToken: "token-new", apnsSandbox: false, nseCapable: true),
-            host: "imap.example.test", port: 993, username: "synthetic", password: "synthetic-password",
-            authToken: "synthetic-worker-token")
-        let payloads = sealed.payloads.withLock { $0 }
-        #expect(payloads.count == 1)
-        guard payloads.count == 1 else { return }
-        #expect(payloads[0].security == "tls")
-        #expect(payloads[0].host == "imap.example.test")
-        #expect(payloads[0].port == 993)
+        let recipient = try SyntheticProxyKey.a()
+        try await IMAPCredCrypto.$sealingKey.withValue(SyntheticProxyKey.encoded(recipient)) {
+            try await client.subscribeIMAP(context: imapContext,
+                host: "imap.example.test", port: 993, username: "synthetic", password: "synthetic-password",
+                authToken: "synthetic-worker-token")
+        }
+        let requests = PushRequestProtocol.observed()
+        #expect(requests.count == 1)
+        guard requests.count == 1 else { return }
+        // What the proxy opens: the sealed payload asks it for implicit TLS.
+        let opened = try SyntheticProxyKey.openSentBody(requests[0].body, with: recipient)
+        #expect(opened.security == "tls")
+        #expect(opened.host == "imap.example.test")
+        #expect(opened.port == 993)
     }
 
     @Test func consentAndRemovalCarryInstallation() async throws {
