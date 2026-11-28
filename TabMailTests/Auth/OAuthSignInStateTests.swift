@@ -108,23 +108,25 @@ struct OAuthSignInStateTests {
         }
     }
 
-    /// Stands in for the system's random generator: fills every buffer with
-    /// `pattern`, and reports a failure on call `failingCall`.
+    /// Stands in for the system's random generator: call N fills its buffer
+    /// with `patterns[N - 1]` repeated (the last pattern once they run out),
+    /// and call `failingCall` reports a failure.
     @MainActor
     final class FakeRandom {
         private(set) var calls = 0
         let failingCall: Int?
-        let pattern: [UInt8]
+        let patterns: [[UInt8]]
 
-        init(failingCall: Int? = nil, pattern: [UInt8] = [0xFB, 0xFF, 0xBF]) {
+        init(failingCall: Int? = nil, patterns: [[UInt8]] = [[0xFB, 0xFF, 0xBF]]) {
             self.failingCall = failingCall
-            self.pattern = pattern
+            self.patterns = patterns
         }
 
         var fill: OAuthService.RandomFill {
             { [self] count, bytes in
                 calls += 1
                 if calls == failingCall { return errSecAllocate }
+                let pattern = patterns[min(calls, patterns.count) - 1]
                 let buffer = bytes.assumingMemoryBound(to: UInt8.self)
                 for index in 0..<count { buffer[index] = pattern[index % pattern.count] }
                 return errSecSuccess
@@ -384,12 +386,16 @@ struct OAuthSignInStateTests {
     static let patternBase64url = String(repeating: "-_", count: 21) + "8"
     /// The S256 challenge for `patternBase64url`.
     static let patternChallenge = "Weq42wa3m9dnJOzDW6BT5iNBH5jAzz3PTVsU5_AYaqY"
+    /// Thirty-two bytes of 00 10 83, repeated: each group spells "ABCD", and
+    /// the last two bytes "ABA".
+    static let secondPattern: [UInt8] = [0x00, 0x10, 0x83]
+    static let secondPatternBase64url = String(repeating: "ABCD", count: 10) + "ABA"
 
-    @Test("The verifier and the state are the generator's bytes in base64url", arguments: Flow.allCases)
+    @Test("The verifier and the state are separate draws of the generator, in base64url", arguments: Flow.allCases)
     @MainActor
     func randomBytesReachThePageAsBase64url(flow: Flow) async throws {
         let browser = FakeBrowser { sent in Self.reply(to: flow, code: "code-1", states: [sent]) }
-        let random = FakeRandom()
+        let random = FakeRandom(patterns: [[0xFB, 0xFF, 0xBF], Self.secondPattern])
         let http = Self.tokenEndpoint()
         defer { http.close() }
         let service = OAuthService(tokenSession: http.session, signInBrowser: browser.open, randomFill: random.fill)
@@ -406,9 +412,31 @@ struct OAuthSignInStateTests {
         let states = Self.states(in: pages[0])
         let challenges = Self.items(in: pages[0], named: "code_challenge")
         let verifiers = requests[0]["code_verifier"]
-        #expect(states == [Self.patternBase64url])
-        #expect(challenges == [Self.patternChallenge])
+        let pageShowsVerifier = pages[0].absoluteString.contains(Self.patternBase64url)
+        // The first draw is the verifier, the second the state.
         #expect(verifiers == [Self.patternBase64url])
+        #expect(challenges == [Self.patternChallenge])
+        #expect(states == [Self.secondPatternBase64url])
+        #expect(!pageShowsVerifier, "the page carries the challenge, never the verifier")
+    }
+
+    @Test("An accepted reply's code and state are read percent-decoded", arguments: Flow.allCases)
+    @MainActor
+    func percentEncodedReplyIsDecoded(flow: Flow) async throws {
+        // Every byte of the state percent-encoded, and the code's "/" too, as a
+        // provider may send them.
+        let browser = FakeBrowser { sent in
+            let state = sent.utf8.map { String(format: "%%%02X", $0) }.joined()
+            return URL(string: "\(flow.callback)?code=4%2F0Ab-x_y&state=\(state)")!
+        }
+        let (service, http) = Self.service(browser)
+        defer { http.close() }
+
+        let tokens = try await flow.signIn(service)
+
+        let codes = Self.codes(http)
+        #expect(tokens.accessToken == "access")
+        #expect(codes == [["4/0Ab-x_y"]], "the decoded code is exchanged")
     }
 
     @Test("A failing random generator stops the sign-in before any page opens",
@@ -456,7 +484,7 @@ struct OAuthSignInLogTests {
     private static let marker = "Qz7k"
 
     @MainActor
-    private func withDebugLog<T>(_ body: () async throws -> T) async rethrows -> T {
+    private func withDebugLog<T>(_ body: @MainActor () async throws -> T) async rethrows -> T {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("signinlog_\(UUID().uuidString).log")
         AppLogStore.fileURLOverride.withLock { $0 = url }
@@ -473,12 +501,12 @@ struct OAuthSignInLogTests {
         flow.isGoogle ? "[OAuth]" : "[OAuth] Microsoft"
     }
 
-    @Test("A sign-in reply is logged by which items it holds, never their values",
+    @Test("A sign-in's success reply is logged by which items it holds, never their values",
           arguments: [OAuthSignInStateTests.Flow.google, .microsoft])
     @MainActor
-    func replyIsLoggedByItemNames(flow: OAuthSignInStateTests.Flow) async throws {
+    func successReplyIsLoggedByItemNames(flow: OAuthSignInStateTests.Flow) async throws {
         let browser = OAuthSignInStateTests.FakeBrowser { sent in
-            OAuthSignInStateTests.reply(to: flow, code: Self.marker + "-code", states: [sent], error: Self.marker + "-error")
+            OAuthSignInStateTests.reply(to: flow, code: Self.marker + "-code", states: [sent])
         }
         let http = OAuthSignInStateTests.tokenEndpoint()
         defer { http.close() }
@@ -492,11 +520,44 @@ struct OAuthSignInLogTests {
         let sent = browser.pages.flatMap { OAuthSignInStateTests.states(in: $0) }.compactMap { $0 }
         #expect(sent.count == 1)
         guard sent.count == 1 else { return }
-        let namesItems = log.contains("\(Self.prefix(flow)) callback received — code=true, state=true, error=true")
+        let namesItems = log.contains("\(Self.prefix(flow)) callback received — code=true, state=true, error=false")
         let holdsMarker = log.contains(Self.marker)
         let holdsState = log.contains(sent[0])
         #expect(namesItems, "the reply's items are named")
-        #expect(!holdsMarker, "no code or error value is logged")
+        #expect(!holdsMarker, "no code value is logged")
+        #expect(!holdsState, "the state is not logged")
+    }
+
+    @Test("A sign-in's error reply is logged by which items it holds, never their values, and exchanges nothing",
+          arguments: [OAuthSignInStateTests.Flow.google, .microsoft])
+    @MainActor
+    func errorReplyIsLoggedByItemNames(flow: OAuthSignInStateTests.Flow) async {
+        let browser = OAuthSignInStateTests.FakeBrowser { sent in
+            OAuthSignInStateTests.reply(to: flow, code: nil, states: [sent], error: Self.marker + "-error")
+        }
+        let http = OAuthSignInStateTests.tokenEndpoint()
+        defer { http.close() }
+        let service = OAuthService(tokenSession: http.session, signInBrowser: browser.open)
+
+        let (thrown, log) = await withDebugLog {
+            var thrown: (any Error)?
+            do { _ = try await flow.signIn(service) } catch { thrown = error }
+            return (thrown, AppLogStore.read())
+        }
+
+        let sent = browser.pages.flatMap { OAuthSignInStateTests.states(in: $0) }.compactMap { $0 }
+        let urls = http.recordedCalls().map { $0.url }
+        var refused = false
+        if let error = thrown as? OAuthError, case .noAuthCode = error { refused = true }
+        #expect(refused, "thrown: \(String(describing: thrown))")
+        #expect(urls.isEmpty, "\(urls)")
+        #expect(sent.count == 1)
+        guard sent.count == 1 else { return }
+        let namesItems = log.contains("\(Self.prefix(flow)) callback received — code=false, state=true, error=true")
+        let holdsMarker = log.contains(Self.marker)
+        let holdsState = log.contains(sent[0])
+        #expect(namesItems, "the reply's items are named")
+        #expect(!holdsMarker, "no error value is logged")
         #expect(!holdsState, "the state is not logged")
     }
 
