@@ -1594,8 +1594,9 @@ method, header set and timeout with and without a code.
 `AppleSignInRevokeWiringTests` is a source check on the two screens: Settings reads the account before the
 deletion starts, runs the sheet only inside the coordinator's scheduling step (one `performRequest`, no direct
 call), shows the manual steps and Apple's article only under `showsAppleManualStop` in `AccountDeletionConfirmation`
-(the one confirmation view), sets the deletion screen's flag only from the tested predicate and before the receipt
-is built, and passes it to both confirmations (the screen's own after a failed sign-out, and `RootView`'s sheet
+(the one confirmation view), as a direct part of its content between the keep-account line and the error line (not
+inside the error branch, which the root's sheet never shows), sets the deletion screen's flag only from the tested
+predicate, directly in the scheduled case and before the receipt is built, and passes it to both confirmations (the screen's own after a failed sign-out, and `RootView`'s sheet
 through the receipt, which only passes it on), and says Apple's sheet comes next only under `isAppleAccount`; the code is the credential's `authorizationCode` on both screens (never the
 identity token); the age screen holds a `RefusalExit` over `sendDeletionRequest`, sends at the failed check without
 a code, ignores OK while one is under way, sends the decision for every account kept in the backend, leaves

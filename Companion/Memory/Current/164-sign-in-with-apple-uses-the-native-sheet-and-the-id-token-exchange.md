@@ -61,7 +61,7 @@ refresh token); the app only supplies the code.
   (`freshAuthorizationCode` never throws and never logs the code).
 - The answer's `apple_authorization_revoked` reaches the confirmation through
   `ExecutionResult.scheduled(deletionDate:appleAuthorizationRevoked:)`; the status read-back after a lost answer
-  gives nil. Unless the answer is `true`, the confirmation shows Apple's manual path (Settings, your name, Sign in
+  gives nil. For an Apple account, unless the answer is `true`, the confirmation shows Apple's manual path (Settings, your name, Sign in
   with Apple, TabMail, Delete) and links support article 102571 (`showsManualStopLine`). The confirmation is
   `AccountDeletionConfirmation`, shown after the sign-out as a root sheet from `AccountDeletionReceipt`
   (ios#1676, memory 165); the receipt carries `showsAppleManualStop` next to the date, so the manual path shows

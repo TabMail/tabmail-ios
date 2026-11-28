@@ -378,6 +378,7 @@ struct AppleSignInRevokeTests {
         #expect(request.url?.absoluteString == "https://billing.example.com/account/delete")
         #expect(request.httpMethod == "POST")
         #expect(request.allHTTPHeaderFields == ["Authorization": "Bearer token-a", "Content-Type": "application/json"])
+        #expect(request.timeoutInterval == 30)
         #expect(request.httpBody == nil)
     }
 
@@ -386,8 +387,10 @@ struct AppleSignInRevokeTests {
         let request = try BillingClient.makeAccountDeletionRequest(
             baseURL: URL(string: "https://billing.example.com")!, token: "token-a", appleAuthorizationCode: "code-1")
         #expect(request.url?.absoluteString == "https://billing.example.com/account/delete")
+        #expect(request.httpMethod == "POST")
         #expect(request.allHTTPHeaderFields == ["Authorization": "Bearer token-a", "Content-Type": "application/json"],
                 "the code goes only into the body")
+        #expect(request.timeoutInterval == 30)
         let json = try Self.jsonObject(request.httpBody)
         #expect(json == ["apple_authorization_code": "code-1"])
     }
@@ -817,26 +820,36 @@ struct AppleSignInRevokeWiringTests {
     @Test("The confirmation shows the manual steps and Apple's article only under the tested predicate, after the sign-out too")
     func manualStepsRenderGuard() throws {
         let text = try Self.source("TabMail/Views/Settings/AccountDeletionView.swift")
-        // The shared confirmation shows the steps under its own flag only.
+        // The shared confirmation shows the steps under its own flag only, as a direct part of its content between the
+        // keep-account line and the error line (inside the error branch it would vanish after every sign-out, since the
+        // root passes no error).
         let start = try #require(text.range(of: "struct AccountDeletionConfirmation: View {"))
         let end = try #require(text.range(of: "private struct BulletPoint: View {"))
         #expect(start.upperBound < end.lowerBound)
         guard start.upperBound < end.lowerBound else { return }
         let view = String(text[start.upperBound..<end.lowerBound])
         #expect(view.contains(
+            "Text(AccountDeletionCopy.keepAccountConsequence) .font(.caption) .foregroundStyle(.secondary) " +
+            ".multilineTextAlignment(.center) .padding(.horizontal) " +
             "if showsAppleManualStop { VStack(spacing: 6) { Text(AccountDeletionCopy.appleSignInManualStop) " +
             ".font(.subheadline) .foregroundStyle(.secondary) .multilineTextAlignment(.center) " +
             "if let supportURL = URL(string: AccountDeletionCopy.appleSignInSupportURL) { " +
-            "Link(\"How to stop using Sign in with Apple\", destination: supportURL)"))
+            "Link(\"How to stop using Sign in with Apple\", destination: supportURL) .font(.subheadline) } } " +
+            ".padding(.horizontal) } if let errorMessage { Text(errorMessage)"))
         #expect(Self.count("showsAppleManualStop", in: view) == 2, "declared and the guard")
         #expect(Self.count("AccountDeletionCopy.appleSignInManualStop", in: text) == 1)
         #expect(Self.count("AccountDeletionCopy.appleSignInSupportURL", in: text) == 1)
-        // The screen's flag starts false and is set only from the predicate, before the receipt is built, and
-        // both confirmations get it: the screen's own (a failed sign-out) and the root's sheet (through the receipt).
+        // The screen's flag starts false and is set only from the predicate, directly and unconditionally as the
+        // scheduled case runs (a deferred or conditional set would hand the receipt a stale false), before the receipt
+        // is built, and both confirmations get it: the screen's own (a failed sign-out) and the root's sheet (through
+        // the receipt).
         #expect(Self.count("showsAppleManualStop = ", in: text) == 2, "declared false, set only from the predicate")
         #expect(text.contains("@State private var showsAppleManualStop = false"))
         let body = try Self.body(of: "private func deleteAccount() async {", in: text)
-        let decided = try #require(body.range(of: "showsAppleManualStop = AppleIDSignIn.showsManualStopLine("))
+        let decided = try #require(body.range(of:
+            "case .scheduled(let scheduledDate, let appleAuthorizationRevoked): deletionDate = scheduledDate " +
+            "showsAppleManualStop = AppleIDSignIn.showsManualStopLine( isAppleAccount: appleAccount, " +
+            "appleAuthorizationRevoked: appleAuthorizationRevoked ) case .schedulingNotConfirmed:"))
         let handed = try #require(body.range(of:
             "AccountDeletionReceipt.Receipt( scheduledDateText: scheduledDateText, " +
             "showsAppleManualStop: showsAppleManualStop )"))
