@@ -1578,3 +1578,18 @@ upgrade, which no loopback fake can reach without a certificate, the closed conn
 `IMAPTLSFloorErrorTests`, `belowFloorSTARTTLSIsNamed` maps the below-floor alert in SwiftMail's upgrade-failure
 wording to the TLS-floor error, and `floorTokenOutsideTheHandshakeFailureIsNotRelabelled` shows that the token in a
 host name (STARTTLS and 465), a 454 reply, or a refused greeting leaves the error unchanged. `bytesAfterSTARTTLS(count:within:)` waits, bounded, for the fake to keep each connection's bytes, which it does only when the client hangs up.
+
+## Account deletion — the confirmation after sign-out
+
+`AccountDeletionReceiptTests` (in `AccountDeletionCoordinatorTests.swift`, serialized: one process-wide slot)
+covers the hand-off of the "Deletion Scheduled" confirmation to `RootView` across the deletion's sign-out: the
+receipt is in place while the sign-out runs (so the sign-out notification finds it) and carries the date; after
+a successful sign-out it is taken once and a later sign-out finds none; a failed sign-out drops it.
+`AccountDeletionConfirmationWiringTests` is a source check on the two screens: the deletion screen's only
+sign-out is the one `completeSession` through `AccountDeletionReceipt.signOut` with the server's date (no
+`TabMailAuthService.signOut()` either), and every scheduled deletion ends on the confirmation, with the error line
+after a failed sign-out; `RootView` takes the receipt at the end of its own `.tabMailDidSignOut` receiver, shows
+`AccountDeletionConfirmation` as a sheet from it, and touches the "Signed Out" alert's flag only there, without a
+receipt; the failed-age-check sign-out still arms the flag that shows neither notice. The shared
+`AccountDeletionConfirmation` names the server's date when it has one and none otherwise, shows the error line,
+and its Done runs the caller's action. The sheet's presentation is checked on a device.

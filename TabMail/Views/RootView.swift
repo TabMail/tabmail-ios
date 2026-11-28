@@ -60,6 +60,10 @@ struct RootView: View {
     /// Set while signing out after a failed age check: the person has just
     /// read why, so the generic "Signed Out" alert is not shown on top.
     @State private var suppressNextSignedOutAlert = false
+    /// The "Deletion Scheduled" confirmation of an account deletion that just
+    /// signed out (`AccountDeletionReceipt`), shown as a sheet in place of the
+    /// "Signed Out" alert. In memory only.
+    @State private var deletionReceipt: AccountDeletionReceipt.Receipt?
 
     // MARK: - Undo-send toast state
     /// Exact authority for the retained Draft generation behind a confirmed
@@ -773,16 +777,27 @@ struct RootView: View {
                 pendingDeletionDate = nil
                 pendingDeletionRequestId = nil
             }
-            if suppressNextSignedOutAlert {
-                suppressNextSignedOutAlert = false
-            } else {
+            // A deletion that signed out shows its confirmation instead: the
+            // deletion screen left with the signed-in branch.
+            if let receipt = AccountDeletionReceipt.take() {
+                deletionReceipt = receipt
+            } else if !suppressNextSignedOutAlert {
                 showSignedOutAlert = true
             }
+            suppressNextSignedOutAlert = false
         }
         .alert("Signed Out", isPresented: $showSignedOutAlert) {
             Button("OK") {}
         } message: {
             Text("You have been signed out of TabMail. Your email accounts and messages remain on this device. Sign in again to use AI features and push notifications.")
+        }
+        .sheet(item: $deletionReceipt) { receipt in
+            ScrollView {
+                AccountDeletionConfirmation(scheduledDateText: receipt.scheduledDateText, errorMessage: nil) {
+                    deletionReceipt = nil
+                }
+            }
+            .background(Palette.previewPaneBg)
         }
         .onReceive(NotificationCenter.default.publisher(for: .tabMailAccountGone).receive(on: DispatchQueue.main)) { _ in
             if DebugModeManager.isLoggingEnabled() {

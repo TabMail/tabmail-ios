@@ -895,3 +895,145 @@ struct AccountDeletionProductionWiringTests {
         #expect(!source.contains("AccountDeletionCopy.keepAccountConsequence"))
     }
 }
+
+/// The "Deletion Scheduled" confirmation after the deletion signs out. Signing out
+/// moves `RootView` to another branch and removes the deletion screen, so the
+/// confirmation travels to the root in `AccountDeletionReceipt`. Its slot is
+/// process-wide, hence `.serialized`; every test leaves it empty.
+@Suite("Account deletion confirmation after sign-out", .serialized)
+@MainActor
+struct AccountDeletionReceiptTests {
+    @Test("The receipt is waiting before the sign-out runs, so the sign-out notification finds it")
+    func handedBeforeTheSignOut() {
+        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: "date-1")
+        var seen: AccountDeletionReceipt.Receipt?
+        let signedOut = AccountDeletionReceipt.signOut(handing: receipt) {
+            seen = AccountDeletionReceipt.take()
+            return true
+        }
+        #expect(signedOut)
+        #expect(seen == receipt)
+        #expect(seen?.scheduledDateText == "date-1")
+    }
+
+    @Test("After a successful sign-out the root takes the receipt once")
+    func keptForTheRootOnce() {
+        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: nil)
+        var signOutCalls = 0
+        let signedOut = AccountDeletionReceipt.signOut(handing: receipt) {
+            signOutCalls += 1
+            return true
+        }
+        #expect(signedOut)
+        #expect(signOutCalls == 1)
+        let taken = AccountDeletionReceipt.take()
+        #expect(taken == receipt)
+        let later = AccountDeletionReceipt.take()
+        #expect(later == nil, "a later sign-out shows the ordinary alert")
+    }
+
+    @Test("A failed sign-out drops the receipt, so no later sign-out shows a deletion confirmation")
+    func failedSignOutDropsTheReceipt() {
+        let receipt = AccountDeletionReceipt.Receipt(scheduledDateText: "date-1")
+        var signOutCalls = 0
+        let signedOut = AccountDeletionReceipt.signOut(handing: receipt) {
+            signOutCalls += 1
+            return false
+        }
+        #expect(!signedOut)
+        #expect(signOutCalls == 1)
+        let later = AccountDeletionReceipt.take()
+        #expect(later == nil)
+    }
+}
+
+/// The two screens cannot be hosted in a unit test with their environment, so
+/// this is a source check over the links to `AccountDeletionReceipt`, on
+/// whitespace-normalized text.
+@Suite("Account deletion confirmation wiring")
+struct AccountDeletionConfirmationWiringTests {
+    private static func source(_ path: String) throws -> String {
+        let projectRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let raw = try String(contentsOf: projectRoot.appendingPathComponent(path), encoding: .utf8)
+        return raw.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    private static func count(_ needle: String, in text: String) -> Int {
+        text.components(separatedBy: needle).count - 1
+    }
+
+    @Test("The deletion signs out only through the receipt, carrying the server's date")
+    func deletionScreenHandsTheReceipt() throws {
+        let text = try Self.source("TabMail/Views/Settings/AccountDeletionView.swift")
+        #expect(text.contains(
+            "guard AccountDeletionReceipt.signOut(handing: receipt, signOut: { " +
+            "TabMailAuthService.completeSession(mode: .deactivate) }) else { return false }"))
+        #expect(Self.count("completeSession(", in: text) == 1, "no sign-out without the receipt")
+        #expect(Self.count("TabMailAuthService.signOut(", in: text) == 0, "no sign-out without the receipt")
+        let date = try #require(text.range(of: "scheduledDateText = deletionDate.flatMap(Date.fromISO8601)"))
+        let cleanup = try #require(text.range(of:
+            "let localSignOutCompleted = await scopedTabMailCleanup( " +
+            "receipt: AccountDeletionReceipt.Receipt(scheduledDateText: scheduledDateText) )"))
+        #expect(date.upperBound < cleanup.lowerBound, "the receipt carries the server's date")
+        // A failed sign-out leaves this screen up, and it shows the confirmation with its error line.
+        let failed = try #require(text.range(of:
+            "if !localSignOutCompleted { errorMessage = \"Deletion is scheduled, but local sign-out " +
+            "could not finish. Please tap Done and try signing out again.\" }"))
+        let shown = try #require(text.range(of: "withAnimation { deletionComplete = true } } catch {"))
+        #expect(cleanup.upperBound < failed.lowerBound && failed.upperBound < shown.lowerBound,
+                "the confirmation follows every scheduled deletion")
+        #expect(Self.count("deletionComplete = true", in: text) == 1)
+        #expect(text.contains(
+            "if deletionComplete { AccountDeletionConfirmation(scheduledDateText: scheduledDateText, " +
+            "errorMessage: errorMessage) { dismiss() } }"),
+            "a failed sign-out still shows the confirmation on the screen")
+    }
+
+    @Test("The root shows the confirmation in place of the Signed Out alert after a deletion")
+    func rootShowsTheConfirmation() throws {
+        let text = try Self.source("TabMail/Views/RootView.swift")
+        let decision = "if let receipt = AccountDeletionReceipt.take() { deletionReceipt = receipt } " +
+            "else if !suppressNextSignedOutAlert { showSignedOutAlert = true } suppressNextSignedOutAlert = false }"
+        // The decision closes the sign-out receiver itself, with no other receiver between them.
+        let receiver = try #require(text.range(of: ".onReceive(NotificationCenter.default.publisher(for: .tabMailDidSignOut)"))
+        let alert = try #require(text.range(of: ".alert(\"Signed Out\", isPresented: $showSignedOutAlert)"))
+        #expect(receiver.upperBound < alert.lowerBound)
+        guard receiver.upperBound < alert.lowerBound else { return }
+        let body = String(text[receiver.upperBound..<alert.lowerBound])
+        #expect(body.hasSuffix(" " + decision + " "), "taken in the sign-out receiver")
+        #expect(!body.contains(".onReceive(") && !body.contains(".onChange("), "taken in the sign-out receiver")
+        #expect(Self.count("AccountDeletionReceipt.take()", in: text) == 1)
+        // The alert's flag is declared, set in that one place and bound to the alert, so nothing
+        // else shows the alert beside the sheet.
+        #expect(Self.count("showSignedOutAlert", in: text) == 3, "the alert only when no receipt")
+        #expect(text.contains(
+            ".sheet(item: $deletionReceipt) { receipt in ScrollView { " +
+            "AccountDeletionConfirmation(scheduledDateText: receipt.scheduledDateText, errorMessage: nil) { " +
+            "deletionReceipt = nil } }"))
+        // The failed-age-check sign-out still shows neither notice.
+        #expect(text.contains(
+            "private func signOutAfterFailedAgeCheck() async { suppressNextSignedOutAlert = true " +
+            "PendingAccountAdd.shared.clear() if !(await TabMailAuthService.signOut()) { " +
+            "suppressNextSignedOutAlert = false } }"))
+    }
+
+    @Test("The confirmation names the server's date when there is one, and Done runs the caller's action")
+    func confirmationShowsTheDateAndDone() throws {
+        let text = try Self.source("TabMail/Views/Settings/AccountDeletionView.swift")
+        let start = try #require(text.range(of: "struct AccountDeletionConfirmation: View {"))
+        let end = try #require(text.range(of: "private struct BulletPoint: View {"))
+        #expect(start.upperBound < end.lowerBound)
+        guard start.upperBound < end.lowerBound else { return }
+        let view = String(text[start.upperBound..<end.lowerBound])
+        #expect(view.contains(
+            "Text(scheduledDateText.map { \"Your TabMail account is scheduled for permanent deletion on \\($0). \" + " +
+            "\"Your email accounts and messages remain on this device.\" } ?? ( " +
+            "\"Your TabMail account is scheduled for permanent deletion. \" + " +
+            "\"Your email accounts and messages remain on this device.\" ))"),
+            "dated with the server's date, undated without one")
+        #expect(view.contains("if let errorMessage { Text(errorMessage)"), "the error line when there is one")
+        #expect(view.contains("Button { onDone() } label: { Text(\"Done\")"), "Done runs the caller's action")
+        #expect(Self.count("onDone()", in: view) == 1)
+    }
+}

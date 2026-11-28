@@ -27,7 +27,9 @@ struct AccountDeletionView: View {
     var body: some View {
         ScrollView {
             if deletionComplete {
-                deletionConfirmationContent
+                AccountDeletionConfirmation(scheduledDateText: scheduledDateText, errorMessage: errorMessage) {
+                    dismiss()
+                }
             } else {
                 deletionFormContent
             }
@@ -167,72 +169,6 @@ struct AccountDeletionView: View {
         }
         .padding()
     }
-
-    // MARK: - Deletion confirmation
-
-    private var deletionConfirmationContent: some View {
-        VStack(spacing: 20) {
-            Spacer().frame(height: 40)
-
-            Image(systemName: "calendar.badge.clock")
-                .font(.system(size: 56))
-                .foregroundStyle(.orange)
-
-            Text("Deletion Scheduled")
-                .font(.title2.bold())
-
-            // The date comes from the server response. If it could not be
-            // parsed we say nothing about timing rather than invent a date.
-            Text(scheduledDateText.map {
-                "Your TabMail account is scheduled for permanent deletion on \($0). " +
-                    "Your email accounts and messages remain on this device."
-            } ?? (
-                "Your TabMail account is scheduled for permanent deletion. " +
-                    "Your email accounts and messages remain on this device."
-            ))
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-
-            Text(
-                "Changed your mind? Sign in to TabMail again before then and tap Keep Account on the " +
-                    "banner at the top of your inbox. After that date the deletion is permanent."
-            )
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-
-            Text(AccountDeletionCopy.keepAccountConsequence)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal)
-
-            if let errorMessage {
-                Text(errorMessage)
-                    .font(.footnote)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal)
-            }
-
-            Button {
-                dismiss()
-            } label: {
-                Text("Done")
-                    .bold()
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .padding(.horizontal)
-            .padding(.top, 8)
-
-            Spacer()
-        }
-        .padding()
-    }
 }
 
 private extension AccountDeletionView {
@@ -296,8 +232,12 @@ private extension AccountDeletionView {
             scheduledDateText = deletionDate.flatMap(Date.fromISO8601)
                 .map { $0.formatted(date: .long, time: .omitted) }
 
-            // Scoped cleanup: clear TabMail account data, preserve email accounts & messages
-            let localSignOutCompleted = await scopedTabMailCleanup()
+            // Scoped cleanup: clear TabMail account data, preserve email accounts & messages.
+            // A successful sign-out removes this screen; RootView then shows the
+            // confirmation from the receipt.
+            let localSignOutCompleted = await scopedTabMailCleanup(
+                receipt: AccountDeletionReceipt.Receipt(scheduledDateText: scheduledDateText)
+            )
             if !localSignOutCompleted {
                 errorMessage = "Deletion is scheduled, but local sign-out could not finish. Please tap Done and try signing out again."
             }
@@ -347,14 +287,17 @@ private extension AccountDeletionView {
     }
 
     /// Clears TabMail session and stops AI processing while preserving all local data.
-    private func scopedTabMailCleanup() async -> Bool {
+    private func scopedTabMailCleanup(receipt: AccountDeletionReceipt.Receipt) async -> Bool {
         // 1. Cancel all in-flight AI tasks (prevents stale JWTs from hitting backend)
         await AccountManager.shared.cancelAllAIProcessing()
 
         // 2. Deactivate the local session (which also disconnects Device Sync). This is
         // the only operation that may emit sign-out success; a Keychain failure leaves
-        // the signed-in state.
-        guard TabMailAuthService.completeSession(mode: .deactivate) else {
+        // the signed-in state. The receipt is handed with no suspension before the
+        // sign-out, so RootView finds it when the sign-out notification arrives.
+        guard AccountDeletionReceipt.signOut(handing: receipt, signOut: {
+            TabMailAuthService.completeSession(mode: .deactivate)
+        }) else {
             return false
         }
 
@@ -365,6 +308,80 @@ private extension AccountDeletionView {
         return true
     }
 
+}
+
+/// The "Deletion Scheduled" confirmation. The deletion screen shows it when
+/// signing out fails; after a successful sign-out the deletion screen is gone
+/// and `RootView` shows it as a sheet from `AccountDeletionReceipt`.
+struct AccountDeletionConfirmation: View {
+    /// The server's deletion date, formatted; nil names no date.
+    let scheduledDateText: String?
+    let errorMessage: String?
+    let onDone: () -> Void
+
+    var body: some View {
+        VStack(spacing: 20) {
+            Spacer().frame(height: 40)
+
+            Image(systemName: "calendar.badge.clock")
+                .font(.system(size: 56))
+                .foregroundStyle(.orange)
+
+            Text("Deletion Scheduled")
+                .font(.title2.bold())
+
+            // The date comes from the server response. If it could not be
+            // parsed we say nothing about timing rather than invent a date.
+            Text(scheduledDateText.map {
+                "Your TabMail account is scheduled for permanent deletion on \($0). " +
+                    "Your email accounts and messages remain on this device."
+            } ?? (
+                "Your TabMail account is scheduled for permanent deletion. " +
+                    "Your email accounts and messages remain on this device."
+            ))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            Text(
+                "Changed your mind? Sign in to TabMail again before then and tap Keep Account on the " +
+                    "banner at the top of your inbox. After that date the deletion is permanent."
+            )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            Text(AccountDeletionCopy.keepAccountConsequence)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+
+            Button {
+                onDone()
+            } label: {
+                Text("Done")
+                    .bold()
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.horizontal)
+            .padding(.top, 8)
+
+            Spacer()
+        }
+        .padding()
+    }
 }
 
 private struct BulletPoint: View {
