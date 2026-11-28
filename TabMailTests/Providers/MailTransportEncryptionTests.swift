@@ -216,8 +216,11 @@ struct MailTransportEncryptionTests {
 
     /// Queue one ready send (no undo hold) for an account whose SMTP server is
     /// `127.0.0.1:smtpPort`, run `drains` Outbox drains, and return the row's
-    /// status and strike count after each, and the row at the end.
-    private static func drainSend(smtpPort: Int, drains: Int) async throws -> (states: [String], row: OutboxMessage?) {
+    /// status and strike count after each, and the row at the end. `configure`
+    /// sees the provider before the first drain.
+    static func drainSend(
+        smtpPort: Int, drains: Int, configure: (IMAPProvider) -> Void = { _ in }
+    ) async throws -> (states: [String], row: OutboxMessage?) {
         let (pool, dir, previous) = try FolderEpochTestFixture.makeAppDB()
         defer { InstalledTestDatabaseLifetime.finish(previous: previous, pool: pool, directory: dir) }
         let account = try FolderEpochTestFixture.makeAccount(
@@ -230,6 +233,7 @@ struct MailTransportEncryptionTests {
         let provider = IMAPProvider(
             host: "127.0.0.1", port: 1, username: account.emailAddress, password: "synthetic-password",
             senderEmail: account.emailAddress, smtpHost: "127.0.0.1", smtpPort: smtpPort)
+        configure(provider)
         var states: [String] = []
         var row: OutboxMessage?
         try await TestProviderRegistry.withRegisteredProvider(accountId: account.id, provider: provider) {
