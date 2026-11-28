@@ -15,7 +15,7 @@ enum BackendNSEClient {
 
     /// Sends one AI request. Test seam: tests bind a fake with `$transport.withValue`.
     typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
-    @TaskLocal static var transport: Transport = { try await URLSession.shared.data(for: $0) }
+    @TaskLocal static var transport: Transport = { try await URLSession.shared.data(for: $0, delegate: OwnServerRedirectPolicy.shared) }
 
     /// Whether AI is turned off (Opt Out of AI, the App Group flag the app writes), read
     /// right before each AI request is sent, so turning AI off stops this run at its next

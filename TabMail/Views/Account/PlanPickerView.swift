@@ -422,7 +422,7 @@ struct PlanPickerView: View {
             request.httpBody = try? JSONSerialization.data(withJSONObject: ["signedTransactionInfo": jws])
 
             do {
-                let (data, response) = try await URLSession.shared.data(for: request)
+                let (data, response) = try await URLSession.shared.data(for: request, delegate: OwnServerRedirectPolicy.shared)
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 if statusCode == 200 {
                     BackgroundSyncLogger.logDebug("[PlanPicker] Backend verified purchase successfully")

@@ -10,7 +10,7 @@ import Foundation
 /// Background recovery requires a durably shared token under the same activation.
 enum NSETokenManager {
     typealias DataForRequest = TabMailSessionRefresh.Transport
-    @TaskLocal static var transport: DataForRequest = { try await URLSession.shared.data(for: $0) }
+    @TaskLocal static var transport: DataForRequest = { try await URLSession.shared.data(for: $0, delegate: OwnServerRedirectPolicy.shared) }
 
     @TaskLocal static var storeOverride: TabMailSessionStore?
     static var store: TabMailSessionStore { storeOverride ?? .shared }

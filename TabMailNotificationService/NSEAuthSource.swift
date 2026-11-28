@@ -10,7 +10,7 @@ import Foundation
 /// One notification operation stays bound to its original foreground activation.
 struct NSEAuthSource: AuthSource {
     typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
-    @TaskLocal static var transport: Transport = { try await URLSession.shared.data(for: $0) }
+    @TaskLocal static var transport: Transport = { try await URLSession.shared.data(for: $0, delegate: OwnServerRedirectPolicy.shared) }
 
     struct Binding: Sendable { let accountId: String; let generation: String? }
     @TaskLocal static var binding: Binding?

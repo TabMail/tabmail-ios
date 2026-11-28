@@ -197,6 +197,19 @@ final class DeviceSyncService: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    /// The connection to the sync server never follows a redirect (`OwnServerRedirectPolicy`).
+    nonisolated func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        OwnServerRedirectPolicy.shared.urlSession(
+            session, task: task, willPerformHTTPRedirection: response, newRequest: request,
+            completionHandler: completionHandler)
+    }
+
     nonisolated func urlSession(
         _ session: URLSession,
         task: URLSessionTask,

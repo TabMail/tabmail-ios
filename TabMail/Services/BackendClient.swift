@@ -72,16 +72,17 @@ actor BackendClient {
         throw AIOffError()
     }
 
-    /// A streamed AI request (completions). `session` nil is the default LLM session.
+    /// A streamed AI request (completions). `session` nil is the default LLM session. Like every AI
+    /// request, it never follows a redirect from TabMail's servers (`OwnServerRedirectPolicy`).
     private func aiBytes(for request: URLRequest, session: URLSession? = nil) async throws -> (URLSession.AsyncBytes, URLResponse) {
         try refuseIfAIOff()
-        return try await (session ?? llmSession).bytes(for: request)
+        return try await (session ?? llmSession).bytes(for: request, delegate: OwnServerRedirectPolicy.shared)
     }
 
     /// A plain AI request (dictation transcription and its warm-up).
     private func aiData(for request: URLRequest) async throws -> (Data, URLResponse) {
         try refuseIfAIOff()
-        return try await llmSession.data(for: request)
+        return try await llmSession.data(for: request, delegate: OwnServerRedirectPolicy.shared)
     }
 
     // 403 exponential backoff state — shared across all completions requests.
@@ -1565,7 +1566,7 @@ extension BackendClient {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await session.data(for: request, delegate: OwnServerRedirectPolicy.shared)
             guard let httpResponse = response as? HTTPURLResponse,
                   200..<300 ~= httpResponse.statusCode else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
